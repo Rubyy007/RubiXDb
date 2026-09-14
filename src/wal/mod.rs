@@ -73,11 +73,20 @@
 //!   directory if absent (`canonicalize_existing_dir` — Group 4.1) nor
 //!   opens segment files for writing (`scan_segment`'s `mutate` parameter
 //!   — Group 4.2), so it can be run against a read-only directory.
-//! - **`SyncMode::GroupCommit` is rejected, not silently downgraded**:
-//!   `open_for_recovery` returns `EngineError::Unsupported` if configured
-//!   with `GroupCommit`, since no batching implementation exists yet
-//!   (Group 5.2) — a caller can never silently get `Immediate` behavior
-//!   while believing it configured something else.
+//! - **`SyncMode::GroupCommit` is now real (Phase 1: Group Commit)**:
+//!   `open_for_recovery` no longer rejects `GroupCommit`-configured
+//!   `WalConfig`s (it did, pre-Phase-1, via `EngineError::Unsupported` —
+//!   Group 5.2). `wal::group_commit::GroupCommitter` wraps a `FileWal` and
+//!   implements the batching this variant's `max_wait`/`max_batch_bytes`
+//!   fields describe: multiple concurrent callers' `sync()` calls are
+//!   coalesced into one `fsync` per batch, with a durability watermark
+//!   (`durable_through`) published only strictly after that `fsync`
+//!   returns `Ok`. A `FileWal` configured with `GroupCommit` but used
+//!   directly (never wrapped in a `GroupCommitter`) is not an error — it
+//!   behaves exactly like `Immediate` mode, which is safe (strictly more
+//!   durable per call) even though it forgoes the throughput win; see
+//!   `PROCESS.md` §1.9 and `group_commit`'s module doc comment for the
+//!   full design.
 //! - **Purge failure tolerance.** If `purge_before` fails midway, the
 //!   batch's directory fsync is still attempted; if that also fails, some
 //!   unlinked entries may resurrect after a crash. This is tolerated:
@@ -94,6 +103,8 @@ mod file_io;
 mod format;
 #[cfg(test)]
 mod fuzz_tests;
+pub mod group_commit;
+pub mod metrics;
 mod ops;
 mod recovery;
 #[cfg(any(test, feature = "test-util"))]
@@ -101,6 +112,8 @@ pub mod testing;
 
 pub use file_io::WalFile;
 pub use format::{DEFAULT_MAX_RECORD_LEN, DEFAULT_MAX_SEGMENT_SIZE};
+pub use group_commit::GroupCommitter;
+pub use metrics::FsyncLatencyTracker;
 pub use ops::{WalOp, WalOpOwned};
 
 use std::collections::BTreeMap;
@@ -597,20 +610,55 @@ impl FileWal {
     pub fn set_abort_hook(hook: fn(AbortPoint)) {
         abort_hook::set(hook);
     }
+
+    /// Phase 1 (Group Commit): returns `(current_segment_id, cloned_file,
+    /// batch_max_seq)` so `wal::group_commit::GroupCommitter`'s leader can
+    /// `fsync` the active segment without holding this `FileWal`'s lock
+    /// across the syscall itself — see `PROCESS.md` §1.3–§1.5 for the full
+    /// correctness argument (in short: `fsync` is a property of the
+    /// underlying file, not of the handle used to invoke it, so a cloned
+    /// handle's `sync_all()` durably covers every byte written through the
+    /// original handle up to that moment, with no lock contention between
+    /// the two).
+    ///
+    /// `batch_max_seq` is `next_seq() - 1`: the highest `seq` this call has
+    /// itself observed to have been appended. `next_seq` is only ever
+    /// incremented after a record's bytes are fully written (see
+    /// `append`'s body), so this is always a safe — never an
+    /// over-optimistic — bound on what the returned handle's `fsync` will
+    /// end up covering.
+    ///
+    /// `pub(crate)`: not part of this crate's public API surface; only
+    /// `wal::group_commit` calls this.
+    pub(crate) fn active_segment_sync_handle(&self) -> Result<(u64, File, u64)> {
+        let file = self.active.try_clone_file()?;
+        let batch_max_seq = self.next_seq.saturating_sub(1);
+        Ok((self.active_id, file, batch_max_seq))
+    }
+
+    /// Phase 1 (Group Commit): the `SyncMode` this `FileWal` was opened
+    /// with — read by `wal::group_commit::GroupCommitter::new` to recover
+    /// its `max_wait`/`max_batch_bytes` configuration. `SyncMode` is
+    /// `Copy`, so this returns by value rather than a reference.
+    /// `pub(crate)`: not part of this crate's public API surface.
+    pub(crate) fn sync_mode(&self) -> SyncMode {
+        self.config.sync_mode
+    }
 }
 
 impl Wal for FileWal {
     fn open_for_recovery(dir: &Path, config: WalConfig) -> Result<(Self, WalReplayResult)> {
-        if !matches!(config.sync_mode, SyncMode::Immediate) {
-            // Group 5.2: never silently run GroupCommit-configured callers
-            // in Immediate mode — see the module doc comment.
-            return Err(EngineError::Unsupported {
-                operation: "SyncMode::GroupCommit (WAL Spec §4.2): no batching \
-                            implementation exists yet"
-                    .to_string(),
-            });
-        }
-
+        // Phase 1 (Group Commit): `SyncMode::GroupCommit` is no longer
+        // rejected here — see this module's "# Durability" section and
+        // `PROCESS.md` §1.9. `FileWal` itself behaves identically
+        // regardless of `sync_mode` (the field is carried through to
+        // `wal::group_commit::GroupCommitter::new`, which is what actually
+        // reads `max_wait`/`max_batch_bytes` and turns batching on); a
+        // `FileWal` configured with `GroupCommit` but never wrapped in a
+        // `GroupCommitter` simply behaves like `Immediate` mode — safe and
+        // non-surprising (strictly more durable per call, just without the
+        // throughput win), never silently *different* from what a direct
+        // `append_sync` caller asked for.
         let canonical_dir = canonicalize_data_dir(&Self::wal_dir(dir))?;
         // Group "no file locking": acquired *before* any scan/mutation,
         // so a second concurrent `open_for_recovery` (another process, or
@@ -969,9 +1017,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Group 5.2 regression test.
+    /// Phase 1 (Group Commit) regression test, superseding the pre-Phase-1
+    /// `group_commit_is_rejected_not_silently_downgraded` (which asserted
+    /// the old `EngineError::Unsupported` rejection — see this module's
+    /// "# Durability" section and `PROCESS.md` §1.9 for why that contract
+    /// changed): `open_for_recovery` now succeeds with a `GroupCommit`-
+    /// configured `WalConfig`, and the resulting `FileWal` is fully usable
+    /// directly (behaving like `Immediate` mode — one `append_sync` still
+    /// does exactly one `append` + one `fsync`) even without ever being
+    /// wrapped in a `GroupCommitter`.
     #[test]
-    fn group_commit_is_rejected_not_silently_downgraded() {
+    fn group_commit_sync_mode_is_accepted_and_usable_directly() {
         let dir = temp_dir("group_commit");
         let config = WalConfig {
             sync_mode: SyncMode::GroupCommit {
@@ -980,8 +1036,14 @@ mod tests {
             },
             ..WalConfig::default()
         };
-        let err = FileWal::open_for_recovery(&dir, config).unwrap_err();
-        assert!(matches!(err, EngineError::Unsupported { .. }));
+        let (mut wal, _) = FileWal::open_for_recovery(&dir, config).unwrap();
+        let pos = wal
+            .append_sync(WalOp::Put {
+                key: b"k",
+                value: b"v",
+            })
+            .unwrap();
+        assert_eq!(pos.seq, 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

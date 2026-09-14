@@ -39,6 +39,12 @@ pub enum EngineError {
     /// configured data directory. Always a configuration error, never
     /// something a caller should retry.
     InvalidPath { detail: String, path: PathBuf },
+    /// A caller-visible wait bound was exceeded before the awaited
+    /// condition became true (e.g. `wal::group_commit::GroupCommitter::
+    /// await_durable`'s follower timeout). Distinct from `Io`: no I/O
+    /// necessarily failed — the wait itself simply ran out of time, and a
+    /// caller may reasonably retry the wait.
+    Timeout { detail: String },
 }
 
 impl fmt::Display for EngineError {
@@ -56,6 +62,7 @@ impl fmt::Display for EngineError {
             EngineError::InvalidPath { detail, path } => {
                 write!(f, "invalid path {}: {detail}", path.display())
             }
+            EngineError::Timeout { detail } => write!(f, "timeout: {detail}"),
         }
     }
 }

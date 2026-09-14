@@ -127,6 +127,39 @@ impl<F: WalFile> SegmentIo<F> {
     }
 }
 
+/// Phase 1 (Group Commit): a way to `fsync` a segment's bytes without
+/// holding whatever lock protects `append()` across the syscall itself —
+/// see `PROCESS.md` §1.3–§1.4 for the full design rationale. Specific to
+/// `SegmentIo<File>` (not the generic `impl<F: WalFile>` block above)
+/// because cloning is a `std::fs::File` capability with no equivalent in
+/// the `WalFile` trait, and is never needed by the in-memory `MemFile` test
+/// backend.
+impl SegmentIo<File> {
+    /// Returns a second OS-level handle to the same underlying segment
+    /// file (`File::try_clone` — `dup()` on Unix, `DuplicateHandle` on
+    /// Windows; safe, dependency-free `std` API, no `unsafe`). `fsync` is a
+    /// property of the underlying file, not of any one handle to it: a
+    /// `sync_all()` call on the returned clone durably flushes every byte
+    /// previously written through `self`'s own handle (or any other handle
+    /// to the same file) up to the moment the writing `write()`/`pwrite()`
+    /// syscall returned success, exactly as if `self.sync()` had been
+    /// called directly. Two handles calling `fsync`/`FlushFileBuffers`
+    /// concurrently on the same file is safe and well-defined on both
+    /// platforms (at worst, redundant work).
+    ///
+    /// Returns `Err` if this segment is poisoned (`is_poisoned`) — a
+    /// poisoned segment's on-disk state is unknown (see this struct's
+    /// top-level doc comment), so handing out a handle that could be used
+    /// to `fsync` it would misleadingly suggest that handle's caller can
+    /// trust what it flushes.
+    pub(crate) fn try_clone_file(&self) -> io::Result<File> {
+        if self.poisoned {
+            return Err(Self::poisoned_error());
+        }
+        self.file.try_clone()
+    }
+}
+
 /// A file-like handle the WAL's segment I/O can read, write, seek, fsync,
 /// and truncate. Implemented for `std::fs::File`; test code implements it
 /// for `FaultInjectingIo<F>` to deterministically inject faults.
