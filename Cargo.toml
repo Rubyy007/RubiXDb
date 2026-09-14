@@ -8,6 +8,16 @@ publish = false
 [features]
 test-util = []
 bench = []
+# TEMPORARY, experiment-only — see PHASE1_ADR.md (window-size sweep ADR)
+# and PHASE1_TEST_RESULTS.md's window-size sweep section. Not enabled by
+# default, not depended on by any other feature. Gates a runtime,
+# env-var-driven override of GroupCommitter's leader batch-window
+# formula, used only to answer "does throughput scale with window size on
+# this machine" empirically. Reduces to the exact production formula when
+# its env vars are unset, and is fully removable (this feature plus its
+# one gated module in src/wal/group_commit.rs) without touching any
+# production code path.
+phase1-window-experiment = []
 
 [dependencies]
 crc32c = "=0.6.8"

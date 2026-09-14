@@ -752,8 +752,10 @@ impl GroupCommitter {
     fn spin_wait_for_batch_window(&self) {
         super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPre);
         let ema_ns = self.latency.current_ns();
-        let ema_based = Duration::from_nanos(ema_ns / 10);
-        let window = self.max_wait_cap.min(ema_based);
+        #[cfg(feature = "phase1-window-experiment")]
+        let window = phase1_window_experiment::effective_window(self.max_wait_cap, ema_ns);
+        #[cfg(not(feature = "phase1-window-experiment"))]
+        let window = self.max_wait_cap.min(Duration::from_nanos(ema_ns / 10));
         if window.is_zero() {
             super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
             return;
@@ -934,6 +936,90 @@ impl GroupCommitter {
         self.batch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// **Temporary, experiment-only scaffolding — see `PHASE1_ADR.md` (the
+/// window-size sweep ADR) and `PHASE1_TEST_RESULTS.md`'s window-size
+/// sweep section.** Only compiled with the `phase1-window-experiment`
+/// Cargo feature (not enabled by default, not depended on by any other
+/// feature) — a normal build or `cargo test` never sees this module at
+/// all. Its one purpose is to answer, empirically, whether M1.2/M1.3's
+/// throughput miss is caused by the leader's batch-window formula being
+/// too conservative or by this machine's `fsync` latency being the
+/// binding constraint independent of window size — a question the
+/// original report's algebraic argument did not, on its own, settle.
+///
+/// **Fully removable**: delete this module and revert `spin_wait_for_
+/// batch_window`'s one `#[cfg(feature = "phase1-window-experiment")]`
+/// branch to leave only the `#[cfg(not(...))]` branch (the production
+/// formula, unchanged) — a no-op relative to production behavior, since
+/// `effective_window` computes exactly that same formula whenever both
+/// env vars below are unset.
+#[cfg(feature = "phase1-window-experiment")]
+mod phase1_window_experiment {
+    use std::time::Duration;
+
+    /// `PHASE1_EXPERIMENT_MAX_WAIT_US` (microseconds, parsed as `u64`):
+    /// overrides `max_wait_cap` for this process. Unset or unparseable ⇒
+    /// falls back to the real `max_wait_cap` (the production value).
+    ///
+    /// `PHASE1_EXPERIMENT_EMA_DIVISOR` (parsed as `u64`): overrides the
+    /// production `/ 10` divisor applied to the EMA. `0` is a sentinel
+    /// meaning "no EMA cap at all" — the window becomes exactly
+    /// `max_wait`, unconditionally (models "uncap both" sweep rows).
+    /// Unset or unparseable ⇒ falls back to `10` (the production value).
+    pub(super) fn effective_window(max_wait_cap: Duration, ema_ns: u64) -> Duration {
+        let max_wait = std::env::var("PHASE1_EXPERIMENT_MAX_WAIT_US")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(max_wait_cap);
+        let divisor = std::env::var("PHASE1_EXPERIMENT_EMA_DIVISOR")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        match divisor {
+            Some(0) => max_wait,
+            Some(d) => max_wait.min(Duration::from_nanos(ema_ns / d)),
+            _ => max_wait.min(Duration::from_nanos(ema_ns / 10)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // `std::env::set_var`/`remove_var` mutate process-global state,
+        // not per-thread state — Rust's default parallel test runner
+        // would let two tests that each set/clear these env vars race
+        // each other (the exact class of bug this crate already hit once
+        // with a process-wide fault-injection hook — see `PROCESS.md`'s
+        // M0 entry). Both scenarios are therefore one test function, run
+        // strictly sequentially within it, rather than two separate
+        // `#[test]` functions that could interleave.
+        #[test]
+        fn effective_window_matches_env_var_overrides_or_falls_back_to_production_formula() {
+            std::env::remove_var("PHASE1_EXPERIMENT_MAX_WAIT_US");
+            std::env::remove_var("PHASE1_EXPERIMENT_EMA_DIVISOR");
+            let cap = Duration::from_micros(200);
+            let ema_ns = 2_800_000u64;
+            assert_eq!(
+                effective_window(cap, ema_ns),
+                cap.min(Duration::from_nanos(ema_ns / 10)),
+                "unset env vars must reduce to the exact production formula"
+            );
+
+            std::env::set_var("PHASE1_EXPERIMENT_MAX_WAIT_US", "3000");
+            std::env::set_var("PHASE1_EXPERIMENT_EMA_DIVISOR", "0");
+            assert_eq!(
+                effective_window(cap, ema_ns),
+                Duration::from_micros(3000),
+                "divisor=0 must mean 'no EMA cap': window = max_wait exactly"
+            );
+
+            std::env::remove_var("PHASE1_EXPERIMENT_MAX_WAIT_US");
+            std::env::remove_var("PHASE1_EXPERIMENT_EMA_DIVISOR");
+        }
     }
 }
 
