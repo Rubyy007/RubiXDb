@@ -26,7 +26,7 @@ performance targets, and why.
 | Field | Value |
 |---|---|
 | Git commit (code under test) | `b660b5973b59d664e43a0f39f6b360f01e242ec2` |
-| Git commit (this results file added) | recorded in §17 below, filled in after this file is committed |
+| Git commit (this results file added, plus final doc updates) | `d564fa1c0ae7c059c5f790530265d7b7ef77cf4d` |
 | Branch | `phase-1/group-commit` |
 | Rust (`rustc --version`) | `rustc 1.98.1 (48a229cea 2026-09-01)` |
 | Cargo (`cargo --version`) | `cargo 1.98.1 (797e8a9bc 2026-08-05)` |
