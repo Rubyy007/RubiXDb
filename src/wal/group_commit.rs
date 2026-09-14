@@ -564,15 +564,14 @@ impl GroupCommitter {
                     ),
                 });
             }
-            // Spurious or real notify (not a timeout): record this as a
-            // waiter wake for the timing diagnostic — deliberately
-            // excluding timed-out wakes above, since those are driven by
-            // this waiter's own (tens-of-ms-scale) timeout, not by a
-            // `notify_all`, and would otherwise badly skew the "how long
-            // after notify did the last waiter wake" measurement with
-            // values unrelated to any actual notify event.
-            self.timing.record_waiter_wake();
-            // Loop back to the top and re-check.
+            // Spurious or real notify: loop back to the top and re-check.
+            //
+            // No timing-diagnostic call here (revision 1 of `batch_
+            // timing` had every waiter update a shared atomic on each
+            // wake; that contended write measurably degraded the very
+            // system it was trying to observe under M1.3-scale load —
+            // see `batch_timing`'s module doc comment). Coordination is
+            // now measured entirely on the leader side instead.
         }
     }
 
@@ -718,11 +717,11 @@ impl GroupCommitter {
 
         // Phase A timing diagnostic (test-util-gated, zero-cost otherwise
         // — see `batch_timing`'s doc comment): `record_batch_start`
-        // attributes the gap since the *previous* batch's `fsync`
-        // completed to that batch's coordination cost, using whatever
-        // waiter-wake activity has been observed by now.
+        // attributes the gap since the *previous* batch's `notify_all`
+        // to that previous batch's coordination cost — computed here,
+        // leader-side only, with no follower involvement.
         let t_window_started = self.timing.now_ns();
-        self.timing.record_batch_start();
+        self.timing.record_batch_start(t_window_started);
 
         let window_started = Instant::now();
         self.spin_wait_for_batch_window();
@@ -1144,10 +1143,32 @@ mod phase1_window_experiment {
 /// RESULTS.md`'s window-size sweep section (new per-batch timing
 /// subsection). Not part of the stable API.** Records, per batch, when
 /// the leader enters/leaves each stage (window wait, sync-target
-/// snapshot, `fsync`, notify) and when the last waiter observed to be
-/// waking up did so, so the batch cycle can be broken down into
-/// `window + snapshot + fsync + notify + wake` instead of only ever being
+/// snapshot, `fsync`, notify), so the batch cycle can be broken down into
+/// `window + snapshot + fsync + coordination` instead of only ever being
 /// visible as one opaque total.
+///
+/// **Revision 2 — the original design measured a real confound, not the
+/// system.** The first version additionally had every *follower* call a
+/// `fetch_max` on a shared `AtomicU64` each time it woke from `condvar.
+/// wait_timeout`, to sample "when did the last waiter wake" for a
+/// `notify`/`wake` split. Under M1.3-scale load (up to 1,000 threads),
+/// that contended atomic — every wake on every thread forcing a cache-
+/// line invalidation visible to every core — measurably degraded the
+/// system it was trying to observe: M1.3 throughput with this
+/// instrumentation compiled in measured ~9,800–11,100 ops/sec, against
+/// ~62,000–63,000 ops/sec for the *identical* code and environment
+/// without it (`PHASE1_TEST_RESULTS.md` §9C's revision note has the full
+/// account — this was initially, incorrectly, attributed to a near-full
+/// disk that turned out to be a real but secondary factor). Revision 2
+/// removes all follower-side instrumentation entirely: `coordination` is
+/// now computed purely from **leader-side** data — `t_window_started` of
+/// batch N+1 minus `t_notify_sent` of batch N — which requires only a
+/// plain atomic load/store pair, written by whichever single thread is
+/// leader at the time (never more than one), so there is no meaningful
+/// contention left to distort the measurement. The trade-off is losing
+/// the `notify`-vs-`wake` sub-split from revision 1; `coordination` is
+/// reported as one number instead, which is what the pipelining model
+/// actually needs (`window + fsync + coordination`).
 ///
 /// Two implementations, selected by `#[cfg]`, both with the identical
 /// method surface — call sites throughout `GroupCommitter` never need
@@ -1177,14 +1198,11 @@ mod batch_timing {
         /// measure the inter-batch coordination gap against (every batch
         /// except the first).
         coordination_samples: AtomicU64,
-        notify_ns_total: AtomicU64,
-        wake_ns_total: AtomicU64,
-        /// Updated by every waiter (leader-to-be or follower) each time it
-        /// wakes from `condvar.wait_timeout` and re-checks its loop —
-        /// `fetch_max`, so this always holds the most recent wake
-        /// observed anywhere in the process for this committer.
-        last_waiter_wake_ns: AtomicU64,
-        prev_fsync_ended_ns: AtomicU64,
+        coordination_ns_total: AtomicU64,
+        /// Written only by whichever thread is *currently* leader —
+        /// never concurrently, since leadership is exclusive — so these
+        /// two fields carry no meaningful write contention despite being
+        /// shared state.
         prev_notify_sent_ns: AtomicU64,
     }
 
@@ -1197,10 +1215,7 @@ mod batch_timing {
                 snapshot_ns_total: AtomicU64::new(0),
                 fsync_ns_total: AtomicU64::new(0),
                 coordination_samples: AtomicU64::new(0),
-                notify_ns_total: AtomicU64::new(0),
-                wake_ns_total: AtomicU64::new(0),
-                last_waiter_wake_ns: AtomicU64::new(0),
-                prev_fsync_ended_ns: AtomicU64::new(0),
+                coordination_ns_total: AtomicU64::new(0),
                 prev_notify_sent_ns: AtomicU64::new(0),
             }
         }
@@ -1209,39 +1224,21 @@ mod batch_timing {
             u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
         }
 
-        /// Called by any thread (follower or soon-to-be leader) right
-        /// after its `condvar.wait_timeout` call returns, before it
-        /// re-checks `await_durable`'s loop conditions.
-        pub(super) fn record_waiter_wake(&self) {
-            let now = self.now_ns();
-            self.last_waiter_wake_ns.fetch_max(now, Ordering::Relaxed);
-        }
-
         /// Called at the very start of `run_as_leader`, before the window
-        /// wait begins. Attributes the gap since the *previous* batch's
-        /// `fsync` completed — split into "time to call `notify_all`" and
-        /// "time until the last observed waiter wake" — to that previous
-        /// batch's coordination cost. Best-effort: `last_waiter_wake_ns`
-        /// is sampled *here* (at the next batch's window start) rather
-        /// than synchronized precisely with the previous batch's specific
-        /// waiters, on the premise that followers wake in microseconds,
-        /// far faster than the multi-millisecond gap between batches this
-        /// diagnostic exists to measure in the first place.
-        pub(super) fn record_batch_start(&self) {
-            let prev_fsync_ended = self.prev_fsync_ended_ns.load(Ordering::Relaxed);
-            if prev_fsync_ended == 0 {
+        /// wait begins. Attributes the gap since the *previous* batch
+        /// called `notify_all` (i.e. finished) to that previous batch's
+        /// coordination cost — purely from leader-side data, no follower
+        /// involvement, no contended atomic (see this module's revision-2
+        /// doc comment for why that matters).
+        pub(super) fn record_batch_start(&self, t_window_started: u64) {
+            let prev_notify_sent = self.prev_notify_sent_ns.load(Ordering::Relaxed);
+            if prev_notify_sent == 0 {
                 return; // first batch: nothing to compare against yet
             }
-            let prev_notify_sent = self.prev_notify_sent_ns.load(Ordering::Relaxed);
-            let last_wake = self.last_waiter_wake_ns.load(Ordering::Relaxed);
-            self.notify_ns_total.fetch_add(
-                prev_notify_sent.saturating_sub(prev_fsync_ended),
+            self.coordination_ns_total.fetch_add(
+                t_window_started.saturating_sub(prev_notify_sent),
                 Ordering::Relaxed,
             );
-            if last_wake >= prev_notify_sent {
-                self.wake_ns_total
-                    .fetch_add(last_wake - prev_notify_sent, Ordering::Relaxed);
-            }
             self.coordination_samples.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -1268,8 +1265,6 @@ mod batch_timing {
                 Ordering::Relaxed,
             );
             self.batches.fetch_add(1, Ordering::Relaxed);
-            self.prev_fsync_ended_ns
-                .store(t_fsync_ended, Ordering::Relaxed);
             self.prev_notify_sent_ns
                 .store(t_notify_sent, Ordering::Relaxed);
         }
@@ -1291,16 +1286,12 @@ mod batch_timing {
             eprintln!(
                 "[RGC_TIMING_REPORT] batches={batches} \
                  mean_window_us={:.1} mean_snapshot_us={:.1} mean_fsync_us={:.1} \
-                 mean_notify_us={:.1} mean_wake_us={:.1} coordination_samples={coordination_samples}",
+                 mean_coordination_us={:.1} coordination_samples={coordination_samples}",
                 mean_us(self.window_ns_total.load(Ordering::Relaxed), batches),
                 mean_us(self.snapshot_ns_total.load(Ordering::Relaxed), batches),
                 mean_us(self.fsync_ns_total.load(Ordering::Relaxed), batches),
                 mean_us(
-                    self.notify_ns_total.load(Ordering::Relaxed),
-                    coordination_samples
-                ),
-                mean_us(
-                    self.wake_ns_total.load(Ordering::Relaxed),
+                    self.coordination_ns_total.load(Ordering::Relaxed),
                     coordination_samples
                 ),
             );
@@ -1320,8 +1311,7 @@ mod batch_timing {
         pub(super) fn now_ns(&self) -> u64 {
             0
         }
-        pub(super) fn record_waiter_wake(&self) {}
-        pub(super) fn record_batch_start(&self) {}
+        pub(super) fn record_batch_start(&self, _t_window_started: u64) {}
         pub(super) fn record_batch_stages(&self, _: u64, _: u64, _: u64, _: u64, _: u64) {}
         pub(super) fn print_report_if_requested(&self) {}
     }

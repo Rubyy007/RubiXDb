@@ -243,3 +243,55 @@ removed in this same change, since the brief's own instructions describe
 it as "removable in a follow-up commit," not required to be removed
 immediately. Removing it is a pure code-deletion, no-behavior-change
 follow-up whenever desired.
+
+## ADR-13: `batch_timing`'s coordination measurement is leader-exclusive, not follower-reported
+
+**Context**: the Phase A timing instrumentation added ahead of the
+pipelining fix (`PHASE1_TEST_RESULTS.md` §9C) originally had every
+waiter thread record its own wake timestamp into one shared `AtomicU64`
+via `fetch_max`, on the hot path of every real condvar wake. Under
+1,000-way concurrency on this machine (4 cores / 8 threads), that write
+was itself a severe bottleneck — an A/B test with the instrumentation
+compiled in versus out, on an otherwise-identical, confirmed-healthy
+environment, showed ~10,000–11,000 ops/sec with it versus ~62,000–63,000
+ops/sec without. This means the three "STOP" reports the instrumentation
+had produced (§9C.2's three runs) were measuring the instrumentation's
+own contention, not primarily (or, it turned out, even mostly) the
+near-full disk they were attributed to at the time. Full account:
+`PHASE1_TEST_RESULTS.md` §9D.
+
+**Decision**: `batch_timing` never has a follower write to shared state.
+"Coordination" time is instead derived entirely from two timestamps the
+*leader* already writes on every batch — `t_window_started` (this
+batch's leader) minus `prev_notify_sent_ns` (the previous batch's
+leader) — which measures the same gap (time from one batch finishing to
+the next one's window starting) without requiring any follower
+participation. Since at most one thread is ever leader at a time, these
+writes are never contended regardless of follower count.
+
+**Rationale**: a diagnostic mechanism must not be able to distort the
+measurement it exists to take, especially under exactly the high-
+concurrency conditions Phase 1 is trying to characterize — 1,000
+followers is the scenario M1.3 tests, so instrumentation that scales
+its own cost with follower count is disqualifying for this use, not
+merely imprecise. Deriving coordination from leader-only timestamps
+keeps the instrumentation's own overhead constant regardless of how many
+followers are waiting, matching the zero-follower-contention design
+already used for every other piece of production `GroupCommitter` state
+(the pattern ADR-2 established for the leader/follower split generally).
+
+**Verification**: `cargo build --lib` (with and without `--features
+test-util`) clean; `cargo test --lib` 87/87 passed; `cargo clippy
+--all-targets --all-features -- -D warnings` clean; `cargo fmt --check`
+clean; re-ran Phase A on the healthy environment with the fixed
+instrumentation and got results consistent with the model and with the
+user's independently-measured clean numbers (`PHASE1_TEST_RESULTS.md`
+§9D.4).
+
+**Alternatives considered**: sampling only a subset of followers
+(rejected — would still contend under sustained load, just less often,
+and complicates the aggregate math for no real benefit since leader-only
+derivation gives an equivalent signal at zero contention cost); removing
+wake-side timing entirely with no replacement (rejected — coordination
+time between batches is still a real, useful signal for the pipelining
+decision, and the leader-only derivation preserves it exactly).

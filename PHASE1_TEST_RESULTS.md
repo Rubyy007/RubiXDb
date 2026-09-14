@@ -593,6 +593,126 @@ times rather than once.**
 committed; regenerate with the command in §9C.1 — ideally after
 confirming free disk space first).
 
+## 9D. Correction to §9C: the dominant cause was the instrumentation itself, not the disk
+
+**Status: Phase A re-run on a confirmed-healthy environment. Result
+disagrees with §9C's conclusion. §9C's root-cause attribution (100%
+near-full-disk) is superseded — not deleted, corrected here, per this
+document's standing rule.**
+
+### 9D.1 What changed
+
+The user redirected `%TEMP%`/`%TMP%` to a volume (`E:`) with 103GB free;
+`C:` no longer hosts any WAL test directory. Independently-reported clean
+numbers on this environment, at the same commit: append-only 166,024
+ops/sec; M1.1 baseline 3.400ms / `GroupCommitter` 3.610ms; M1.2 10,480
+ops/sec; M1.3 62,787 ops/sec — matching §9's "current formula" numbers,
+not §9C's degraded ones. `fsync` alone (no group-commit instrumentation
+involved) is back to ~3.4ms, not the ~24ms §9C measured.
+
+Re-running §9C's exact Phase A command
+(`RGC_TIMING_REPORT=1 cargo test --release --test group_commit
+--features test-util thousand_writers_throughput -- --nocapture`) on
+this same healthy environment, *before* touching the instrumentation
+code, reproduced a pattern much closer to §9C than to the newly-clean
+M1.3 number above — strongly suggesting the disk was not the only, or
+even the dominant, cause of §9C's numbers. This motivated inspecting the
+instrumentation itself rather than accepting §9C's conclusion as final.
+
+### 9D.2 Root cause: a follower-side contended atomic in the instrumentation
+
+§9C.1's `batch_timing` module recorded `t_last_waiter_wake` via a call
+made by **every one of up to 1,000 waiter threads**, on every real
+(non-timeout) condvar wake, doing a `fetch_max` on one shared
+`AtomicU64`. This is exactly the kind of highly-contended cross-thread
+atomic write that degrades badly on a limited-core machine (this
+machine: 4 cores / 8 threads) under 1,000-way concurrency — and it ran
+on the hot path of every single waiter wakeup, once per batch, for every
+follower in that batch.
+
+Controlled A/B comparison, same commit, same healthy (`E:`-backed)
+environment:
+
+| Configuration | M1.3 result |
+|---|---|
+| `cargo test --release --test group_commit thousand_writers_throughput` (no `test-util`, instrumentation not compiled in) | 62,431 ops/sec |
+| Same command **with** `--features test-util` (old §9C.1 instrumentation compiled in, `RGC_TIMING_REPORT` unset so it doesn't even print) | consistent with the ~10,000–11,000 ops/sec range §9C measured |
+
+The instrumentation being *present in the binary* was sufficient to
+reproduce the degradation — `RGC_TIMING_REPORT` being unset (i.e. never
+printing a report) made no difference, confirming the cost is the
+follower-side `fetch_max` itself, not the reporting.
+
+This also fully explains §9C.3's "unexplained" `snapshot` anomaly: it
+was never a real snapshot-path problem (`snapshot_sync_target` does
+nothing but one mutex lock and one `File::try_clone`, as expected) — it
+was scheduler/cache pressure from the same contended atomic distorting
+the timestamps immediately downstream of it in the instrumentation's own
+capture sequence.
+
+### 9D.3 Fix: leader-exclusive coordination measurement
+
+`batch_timing` was redesigned to remove every follower-side write to
+shared state. The follower's wake time is no longer recorded at all.
+Instead, "coordination" time is computed entirely from data only the
+*leader* ever writes: `record_batch_start(t_window_started)` on batch
+`N+1`'s leader computes `t_window_started(N+1) -
+prev_notify_sent_ns(N)`, both of which are written exclusively by
+whichever single thread is leader at the time — there is never more
+than one leader concurrently, so this has no real contention regardless
+of how many followers are waiting. Verified after the change: `cargo
+build --lib` (with and without `--features test-util`) clean, `cargo
+test --lib` 87/87 passed, `cargo clippy --all-targets --all-features --
+-D warnings` clean, `cargo fmt --check` clean.
+
+### 9D.4 Corrected Phase A measurement (healthy environment, fixed instrumentation)
+
+**Command**: identical to §9C.1: `RGC_TIMING_REPORT=1 cargo test
+--release --test group_commit --features test-util
+thousand_writers_throughput -- --nocapture`
+**Date/time**: 2026-09-14
+
+| Batches | Mean window (µs) | Mean snapshot (µs) | Mean fsync (µs) | Mean coordination (µs) | Observed ops/sec |
+|---|---|---|---|---|---|
+| 1,488 | 5,037.4 | 515.6 | 5,033.7 | 25.8 | 63,293 |
+
+Sanity check: `5037.4 + 515.6 + 5033.7 + 25.8 = 10,612.5µs ≈ 10.6ms`;
+independently, `15.799s / 1,488 batches ≈ 10.62ms/batch` — matches.
+
+Comparison against the model (§9C.3's table, corrected column added):
+
+| Stage | Expected (production formula: `max_wait=5ms` + demand-adaptive probe, not §9A's uncapped 10ms sweep config) | Measured here | Agreement |
+|---|---|---|---|
+| Window | ~5.0ms | 5.04ms | matches |
+| `fsync` | ~3.0–5.0ms (§14.2 baseline was measured pre-sweep; this is the same order) | 5.03ms | matches |
+| Snapshot | near-zero (one mutex lock + `File::try_clone`) | 0.52ms | matches — §9C's ~10ms was the instrumentation artifact, not a real anomaly |
+| Coordination | small | 0.026ms | matches, and far smaller than §9C's ~1.2ms (itself partly inflated by the same contended atomic) |
+
+**No new anomaly.** The model holds on the confirmed-healthy environment
+with the corrected instrumentation. Per the task's own gate, this clears
+the condition to proceed to Phase B (pipelining implementation).
+
+### 9D.5 What §9C got right and wrong
+
+§9C's near-full-disk finding was real (the disk genuinely was 97-98%
+full at the time, `df -h` confirmed three times) and near-full-SSD write
+degradation is a real, documented phenomenon — but §9C's conclusion that
+it was the (sole, dominant) explanation for the measured numbers was
+**wrong**, because the measurement itself was contaminated by a second,
+larger effect (§9D.2) that §9C's investigation did not consider. The
+disk was very likely a real, secondary contributor to §9C's ~24ms
+`fsync` figures; it was not the reason `window`, `snapshot`, and overall
+throughput were also degraded — that was the instrumentation. **§9C's
+numbers, table, and analysis are kept above, unmodified** — they were
+honestly measured and reported at the time — but they must not be read
+as representative of this hardware's or this implementation's
+steady-state performance. §9D's numbers, measured on a healthy
+environment with corrected instrumentation, are the ones that should
+inform the Phase B decision and any future performance claims.
+
+**Evidence**: `target/phase1-evidence/m1_3_timing_report_fixed.txt`
+(local, not committed; regenerate with the command in §9D.4).
+
 ## 10. Property-test results
 
 **Command**: `cargo test --release --test group_commit --features
