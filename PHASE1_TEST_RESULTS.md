@@ -25,8 +25,9 @@ performance targets, and why.
 
 | Field | Value |
 |---|---|
-| Git commit (code under test) | `b660b5973b59d664e43a0f39f6b360f01e242ec2` |
-| Git commit (this results file added, plus final doc updates) | `d564fa1c0ae7c059c5f790530265d7b7ef77cf4d` |
+| Git commit (code under test, §1–§9 and §11–§14.2 original measurements) | `b660b5973b59d664e43a0f39f6b360f01e242ec2` |
+| Git commit (this results file first added, plus doc updates) | `d564fa1c0ae7c059c5f790530265d7b7ef77cf4d` |
+| Git commit (window-size sweep, formula fix, §9A/§9B and all "current formula" numbers) | `4281d34d16547f5743d5d1ce98e09dc7526f9808` (final commit for this document as of this reading) |
 | Branch | `phase-1/group-commit` |
 | Rust (`rustc --version`) | `rustc 1.98.1 (48a229cea 2026-09-01)` |
 | Cargo (`cargo --version`) | `cargo 1.98.1 (797e8a9bc 2026-08-05)` |
