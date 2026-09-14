@@ -268,6 +268,10 @@ pub struct GroupCommitter {
     /// `static`-based version.
     #[cfg(any(test, feature = "test-util"))]
     fsync_fault_hook: Mutex<Option<FsyncFaultHook>>,
+    /// Temporary, test-util-gated per-batch timing diagnostic — see
+    /// `batch_timing`'s module doc comment. Zero-sized and a no-op in
+    /// non-`test-util` builds.
+    timing: batch_timing::BatchTiming,
 }
 
 /// See `GroupCommitter::fsync_fault_hook`'s doc comment. A type alias
@@ -397,6 +401,7 @@ impl GroupCommitter {
             stat_window_wait_samples: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-util"))]
             fsync_fault_hook: Mutex::new(None),
+            timing: batch_timing::BatchTiming::new(),
         };
         committer.warm_up_latency_estimate()?;
         Ok(committer)
@@ -559,7 +564,15 @@ impl GroupCommitter {
                     ),
                 });
             }
-            // Spurious or real notify: loop back to the top and re-check.
+            // Spurious or real notify (not a timeout): record this as a
+            // waiter wake for the timing diagnostic — deliberately
+            // excluding timed-out wakes above, since those are driven by
+            // this waiter's own (tens-of-ms-scale) timeout, not by a
+            // `notify_all`, and would otherwise badly skew the "how long
+            // after notify did the last waiter wake" measurement with
+            // values unrelated to any actual notify event.
+            self.timing.record_waiter_wake();
+            // Loop back to the top and re-check.
         }
     }
 
@@ -678,7 +691,17 @@ impl GroupCommitter {
     /// prior critical section panicked, which this module's own code never
     /// does) is recovered rather than propagated, matching `lock_wal`'s
     /// policy — see its doc comment.
+    ///
+    /// Also where the Phase A timing diagnostic's report is printed (if
+    /// `RGC_TIMING_REPORT` is set — see `batch_timing`'s doc comment),
+    /// rather than from a `Drop` impl: `GroupCommitter` deliberately does
+    /// not implement `Drop`, because this very method moves `self.wal`'s
+    /// inner value out of `self` by value, which Rust forbids for a type
+    /// that implements `Drop` (its destructor must be able to see every
+    /// field). Calling the report here instead reaches the same "end of
+    /// this committer's lifecycle" point without that conflict.
     pub fn into_inner(self) -> FileWal {
+        self.timing.print_report_if_requested();
         self.wal
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -693,6 +716,14 @@ impl GroupCommitter {
     fn run_as_leader(&self) -> Result<()> {
         let durable_through_before_batch = self.durable_through.load(Ordering::Acquire);
 
+        // Phase A timing diagnostic (test-util-gated, zero-cost otherwise
+        // — see `batch_timing`'s doc comment): `record_batch_start`
+        // attributes the gap since the *previous* batch's `fsync`
+        // completed to that batch's coordination cost, using whatever
+        // waiter-wake activity has been observed by now.
+        let t_window_started = self.timing.now_ns();
+        self.timing.record_batch_start();
+
         let window_started = Instant::now();
         self.spin_wait_for_batch_window();
         let window_elapsed_ns =
@@ -701,6 +732,7 @@ impl GroupCommitter {
             .fetch_add(window_elapsed_ns, Ordering::Relaxed);
         self.stat_window_wait_samples
             .fetch_add(1, Ordering::Relaxed);
+        let t_window_ended = self.timing.now_ns();
 
         let (cloned_file, batch_max_seq) = match self.snapshot_sync_target() {
             Ok(t) => t,
@@ -710,6 +742,7 @@ impl GroupCommitter {
                 return Err(e);
             }
         };
+        let t_snapshot_ended = self.timing.now_ns();
 
         // `AbortPoint::BeforeSync`/`AfterSync` (`super::AbortPoint`) are
         // fired here, not just inside `FileWal::sync()` (which this leader
@@ -728,6 +761,7 @@ impl GroupCommitter {
         let started = Instant::now();
         let fsync_result = self.do_leader_fsync(&cloned_file);
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let t_fsync_ended = self.timing.now_ns();
 
         match fsync_result {
             Ok(()) => {
@@ -744,6 +778,14 @@ impl GroupCommitter {
                 self.stat_max_batch_records
                     .fetch_max(batch_records, Ordering::Relaxed);
 
+                let t_notify_sent = self.timing.now_ns();
+                self.timing.record_batch_stages(
+                    t_window_started,
+                    t_window_ended,
+                    t_snapshot_ended,
+                    t_fsync_ended,
+                    t_notify_sent,
+                );
                 self.finish_batch_ok();
                 Ok(())
             }
@@ -1094,6 +1136,194 @@ mod phase1_window_experiment {
             std::env::remove_var("PHASE1_EXPERIMENT_MAX_WAIT_US");
             std::env::remove_var("PHASE1_EXPERIMENT_EMA_DIVISOR");
         }
+    }
+}
+
+/// **Temporary, test-util-gated diagnostic scaffolding — see the
+/// pipelining-fix task's "Phase A — Measure" requirement and `PHASE1_TEST_
+/// RESULTS.md`'s window-size sweep section (new per-batch timing
+/// subsection). Not part of the stable API.** Records, per batch, when
+/// the leader enters/leaves each stage (window wait, sync-target
+/// snapshot, `fsync`, notify) and when the last waiter observed to be
+/// waking up did so, so the batch cycle can be broken down into
+/// `window + snapshot + fsync + notify + wake` instead of only ever being
+/// visible as one opaque total.
+///
+/// Two implementations, selected by `#[cfg]`, both with the identical
+/// method surface — call sites throughout `GroupCommitter` never need
+/// their own `#[cfg(...)]` gating, matching this crate's existing
+/// `fire_abort_hook` pattern. The `test-util` build actually records and
+/// can print a report (env-var-gated: `RGC_TIMING_REPORT`, checked once
+/// from `GroupCommitter::into_inner`, not `Drop` — a real `Drop` impl
+/// would conflict with `into_inner`'s existing `self.wal.into_inner()`
+/// partial move, since a type that implements `Drop` cannot have a field
+/// moved out of it by value). The non-`test-util` build is entirely
+/// zero-cost: every method is an empty/constant-returning no-op that
+/// optimizes away completely.
+#[cfg(any(test, feature = "test-util"))]
+mod batch_timing {
+    use std::env;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    #[derive(Debug)]
+    pub(super) struct BatchTiming {
+        epoch: Instant,
+        batches: AtomicU64,
+        window_ns_total: AtomicU64,
+        snapshot_ns_total: AtomicU64,
+        fsync_ns_total: AtomicU64,
+        /// Number of batches for which a *previous* batch existed to
+        /// measure the inter-batch coordination gap against (every batch
+        /// except the first).
+        coordination_samples: AtomicU64,
+        notify_ns_total: AtomicU64,
+        wake_ns_total: AtomicU64,
+        /// Updated by every waiter (leader-to-be or follower) each time it
+        /// wakes from `condvar.wait_timeout` and re-checks its loop —
+        /// `fetch_max`, so this always holds the most recent wake
+        /// observed anywhere in the process for this committer.
+        last_waiter_wake_ns: AtomicU64,
+        prev_fsync_ended_ns: AtomicU64,
+        prev_notify_sent_ns: AtomicU64,
+    }
+
+    impl BatchTiming {
+        pub(super) fn new() -> Self {
+            BatchTiming {
+                epoch: Instant::now(),
+                batches: AtomicU64::new(0),
+                window_ns_total: AtomicU64::new(0),
+                snapshot_ns_total: AtomicU64::new(0),
+                fsync_ns_total: AtomicU64::new(0),
+                coordination_samples: AtomicU64::new(0),
+                notify_ns_total: AtomicU64::new(0),
+                wake_ns_total: AtomicU64::new(0),
+                last_waiter_wake_ns: AtomicU64::new(0),
+                prev_fsync_ended_ns: AtomicU64::new(0),
+                prev_notify_sent_ns: AtomicU64::new(0),
+            }
+        }
+
+        pub(super) fn now_ns(&self) -> u64 {
+            u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        }
+
+        /// Called by any thread (follower or soon-to-be leader) right
+        /// after its `condvar.wait_timeout` call returns, before it
+        /// re-checks `await_durable`'s loop conditions.
+        pub(super) fn record_waiter_wake(&self) {
+            let now = self.now_ns();
+            self.last_waiter_wake_ns.fetch_max(now, Ordering::Relaxed);
+        }
+
+        /// Called at the very start of `run_as_leader`, before the window
+        /// wait begins. Attributes the gap since the *previous* batch's
+        /// `fsync` completed — split into "time to call `notify_all`" and
+        /// "time until the last observed waiter wake" — to that previous
+        /// batch's coordination cost. Best-effort: `last_waiter_wake_ns`
+        /// is sampled *here* (at the next batch's window start) rather
+        /// than synchronized precisely with the previous batch's specific
+        /// waiters, on the premise that followers wake in microseconds,
+        /// far faster than the multi-millisecond gap between batches this
+        /// diagnostic exists to measure in the first place.
+        pub(super) fn record_batch_start(&self) {
+            let prev_fsync_ended = self.prev_fsync_ended_ns.load(Ordering::Relaxed);
+            if prev_fsync_ended == 0 {
+                return; // first batch: nothing to compare against yet
+            }
+            let prev_notify_sent = self.prev_notify_sent_ns.load(Ordering::Relaxed);
+            let last_wake = self.last_waiter_wake_ns.load(Ordering::Relaxed);
+            self.notify_ns_total.fetch_add(
+                prev_notify_sent.saturating_sub(prev_fsync_ended),
+                Ordering::Relaxed,
+            );
+            if last_wake >= prev_notify_sent {
+                self.wake_ns_total
+                    .fetch_add(last_wake - prev_notify_sent, Ordering::Relaxed);
+            }
+            self.coordination_samples.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Called once a batch's `fsync` has succeeded, immediately before
+        /// `finish_batch_ok` is invoked.
+        pub(super) fn record_batch_stages(
+            &self,
+            t_window_started: u64,
+            t_window_ended: u64,
+            t_snapshot_ended: u64,
+            t_fsync_ended: u64,
+            t_notify_sent: u64,
+        ) {
+            self.window_ns_total.fetch_add(
+                t_window_ended.saturating_sub(t_window_started),
+                Ordering::Relaxed,
+            );
+            self.snapshot_ns_total.fetch_add(
+                t_snapshot_ended.saturating_sub(t_window_ended),
+                Ordering::Relaxed,
+            );
+            self.fsync_ns_total.fetch_add(
+                t_fsync_ended.saturating_sub(t_snapshot_ended),
+                Ordering::Relaxed,
+            );
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            self.prev_fsync_ended_ns
+                .store(t_fsync_ended, Ordering::Relaxed);
+            self.prev_notify_sent_ns
+                .store(t_notify_sent, Ordering::Relaxed);
+        }
+
+        /// Prints a one-line aggregate report to stderr if `RGC_TIMING_
+        /// REPORT` is set in the environment (any value) — checked once,
+        /// from `GroupCommitter::into_inner`. A no-op otherwise.
+        pub(super) fn print_report_if_requested(&self) {
+            if env::var_os("RGC_TIMING_REPORT").is_none() {
+                return;
+            }
+            let batches = self.batches.load(Ordering::Relaxed);
+            if batches == 0 {
+                eprintln!("[RGC_TIMING_REPORT] no batches recorded");
+                return;
+            }
+            let coordination_samples = self.coordination_samples.load(Ordering::Relaxed).max(1);
+            let mean_us = |total_ns: u64, n: u64| (total_ns as f64) / (n.max(1) as f64) / 1000.0;
+            eprintln!(
+                "[RGC_TIMING_REPORT] batches={batches} \
+                 mean_window_us={:.1} mean_snapshot_us={:.1} mean_fsync_us={:.1} \
+                 mean_notify_us={:.1} mean_wake_us={:.1} coordination_samples={coordination_samples}",
+                mean_us(self.window_ns_total.load(Ordering::Relaxed), batches),
+                mean_us(self.snapshot_ns_total.load(Ordering::Relaxed), batches),
+                mean_us(self.fsync_ns_total.load(Ordering::Relaxed), batches),
+                mean_us(
+                    self.notify_ns_total.load(Ordering::Relaxed),
+                    coordination_samples
+                ),
+                mean_us(
+                    self.wake_ns_total.load(Ordering::Relaxed),
+                    coordination_samples
+                ),
+            );
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "test-util")))]
+mod batch_timing {
+    #[derive(Debug, Default)]
+    pub(super) struct BatchTiming;
+
+    impl BatchTiming {
+        pub(super) fn new() -> Self {
+            BatchTiming
+        }
+        pub(super) fn now_ns(&self) -> u64 {
+            0
+        }
+        pub(super) fn record_waiter_wake(&self) {}
+        pub(super) fn record_batch_start(&self) {}
+        pub(super) fn record_batch_stages(&self, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        pub(super) fn print_report_if_requested(&self) {}
     }
 }
 

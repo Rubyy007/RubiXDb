@@ -457,6 +457,120 @@ case.
 indistinguishable from the pre-window-size-sweep baseline (§9's original
 M1.1 entry: 2.807–2.986ms). **PASS.**
 
+## 9C. Pipelining-fix investigation — Phase A measurement, STOPPED per its own gate
+
+**Status: Phase A run, result reported, Phase B (pipelining implementation)
+NOT started** — the measured timing disagrees with the expected model
+strongly enough to trigger the task's own explicit stop condition ("If
+... the timing disagrees with the model, STOP and report"). This section
+is that report.
+
+### 9C.1 Instrumentation added
+
+`src/wal/group_commit.rs` gained a `batch_timing` module (`#[cfg(any(
+test, feature = "test-util"))]`, zero-cost no-op otherwise — same pattern
+as `fire_abort_hook`) recording, per batch: `t_window_started`, `t_
+window_ended`, `t_snapshot_ended`, `t_fsync_ended`, `t_notify_sent`
+(captured in `run_as_leader`), and `t_last_waiter_wake` (captured by
+every waiter in `await_durable`'s loop on a real — non-timeout — wake,
+via a `fetch_max`'d global timestamp). Aggregated as running sums/counts
+(not a growing `Vec`, to stay cheap over many batches) and printed as one
+line to stderr from `GroupCommitter::into_inner` if `RGC_TIMING_REPORT`
+is set in the environment. (Not a `Drop` impl: `into_inner` itself moves
+`self.wal`'s contents out of `self` by value, which Rust forbids for a
+type that implements `Drop` — documented on `into_inner` itself.)
+
+**Command**: `RGC_TIMING_REPORT=1 cargo test --release --test group_commit
+--features test-util thousand_writers_throughput -- --nocapture`
+
+### 9C.2 Measured result (two runs, ~15s apart, otherwise idle machine)
+
+| Run | Batches | Mean window (µs) | Mean snapshot (µs) | Mean fsync (µs) | Mean notify (µs) | Mean wake (µs) | Observed ops/sec |
+|---|---|---|---|---|---|---|---|
+| 1 | 1,506 | 23,715.4 | 10,074.2 | 24,776.3 | 297.7 | 953.1 | 11,100 |
+| 2 | 1,483 | 25,038.9 | 11,813.7 | 24,417.5 | 375.3 | 841.4 | 10,788 |
+
+Sanity check (internal consistency, not against the model yet): summing
+all five mean stage durations for run 1 gives `23,715.4 + 10,074.2 +
+24,776.3 + 297.7 + 953.1 = 59,816.7µs ≈ 59.8ms`; independently, `90.088s
+/ 1,506 batches ≈ 59.8ms/batch`. These match almost exactly, so the
+instrumentation itself is trustworthy — the five stages genuinely do sum
+to the observed cycle time, and the discrepancy below is a real
+environmental effect, not an instrumentation bug.
+
+### 9C.3 Comparison against the expected model — disagrees sharply
+
+| Stage | Expected (§9A.2, "otherwise idle") | Measured here | Ratio |
+|---|---|---|---|
+| Window | ~10.0ms | ~23.7–25.0ms | ~2.4–2.5x |
+| `fsync` | ~3.0ms (§14.2) | ~24.4–24.8ms | ~8.1–8.3x |
+| Snapshot | expected near-zero (one mutex lock + `File::try_clone`) | ~10.1–11.8ms | order-of-magnitude unexpected |
+| Coordination (notify+wake) | ~1.6ms | ~1.2–1.25ms | roughly consistent |
+
+Coordination is *not* the outlier (it is, if anything, slightly *below*
+the ~1.6ms estimate) — the disagreement is concentrated in `fsync` (a
+genuine I/O operation, ~8x slower than previously measured) and,
+unexpectedly, `snapshot_sync_target` (a mutex lock plus one `File::
+try_clone` — no I/O of its own, yet averaging over 10ms, which is not
+explained by anything in this codebase's own logic and points to lock
+contention or scheduler pressure rather than the snapshot code itself).
+
+### 9C.4 Root cause identified: this disk is nearly full
+
+`df -h` on the volume `%TEMP%` resolves to (`C:`, where every WAL test
+directory in this entire report was created): **82GB total, ~80GB used,
+2.5GB free — 98% full.** This is independent of anything `GroupCommitter`
+does. Near-full SSDs are well documented to suffer materially higher
+write/flush latency than the same drive with more free space, because
+the controller has fewer free blocks available for wear-leveling and
+garbage collection during writes — an ~8x `fsync` slowdown (§14.2's
+~2.8–3.0ms baseline vs. this section's ~24.4–24.8ms) is well within the
+range that phenomenon can produce. This machine's disk was very likely
+already trending toward this state throughout this session (the disk-
+speed variance documented in §9, §12, and §17 was real and reported
+honestly at the time), and appears to have crossed further into
+degraded territory during the extensive testing this and the prior
+follow-up task required (many multi-minute, high-concurrency WAL-writing
+runs in succession). This session's own leftover temp WAL directories
+were checked and found negligible (~96KB total, now removed) — the
+~80GB in use is unrelated to this testing session's own artifacts.
+
+### 9C.5 Why this stops Phase B, per the task's own gate
+
+The pipelining fix's entire value proposition (`window + fsync +
+coordination → max(window, fsync + coordination)`) is calibrated against
+specific absolute numbers (`window ≈ 10ms`, `fsync ≈ 3ms`, `coordination
+≈ 1.6ms`, predicting `14.6ms → 10.0ms`, `66k → ~99k ops/sec`). Under the
+condition actually measured just now (`fsync ≈ 24.6ms`, now the largest
+single stage, larger than `window`), the *same* pipelining formula would
+predict `max(24ms, 24.6ms + 1.2ms) ≈ 25.8ms` — barely different from the
+current serialized `~59.8ms`... which does not match either, because
+`snapshot`'s unexplained ~10-11ms is not accounted for by the pipelining
+model at all (pipelining overlaps *window* with the *next* batch's
+`fsync`; it does not touch `snapshot`, which sits `fsync`-adjacent in the
+critical path either way). In short: **implementing the fix right now
+would be tuned against numbers this investigation has just shown are not
+this hardware's steady-state performance**, and the `snapshot` anomaly
+specifically needs its own explanation (contention? scheduler pressure
+under a near-full disk's slower I/O completion times generally worsening
+context-switch latency system-wide?) before any implementation decision
+should be made on top of it.
+
+**Recommendation, not a unilateral decision**: free disk space on this
+machine (or move the WAL test directories to a volume with headroom) and
+re-run this exact Phase A measurement before deciding whether to proceed
+to Phase B. If the re-measurement matches §9A's original model (`window
+≈ 10ms`, `fsync ≈ 3ms`, `coordination ≈ 1.6ms`, `snapshot` near-zero),
+Phase B's specification (the `filling_active`/`fsyncing_active`
+`BatchState` split) can proceed as designed. If `snapshot`'s anomaly
+persists even on a healthy disk, that needs its own root-cause
+investigation first, separate from pipelining.
+
+**Evidence**: `target/phase1-evidence/m1_3_timing_report.txt`,
+`target/phase1-evidence/m1_3_timing_report_rerun.txt` (both local, not
+committed; regenerate with the command in §9C.1 — ideally after
+confirming free disk space first).
+
 ## 10. Property-test results
 
 **Command**: `cargo test --release --test group_commit --features
