@@ -452,8 +452,67 @@ way — `io::Error::other` over `io::Error::new(ErrorKind::Other, ..)`, and a
 `type_complexity` lint on the fault-hook field, resolved with a type
 alias). `cargo fmt --check`: clean.
 
-**Key commit:** (recorded after this entry is committed — see git log for
-`phase-1(group-commit): add FsyncLatencyTracker and core GroupCommitter`).
+**Key commit:** `26c4624` — `phase-1(group-commit): add FsyncLatencyTracker
+and core GroupCommitter`.
+
+### 2026-09-14 — M0.1: review-driven hardening pass
+
+**Status:** done. A review pass (external, pre-M1.x) flagged five real
+issues in the M0 implementation, addressed here before starting the M1.x
+test suite:
+
+1. **`FileWal::durable_seq`, a genuine footgun fix, not just a documented
+   caveat.** `GroupCommitter::new` previously seeded `durable_through` from
+   `wal.next_seq() - 1` ("assigned"), with a doc comment explaining why a
+   caller handing over a `FileWal` with unsynced raw `append()` calls was
+   "outside the documented flow." Correct as far as it went, but the
+   review's point stands: a class of bug is better eliminated than
+   documented around. Added a `durable_seq: u64` field to `FileWal`,
+   updated only inside `sync()` and `rotate()` (both of which only reach
+   that line after a real, successful `fsync`), never by `append()` alone.
+   `GroupCommitter::new` now reads `wal.durable_seq()` instead. New
+   regression test: `an_unsynced_raw_append_before_wrapping_is_not_treated_
+   as_durable`, which fails against the old `next_seq() - 1` logic and
+   passes against the new field.
+2. **`spin_wait_for_batch_window` now yields every 10,000 iterations**
+   (`std::thread::yield_now()`) instead of spinning unconditionally for the
+   whole window. At the algorithm's own 200 µs default this barely matters
+   (the window is too short to reach 10,000 iterations in most cases), but
+   `max_wait` is caller-configurable (`SyncMode::GroupCommit`), and nothing
+   stops a caller from configuring a multi-millisecond window, at which
+   point unconditional spinning would burn a full core per batch for no
+   reason.
+3. **Stale doc comment on `follower_wait_timeout` fixed**, not just the
+   code: the "cold-start EMA = 0" framing predated the M0 warm-up-fsync
+   fix (which guarantees the EMA is never literally `0` once any caller
+   can reach `await_durable`). Re-derived the floor's actual remaining
+   rationale — a *fast* warm-up sample can still make `10 * EMA` smaller
+   than `max_wait_cap`, so the floor is a general "never give a follower
+   less time than the leader's own maximum decision window" invariant, not
+   merely a cold-start patch — and rewrote the comment to say that instead
+   of the now-inaccurate original framing.
+4. **`await_durable_retrying_on_timeout` bounded at 1,000 retries** (both
+   the copy in `group_commit.rs`'s own unit tests and the one added to
+   `tests/group_commit/support.rs` below), panicking with the last
+   `Timeout` detail if exhausted, rather than looping unconditionally — an
+   unbounded retry turns "the test correctly detects a regression" into
+   "the CI job hangs until its own external timeout," which is a strictly
+   worse failure mode for exactly the property this loop exists to
+   tolerate (transient scheduling-related timeouts, not genuine hangs).
+5. **Module-level doc comment now states `GroupCommitter::new`'s real
+   `fsync` cost**, not only `new`'s own doc comment — so a reader skimming
+   just the top of `group_commit.rs` (not necessarily reading every
+   method's doc comment) still learns that construction blocks for
+   roughly one `fsync`'s worth of latency.
+
+**Tests passing:** 84/84 lib (up from 83 — the new footgun regression
+test). `cargo clippy --all-targets --all-features -- -D warnings`: clean
+(one real finding along the way: `iterations % YIELD_EVERY == 0` →
+`iterations.is_multiple_of(YIELD_EVERY)`, a newly-stable clippy lint on
+this toolchain). `cargo fmt --check`: clean.
+
+**Key commit:** `phase-1(group-commit): fix durable_seq footgun, spin
+CPU burn, and stale docs` (this entry's changes).
 
 ---
 

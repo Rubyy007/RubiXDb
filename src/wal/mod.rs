@@ -563,6 +563,18 @@ pub struct FileWal {
     active_id: u64,
     active: SegmentIo<File>,
     next_seq: u64,
+    /// Phase 1 (Group Commit): the highest `seq` this `FileWal` has itself
+    /// *proven durable* via a completed, successful `fsync` — updated only
+    /// by `sync()` and `rotate()` (both of which genuinely `fsync` before
+    /// returning `Ok`), never by `append()` alone. Distinct from
+    /// `next_seq - 1` (which only says "assigned," not "durable"): a
+    /// caller that appends without syncing before handing this `FileWal`
+    /// to `wal::group_commit::GroupCommitter::new` must not have those
+    /// unsynced records silently treated as already durable just because
+    /// they were assigned a `seq`. `open_for_recovery` initializes this to
+    /// `next_seq - 1` because everything recovery found *was* read back
+    /// from disk — by that contract, already durable.
+    durable_seq: u64,
     /// Sealed (non-active) segments' highest contained `seq`, used by
     /// `purge_before` (WAL Spec §10). A segment absent from this map is
     /// never purged — the safe default for anything recovery couldn't
@@ -644,6 +656,17 @@ impl FileWal {
     pub(crate) fn sync_mode(&self) -> SyncMode {
         self.config.sync_mode
     }
+
+    /// Phase 1 (Group Commit): the highest `seq` proven durable by a
+    /// completed, successful `fsync` — see the `durable_seq` field's doc
+    /// comment. Read by `wal::group_commit::GroupCommitter::new` to
+    /// initialize its own `durable_through` watermark correctly, rather
+    /// than assuming every `seq` this `FileWal` has ever *assigned*
+    /// (`next_seq() - 1`) is already durable. `pub(crate)`: not part of
+    /// this crate's public API surface.
+    pub(crate) fn durable_seq(&self) -> u64 {
+        self.durable_seq
+    }
 }
 
 impl Wal for FileWal {
@@ -686,6 +709,7 @@ impl Wal for FileWal {
             active_id,
             active: SegmentIo::new(file, active_size),
             next_seq,
+            durable_seq: next_seq.saturating_sub(1),
             sealed_max_seq,
             active_segment_has_records,
             _lock: lock,
@@ -723,6 +747,9 @@ impl Wal for FileWal {
         fire_abort_hook(AbortPoint::BeforeSync);
         self.active.sync()?;
         fire_abort_hook(AbortPoint::AfterSync);
+        // Only reached after a genuinely successful fsync — see
+        // `durable_seq`'s field doc comment.
+        self.durable_seq = self.next_seq.saturating_sub(1);
         Ok(())
     }
 
@@ -743,6 +770,13 @@ impl Wal for FileWal {
             let _ = fs::remove_file(&new_path);
             return Err(sync_err.into());
         }
+        // `rotate()` genuinely fsyncs the old segment as part of sealing
+        // it (the call just above): everything appended so far is now
+        // durable, exactly like a successful `sync()` — see
+        // `durable_seq`'s field doc comment. Deliberately updated here too
+        // (not only in `sync()`), for a caller that rotates without ever
+        // calling `sync()` directly.
+        self.durable_seq = self.next_seq.saturating_sub(1);
 
         let sealed_max_seq = if self.active_segment_has_records {
             self.next_seq.saturating_sub(1)

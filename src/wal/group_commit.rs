@@ -36,6 +36,14 @@
 //!   lock), so an in-flight leader's cloned handle always refers to a
 //!   file `rotate()` can seal around it but never invalidates. See
 //!   `PROCESS.md` §1.5 for the full linearization argument.
+//! - **`GroupCommitter::new` performs one real, synchronous `fsync` before
+//!   returning** (a "warm-up" probe — see its own doc comment for the
+//!   cold-start problem this solves). Construction therefore blocks for
+//!   roughly one `fsync`'s worth of latency (this machine's own WAL
+//!   benchmark: 3–10 ms for `Immediate`-mode `append_sync`, see
+//!   `PROGRESS.md`) — a one-time cost, not a per-call one, but real enough
+//!   that a caller on the hot path (rather than at startup) should not
+//!   construct a fresh `GroupCommitter` per request.
 
 use std::fs::File;
 use std::io;
@@ -145,22 +153,24 @@ impl GroupCommitter {
     /// configured" principle `wal::mod`'s own doc comment already applies
     /// to `SyncMode::GroupCommit` itself).
     ///
-    /// **`durable_through` starts at `wal.next_seq() - 1`, not `0`.** If
-    /// `wal` was just returned by `FileWal::open_for_recovery`, every
-    /// `seq` below its `next_seq()` was found by walking bytes already on
-    /// disk — by that recovery's own contract, already durable (this
-    /// process would not be able to read those bytes back after a restart
-    /// if they had not survived it). Starting `durable_through` at `0`
-    /// instead would make `await_durable` on any already-durable `seq`
-    /// from before this `GroupCommitter` existed block until some *new*
-    /// batch happens to reach that high-water mark — needlessly indirect
-    /// at best, and an outright hang if no further writes ever arrive. A
-    /// `FileWal` handed to `new` after additional raw, unsynced `append()`
-    /// calls (bypassing `sync()`) is an unusual usage pattern outside the
-    /// documented flow (open, then immediately wrap); this constructor
-    /// cannot distinguish that case from the normal one and treats
-    /// everything already assigned a `seq` as the caller's responsibility
-    /// to have already made durable.
+    /// **`durable_through` starts at `wal.durable_seq()`, not `0`.** If
+    /// `wal` was just returned by `FileWal::open_for_recovery`, every `seq`
+    /// below its `next_seq()` was found by walking bytes already on disk —
+    /// by that recovery's own contract, already durable (this process
+    /// would not be able to read those bytes back after a restart if they
+    /// had not survived it), so `durable_seq()` (initialized from that same
+    /// `next_seq` at recovery time) correctly captures it. Starting
+    /// `durable_through` at `0` instead would make `await_durable` on any
+    /// already-durable `seq` from before this `GroupCommitter` existed
+    /// block until some *new* batch happens to reach that high-water mark —
+    /// needlessly indirect at best, and an outright hang if no further
+    /// writes ever arrive. Using `wal.next_seq() - 1` instead of
+    /// `wal.durable_seq()` would reintroduce a real footgun: a caller that
+    /// appends to `wal` without syncing before handing it to `new` would
+    /// have those genuinely-not-yet-durable records silently treated as
+    /// durable. `durable_seq()` cannot make that mistake — it only ever
+    /// advances inside `FileWal::sync()`/`rotate()`, after a `fsync` has
+    /// actually completed (see its field doc comment in `wal::mod`).
     ///
     /// **Performs one real `fsync` before returning**, to seed
     /// `FsyncLatencyTracker` with a genuine measurement rather than
@@ -191,7 +201,7 @@ impl GroupCommitter {
                 });
             }
         };
-        let initial_durable_through = wal.next_seq().saturating_sub(1);
+        let initial_durable_through = wal.durable_seq();
         let committer = GroupCommitter {
             wal: Mutex::new(wal),
             durable_through: AtomicU64::new(initial_durable_through),
@@ -406,12 +416,26 @@ impl GroupCommitter {
             }
         };
 
+        // `AbortPoint::BeforeSync`/`AfterSync` (`super::AbortPoint`) are
+        // fired here, not just inside `FileWal::sync()` (which this leader
+        // path never calls — see this module's doc comment on why the
+        // `fsync` deliberately bypasses it). Both abort points describe
+        // the same conceptual moment — "immediately before/after the
+        // `fsync` that makes prior appends durable" — Shape B just
+        // relocates *where* that moment physically happens; a crash-
+        // consistency test targeting these points (`tests/group_commit/
+        // crash_consistency.rs`, M1.6) needs them reachable from whichever
+        // code path actually performs the group-commit leader's `fsync`.
+        // `fire_abort_hook` is a zero-cost no-op without the `test-util`
+        // feature, so this costs nothing in production builds.
+        super::fire_abort_hook(super::AbortPoint::BeforeSync);
         let started = Instant::now();
         let fsync_result = self.do_leader_fsync(&cloned_file);
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         match fsync_result {
             Ok(()) => {
+                super::fire_abort_hook(super::AbortPoint::AfterSync);
                 self.latency.record(elapsed_ns);
                 self.durable_through
                     .fetch_max(batch_max_seq, Ordering::Release);
@@ -455,6 +479,21 @@ impl GroupCommitter {
             return;
         }
         let deadline = Instant::now() + window;
+        // Yield the CPU periodically rather than spinning unconditionally
+        // for the whole window: at the algorithm's own default (200 µs
+        // cap), a pure spin costs at most ~200 µs of one core regardless
+        // (already small), but `max_wait_cap` is caller-configurable
+        // (`SyncMode::GroupCommit.max_wait`, WAL Spec §5) — nothing stops a
+        // caller from configuring a window in the low milliseconds, at
+        // which point unconditional spinning would burn a full core for
+        // that entire duration on every single batch. `yield_now()` every
+        // `YIELD_EVERY` iterations gives the OS scheduler a chance to run
+        // other ready threads (in particular, other `append()` callers
+        // trying to grow this very batch) without meaningfully coarsening
+        // the wait granularity at the sub-millisecond scale this window
+        // normally runs at.
+        const YIELD_EVERY: u32 = 10_000;
+        let mut iterations: u32 = 0;
         loop {
             if self.batch_bytes.load(Ordering::Relaxed) >= self.max_batch_bytes {
                 return;
@@ -462,15 +501,25 @@ impl GroupCommitter {
             if Instant::now() >= deadline {
                 return;
             }
-            std::hint::spin_loop();
+            iterations += 1;
+            if iterations.is_multiple_of(YIELD_EVERY) {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 
     /// A follower's `condvar.wait_timeout` bound: `10 * EMA`, floored at
-    /// `max_wait_cap` (`PROCESS.md` §1.11 item 1) so a cold-start EMA of
-    /// `0` (before any batch has ever completed) can never make a
-    /// legitimate concurrent waiter time out before the leader has even
-    /// had its own maximum decision window to work with.
+    /// `max_wait_cap`. The floor is a general invariant, not merely a
+    /// cold-start patch: even though `GroupCommitter::new`'s warm-up probe
+    /// (see its doc comment) guarantees the EMA is never literally `0` by
+    /// the time any caller can reach `await_durable`, a *fast* warm-up
+    /// sample (e.g. an SSD/NVMe measuring tens of microseconds) can still
+    /// make `10 * EMA` smaller than `max_wait_cap` itself — and a follower
+    /// must never be given less time to wait than the leader's own maximum
+    /// decision window, regardless of how quickly recent `fsync` calls
+    /// happened to measure.
     fn follower_wait_timeout(&self) -> Duration {
         let ema_ns = self.latency.current_ns();
         let derived = Duration::from_nanos(ema_ns.saturating_mul(10));
@@ -629,14 +678,27 @@ mod tests {
     /// `seq` (never to re-`append`, which would assign a *new* `seq`).
     /// Used by tests that need many concurrent `append_durable`-shaped
     /// calls to all eventually succeed.
+    ///
+    /// Bounded at `MAX_RETRIES` (not an unconditional `loop`): an
+    /// unbounded retry-on-timeout would turn a genuine regression (the
+    /// committer wedged for some other reason) into a hung test process
+    /// rather than a clean, fast test failure — exactly the "test fails"
+    /// vs. "CI hangs until the job-level timeout" distinction this crate's
+    /// own fail-closed philosophy argues against papering over.
     fn await_durable_retrying_on_timeout(committer: &GroupCommitter, seq: u64) {
-        loop {
+        const MAX_RETRIES: u32 = 1_000;
+        let mut last_timeout_detail = String::new();
+        for _ in 0..MAX_RETRIES {
             match committer.await_durable(seq) {
                 Ok(()) => return,
-                Err(EngineError::Timeout { .. }) => continue,
+                Err(EngineError::Timeout { detail }) => last_timeout_detail = detail,
                 Err(e) => panic!("unexpected error awaiting durability for seq={seq}: {e}"),
             }
         }
+        panic!(
+            "await_durable(seq={seq}) still not satisfied after {MAX_RETRIES} retries; \
+             last timeout: {last_timeout_detail}"
+        );
     }
 
     static_assertions::assert_impl_all!(GroupCommitter: Send, Sync);
@@ -715,6 +777,40 @@ mod tests {
         assert_eq!(committer.durable_through(), 5);
         // No new write needed: an already-durable seq resolves immediately.
         committer.await_durable(5).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for a real footgun caught in review: `durable_
+    /// through` must be seeded from `FileWal::durable_seq()` (only ever
+    /// advanced by a genuinely successful `fsync`), not from
+    /// `next_seq() - 1` (merely "assigned"). A raw, unsynced `append()`
+    /// before handing the `FileWal` to `GroupCommitter::new` must *not* be
+    /// silently treated as already durable.
+    #[test]
+    fn an_unsynced_raw_append_before_wrapping_is_not_treated_as_durable() {
+        let dir = temp_dir("unsynced_append_footgun");
+        let (mut wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        // append() only — deliberately never sync()ed.
+        let pos = wal
+            .append(WalOp::Put {
+                key: b"k",
+                value: b"v",
+            })
+            .unwrap();
+        assert_eq!(pos.seq, 1);
+
+        let committer = GroupCommitter::new(wal).unwrap();
+        // The unsynced record must NOT be reported durable yet.
+        assert_eq!(
+            committer.durable_through(),
+            0,
+            "an unsynced append must not be treated as durable just because it was assigned a seq"
+        );
+        // It does become durable once a real batch (this committer's own
+        // warm-up fsync already covers it, since the warm-up fsyncs the
+        // active segment as it stands at construction time) has run.
+        committer.await_durable(1).unwrap();
+
         let _ = fs::remove_dir_all(&dir);
     }
 
