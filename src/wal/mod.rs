@@ -754,6 +754,7 @@ impl Wal for FileWal {
     }
 
     fn rotate(&mut self) -> Result<()> {
+        fire_abort_hook(AbortPoint::DuringRotationPre);
         // Group 1.4: create the new segment file *first*. If this fails,
         // nothing about `self` has been touched at all — `rotate()`
         // behaves as if it were never called.
@@ -787,6 +788,7 @@ impl Wal for FileWal {
         self.active_id = new_id;
         self.active = SegmentIo::new(new_file, SEGMENT_HEADER_LEN as u64);
         self.active_segment_has_records = false;
+        fire_abort_hook(AbortPoint::DuringRotationPost);
         Ok(())
     }
 
@@ -879,12 +881,21 @@ pub fn inspect(dir: &Path, config: &WalConfig) -> Result<WalReplayResult> {
     Ok(result)
 }
 
-/// A point in `FileWal`'s write path a crash-consistency test can ask to
-/// abort at (Group 7.2 — see `tests/crash_consistency.rs`). Defined
-/// unconditionally (it's a zero-cost enum) so call sites throughout this
-/// module never need their own `#[cfg(feature = "test-util")]` gating;
-/// only the hook *storage and dispatch* below are feature-gated, and
-/// `fire_abort_hook` is a no-op when the feature is off.
+/// A point in `FileWal`'s or `wal::group_commit::GroupCommitter`'s write
+/// path a crash-consistency test can ask to abort at (Group 7.2 — see
+/// `tests/crash_consistency.rs`; Phase 1 group-commit points — see
+/// `tests/group_commit/crash_consistency.rs`). Defined unconditionally
+/// (it's a zero-cost enum) so call sites throughout this crate never need
+/// their own `#[cfg(feature = "test-util")]` gating; only the hook
+/// *storage and dispatch* below are feature-gated, and `fire_abort_hook`
+/// is a no-op when the feature is off.
+///
+/// The four WAL-level points (`AfterHeader` through `AfterSync`) predate
+/// Phase 1 and are unchanged. The seven Phase 1 points name real,
+/// reachable code boundaries in `GroupCommitter`'s leader/rotation paths —
+/// each is fired from exactly one call site, documented on the variant
+/// itself. No point here is a "boundary" invented in the abstract that
+/// doesn't correspond to an actual place `fire_abort_hook` is called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortPoint {
     /// Immediately after a new segment's header has been written, fsynced,
@@ -897,6 +908,31 @@ pub enum AbortPoint {
     BeforeSync,
     /// Immediately after `sync()`'s `fsync` call completes.
     AfterSync,
+    /// `GroupCommitter::await_durable`: immediately before a caller that
+    /// found no active leader attempts to become one (before
+    /// `leader_active` is set).
+    BeforeLeader,
+    /// `GroupCommitter::await_durable`: immediately after `leader_active`
+    /// is flipped to `true` (under `batch`), before the batch-window wait
+    /// begins.
+    AfterLeaderElection,
+    /// `GroupCommitter::run_as_leader`: immediately at the start of the
+    /// batch-window wait (`spin_wait_for_batch_window`'s first line).
+    DuringBatchWaitPre,
+    /// `GroupCommitter::run_as_leader`: immediately after the batch-window
+    /// wait returns (window elapsed or byte threshold reached), before the
+    /// sync-target snapshot is taken.
+    DuringBatchWaitPost,
+    /// `GroupCommitter::run_as_leader`: immediately after `durable_through`
+    /// is published (`fetch_max`) on a successful `fsync`, before
+    /// `finish_batch_ok` wakes any waiters.
+    AfterWatermarkBeforeWake,
+    /// `FileWal::rotate`: immediately at the start of the call, before the
+    /// new segment file is created.
+    DuringRotationPre,
+    /// `FileWal::rotate`: immediately before returning `Ok` (after the new
+    /// segment is created and the old one sealed).
+    DuringRotationPost,
 }
 
 #[cfg(feature = "test-util")]

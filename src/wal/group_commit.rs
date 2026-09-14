@@ -47,13 +47,103 @@
 
 use std::fs::File;
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::error::{EngineError, Result};
 use crate::wal::metrics::FsyncLatencyTracker;
 use crate::wal::{FileWal, SyncMode, Wal, WalOp, WalPosition};
+
+/// Default backpressure bound (§11) for `GroupCommitter::new` — see
+/// `with_max_pending_waiters`'s doc comment. Chosen to be far above any
+/// realistic concurrent-writer count this crate's own test suite exercises
+/// (M1.3: 1,000) while still being a real, finite bound rather than
+/// `usize::MAX` masquerading as "unbounded" — a caller with an unusual
+/// concurrency profile should call `with_max_pending_waiters` explicitly
+/// rather than rely on this default being "big enough" by accident.
+pub const DEFAULT_MAX_PENDING_WAITERS: usize = 65_536;
+
+/// How long `GroupCommitter::shutdown` waits for an already-in-flight
+/// leader batch to finish before giving up and returning a snapshot
+/// anyway — see `shutdown`'s doc comment. `shutdown()` itself must never
+/// hang, so this is a real bound, not best-effort.
+const SHUTDOWN_DRAIN_BOUND: Duration = Duration::from_secs(5);
+
+/// A point-in-time snapshot of batching observability counters —
+/// `GroupCommitter::stats()`. All counts are cumulative since
+/// construction; none of them participate in any correctness decision
+/// (durability is always derived from `durable_through`/`FileWal::
+/// next_seq`, never from these).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GroupCommitStats {
+    /// Number of times a caller became leader and attempted a batch
+    /// `fsync` (successful or not).
+    pub sync_attempts: u64,
+    /// Number of those attempts whose `fsync` returned `Ok`.
+    pub sync_successes: u64,
+    /// Sum of records covered across every *successful* batch.
+    pub records_total: u64,
+    /// The largest single successful batch's record count.
+    pub max_batch_records: u64,
+    /// Sum of every leader's batch-window wait duration, in nanoseconds —
+    /// divide by `window_wait_samples` for the mean.
+    pub window_wait_ns_total: u64,
+    pub window_wait_samples: u64,
+    /// `GroupCommitter::durable_through()` at the moment of this snapshot.
+    pub durable_through: u64,
+    /// Callers currently inside `await_durable` at the moment of this
+    /// snapshot (leader or follower).
+    pub pending_waiters: usize,
+}
+
+impl GroupCommitStats {
+    /// `sync_attempts - sync_successes`.
+    pub fn sync_failures(&self) -> u64 {
+        self.sync_attempts.saturating_sub(self.sync_successes)
+    }
+
+    /// Mean records per successful batch, or `0.0` if none have completed.
+    pub fn avg_batch_records(&self) -> f64 {
+        if self.sync_successes == 0 {
+            0.0
+        } else {
+            (self.records_total as f64) / (self.sync_successes as f64)
+        }
+    }
+
+    /// Mean leader batch-window wait, in nanoseconds, or `0.0` if no batch
+    /// has run yet.
+    pub fn avg_window_wait_ns(&self) -> f64 {
+        if self.window_wait_samples == 0 {
+            0.0
+        } else {
+            (self.window_wait_ns_total as f64) / (self.window_wait_samples as f64)
+        }
+    }
+}
+
+/// The outcome of `GroupCommitter::shutdown` — see its doc comment.
+#[derive(Debug, Clone, Copy)]
+pub struct ShutdownReport {
+    /// The durability watermark at the moment of this snapshot.
+    pub durable_through: u64,
+    /// The highest `seq` this `FileWal` had assigned at the moment of this
+    /// snapshot — may exceed `durable_through` if a batch was still in
+    /// flight (or never got the chance to start) when `shutdown()` was
+    /// called.
+    pub highest_assigned_seq: u64,
+}
+
+impl ShutdownReport {
+    /// `true` if any assigned `seq` was not yet proven durable at the
+    /// moment of this snapshot — the caller-visible signal §10 requires
+    /// ("If pending writes are not durable at shutdown, the implementation
+    /// must report that state explicitly").
+    pub fn has_undurable_pending(&self) -> bool {
+        self.highest_assigned_seq > self.durable_through
+    }
+}
 
 /// Coordination state guarded by `GroupCommitter::batch`. Deliberately
 /// minimal (`PROCESS.md` §1.10): no per-waiter registry is needed, since
@@ -73,6 +163,21 @@ struct BatchState {
     /// `Clone`) so every subsequent caller can synthesize an equivalent,
     /// same-class error (`GroupCommitter::poisoned_error`).
     poisoned: Option<io::ErrorKind>,
+}
+
+/// RAII guard for one reserved slot in `GroupCommitter::pending_waiters` —
+/// see `acquire_waiter_permit`. Releases the slot on drop, including on
+/// every early-return path through `await_durable` and on unwind.
+struct WaiterPermit<'a> {
+    committer: &'a GroupCommitter,
+}
+
+impl Drop for WaiterPermit<'_> {
+    fn drop(&mut self) {
+        self.committer
+            .pending_waiters
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Wraps a `FileWal` (WAL Spec §5) opened with `SyncMode::GroupCommit {
@@ -106,6 +211,24 @@ pub struct GroupCommitter {
     /// `0` whenever a new leader is elected). A heuristic only — see
     /// `estimate_frame_len`'s doc comment for why it need not be exact.
     batch_bytes: AtomicUsize,
+    /// Backpressure (§11): the number of callers currently inside
+    /// `await_durable` (leader or follower), bounded by
+    /// `max_pending_waiters`. See `acquire_waiter_permit`.
+    pending_waiters: AtomicUsize,
+    max_pending_waiters: usize,
+    /// Set once by `shutdown()`, never cleared. Checked by `append` and by
+    /// every iteration of `await_durable`'s wait loop so no caller — new or
+    /// already waiting — can start or remain blocked on a batch that will
+    /// never be allowed to begin after shutdown was requested.
+    shutting_down: AtomicBool,
+    /// Observability counters (§16/§24) — see `stats()`. All `Relaxed`:
+    /// purely descriptive, never used to make a correctness decision.
+    stat_sync_attempts: AtomicU64,
+    stat_sync_successes: AtomicU64,
+    stat_records_total: AtomicU64,
+    stat_max_batch_records: AtomicU64,
+    stat_window_wait_ns_total: AtomicU64,
+    stat_window_wait_samples: AtomicU64,
     /// Test-only `fsync` fault-injection seam — see `do_leader_fsync`'s doc
     /// comment for why this exists (the leader bypasses `wal::testing::
     /// FaultInjectingIo`'s layer entirely by design) and why it is a field
@@ -140,6 +263,12 @@ impl std::fmt::Debug for GroupCommitter {
             .field("max_wait_cap", &self.max_wait_cap)
             .field("max_batch_bytes", &self.max_batch_bytes)
             .field("batch_bytes", &self.batch_bytes.load(Ordering::Relaxed))
+            .field(
+                "pending_waiters",
+                &self.pending_waiters.load(Ordering::Relaxed),
+            )
+            .field("max_pending_waiters", &self.max_pending_waiters)
+            .field("shutting_down", &self.shutting_down.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -186,7 +315,26 @@ impl GroupCommitter {
     /// that a storage layer that cannot complete a single `fsync` at
     /// startup is not one this `GroupCommitter` should silently proceed
     /// against.
+    ///
+    /// Equivalent to `with_max_pending_waiters(wal, DEFAULT_MAX_PENDING_
+    /// WAITERS)` — see that constructor for the backpressure bound this
+    /// applies.
     pub fn new(wal: FileWal) -> Result<Self> {
+        Self::with_max_pending_waiters(wal, DEFAULT_MAX_PENDING_WAITERS)
+    }
+
+    /// As `new`, but with an explicit cap on how many callers may be
+    /// simultaneously inside `await_durable` (leader or follower) at once —
+    /// the backpressure bound (§11): once `max_pending_waiters` callers are
+    /// concurrently waiting, a new `await_durable` call fails immediately
+    /// with `EngineError::CapacityExceeded` rather than queuing
+    /// unboundedly or blocking for room. This bounds `GroupCommitter`'s own
+    /// resource usage (OS threads blocked in `condvar.wait_timeout`) under
+    /// a workload spike or a misbehaving/adversarial caller that spawns
+    /// unbounded concurrent writers; it does not bound anything else,
+    /// since no other part of this type's state grows with waiter count
+    /// (`PROCESS.md` §1.10: no per-waiter registry exists at all).
+    pub fn with_max_pending_waiters(wal: FileWal, max_pending_waiters: usize) -> Result<Self> {
         let (max_wait, max_batch_bytes) = match wal.sync_mode() {
             SyncMode::GroupCommit {
                 max_wait,
@@ -211,6 +359,15 @@ impl GroupCommitter {
             max_wait_cap: max_wait,
             max_batch_bytes,
             batch_bytes: AtomicUsize::new(0),
+            pending_waiters: AtomicUsize::new(0),
+            max_pending_waiters,
+            shutting_down: AtomicBool::new(false),
+            stat_sync_attempts: AtomicU64::new(0),
+            stat_sync_successes: AtomicU64::new(0),
+            stat_records_total: AtomicU64::new(0),
+            stat_max_batch_records: AtomicU64::new(0),
+            stat_window_wait_ns_total: AtomicU64::new(0),
+            stat_window_wait_samples: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-util"))]
             fsync_fault_hook: Mutex::new(None),
         };
@@ -255,6 +412,15 @@ impl GroupCommitter {
     /// caller-visible durability event, even though it happens to make
     /// everything appended so far genuinely durable as a side effect.
     fn warm_up_latency_estimate(&self) -> Result<()> {
+        // `_batch_max_seq` is deliberately discarded, not folded into
+        // `durable_through`: even though this probe's `fsync` genuinely
+        // makes those bytes durable as a side effect, publishing that here
+        // would make the warm-up observable as a durability event to a
+        // caller who never asked for one. The (safe, under- rather than
+        // over-report) cost is that the first real caller after `new()`
+        // may wait through one more, technically redundant `fsync` before
+        // `durable_through` first advances — never a correctness issue,
+        // since `durable_through` only ever needs to be a lower bound.
         let (cloned_file, _batch_max_seq) = self.snapshot_sync_target()?;
         let started = Instant::now();
         self.do_leader_fsync(&cloned_file)?;
@@ -271,6 +437,11 @@ impl GroupCommitter {
     /// module's doc comment), so it is never blocked by another thread's
     /// in-flight `fsync`.
     pub fn append(&self, op: WalOp) -> Result<WalPosition> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(EngineError::Aborted {
+                detail: "GroupCommitter is shutting down; new appends are rejected".to_string(),
+            });
+        }
         let approx_len = estimate_frame_len(&op);
         let position = {
             let mut wal = self.lock_wal();
@@ -295,6 +466,18 @@ impl GroupCommitter {
         if self.durable_through.load(Ordering::Acquire) >= seq {
             return Ok(());
         }
+        // Checked before acquiring a waiter permit: a caller that arrives
+        // after shutdown was requested, for a `seq` that is not already
+        // durable, is told immediately rather than consuming a permit slot
+        // it will only ever fail out of anyway.
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(Self::shutting_down_error(seq));
+        }
+        // Backpressure (§11): bounded, not blocking-for-room — see
+        // `acquire_waiter_permit`'s doc comment. Held for the rest of this
+        // call (leader or follower) via RAII; released on every return
+        // path, including early returns and panics-that-never-happen.
+        let _permit = self.acquire_waiter_permit()?;
 
         let mut guard = self.lock_batch();
         loop {
@@ -304,10 +487,19 @@ impl GroupCommitter {
             if let Some(kind) = guard.poisoned {
                 return Err(Self::poisoned_error(kind));
             }
+            // Re-checked every iteration (not just on entry): a follower
+            // already waiting when shutdown() is called is woken by its
+            // notify_all() and must observe this on its very next loop
+            // iteration, not keep waiting out its full timeout.
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(Self::shutting_down_error(seq));
+            }
 
             if !guard.leader_active {
+                super::fire_abort_hook(super::AbortPoint::BeforeLeader);
                 guard.leader_active = true;
                 self.batch_bytes.store(0, Ordering::Relaxed);
+                super::fire_abort_hook(super::AbortPoint::AfterLeaderElection);
                 drop(guard);
                 return self.run_as_leader();
             }
@@ -388,6 +580,72 @@ impl GroupCommitter {
         &self.latency
     }
 
+    /// A snapshot of batching observability counters (§16/§24) —
+    /// batch/sync counts, records-per-batch, durable watermark. Cheap
+    /// (a handful of `Relaxed` atomic loads); safe to call at any time,
+    /// including concurrently with active writers.
+    pub fn stats(&self) -> GroupCommitStats {
+        GroupCommitStats {
+            sync_attempts: self.stat_sync_attempts.load(Ordering::Relaxed),
+            sync_successes: self.stat_sync_successes.load(Ordering::Relaxed),
+            records_total: self.stat_records_total.load(Ordering::Relaxed),
+            max_batch_records: self.stat_max_batch_records.load(Ordering::Relaxed),
+            window_wait_ns_total: self.stat_window_wait_ns_total.load(Ordering::Relaxed),
+            window_wait_samples: self.stat_window_wait_samples.load(Ordering::Relaxed),
+            durable_through: self.durable_through(),
+            pending_waiters: self.pending_waiters.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Shuts this `GroupCommitter` down (§10): no new `append`/
+    /// `await_durable` call started after this returns will be allowed to
+    /// begin a new batch — both fail fast with `EngineError::Aborted`
+    /// (unless the requested `seq` is already durable, in which case
+    /// `await_durable` still reports that truthfully; shutdown does not
+    /// retroactively un-durable anything). A caller already blocked in
+    /// `await_durable` at the moment this is called is woken (via
+    /// `notify_all`) and observes the flag on its next loop iteration,
+    /// rather than waiting out its full timeout.
+    ///
+    /// Gives any batch that is *already* leader-active a bounded chance
+    /// (`SHUTDOWN_DRAIN_BOUND`) to finish — its `fsync` cannot be
+    /// interrupted mid-syscall regardless, so this only affects how long
+    /// `shutdown()` itself waits before returning a settled-enough
+    /// snapshot; it never blocks unconditionally (`shutdown()` itself must
+    /// never hang).
+    ///
+    /// Returns a `ShutdownReport` explicitly stating whether any assigned
+    /// `seq` remains un-synced at the moment of the snapshot (§10: "If
+    /// pending writes are not durable at shutdown, the implementation must
+    /// report that state explicitly") — this crate never silently drops
+    /// that information.
+    pub fn shutdown(&self) -> ShutdownReport {
+        self.shutting_down.store(true, Ordering::Release);
+        self.condvar.notify_all();
+
+        let deadline = Instant::now() + SHUTDOWN_DRAIN_BOUND;
+        let mut guard = self.lock_batch();
+        while guard.leader_active {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (new_guard, _) = self
+                .condvar
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = new_guard;
+        }
+        drop(guard);
+
+        let durable_through = self.durable_through();
+        let highest_assigned_seq = self.lock_wal().next_seq().saturating_sub(1);
+        ShutdownReport {
+            durable_through,
+            highest_assigned_seq,
+        }
+    }
+
     /// Consumes this `GroupCommitter` and returns the wrapped `FileWal`.
     /// Never panics: a poisoned `std::sync::Mutex` (only possible if a
     /// prior critical section panicked, which this module's own code never
@@ -406,11 +664,21 @@ impl GroupCommitter {
     /// the caller in `await_durable` under `batch`, which this function
     /// itself never re-locks until the batch concludes).
     fn run_as_leader(&self) -> Result<()> {
+        let durable_through_before_batch = self.durable_through.load(Ordering::Acquire);
+
+        let window_started = Instant::now();
         self.spin_wait_for_batch_window();
+        let window_elapsed_ns =
+            u64::try_from(window_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.stat_window_wait_ns_total
+            .fetch_add(window_elapsed_ns, Ordering::Relaxed);
+        self.stat_window_wait_samples
+            .fetch_add(1, Ordering::Relaxed);
 
         let (cloned_file, batch_max_seq) = match self.snapshot_sync_target() {
             Ok(t) => t,
             Err(e) => {
+                self.stat_sync_attempts.fetch_add(1, Ordering::Relaxed);
                 self.finish_batch_with_error(Self::io_kind_of(&e));
                 return Err(e);
             }
@@ -429,6 +697,7 @@ impl GroupCommitter {
         // `fire_abort_hook` is a zero-cost no-op without the `test-util`
         // feature, so this costs nothing in production builds.
         super::fire_abort_hook(super::AbortPoint::BeforeSync);
+        self.stat_sync_attempts.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let fsync_result = self.do_leader_fsync(&cloned_file);
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -439,6 +708,15 @@ impl GroupCommitter {
                 self.latency.record(elapsed_ns);
                 self.durable_through
                     .fetch_max(batch_max_seq, Ordering::Release);
+                super::fire_abort_hook(super::AbortPoint::AfterWatermarkBeforeWake);
+
+                let batch_records = batch_max_seq.saturating_sub(durable_through_before_batch);
+                self.stat_sync_successes.fetch_add(1, Ordering::Relaxed);
+                self.stat_records_total
+                    .fetch_add(batch_records, Ordering::Relaxed);
+                self.stat_max_batch_records
+                    .fetch_max(batch_records, Ordering::Relaxed);
+
                 self.finish_batch_ok();
                 Ok(())
             }
@@ -472,10 +750,12 @@ impl GroupCommitter {
     /// leader at a time (enforced by `batch.leader_active`), so this spin
     /// never contends with itself.
     fn spin_wait_for_batch_window(&self) {
+        super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPre);
         let ema_ns = self.latency.current_ns();
         let ema_based = Duration::from_nanos(ema_ns / 10);
         let window = self.max_wait_cap.min(ema_based);
         if window.is_zero() {
+            super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
             return;
         }
         let deadline = Instant::now() + window;
@@ -496,9 +776,11 @@ impl GroupCommitter {
         let mut iterations: u32 = 0;
         loop {
             if self.batch_bytes.load(Ordering::Relaxed) >= self.max_batch_bytes {
+                super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
                 return;
             }
             if Instant::now() >= deadline {
+                super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
                 return;
             }
             iterations += 1;
@@ -588,6 +870,34 @@ impl GroupCommitter {
         }
     }
 
+    fn shutting_down_error(seq: u64) -> EngineError {
+        EngineError::Aborted {
+            detail: format!(
+                "GroupCommitter is shutting down; seq={seq} was not yet durable \
+                 and no new batch will be started to make it so"
+            ),
+        }
+    }
+
+    /// Backpressure (§11): reserves one of `max_pending_waiters` slots for
+    /// the duration of the returned guard, or fails immediately
+    /// (`EngineError::CapacityExceeded`) if none are free — never blocks
+    /// waiting for a slot to open up, which would just relocate the
+    /// unbounded-queuing problem this exists to prevent from "waiters
+    /// blocked in `await_durable`'s main loop" to "waiters blocked trying
+    /// to enter it."
+    fn acquire_waiter_permit(&self) -> Result<WaiterPermit<'_>> {
+        let previous = self.pending_waiters.fetch_add(1, Ordering::AcqRel);
+        if previous >= self.max_pending_waiters {
+            self.pending_waiters.fetch_sub(1, Ordering::AcqRel);
+            return Err(EngineError::CapacityExceeded {
+                requested: (previous as u64).saturating_add(1),
+                max: self.max_pending_waiters as u64,
+            });
+        }
+        Ok(WaiterPermit { committer: self })
+    }
+
     /// Never panics: a poisoned `std::sync::Mutex` (only reachable if a
     /// prior critical section panicked — none of this module's own code
     /// does) is recovered rather than propagated. This is a deliberate,
@@ -598,9 +908,6 @@ impl GroupCommitter {
     /// unrelated bug elsewhere panicked mid-critical-section) for the
     /// practical one this crate's Non-Negotiable rules forbid outright
     /// (`.unwrap()` that can actually panic in a reachable path).
-    /// Never panics: a poisoned `std::sync::Mutex` (only reachable if a
-    /// prior critical section panicked — none of this module's own code
-    /// does) is recovered rather than propagated.
     ///
     /// **Tried and reverted: spinning on `try_lock` before falling back to
     /// a blocking `lock()`.** The theory (this lock's critical section is
@@ -721,6 +1028,135 @@ mod tests {
     }
 
     static_assertions::assert_impl_all!(GroupCommitter: Send, Sync);
+
+    /// §11 backpressure: once `max_pending_waiters` callers are
+    /// concurrently inside `await_durable`, a new call fails immediately
+    /// with `CapacityExceeded` rather than blocking or queuing. Uses
+    /// `install_fsync_fault_hook` to hold the one permitted waiter's
+    /// `fsync` open for a controlled duration, making the race
+    /// deterministic rather than timing-dependent.
+    #[test]
+    fn backpressure_rejects_beyond_max_pending_waiters() {
+        let dir = temp_dir("backpressure");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = Arc::new(GroupCommitter::with_max_pending_waiters(wal, 1).unwrap());
+
+        committer.install_fsync_fault_hook(|| {
+            thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+
+        let pos = committer
+            .append(WalOp::Put {
+                key: b"k1",
+                value: b"v1",
+            })
+            .unwrap();
+        let waiter_committer = Arc::clone(&committer);
+        let handle = thread::spawn(move || waiter_committer.await_durable(pos.seq));
+        // Give the spawned thread time to enter await_durable and hold the
+        // one permitted waiter slot (well under the 300ms fault-hook delay
+        // above, so this is not a tight race).
+        thread::sleep(Duration::from_millis(50));
+
+        let pos2 = committer
+            .append(WalOp::Put {
+                key: b"k2",
+                value: b"v2",
+            })
+            .unwrap();
+        let err = committer.await_durable(pos2.seq).unwrap_err();
+        assert!(
+            matches!(err, EngineError::CapacityExceeded { .. }),
+            "expected CapacityExceeded, got {err:?}"
+        );
+
+        let first_result = handle.join().unwrap();
+        assert!(
+            first_result.is_ok(),
+            "the one permitted waiter must still succeed"
+        );
+
+        committer.clear_fsync_fault_hook();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// §10 shutdown: no new batch starts after `shutdown()`, already-
+    /// assigned-but-possibly-not-yet-durable state is reported explicitly
+    /// (not silently dropped), and no caller is left blocked.
+    #[test]
+    fn shutdown_prevents_new_batches_and_reports_pending_state() {
+        let dir = temp_dir("shutdown_report");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = GroupCommitter::new(wal).unwrap();
+
+        let pos1 = committer
+            .append_durable(WalOp::Put {
+                key: b"k1",
+                value: b"v1",
+            })
+            .unwrap();
+        let pos2 = committer
+            .append(WalOp::Put {
+                key: b"k2",
+                value: b"v2",
+            })
+            .unwrap();
+
+        let report = committer.shutdown();
+        assert!(report.durable_through >= pos1.seq);
+        assert_eq!(report.highest_assigned_seq, pos2.seq);
+        assert!(report.highest_assigned_seq >= report.durable_through);
+
+        let append_err = committer
+            .append(WalOp::Put {
+                key: b"k3",
+                value: b"v3",
+            })
+            .unwrap_err();
+        assert!(matches!(append_err, EngineError::Aborted { .. }));
+
+        // A seq that can never become durable (nothing beyond pos2 was
+        // ever appended) must fail fast after shutdown, not hang.
+        let never_appended_seq = pos2.seq + 1000;
+        let await_err = committer.await_durable(never_appended_seq).unwrap_err();
+        assert!(matches!(await_err, EngineError::Aborted { .. }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `stats()` reflects real batching activity — not asserting exact
+    /// counts (timing-dependent how many batches 20 sequential calls
+    /// happen to produce), only that the counters move in the expected
+    /// direction and stay internally consistent.
+    #[test]
+    fn stats_reflect_real_batching_activity() {
+        let dir = temp_dir("stats");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = GroupCommitter::new(wal).unwrap();
+
+        let before = committer.stats();
+        for i in 0..20u32 {
+            committer
+                .append_durable(WalOp::Put {
+                    key: format!("k{i}").as_bytes(),
+                    value: b"v",
+                })
+                .unwrap();
+        }
+        let after = committer.stats();
+
+        assert!(after.sync_attempts > before.sync_attempts);
+        assert!(after.sync_successes > before.sync_successes);
+        assert_eq!(after.sync_failures(), 0);
+        assert!(after.records_total >= 20);
+        assert!(after.max_batch_records >= 1);
+        assert!(after.avg_batch_records() >= 1.0);
+        assert_eq!(after.durable_through, 20);
+        assert_eq!(after.pending_waiters, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn new_rejects_a_wal_opened_with_immediate_sync_mode() {

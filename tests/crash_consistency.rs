@@ -43,6 +43,18 @@ fn abort_point_name(p: AbortPoint) -> &'static str {
         AbortPoint::MidAppend => "MidAppend",
         AbortPoint::BeforeSync => "BeforeSync",
         AbortPoint::AfterSync => "AfterSync",
+        // Phase 1 (Group Commit) points: not exercised by this WAL-only
+        // test (see tests/group_commit/crash_consistency.rs for those) —
+        // named here only so this match stays exhaustive as the enum
+        // grows, per this crate's own "never silently drop a variant from
+        // an exhaustive match" convention.
+        AbortPoint::BeforeLeader => "BeforeLeader",
+        AbortPoint::AfterLeaderElection => "AfterLeaderElection",
+        AbortPoint::DuringBatchWaitPre => "DuringBatchWaitPre",
+        AbortPoint::DuringBatchWaitPost => "DuringBatchWaitPost",
+        AbortPoint::AfterWatermarkBeforeWake => "AfterWatermarkBeforeWake",
+        AbortPoint::DuringRotationPre => "DuringRotationPre",
+        AbortPoint::DuringRotationPost => "DuringRotationPost",
     }
 }
 

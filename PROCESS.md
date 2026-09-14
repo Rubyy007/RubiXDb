@@ -634,7 +634,107 @@ the test until it passes"), the thresholds are left exactly as specified.
 
 ---
 
+### 2026-09-14 — M1.4/M1.5/M1.6/watermark_monotonicity, and a large scope expansion
+
+**Status:** all four land and pass. Mid-session, the user sent a second,
+much more detailed specification (§0 below) asking for: 5 new
+documentation files (`PHASE1_ARCHITECTURE.md`, `PHASE1_GROUP_COMMIT.md`,
+`PHASE1_FAILURE_MODEL.md`, `PHASE1_ADR.md`, `PHASE1_TEST_RESULTS.md`),
+expanding `AbortPoint` from 4 to 11 variants, explicit `GroupCommitter`
+backpressure and `shutdown()`, a `stats()` observability snapshot, and a
+write-only load-test harness. Two parts of that request were flagged back
+to the user as hard blockers rather than guessed past (an 80/20 read/write
+load test against a read path that does not exist in this repository; a
+literal flame graph plus CPU/RSS metrics requiring new tooling/dependency
+authorization) — resolved via `AskUserQuestion`: write-only load test,
+skip profiler tooling (documented `NOT VERIFIED ON THIS PLATFORM`),
+proceed with everything else.
+
+**M1.4/M1.5/M1.6/watermark_monotonicity, as originally scoped:**
+- M1.4 (`leader_failure_propagation.rs`): injects a permanent leader
+  `fsync` failure under 50 concurrent waiters via `GroupCommitter::
+  install_fsync_fault_hook`. Passes: every waiter gets `Err`, at least one
+  observes the concrete `Io` error, a fresh record after poisoning also
+  fails immediately, no waiter exceeds a 15s no-hang bound (measured via
+  an `mpsc` channel + `recv_timeout`, not `.join()`, so a genuine hang
+  would fail the test rather than hang it).
+- M1.5 (`rotation_mid_batch.rs`): 100 writer threads plus a separate
+  rotator thread calling `rotate()` at a jittered offset. Passes: no
+  waiter hangs, every acknowledged `seq` is durable after reopen, and (in
+  this fault-free scenario) the recovered set exactly matches the
+  acknowledged set.
+- M1.6 (`crash_consistency.rs`): real child-process `abort()` at each
+  `AbortPoint`, 100 writer threads. Required adding `AbortPoint::
+  BeforeSync`/`AfterSync` firing from `GroupCommitter::run_as_leader`
+  itself (not only `FileWal::sync()`, which that path never calls) — the
+  reason is recorded in this file's design log §1 and in the test's own
+  doc comment. Per-thread unbuffered ack files let the parent verify "no
+  acknowledged seq is missing from the recovered prefix" without anything
+  needing to survive `abort()` in memory. All (eventually 11) abort points
+  pass.
+- `watermark_monotonicity.rs` (proptest, 30 cases — not 1,000+; documented
+  why in the file itself: each case drives real concurrent I/O, unlike
+  the WAL's own pure in-memory recovery proptest): a background monitor
+  thread samples `durable_through` throughout each case and asserts the
+  sequence never decreases; every acknowledged waiter is checked against
+  a post-run reopen.
+
+**Scope-expansion work, done after the user's follow-up authorization:**
+- `FileWal::durable_seq` footgun fix, spin-then-yield, stale-doc fixes —
+  see the M0.1 entry above (landed just before this one).
+- `AbortPoint` expanded to 11 variants (7 new, all real reachable
+  boundaries — see `wal::mod`'s doc comment for the exact call site of
+  each). `tests/crash_consistency.rs` (pre-existing, unrelated to group
+  commit) needed its own exhaustive `match` updated to keep compiling —
+  a real, if small, instance of "adding a variant to a shared enum
+  touches every exhaustive match on it," fixed rather than papered over
+  with a wildcard arm that would silently swallow future variants too.
+- `GroupCommitter::with_max_pending_waiters`/backpressure: a bounded
+  `pending_waiters` counter, `CapacityExceeded` on overflow, no blocking-
+  for-room (would just relocate the unbounded-queue problem).
+- `GroupCommitter::shutdown()`: flag-and-drain, `ShutdownReport` with
+  `has_undurable_pending()`, bounded at `SHUTDOWN_DRAIN_BOUND` so
+  `shutdown()` itself cannot hang.
+- `GroupCommitter::stats()`/`GroupCommitStats`: sync attempts/successes,
+  records total/max-per-batch, window-wait total/samples, all `Relaxed`
+  atomics updated on the leader path only.
+- `examples/group_commit_load_test.rs`: the §16 write-only load harness,
+  4-level concurrency matrix (1/10/100/1,000), warm-up phase excluded
+  from measurement, per-op latency percentiles, `GroupCommitStats`-backed
+  batch metrics, WAL-directory byte count, explicit `Timeout`-vs-other
+  failure breakdown, post-run recovery check.
+- `examples/append_only_benchmark.rs`: the append-path-vs-`fsync`-window
+  isolation diagnostic, promoted from an ad hoc scratch script (used
+  earlier for the M1.2/M1.3 root-cause analysis) to a permanent,
+  reproducible artifact.
+- Unit tests added for backpressure, shutdown, and `stats()` (`wal::
+  group_commit::tests`).
+
+**A real regression fixed along the way:** a leftover, duplicated doc
+comment fragment on `lock_wal` (from an earlier edit that replaced content
+but left an orphaned partial comment above it) — cleaned up while adding
+the new lock-related doc content nearby; caught by re-reading the diff,
+not by any tool.
+
+**Tests passing:** 87 lib tests (up from 84 — three new backpressure/
+shutdown/stats unit tests). `cargo test`, `cargo test --release`, `cargo
+test --features test-util` all run the full matrix; M1.1, M1.4, M1.5,
+M1.6, and `watermark_monotonicity` pass in every configuration. M1.2/M1.3
+continue to fail their throughput targets on this machine (see the
+dedicated M1.1/M1.2/M1.3 entry above and `PHASE1_TEST_RESULTS.md` for the
+full, consolidated numbers and root-cause analysis — per the user's
+second specification, all results now live in that one file, not
+scattered across design docs). `cargo clippy --all-targets --all-features
+-- -D warnings`: clean. `cargo fmt --check`: clean.
+
 ## 3. Benchmark results
+
+Superseded by `PHASE1_TEST_RESULTS.md`, per the user's explicit "no
+results, numbers, pass/fail status, or benchmark output outside of
+PHASE1_TEST_RESULTS.md" rule for the expanded Phase 1 specification. This
+section is kept for historical continuity with the M1.1/M1.2/M1.3 entry
+above (written before that rule existed) but is not updated further —
+see `PHASE1_TEST_RESULTS.md` for the current, single source of truth.
 
 (Populated as each M1.x test is run for the first time, with the exact
 command to reproduce. Raw numbers only — no target is ever hand-tuned to
