@@ -598,6 +598,25 @@ impl GroupCommitter {
     /// unrelated bug elsewhere panicked mid-critical-section) for the
     /// practical one this crate's Non-Negotiable rules forbid outright
     /// (`.unwrap()` that can actually panic in a reachable path).
+    /// Never panics: a poisoned `std::sync::Mutex` (only reachable if a
+    /// prior critical section panicked — none of this module's own code
+    /// does) is recovered rather than propagated.
+    ///
+    /// **Tried and reverted: spinning on `try_lock` before falling back to
+    /// a blocking `lock()`.** The theory (this lock's critical section is
+    /// tiny, so a contended blocking `lock()`'s OS-level park/wake cost
+    /// should dominate over just re-trying) measured *worse* under M1.2's
+    /// real 100-thread load on this machine (throughput dropped from
+    /// ~10,100 to ~4,500 ops/sec) — this environment has meaningfully
+    /// fewer logical cores than concurrently-runnable threads, so 100
+    /// threads burning CPU on `spin_loop()` starves whichever thread
+    /// actually holds the lock (and the leader's own spin-wait) of the
+    /// scheduler time it needs to finish and release it, a well-known
+    /// failure mode of spinlocks under CPU oversubscription. Reverted;
+    /// kept here as a documented negative result (`PROCESS.md`'s M1.2
+    /// benchmark entry) rather than silently dropped — the *next* thing to
+    /// try is reducing how much work happens per contended acquisition,
+    /// not how the lock itself is acquired.
     fn lock_wal(&self) -> MutexGuard<'_, FileWal> {
         self.wal
             .lock()

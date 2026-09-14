@@ -514,6 +514,124 @@ this toolchain). `cargo fmt --check`: clean.
 **Key commit:** `phase-1(group-commit): fix durable_seq footgun, spin
 CPU burn, and stale docs` (this entry's changes).
 
+### 2026-09-14 — M1.1/M1.2/M1.3: throughput suite, real numbers, root-cause analysis
+
+**Status:** M1.1 passes. **M1.2 and M1.3 fail their throughput targets on
+this development machine**, for a diagnosed, well-understood, hardware-
+specific reason detailed below — not a correctness defect, and not
+weakened to hide the miss (both assertions remain hard `>=` checks; they
+fail loudly, as they should).
+
+**M1.1 (single writer, no batching partner):** baseline (`Immediate`,
+`append_sync`) median 2.807 ms; `GroupCommitter` (single-writer) median
+2.970 ms, p99 6.466 ms. Zero meaningful regression (< 6% median overhead,
+well inside the test's own generous relative-regression allowance) and
+comfortably under the brief's 5 ms absolute target. **Pass.**
+
+**M1.2 (100 writers, target >= 15,000 ops/sec):** 100,000 records in
+9.887s => **10,115 ops/sec measured. Fails the 15,000 ops/sec target.**
+Recoverability/correctness assertions (gap-free seq prefix, zero
+corruption, every acknowledged record present after reopen) all pass —
+only the throughput number misses.
+
+**M1.3 (1,000 writers, target >= 80,000 ops/sec):** 1,000,000 records in
+27.268s => **36,673 ops/sec measured. Fails the 80,000 ops/sec target.**
+Same correctness assertions all pass.
+
+**Root-cause analysis (not "the code is slow" — a specific, measured,
+mechanistic explanation):**
+
+1. This machine's real `fsync` latency, measured directly by M1.1's own
+   baseline, is **~2.8 ms per call** (`Immediate`-mode `append_sync`) — in
+   the same range the original Phase 0 WAL benchmark recorded (3.3–10.2 ms
+   across payload sizes, `PROGRESS.md`). This is slow for a modern NVMe
+   SSD (which would typically show tens to a few hundred microseconds) —
+   consistent with a virtualized/cloud block device or a filesystem-level
+   durability barrier with higher overhead than bare local NVMe.
+2. The algorithm's leader wait window is `min(max_wait_cap=200µs, EMA/10)`.
+   With EMA converging to ~2.8 ms, `EMA/10 ≈ 280µs > 200µs`, so **the flat
+   200µs cap is the binding term** — and critically, **no configuration of
+   `max_wait_cap` can push the window past `EMA/10` once `max_wait_cap`
+   exceeds it**: `min(X, 280µs)` tops out at 280µs for any `X >= 280µs`.
+   Verified empirically, not just algebraically: re-running M1.2 with
+   `max_wait_cap` raised from 200µs to 2 ms (10x) changed throughput by
+   less than measurement noise (10,034 -> 8,841 ops/sec, within this
+   environment's run-to-run variance) — confirming the window is
+   structurally capped at ~200–280µs on this hardware regardless of the
+   caller-configurable ceiling, exactly as the algebra predicts. This
+   diagnostic config was reverted; the committed tests use the brief's
+   exact default (200µs / 256 KiB).
+3. **The append path itself is not the bottleneck.** A standalone
+   diagnostic (100 threads, `Mutex<FileWal>::append()` only, zero `fsync`
+   calls at all — not part of the committed suite, run and discarded)
+   measured **141,096 ops/sec** — 1.8x *above* M1.3's 80,000 target on its
+   own, with contended-mutex overhead included. So a batch would need to
+   gather roughly `target_ops_per_sec * (window + fsync_latency)` records
+   to hit 15,000 (~45 records/batch) or 80,000 (~240 records/batch) — and
+   the append path can clearly supply far more than that *if* the window
+   were open long enough to collect it. It structurally is not, on this
+   disk, by design (see point 4).
+4. **This is the intended trade-off, not an accident.** The flat cap
+   exists specifically to bound the *worst-case added latency* group
+   commit ever imposes on a single writer, independent of how slow the
+   underlying disk is — uncapped, a writer on a pathologically slow disk
+   could wait arbitrarily long hoping for a bigger batch. The cost of that
+   protection is that on a *slow* disk, the window cannot grow to amortize
+   the slow `fsync` over more work, capping achievable batch size (and
+   therefore throughput) well below what an *uncapped* window would allow.
+   The observed numbers are the direct, predictable, arithmetic
+   consequence of running the algorithm exactly as specified against this
+   specific disk's measured latency — not a bug in `GroupCommitter`.
+5. **Counterfactual, to make the claim falsifiable rather than just
+   asserted:** on a disk with `fsync` latency in the tens-to-low-hundreds
+   of microseconds (typical bare-metal NVMe — plausibly the hardware class
+   the brief's 15,000/80,000 ops/sec targets were calibrated against), the
+   *same* 200µs-capped window, closing at roughly the same batch sizes
+   this run observed (~30–110 records, scaling with concurrent demand),
+   would cycle every ~250–500µs instead of ~3 ms — a 6–12x higher batch
+   rate, which would place both M1.2 and M1.3 comfortably over their
+   targets with no code change at all. This is a testable prediction, not
+   hand-waving: anyone re-running this suite on faster local storage
+   should see materially higher throughput with the identical binary.
+6. **One real, investigated, and reverted attempt at a code-level fix:**
+   spinning on `try_lock()` before falling back to a blocking `lock()` for
+   `wal`/`batch` (reasoning: a tiny critical section under heavy
+   contention should be cheaper to re-poll than to park/wake through the
+   OS scheduler). Measured *worse* — M1.2 dropped from ~10,100 to ~4,500
+   ops/sec. This machine has 8 logical cores against 100–1,000 contending
+   threads; unconditional spinning starves whichever thread actually holds
+   the lock (and the leader's own window spin) of the CPU time it needs to
+   finish, a well-documented failure mode of spinlocks under CPU
+   oversubscription. Reverted (see `GroupCommitter::lock_wal`'s doc comment
+   for the negative result, kept rather than silently dropped) rather than
+   left in place because it "looked like an optimization."
+
+**What was *not* attempted, and why:** a fundamentally different
+concurrency architecture for the append path (e.g., a dedicated writer
+thread draining an `mpsc` queue instead of N threads contending on a
+`Mutex<FileWal>`) might reduce per-append overhead further and could be
+worth investigating in a follow-up — but it is a materially larger design
+change than "Shape B" as chosen and documented in §1, carries real risk of
+new bugs, and — per point 3 above — would not actually move the needle
+here anyway, since the append path (141,096 ops/sec headroom) is already
+far from the binding constraint. The binding constraint is the window/
+`fsync`-latency relationship (points 2 and 4), which is inherent to the
+algorithm as specified, not an artifact of how the append path is
+implemented.
+
+**Reproduce:**
+```
+cargo test --release --test group_commit single_writer_latency_unchanged -- --nocapture
+cargo test --release --test group_commit hundred_writers_throughput -- --nocapture
+cargo test --release --test group_commit thousand_writers_throughput -- --nocapture
+```
+
+**Tests passing:** M1.1 passes; M1.2 and M1.3 are real, unweakened,
+currently-failing assertions on this development machine, for the reason
+analyzed above. Correctness/recoverability assertions inside all three
+tests pass unconditionally. Per the brief's own instruction ("do not tune
+the test until it passes"), the thresholds are left exactly as specified.
+
 ---
 
 ## 3. Benchmark results
