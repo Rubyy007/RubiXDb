@@ -6,6 +6,50 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Phase 1: Group Commit
+
+Adds `wal::group_commit::GroupCommitter`, a leader-follower group commit
+layer over the existing `FileWal`: concurrent callers share one `fsync`
+per batch instead of paying one per write, with a monotone
+`durable_through` watermark, bounded backpressure, explicit shutdown, and
+observability counters. No change to the WAL's on-disk format, `Wal`
+trait signatures, or `FileWal`'s single-writer internal model — see
+`PHASE1_ARCHITECTURE.md`/`PHASE1_GROUP_COMMIT.md`/`PHASE1_ADR.md` for the
+design and `PHASE1_TEST_RESULTS.md` for full results, benchmark numbers,
+and the production-readiness decision (**not production ready**: the
+100-writer/1,000-writer throughput targets are not met on the
+development machine's disk — a diagnosed hardware/algorithm interaction,
+not a correctness defect; every other gate is met).
+
+- **`GroupCommitter`** (`src/wal/group_commit.rs`): `append`/
+  `await_durable`/`append_durable`/`rotate`/`durable_through`/`stats`/
+  `shutdown`, plus `with_max_pending_waiters` for explicit backpressure
+  configuration. `SyncMode::GroupCommit` is no longer rejected by
+  `FileWal::open_for_recovery` (it previously returned `EngineError::
+  Unsupported` — see below).
+- **`FsyncLatencyTracker`** (`src/wal/metrics.rs`): an `AtomicU64`-only
+  EMA `fsync`-latency tracker (`new = 0.1 * sample + 0.9 * old`), driving
+  the leader's batch-window sizing and a follower's timeout.
+- **`FileWal::durable_seq`**: a new field, advanced only inside `sync()`/
+  `rotate()` after a genuinely successful `fsync` — distinct from
+  `next_seq() - 1` ("assigned," not "durable"), closing a real footgun
+  where an unsynced raw `append()` before constructing a `GroupCommitter`
+  could otherwise be silently treated as durable.
+- **`AbortPoint`** (`src/wal/mod.rs`) expanded from 4 to 11 variants: the
+  7 new ones (`BeforeLeader`, `AfterLeaderElection`, `DuringBatchWaitPre`/
+  `Post`, `AfterWatermarkBeforeWake`, `DuringRotationPre`/`Post`) name
+  real, reachable boundaries in `GroupCommitter`'s leader/rotation paths.
+  `BeforeSync`/`AfterSync` now additionally fire from `GroupCommitter`'s
+  own leader `fsync` call, not only from `FileWal::sync()`, which that
+  path never calls.
+- **`EngineError::Timeout`** (`src/error.rs`): a new variant for a
+  follower's bounded wait expiring — required by the algorithm, distinct
+  from `Io` (no I/O necessarily failed) and safe to retry.
+- Seven new integration test files under `tests/group_commit/` (one per
+  milestone, plus a proptest), a write-only load-test harness (`examples/
+  group_commit_load_test.rs`), and a permanent append-path diagnostic
+  (`examples/append_only_benchmark.rs`).
+
 ### Five follow-up fixes from external review
 
 - **`purge_before` now attempts its directory fsync on the error path

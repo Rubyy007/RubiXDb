@@ -295,3 +295,28 @@ recorded in this entry.
 - Compaction is otherwise fully specified (LSM Engine Spec §5) — trigger
   count, strategy, and the tombstone-safety rule are all pinned; nothing
   left open there beyond the defaults already given.
+
+## Phase 1: Group Commit
+
+`wal::group_commit::GroupCommitter` — a leader-follower group commit
+layer over `FileWal` — is documented separately rather than folded into
+this file, per the Phase 1 brief's own documentation structure:
+`PHASE1_ARCHITECTURE.md` (design), `PHASE1_GROUP_COMMIT.md` (state
+machine and durability model), `PHASE1_FAILURE_MODEL.md` (error
+semantics), `PHASE1_ADR.md` (decisions and rationale), and `PHASE1_TEST_
+RESULTS.md` (the single source of truth for all Phase 1 results —
+no test results, benchmark numbers, or pass/fail status live in any other
+document, this file included, for that phase). `PROCESS.md` §1–§2 is the
+chronological design/milestone log written during implementation.
+
+One Tier-3-adjacent decision made during Phase 1, recorded here for
+traceability since it affects this file's own "what's implemented so far"
+picture: the Phase 1 load-test harness (`examples/group_commit_load_
+test.rs`) is **write-only**. This repository has no read path — Memtable,
+SSTable, and the LSM facade are unimplemented (see "What is intentionally
+not decided yet" above and `PROGRESS.md`) — so an 80/20 read/write
+workload as originally specified cannot be run without either fabricating
+read performance for functionality that doesn't exist (explicitly
+disallowed by that phase's own brief) or building a read path, which is
+out of Phase 1's scope. Resolved with the user via `AskUserQuestion`
+rather than guessed past; full reasoning in `PHASE1_ADR.md` ADR-11.

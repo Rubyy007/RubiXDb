@@ -456,3 +456,53 @@ property.
 **Open Tier 3 question currently blocking further work:** unchanged —
 the WAL Spec §6.2 amendment still needs the user's confirmation before
 Memtable work begins.
+
+---
+
+## 2026-09-14 (Phase 1: Group Commit)
+
+**Implemented:** `wal::group_commit::GroupCommitter`, a leader-follower
+group commit layer on top of the existing, frozen `FileWal` — concurrent
+callers share one `fsync` per batch instead of one per write, via a
+monotone `durable_through` watermark. Full design in `PHASE1_
+ARCHITECTURE.md`/`PHASE1_GROUP_COMMIT.md`/`PHASE1_ADR.md`; full results
+in `PHASE1_TEST_RESULTS.md` (the single source of truth for this phase's
+numbers, per the user's own explicit rule — not duplicated here).
+
+Also implemented, per a mid-session scope expansion the user authorized
+after two hard blockers were flagged and resolved via `AskUserQuestion`
+(no read path exists to load-test 80/20 against; no profiler tooling is
+set up on this platform): `GroupCommitter` backpressure
+(`with_max_pending_waiters`), explicit `shutdown()`, a `stats()`
+observability snapshot, `AbortPoint` expanded from 4 to 11 variants (7
+new, all real reachable boundaries in the group-commit leader/rotation
+paths), a write-only load-test harness (`examples/group_commit_load_
+test.rs`), and a permanent append-path diagnostic (`examples/append_
+only_benchmark.rs`).
+
+**Tests passing:** 87 lib tests (up from 80), all pre-existing WAL
+integration tests unchanged and green, plus the full `tests/group_
+commit/` suite (M1.1, M1.4, M1.5, M1.6, `watermark_monotonicity` all
+pass in every configuration; M1.2/M1.3's throughput assertions do not —
+see below). `cargo clippy --all-targets --all-features -- -D warnings`
+and `cargo fmt --check`: clean.
+
+**Explicitly not done:** the M1.2 (≥15,000 ops/sec, 100 writers) and
+M1.3 (≥80,000 ops/sec, 1,000 writers) throughput targets are not met on
+this development machine — root-caused (not merely observed) to this
+machine's real SATA SSD `fsync` latency (~2.8–3.0ms) interacting with the
+algorithm's own 200µs latency-protecting window cap, evidenced by an
+isolated append-path diagnostic (~138–141k ops/sec, 4–47x above either
+target on its own) and a specific, falsifiable counterfactual. Full
+analysis in `PHASE1_TEST_RESULTS.md` §14–§18. **Phase 1 production-
+readiness decision: NOT PRODUCTION READY**, this one blocker aside —
+every other gate (correctness, crash-consistency across 11 abort points,
+security checklist, zero regression) is met.
+
+**Open question for the user, not resolved unilaterally:** whether to
+accept the current implementation as correct-but-disk-bound on this
+hardware (re-verify on faster storage before considering Phase 1 done),
+or to pursue a different implementation strategy despite the evidence
+that the append path itself is not the bottleneck (`PHASE1_TEST_
+RESULTS.md` §15's dominant-cost analysis). Not re-litigated here — see
+that document.
