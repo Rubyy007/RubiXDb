@@ -713,6 +713,127 @@ inform the Phase B decision and any future performance claims.
 **Evidence**: `target/phase1-evidence/m1_3_timing_report_fixed.txt`
 (local, not committed; regenerate with the command in §9D.4).
 
+## 9E. Phase B (pipelining) implemented and measured — regresses throughput; not adopted
+
+**Status: implemented, correctness-verified, performance-measured.
+Result contradicts the Phase A model's prediction. Recommendation below;
+not a unilateral decision.**
+
+### 9E.1 What was implemented
+
+`BatchState.leader_active` was split into `filling_active` (the window
+wait + sync-target snapshot) and `fsyncing_active` (the `fsync` syscall
+itself), with an atomic handoff (`GroupCommitter::begin_fsyncing_phase`)
+that clears `filling_active` and claims `fsyncing_active` in the same
+critical section — so the *next* batch's leader can start its window the
+moment the *current* batch's snapshot is taken, while that batch's own
+`fsync` is still ahead of it in line. `fsync` itself stays strictly
+one-at-a-time (FIFO, via the same handoff). Full design:
+`PHASE1_GROUP_COMMIT.md` §1 (updated); rationale: `PHASE1_ADR.md`
+ADR-14 (new, below).
+
+### 9E.2 Correctness: fully verified, no regressions
+
+`cargo build --lib` (with/without `--features test-util`) clean; `cargo
+test --lib` 87/87 passed; `cargo clippy --all-targets --all-features --
+-D warnings` clean; `cargo fmt --check` clean. Full `group_commit`
+integration suite (`cargo test --release --test group_commit --features
+test-util`): M1.4 (leader-failure propagation), M1.5 (rotation mid-
+batch), M1.6 (crash consistency across every `AbortPoint`, including the
+two new ones this handoff touches), and `watermark_monotonicity` (the
+proptest) **all still pass**, unmodified. M1.1 (single-writer latency,
+isolated run) is unaffected: baseline 3.583ms vs. `GroupCommitter`
+3.611ms — matches pre-pipelining numbers, as expected (a lone writer
+never has a successor batch to overlap with).
+
+### 9E.3 Performance: a real, reproducible regression, not an improvement
+
+**Command**: `RGC_TIMING_REPORT=1 cargo test --release --test
+group_commit --features test-util thousand_writers_throughput --
+--nocapture`, run in isolation (not concurrently with other tests in the
+same binary — running the full suite concurrently inflates every number
+via cross-test disk contention independent of pipelining; isolated runs
+are the only ones comparable to §9D.4).
+
+| Metric | §9D.4 (pre-pipelining, serial) | Pipelined (this section), run 1 | Pipelined, run 2 |
+|---|---|---|---|
+| Batches | 1,488 | 2,348 | 2,415 |
+| Mean window (µs) | 5,037.4 | 5,764.2 | 5,839.1 |
+| Mean snapshot (µs) | 515.6 | 3,201.4 | 2,814.2 |
+| Mean fsync (µs) | 5,033.7 | 10,405.9 | 8,825.7 |
+| M1.3 throughput (ops/sec) | 63,293 | 36,899 | 39,625 |
+
+M1.2 (100 writers), isolated: 10,480 ops/sec pre-pipelining (§9D's
+environment baseline) vs. **8,349 ops/sec** pipelined — also regressed.
+
+Reproduced twice for M1.3 (both isolated runs above land within ~7% of
+each other); this is not run-to-run noise. **Every stage got worse, not
+better** — `fsync` roughly doubled, `snapshot` grew ~5-6x, `window` grew
+slightly, and average records-per-batch *fell* (1,000,000 records /
+1,488 batches ≈ 672/batch pre-pipelining vs. /2,348-2,415 ≈ 415-426/batch
+pipelined) even though the whole premise of batching is fewer, larger
+`fsync` calls.
+
+(`mean_coordination_us` is not comparable across the two configurations
+and is omitted from the table: `batch_timing`'s coordination formula,
+§9D.3, assumes `t_window_started(N+1)` immediately follows `prev_notify_
+sent_ns(N)` — true when batches are serial, no longer true once `N+1`'s
+window can start before `N`'s `fsync` even finishes. The instrumentation
+was not redesigned a second time for this measurement, since the
+question this section answers — did throughput improve? — does not
+depend on that specific metric.)
+
+### 9E.4 Why: a working hypothesis, not a confirmed root cause
+
+The pipelining model (`PHASE1_ADR.md` ADR-14, following the original
+task's stated premise) predicted `window + fsync + coordination →
+max(window, fsync + coordination)` by overlapping one batch's window
+with the *previous* batch's `fsync`. The measured result shows the
+opposite: running a `snapshot_sync_target` (a brief `wal`-mutex lock plus
+`File::try_clone`) concurrently with another thread's in-flight `fsync`
+on a clone of the same file made **both** operations slower, and made
+`fsync` itself roughly twice as slow on average. A plausible explanation,
+not yet verified by a targeted experiment: this is a Windows/NTFS
+environment, and `FlushFileBuffers` (what `std::fs::File::sync_all`
+calls) is documented/commonly observed to serialize certain per-file
+operations at the kernel level regardless of how many handles are
+involved — if concurrent `fsync`s on the same file's clones already
+serialize at the OS level (as Shape B's ADR-1 always assumed was safe
+for *correctness*, but never claimed was fast), then this pipelining
+change buys no real overlap on this platform while still paying for the
+extra `wal`-lock acquisition (the successor's own `snapshot_sync_target`)
+and the extra condvar handoff (`begin_fsyncing_phase`) on every batch —
+pure added overhead with no offsetting benefit. This is a hypothesis
+about *this platform*; it has not been tested against a Linux/ext4 or
+Linux/xfs environment, where concurrent `fsync` calls on the same inode
+are more commonly able to proceed independently.
+
+### 9E.5 Recommendation, not a unilateral decision
+
+Per this project's own stated priority (`PROCESS.md`: "Correctness >
+performance > elegance") and this section's own measured evidence,
+**shipping this change as the default would be a straightforward
+regression with no offsetting benefit on this environment** — it does
+not move M1.2/M1.3 closer to their targets; it moves them further away.
+The implementation is correct and is left in the tree (`src/wal/
+group_commit.rs`, this commit) rather than reverted, so the measurement
+above is reproducible and the design is available if a future
+Linux-hosted measurement or a targeted Windows-specific investigation
+(e.g., does `FlushFileBuffers` really serialize across handles to the
+same file on this OS — a small standalone experiment, independent of
+`GroupCommitter`, could confirm or refute this directly) changes the
+conclusion. Two options, not decided here: **(a)** revert to the
+pre-pipelining serial `leader_active` design (§9D's numbers) as the
+shipped behavior, since it measurably outperforms this change on the
+only environment available; or **(b)** keep investigating the Windows-
+specific hypothesis above before deciding. Recommendation: **(a)**,
+unless there is a reason to expect the target deployment environment is
+not Windows/NTFS.
+
+**Evidence**: `target/phase1-evidence/m1_3_pipelined_isolated.txt`,
+`target/phase1-evidence/m1_3_pipelined_isolated_rerun.txt` (both local,
+not committed; regenerate with the command in §9E.3).
+
 ## 10. Property-test results
 
 **Command**: `cargo test --release --test group_commit --features

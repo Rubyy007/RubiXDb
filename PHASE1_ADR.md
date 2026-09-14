@@ -295,3 +295,65 @@ derivation gives an equivalent signal at zero contention cost); removing
 wake-side timing entirely with no replacement (rejected — coordination
 time between batches is still a real, useful signal for the pipelining
 decision, and the leader-only derivation preserves it exactly).
+
+## ADR-14: pipelining (`filling_active`/`fsyncing_active` split) — implemented and correct, but not adopted as the shipped default
+
+**Context**: with §9D's corrected Phase A measurement confirming the
+model (`window ≈ 5ms`, `fsync ≈ 5ms`, `snapshot` near-zero,
+`coordination` near-zero) on a healthy environment, the pipelining
+fix's premise — overlap one batch's window with the *previous* batch's
+`fsync` to turn `window + fsync + coordination` into `max(window, fsync
++ coordination)` — was cleared to implement per the task's own gate.
+
+**Decision (implementation)**: `BatchState.leader_active` was split into
+`filling_active` (window wait + sync-target snapshot) and `fsyncing_
+active` (the `fsync` syscall itself). A new handoff method,
+`begin_fsyncing_phase`, atomically (under `batch`'s lock, in one
+critical section) clears the outgoing batch's `filling_active` and
+either claims `fsyncing_active` for that same thread (if free) or blocks
+until the `fsync` currently in flight finishes — this keeps `fsync`
+strictly one-at-a-time and FIFO-ordered across batches without a
+separate queue, since at most one batch can ever be waiting at this
+handoff at a time (the next batch cannot even be elected until this
+handoff releases `filling_active`). Full design: `PHASE1_GROUP_COMMIT.md`
+§1 (updated state machine: `FILLING`/`FSYNCING` replace `LEADER_ACTIVE`).
+
+**Decision (adoption): reverted to the pre-pipelining serial design as
+the default is recommended, not yet unilaterally executed** — see
+`PHASE1_TEST_RESULTS.md` §9E.5. The implementation remains in the tree,
+correctness-verified, because the measurement is only valid on the
+environment it was taken on (Windows/NTFS) and a different platform
+could plausibly reach a different conclusion (§9E.4).
+
+**Finding**: correctness is fully intact — every invariant in
+`PHASE1_GROUP_COMMIT.md` §2 still holds (the poisoning-discovered-at-
+handoff case, §9E's `POISONED` state description, is a new but
+correctly-handled path, not a new hole), and the full `group_commit`
+integration suite (M1.1/M1.4/M1.5/M1.6/`watermark_monotonicity`) passes
+unmodified. **Performance is a reproducible regression**, not an
+improvement: isolated M1.3 runs dropped from 63,293 ops/sec
+(pre-pipelining, §9D.4) to 36,899-39,625 ops/sec; M1.2 dropped from
+10,480 to 8,349 ops/sec. Every measured stage got worse — `fsync`
+roughly doubled, `snapshot` grew 5-6x — not just the ones pipelining
+touches. Full data and a working (unverified) hypothesis for why —
+`FlushFileBuffers` plausibly serializing across handles to the same file
+at the Windows kernel level, so the intended overlap never actually
+happens while the extra `wal`-lock acquisition and condvar handoff still
+get paid on every batch — `PHASE1_TEST_RESULTS.md` §9E.
+
+**Rationale for not adopting**: `PROCESS.md`'s own stated priority order
+is "Correctness > performance > elegance" — but the entire point of
+Phase B was to *improve* performance; a correct change that reproducibly
+makes the thing it was built to improve worse, with no offsetting
+benefit measured anywhere, fails on its own terms. Shipping it as the
+default would move M1.2/M1.3 further from their targets, not closer.
+
+**Alternatives considered**: keep pipelining but only enable it above
+some concurrency threshold (rejected — no evidence yet that any
+concurrency level benefits on this platform; would be tuning against an
+unconfirmed hypothesis); investigate the Windows `FlushFileBuffers`
+hypothesis before deciding (viable, not done here — flagged as future
+work in §9E.5's option (b)).
+
+**Verification**: see `PHASE1_TEST_RESULTS.md` §9E.2 (correctness) and
+§9E.3 (performance, reproduced twice).

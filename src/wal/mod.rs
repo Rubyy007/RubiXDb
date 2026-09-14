@@ -909,10 +909,10 @@ pub enum AbortPoint {
     /// Immediately after `sync()`'s `fsync` call completes.
     AfterSync,
     /// `GroupCommitter::await_durable`: immediately before a caller that
-    /// found no active leader attempts to become one (before
-    /// `leader_active` is set).
+    /// found no active filling leader attempts to become one (before
+    /// `filling_active` is set).
     BeforeLeader,
-    /// `GroupCommitter::await_durable`: immediately after `leader_active`
+    /// `GroupCommitter::await_durable`: immediately after `filling_active`
     /// is flipped to `true` (under `batch`), before the batch-window wait
     /// begins.
     AfterLeaderElection,
