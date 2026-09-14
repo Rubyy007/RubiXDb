@@ -26,8 +26,11 @@ encoded.
   describes everyone *except* the leader during that same interval.
 - **BATCH_WINDOW** — a sub-state of `LEADER_ACTIVE`: the leader is inside
   `spin_wait_for_batch_window` (`DuringBatchWaitPre` → `DuringBatchWaitPost`),
-  waiting for `min(max_wait, EMA/10)` or `max_batch_bytes`, whichever
-  comes first.
+  waiting for `min(max_wait, EMA/WINDOW_EMA_DIVISOR)` or `max_batch_bytes`,
+  whichever comes first — after first probing for `PROBE_WINDOW` (200µs)
+  to confirm a follower has actually joined before committing to the
+  full window (`PHASE1_ADR.md` ADR-12; `WINDOW_EMA_DIVISOR` was
+  originally `10`, revised to `1` by that ADR's window-size sweep).
 - **SYNC_IN_PROGRESS** — a sub-state of `LEADER_ACTIVE`, after the window
   closes: the leader has snapshotted `(cloned file, batch_max_seq)` and is
   executing the `fsync` (`BeforeSync` → the syscall → `AfterSync`).

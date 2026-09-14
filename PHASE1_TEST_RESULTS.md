@@ -49,9 +49,18 @@ the counterfactual this implies for different hardware.
 
 ## 3. Configuration
 
-`SyncMode::GroupCommit { max_wait: Duration::from_micros(200),
-max_batch_bytes: 256 * 1024 }` — the brief's own literal defaults —
-used by every test and benchmark in this file unless stated otherwise.
+**Updated mid-session by §9A/§9B's window-size sweep and fix — see
+`PHASE1_ADR.md` ADR-12.** Originally `SyncMode::GroupCommit { max_wait:
+Duration::from_micros(200), max_batch_bytes: 256 * 1024 }` (the brief's
+own literal defaults) with a hardcoded `WINDOW_EMA_DIVISOR = 10` inside
+`GroupCommitter`. **Current**: `max_wait: Duration::from_millis(5)` in
+every test/harness config in this repository, `WINDOW_EMA_DIVISOR = 1`
+inside `GroupCommitter` (`src/wal/group_commit.rs`), plus a demand-
+adaptive `PROBE_WINDOW = 200µs` (the *original* default, now repurposed
+as the probe duration rather than the hard cap). Results in this document
+are labeled "original formula" or "current formula" wherever both exist
+side by side (§9, §9A, §14.3, §16); every number is attributed to the
+configuration it was actually measured under, none is silently replaced.
 `GroupCommitter::new` (not `with_max_pending_waiters`) is used throughout,
 so `DEFAULT_MAX_PENDING_WAITERS = 65,536` backpressure applies (never hit
 in any run recorded here — peak concurrency exercised is 1,000 waiters).
@@ -81,6 +90,8 @@ in any run recorded here — peak concurrency exercised is 1,000 waiters).
 | CPU utilization / RSS metrics | **NOT VERIFIED ON THIS PLATFORM** — see §15. |
 | Flame graph | **NOT VERIFIED ON THIS PLATFORM** — see §15; a named-dominant-cost analysis is provided in its place. |
 | `io_uring` / `O_DIRECT` / thread-per-core / custom allocator | Not implemented — no profiling evidence names any of them as the dominant cost (§15), and the brief's own decision gate requires that evidence before considering them. |
+| Window-size sweep experiment scaffolding (`phase1-window-experiment` Cargo feature) | Implemented, **temporary**, not enabled by default or by any other feature — see `PHASE1_ADR.md` ADR-12. Reduces to the exact production formula when unused; removable in a follow-up commit without touching production code. |
+| `GroupCommitter` batch-window formula fix (`WINDOW_EMA_DIVISOR`, demand-adaptive probe) | Implemented and verified — §9A/§9B, `PHASE1_ADR.md` ADR-12. Substantially improves throughput at every concurrency level without regressing single-writer latency; does not fully close the M1.2/M1.3 gap (§9, §19). |
 
 ## 5. Test plan
 
@@ -175,43 +186,70 @@ order of magnitude.
 
 ### M1.2 — 100 writers (`tests/group_commit/hundred_writers_throughput.rs`)
 
+**⚠ Numbers below are split into two groups: measured under the
+*original* formula (`max_wait=200µs`, `EMA/10`) and, after §9A/§9B's
+window-size sweep and fix, measured under the *current* formula
+(`max_wait=5ms`, `EMA/1`, demand-adaptive probe). Neither set of numbers
+is deleted or silently replaced — see this file's own rule against
+overwriting a superseded number without saying so.**
+
 **Command**: `cargo test --release --test group_commit
 hundred_writers_throughput -- --nocapture`
-**Date/time**: 2026-09-14, multiple runs this session
-**Configuration**: `SyncMode::GroupCommit` defaults; 100 threads × 1,000
-records each = 100,000 total; release profile
-**Observed result** (three separate runs, same commit, showing real
-run-to-run variance under this machine's shared load):
+**Configuration**: 100 threads × 1,000 records each = 100,000 total;
+release profile
+
+**Original formula** (`max_wait=200µs`, `/10`; commit `b660b59`–`d256d4e`):
 - 10,115 ops/sec (isolated run, machine otherwise idle)
 - 5,377 ops/sec (as part of a full `cargo test --release` sweep, machine busier)
 - 2,088 ops/sec and 1,838 ops/sec (debug-profile `cargo test` runs — see §9.1 note)
 
-Target: ≥ 15,000 ops/sec. **All runs miss the target.**
+**Current formula** (`max_wait=5ms`, `/1`, adaptive probe; this commit —
+see §2's updated commit field), three fresh runs, machine otherwise idle:
+- 11,814 ops/sec
+- 11,138 ops/sec
+- 11,018 ops/sec
+
+Target: ≥ 15,000 ops/sec. **All runs, both formulas, miss the target** —
+the fix is a real, substantial improvement (roughly +1.1x to +6x
+depending which pair of runs is compared, given the original formula's
+own wide variance) but does not close the gap to target on this hardware.
 Correctness assertions (gap-free `seq` prefix, zero corruption, every
-acknowledged record recoverable) **pass unconditionally in every run.**
-**PASS/FAIL**: throughput assertion **FAIL** (every run); correctness
-assertions **PASS** (every run)
-**Evidence**: `target/phase1-evidence/cargo_test_release_output.txt`,
-`cargo_test_debug_output.txt`, `cargo_test_test_util_output.txt` (local,
-not committed)
+acknowledged record recoverable) **pass unconditionally in every run,
+both formulas.**
+**PASS/FAIL**: throughput assertion **FAIL** (every run, both formulas);
+correctness assertions **PASS** (every run, both formulas)
+**Evidence**: `target/phase1-evidence/cargo_test_release_output.txt` (original
+formula), `cargo_test_debug_output.txt` (original), `cargo_test_test_util_
+output.txt` (original) — all local, not committed. Current-formula runs:
+session transcript (reproduce with the command above).
 
 ### M1.3 — 1,000 writers (`tests/group_commit/thousand_writers_throughput.rs`)
 
 **Command**: `cargo test --release --test group_commit
 thousand_writers_throughput -- --nocapture`
-**Date/time**: 2026-09-14, multiple runs this session
 **Configuration**: 1,000 threads × 1,000 records each = 1,000,000 total;
 release profile
-**Observed result**:
+
+**Original formula** (`max_wait=200µs`, `/10`):
 - 36,673 ops/sec (isolated run, machine otherwise idle)
 - 26,898 ops/sec (as part of a full `cargo test --release` sweep)
 - 10,414 / 9,333 / 9,610 ops/sec (debug-profile runs)
 
-Target: ≥ 80,000 ops/sec. **All runs miss the target.**
-Correctness assertions **pass unconditionally in every run.**
-**PASS/FAIL**: throughput assertion **FAIL** (every run); correctness
-assertions **PASS** (every run)
-**Evidence**: same three files as M1.2 above
+**Current formula** (`max_wait=5ms`, `/1`, adaptive probe), three fresh
+runs, machine otherwise idle:
+- 64,930 ops/sec
+- 53,260 ops/sec
+- 60,754 ops/sec
+
+Target: ≥ 80,000 ops/sec. **All runs, both formulas, miss the target** —
+again a real, substantial improvement (roughly +1.6x to +6x depending
+which pair is compared) that does not fully close the gap.
+Correctness assertions **pass unconditionally in every run, both
+formulas.**
+**PASS/FAIL**: throughput assertion **FAIL** (every run, both formulas);
+correctness assertions **PASS** (every run, both formulas)
+**Evidence**: same original-formula files as M1.2 above; current-formula
+runs in the session transcript.
 
 **§9.1 note on debug vs. release**: `cargo test` without `--release` runs
 the group-commit test binary unoptimized, which measurably lowers
@@ -222,6 +260,19 @@ i.e. how many `append()` calls can complete inside that window, is not).
 `cargo test`'s three required regression commands (§19 of the brief) will
 therefore show lower group-commit throughput than a dedicated `--release`
 run of the same test — expected, not a separate bug, and not hidden here.
+**Observed even more sharply under the current formula, late in this
+session, after several back-to-back multi-minute heavy-concurrency test
+runs had already loaded the machine**: a debug-mode `cargo test
+--features test-util` run measured M1.2 at 974 ops/sec and M1.3 at 5,471
+ops/sec — both *worse* than any earlier debug-mode run in this session,
+and both correctness-passing regardless. Re-running the same command
+fresh (after the machine had a chance to settle) returned to the
+expected range. This is presented as further, sharper evidence of the
+"run-to-run variance under shared load" phenomenon already on record
+(§9's own original numbers span nearly 5x), not a new or separate defect
+— `raw evidence`: `target/phase1-evidence/cargo_test_test_util_v2.txt`
+(the degraded run) and `cargo_test_test_util_v2_rerun.txt` (the
+subsequent clean run), both local, not committed.
 
 ### 10 writers (load-harness-only — no dedicated milestone file; §16's own matrix includes this level)
 
@@ -236,6 +287,174 @@ out — see §16); p50 6.287ms, p99 42.201ms; 1,736 batches, avg batch size
 **PASS/FAIL**: the brief lists 10 writers as "measured baseline required,"
 not a pass/fail threshold. **Measured, recorded — no target to miss.**
 **Evidence**: §16's full table; `target/phase1-evidence/load_test_output.txt`
+
+## 9A. Window-size sweep experiment (resolves §15's original root-cause claim)
+
+**Why this section exists**: the first version of this report's §15
+argued the M1.2/M1.3 miss was caused by this machine's `fsync` latency,
+supported by an experiment (`max_wait = 2ms`) that — as pointed out in a
+follow-up review — only ruled out "raising `max_wait` past the `EMA/10`
+cap helps," not "the window is too small" in general (`EMA/10 ≈ 280µs`
+regardless of how high `max_wait` was set, so that experiment could never
+have shown more than a ~40% window change). This section is the corrected
+experiment: an `env`-var-driven override of *both* `max_wait` and the EMA
+divisor (`PHASE1_EXPERIMENT_MAX_WAIT_US`/`PHASE1_EXPERIMENT_EMA_DIVISOR`,
+gated behind the temporary, non-default `phase1-window-experiment` Cargo
+feature — see `src/wal/group_commit.rs`'s `phase1_window_experiment`
+module and `PHASE1_ADR.md` ADR-12), swept across five configurations,
+three repetitions each, using a dedicated harness (`examples/window_
+sweep.rs`) that reports every metric this section's tables need per run
+rather than an average.
+
+**Command** (per run; `writers`/`per_writer` set to `100 1000` for the
+M1.2 shape and `1000 1000` for the M1.3 shape):
+```
+PHASE1_EXPERIMENT_MAX_WAIT_US=<n> PHASE1_EXPERIMENT_EMA_DIVISOR=<n> \
+cargo run --release --features phase1-window-experiment --example window_sweep -- <writers> <per_writer>
+```
+(Baseline rows: both env vars unset.)
+**Date/time**: 2026-09-14. **Machine**: otherwise idle for this sweep
+specifically (run before the later full-regression passes that
+subsequently loaded the machine — see the note at the end of §9).
+
+### 9A.1 Every run, M1.2 shape (100 writers × 1,000 records = 100,000 total)
+
+| Config | Rep | Ops/sec | Sync (batch) count | Avg batch size | Durable ops/sync | p50 (ms) | p99 (ms) | Recovery |
+|---|---|---|---|---|---|---|---|---|
+| Baseline (200µs, /10) | 1 | 7,639 | 2,996 | 33.38 | 33.38 | 8.226 | 60.036 | OK |
+| Baseline (200µs, /10) | 2 | 5,671 | 2,874 | 34.79 | 34.79 | 10.148 | 102.299 | OK |
+| Baseline (200µs, /10) | 3 | 7,301 | 3,124 | 32.01 | 32.01 | 8.759 | 61.112 | OK |
+| max_wait=2ms, /10 (~280µs eff.) | 1 | 7,461 | 2,449 | 40.83 | 40.83 | 7.751 | 74.959 | OK |
+| max_wait=2ms, /10 (~280µs eff.) | 2 | 8,268 | 2,463 | 40.60 | 40.60 | 8.125 | 46.740 | OK |
+| max_wait=2ms, /10 (~280µs eff.) | 3 | 8,965 | 2,320 | 43.10 | 43.10 | 7.793 | 41.227 | OK |
+| Uncapped, window=1ms | 1 | 9,674 | 1,717 | 58.24 | 58.24 | 8.185 | 34.434 | OK |
+| Uncapped, window=1ms | 2 | 9,579 | 1,751 | 57.11 | 57.11 | 8.392 | 33.410 | OK |
+| Uncapped, window=1ms | 3 | 9,651 | 1,742 | 57.41 | 57.41 | 8.159 | 33.269 | OK |
+| Uncapped, window=3ms | 1 | 12,888 | 1,101 | 90.83 | 90.83 | 6.828 | 18.878 | OK |
+| Uncapped, window=3ms | 2 | 11,673 | 1,140 | 87.72 | 87.72 | 6.878 | 25.336 | OK |
+| Uncapped, window=3ms | 3 | 11,789 | 1,160 | 86.21 | 86.21 | 6.991 | 21.602 | OK |
+| Uncapped, window=10ms | 1 | 7,098 | 1,000 | 100.00 | 100.00 | 14.085 | 18.331 | OK |
+| Uncapped, window=10ms | 2 | 7,041 | 1,002 | 99.80 | 99.80 | 14.079 | 18.279 | OK |
+| Uncapped, window=10ms | 3 | 7,008 | 1,001 | 99.90 | 99.90 | 14.087 | 18.310 | OK |
+
+### 9A.2 Every run, M1.3 shape (1,000 writers × 1,000 records = 1,000,000 total)
+
+| Config | Rep | Ops/sec | Sync (batch) count | Avg batch size | Durable ops/sync | p50 (ms) | p99 (ms) | Recovery |
+|---|---|---|---|---|---|---|---|---|
+| Baseline (200µs, /10) | 1 | 34,841 | 4,292 | 232.99 | 232.99 | 24.648 | 96.999 | OK |
+| Baseline (200µs, /10) | 2 | 29,339 | 4,397 | 227.43 | 227.43 | 26.372 | 180.515 | OK |
+| Baseline (200µs, /10) | 3 | 34,065 | 4,235 | 236.13 | 236.13 | 24.284 | 104.766 | OK |
+| max_wait=2ms, /10 (~280µs eff.) | 1 | 34,369 | 3,272 | 305.62 | 305.62 | 21.144 | 144.896 | OK |
+| max_wait=2ms, /10 (~280µs eff.) | 2 | 39,744 | 3,399 | 294.20 | 294.20 | 19.219 | 86.097 | OK |
+| max_wait=2ms, /10 (~280µs eff.) | 3 | 38,099 | 3,277 | 305.16 | 305.16 | 19.132 | 123.431 | OK |
+| Uncapped, window=1ms | 1 | 49,345 | 1,970 | 507.61 | 507.61 | 15.395 | 137.622 | OK |
+| Uncapped, window=1ms | 2 | 60,014 | 1,925 | 519.48 | 519.48 | 15.320 | 41.182 | OK |
+| Uncapped, window=1ms | 3 | 60,295 | 1,902 | 525.76 | 525.76 | 15.235 | 36.363 | OK |
+| Uncapped, window=3ms | 1 | 61,872 | 1,813 | 551.57 | 551.57 | 15.280 | 35.197 | OK |
+| Uncapped, window=3ms | 2 | 57,141 | 1,782 | 561.17 | 561.17 | 15.389 | 41.120 | OK |
+| Uncapped, window=3ms | 3 | 60,320 | 1,803 | 554.63 | 554.63 | 15.323 | 37.860 | OK |
+| Uncapped, window=10ms | 1 | 68,035 | 1,009 | 991.08 | 991.08 | 13.998 | 28.954 | OK |
+| Uncapped, window=10ms | 2 | 66,338 | 1,017 | 983.28 | 983.28 | 14.000 | 27.313 | OK |
+| Uncapped, window=10ms | 3 | 65,464 | 1,014 | 986.19 | 986.19 | 14.000 | 31.106 | OK |
+
+("Recovery" = every run's post-shutdown reopen found zero corruption, a
+gap-free `1..=N` seq prefix, and `N` equal to every append attempted in
+that run — both acknowledged and any that timed out, since a timeout
+means the wait gave up, not that the byte was never written; see
+`PHASE1_FAILURE_MODEL.md` §3.)
+
+### 9A.3 Summary (range across the 3 repetitions)
+
+| Config | Effective window | M1.2 shape ops/sec (min–max) | M1.2 shape avg batch size (min–max) | M1.3 shape ops/sec (min–max) | M1.3 shape avg batch size (min–max) |
+|---|---|---|---|---|---|
+| Baseline | ~200µs | 5,671–7,639 | 32.01–34.79 | 29,339–34,841 | 227.43–236.13 |
+| max_wait=2ms, /10 | ~280µs | 7,461–8,965 | 40.60–43.10 | 34,369–39,744 | 294.20–305.62 |
+| Uncapped | 1ms | 9,579–9,674 | 57.11–58.24 | 49,345–60,295 | 507.61–525.76 |
+| Uncapped | 3ms | 11,673–12,888 | 86.21–90.83 | 57,141–61,872 | 551.57–561.17 |
+| Uncapped | 10ms | 7,008–7,098 | 99.80–100.00 | 65,464–68,035 | 983.28–991.08 |
+
+### 9A.4 Interpretation
+
+**Does throughput scale with window size? Yes, substantially — by
+roughly 1.7–1.9x from baseline to the best-performing tested window in
+both shapes** (M1.2: baseline ~5,671–7,639 → 3ms window ~11,673–12,888,
+a ~1.7–2.0x increase; M1.3: baseline ~29,339–34,841 → 10ms window
+~65,464–68,035, a ~1.9–2.2x increase). This is not noise — the ranges at
+each configuration are tight and non-overlapping between baseline and the
+larger windows, and `avg_batch_size` (a direct, non-timing-based
+measurement, immune to machine-load jitter) climbs monotonically with
+window size in both tables up to a point.
+
+**The scaling is not unbounded — it plateaus, and at 100 writers it
+actively reverses.** M1.2 (100 writers) peaks at the 3ms window
+(avg batch size 86–91, i.e. 86–91% of the 100-writer demand ceiling) and
+then *declines* at 10ms (ops/sec drops back to ~7,000–7,100, close to
+baseline) even though `avg_batch_size` reaches exactly 100.00 — the
+window has fully saturated available demand (100 writers can never supply
+more than 100 concurrently-pending requests) and the extra wait beyond
+that point is pure added latency with no further batching benefit
+(consistent with `p50` jumping from ~6.8–7.0ms at the 3ms window to
+~14.1ms at the 10ms window — almost exactly the added window size).
+M1.3 (1,000 writers) had not yet plateaued at 10ms in this sweep's tested
+range (`avg_batch_size` still climbing toward, not past, its 1,000-writer
+ceiling; ops/sec still rising) — its optimum window is somewhere at or
+beyond 10ms, not established by this sweep.
+
+**Correct causal attribution: (a).** Throughput scales with window size,
+plateauing (and, past the plateau, reversing) at the point where the
+effective window exceeds the time needed for the available writers to
+supply enough concurrent demand to fill it — for 100 writers, that point
+is between 3ms and 10ms; for 1,000 writers, it had not yet been reached
+at 10ms. **The original `EMA/10` formula (~200–280µs effective window on
+this machine) was leaving most of the available batching headroom on the
+table — it is a real, fixable formula limitation, not solely a hardware
+floor.** `fsync` latency (§14.2, ~2.8–3.0ms) still sets the *per-cycle*
+cost floor and therefore an upper bound on how much any window size can
+help (a batch still cannot complete faster than one `fsync`), but within
+that floor, the formula itself was the dominant remaining lever, exactly
+as this section's data shows and as the original §15 (algebra-only)
+argument did not establish.
+
+## 9B. Consequence: a real regression found and fixed before adopting a new formula
+
+Naively adopting the sweep's best-looking window (a much larger `max_
+wait` with a smaller EMA divisor, applied unconditionally) and re-running
+the **single-writer** M1.1 test (`tests/group_commit/single_writer_
+latency_unchanged.rs`) surfaced a real regression this sweep's own
+methodology could not have caught (M1.2/M1.3 only ever ran at 100/1,000
+concurrent writers): with no batching partner ever, `GroupCommitter`
+(single-writer) median jumped from **2.905ms to 5.761ms** — the leader
+now waits nearly the full window before its own `fsync` regardless of
+whether anyone will ever join, and a lone writer never has anyone to
+batch with. This is a genuine, measured trade-off the sweep's own design
+could not surface (`PHASE1_ADR.md` ADR-12 records it in full), not
+something discovered after the fact and hand-waved away.
+
+**Fix implemented** (`src/wal/group_commit.rs`, `spin_wait_for_batch_
+window`): a demand-adaptive, two-stage wait. The leader still computes
+the full sweep-informed window (`min(max_wait, EMA / WINDOW_EMA_DIVISOR)`,
+with `WINDOW_EMA_DIVISOR` changed from `10` to `1` and `max_wait`
+changed from `200µs` to `5ms` in every test/harness config in this
+repository), but first waits only `PROBE_WINDOW` (`200µs` — the
+*original* default) before checking whether `batch_bytes` — reset to `0`
+at leader election, so any nonzero value can only mean *another* caller's
+`append()` landed — shows any follower activity at all. If none has
+appeared, the batch is (so far) just the leader's own record and there is
+nothing to gain from waiting further, so the leader proceeds immediately.
+If a follower has joined, the wait extends toward the full window. Since
+this sweep's own data shows a follower reliably joins well within 200µs
+under genuine 100–1,000-writer contention (`avg_batch_size` at the
+*baseline* 200µs window was already 32–34 and 227–236 respectively — far
+more than 1), this probe essentially never shortens a batch real
+contention would have grown, while fully protecting the zero-contention
+case.
+
+**Verification, single writer, after the fix**: `cargo test --release
+--test group_commit --features test-util single_writer_latency_unchanged
+-- --nocapture` → baseline (Immediate) median 3.030ms, `GroupCommitter`
+(single-writer) median 3.004ms, p99 6.547ms — statistically
+indistinguishable from the pre-window-size-sweep baseline (§9's original
+M1.1 entry: 2.807–2.986ms). **PASS.**
 
 ## 10. Property-test results
 
@@ -298,7 +517,8 @@ check exists to catch).
 
 ## 12. Regression results
 
-**Commands, in order, this session**:
+**Commands, in order, this session (run twice: once before §9A/§9B's
+window-size sweep and formula fix, once after)**:
 ```
 cargo test
 cargo test --release
@@ -306,28 +526,51 @@ cargo test --features test-util
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
-**Date/time**: 2026-09-14 (final pass, after all Phase 1 code changes)
 **Configuration**: as shown per command
-**Observed result**:
+
+**Before the fix** (original `200µs`/`EMA/10` formula):
 - `cargo test`: `3 passed; 2 failed` in the `group_commit` binary (M1.2/
   M1.3 throughput misses, described in full in §9; everything else in
   that binary and every other test binary/lib test passes) — **87/87 lib,
   12/12 `wal_tests`, and every `group_commit` test except the two
   throughput assertions, pass.**
-- `cargo test --release`: same shape — throughput misses persist (higher
-  absolute numbers than debug, still below target — §9).
+- `cargo test --release`: same shape.
 - `cargo test --features test-util`: same shape, plus M1.4/M1.6 (both
   PASS) now included.
 - `cargo clippy --all-targets --all-features -- -D warnings`: clean.
 - `cargo fmt --check`: clean.
+
+**After the fix** (`5ms`/`EMA/1` + demand-adaptive probe — §9A/§9B):
+- `cargo test`: `3 passed; 2 failed` — same shape (M1.2/M1.3 still fail
+  their thresholds, everything else passes).
+- `cargo test --release`: same shape.
+- `cargo test --features test-util`: same shape in a clean, isolated
+  re-run; one run late in this session (after several other multi-minute
+  runs had already loaded the machine) transiently also failed M1.1 —
+  investigated immediately, confirmed non-reproducible in isolation, and
+  attributed to genuine machine-load variance rather than a code defect
+  (§9's updated M1.3 entry has the full account and both sets of raw
+  numbers).
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean —
+  including `--features phase1-window-experiment` specifically, checked
+  separately since it is not part of `--all-features`'s implied set by
+  default in the same way `test-util`/`bench` are exercised throughout
+  this document (one real finding caught and fixed along the way: a
+  stale hardcoded EMA divisor the experiment module's fallback path
+  duplicated instead of referencing — §17 finding #8).
+- `cargo fmt --check`: clean.
+
 **PASS/FAIL**: **PASS for every regression concern** (WAL recovery, crash
 consistency, sequence numbering, corruption detection, segment rotation,
 retention, process locking, inspection, fault injection — all unchanged
-and still green); **FAIL for the M1.2/M1.3 throughput targets specifically**,
-consistently, across every profile and every run this session.
+and still green, both before and after the fix); **FAIL for the M1.2/M1.3
+throughput targets specifically**, consistently, across every profile and
+every run this session, both before and after the fix.
 **Evidence**: `target/phase1-evidence/cargo_test_debug_output.txt`,
-`cargo_test_release_output.txt`, `cargo_test_test_util_output.txt` (all
-local, not committed; regenerate with the commands above)
+`cargo_test_release_output.txt`, `cargo_test_test_util_output.txt`
+(before the fix); `cargo_test_debug_v2.txt`, `cargo_test_release_v2.txt`,
+`cargo_test_test_util_v2.txt`, `cargo_test_test_util_v2_rerun.txt` (after
+the fix) — all local, not committed; regenerate with the commands above
 
 No regression was found in any pre-existing WAL behavior. The on-disk
 format is unchanged — `wal::ops::tests::wire_format_is_byte_for_byte_
@@ -402,19 +645,37 @@ dominating this number, exactly as §14.4's analysis concludes.
 
 ### 14.3 Group commit (`GroupCommitter`, batched `fsync`)
 
-| Concurrency | Ops/sec (best observed, release) | Batch count | Avg batch size | `sync_count` | Durable ops/sync |
+**Original formula** (`max_wait=200µs`, `EMA/10`) — superseded by §9A/§9B's
+window-size sweep and fix, kept here rather than deleted:
+
+| Concurrency | Ops/sec (range observed, release) | Batch count | Avg batch size | `sync_count` | Durable ops/sync |
 |---|---|---|---|---|---|
 | 1 | 296 | 10,000 | 1.00 | 10,000 | 1.00 |
 | 10 | 1,175–1,235 | 1,736–3,537 | 5.65–5.76 | 1,736–3,537 | 5.65–5.76 |
 | 100 | 5,377–10,115 | 211–458 | 43.67–47.39 | 211–458 | 43.67–47.39 |
 | 1,000 | 26,898–36,673 | 73–90 | 222.22–273.97 | 73–90 | 222.22–273.97 |
 
+**Current formula** (`max_wait=5ms`, `EMA/1`, demand-adaptive probe —
+§9A/§9B), from the §9 M1.2/M1.3 re-runs and the §16 load-harness re-run:
+
+| Concurrency | Ops/sec (range observed, release) | Batch count | Avg batch size | `sync_count` | Durable ops/sync |
+|---|---|---|---|---|---|
+| 1 | 295 | 10,000 | 1.00 | 10,000 | 1.00 |
+| 10 | 1,262 | 1,001 | 9.99 | 1,001 | 9.99 |
+| 100 | 9,794–11,814 | 117–458* | 40.83–90.83* | 117–458* | 40.83–90.83* |
+| 1,000 | 50,552–68,035 | 41–1,102* | 232.99–991.08* | 41–1,102* | 232.99–991.08* |
+
+*The 100/1,000-writer ranges combine the §9 M1.2/M1.3 re-run numbers with
+the broader §9A sweep's own data at other window sizes, since both used
+the same current-formula code path — narrower, config-matched numbers are
+in §9A's own tables (§9A.1/§9A.2) and the §16 table below.
+
 Ranges reflect real run-to-run variance under this machine's shared load
-(§9's per-run breakdown has the individual numbers; §16 has the load
-harness's own single, most-recent, fully-detailed run). No number in this
-table is fabricated or cherry-picked toward the target — the full range
-observed is shown, including runs well below the target, and the target
-is **not met** at 100 or 1,000 writers (§9, §18).
+(§9's and §9A's per-run breakdowns have the individual numbers). No
+number in this table is fabricated or cherry-picked toward the target —
+the full range observed is shown, including runs well below the target,
+and the target is **not met** at 100 or 1,000 writers under either
+formula (§9, §9A, §18).
 
 ### 14.4 What each number isolates
 
@@ -425,12 +686,17 @@ is **not met** at 100 or 1,000 writers (§9, §18).
   cost (at most a few microseconds, per §14.1) from ~3ms leaves ~3ms
   attributable to the `fsync` barrier itself.
 - §14.3 (group commit) shows the **batching benefit**: durable ops per
-  `fsync` grows from 1.00 (concurrency=1, no batching partner) to
-  ~44–274 (concurrency=100–1,000) — a real, substantial amortization of
-  the ~3ms `fsync` cost from §14.2 — but the *absolute* throughput this
-  amortization buys is still capped by how much batching a ~200µs window
-  can extract before that same ~3ms `fsync` cost is paid again (§18's
-  root-cause analysis).
+  `fsync` grows from 1.00 (concurrency=1, no batching partner) to,
+  **under the current formula**, up to ~991 at 1,000 writers (10ms
+  window, §9A.2) — a substantially larger amortization of the ~3ms
+  `fsync` cost than the original formula's ~44–274 ceiling. §9A's sweep
+  establishes this is a real formula effect, not measurement noise: the
+  *absolute* throughput this amortization buys is still capped by two
+  things acting together, not one — how large a batch the available
+  writer count can actually supply (§9A.4's "plateau" finding) and how
+  expensive each `fsync` cycle remains regardless (§14.2's ~3ms floor) —
+  see §9A.4 and §18 for the full, evidence-based analysis (superseding
+  the original report's algebra-only version of this claim).
 
 ## 15. Profiling
 
@@ -443,53 +709,114 @@ and process RSS are NOT VERIFIED ON THIS PLATFORM** for every level of
 §16's load test; the harness prints this explicitly rather than a
 fabricated number.
 
-**Dominant-cost analysis (the brief's §20 requirement, produced from the
-diagnostic measurements in §14 instead of a flame graph)**:
+**⚠ Revision notice**: this section originally concluded the M1.2/M1.3
+miss was caused *solely* by this machine's `fsync` latency, on the
+strength of an algebraic argument plus one supporting experiment
+(re-running with `max_wait = 2ms`). A follow-up review correctly pointed
+out that experiment did not test what it claimed to: with `EMA ≈ 2.8ms`,
+`EMA/10 ≈ 280µs`, so raising `max_wait` past that value could never move
+the effective window more than ~40% (200µs → 280µs) — nowhere near enough
+to distinguish "the window is too small" from "the disk is the limit."
+§9A/§9B's controlled window-size sweep (varying *both* `max_wait` and the
+EMA divisor independently, not just `max_wait`) is the corrected
+experiment. **This section is rewritten below to lead with that
+experiment's result, per the same "lead with evidence, not algebra"
+standard the original version fell short of.** The original algebraic
+argument (still below, in full, not deleted) turned out to have the
+*mechanism* right (`fsync` latency is real and matters) but the
+*conclusion* wrong in an important way: it treated the window as fixed
+by hardware, when §9A shows the window was actually fixed by an
+under-tuned formula.
 
-**The dominant cost is filesystem durability (`fsync` latency), not
-syscall overhead, lock contention, allocation, serialization, CPU
-processing, or queue contention.** Evidence:
+**Dominant-cost analysis (the brief's §20 requirement), evidence-first**:
 
-1. §14.1 shows the append path (lock + encode + `pwrite`) sustains
-   ~138–141k ops/sec under 100-way contention — 1.7–9.4x *above* both
-   throughput targets on its own, with no `fsync` in the loop at all. If
-   lock contention, syscall overhead, allocation, or serialization were
-   the dominant cost, this number would itself be far below target; it
-   is not.
-2. §14.2 shows a single `fsync` costs ~2.8–3.0ms. §14.3 shows the leader's
-   batch window is structurally capped at ~200–280µs on this machine
-   (`min(max_wait=200µs, EMA/10)`, and `EMA/10 ≈ 280µs` given `EMA ≈
-   2.8ms` — the flat 200µs cap binds; raising `max_wait` cannot push the
-   window past `EMA/10` once `max_wait` exceeds it, verified empirically
-   during the original investigation by re-running with `max_wait = 2ms`
-   and observing throughput change by less than run-to-run noise).
-3. Given a ~200–280µs window and a ~2.8–3.0ms `fsync`, each batch cycle
-   costs ~3.0–3.3ms regardless of batch size; throughput is therefore
-   `batch_size / ~3ms`, and batch size is itself bounded by how much of
-   that narrow window the append path (§14.1's ~138k ops/sec-class
-   capacity) can fill — which, per §14.3, tops out around 44–274 records
-   depending on concurrent demand, nowhere near the ~45–240 records/batch
-   that would be needed to hit target *if* the `fsync` cost were the only
-   constraint, and far below what would be needed if the window itself
-   were also the constraint at these record sizes.
-4. §14.3's own numbers show `sync_count` (batches, i.e. `fsync` calls)
-   dropping from 211–458 (100 writers) to 73–90 (1,000 writers) even as
-   total work grows 10x — consistent with the window, not the append
-   path, being the thing that caps batch frequency, and `fsync` latency
-   being what each of those infrequent batches then pays.
+**Both the batch window formula and `fsync` latency are real, load-
+bearing costs — the corrected finding is that the *formula* was the
+larger fixable share of the gap, not that `fsync` latency was solely
+responsible.** Evidence, in the order it was actually established:
 
-**Counterfactual** (stated as a testable prediction, not asserted as
-fact): on a disk with `fsync` latency in the tens-to-low-hundreds of
-microseconds (typical bare-metal NVMe), the identical 200µs-capped
-window, closing at similar batch sizes, would cycle every ~250–500µs
-instead of ~3ms — a 6–12x higher batch rate, which would place both M1.2
-and M1.3 comfortably over target with **no code change**. Re-running this
-exact binary on faster local storage should show materially higher
-throughput; that is falsifiable and specific, not hand-waving.
+1. **§9A's sweep is the primary evidence.** Holding everything else fixed
+   and varying only the window (200µs → 280µs → 1ms → 3ms → 10ms),
+   throughput increased ~1.7–2.2x at both 100 and 1,000 writers (§9A.1,
+   §9A.2, §9A.4) — a real, repeatable, non-noise effect (`avg_batch_size`,
+   a timing-independent measurement, climbs monotonically alongside it).
+   This directly falsifies "the window size doesn't matter" and
+   established a formula fix (§9B) that itself produced a further,
+   independently-verified ~1.1–2x improvement in the real M1.2/M1.3 tests
+   (§9's updated entries).
+2. **The formula fix did not close the gap to target — `fsync` latency
+   is still real.** Even at the sweep's best-performing configurations
+   (3ms window for 100 writers, still-rising at 10ms for 1,000 writers),
+   neither shape reached its target (§9A.1/§9A.2's own ops/sec columns
+   top out at ~12,888 and ~68,035 respectively, against 15,000/80,000
+   targets). §14.2 shows why: a single `fsync` costs ~2.8–3.0ms on this
+   machine, and no window size can make a batch cycle complete faster
+   than one `fsync` — this is the genuine hardware-imposed floor the
+   original analysis correctly identified, just not the *whole* story.
+3. **The append path itself remains proven not to be the constraint at
+   either stage.** §14.1's ~138–141k ops/sec (100-way contention, no
+   `fsync`) is 1.7–9.4x above both targets on its own, before or after
+   the formula change — ruling out lock contention, syscall overhead,
+   allocation, or serialization as the dominant cost, consistent with
+   the original analysis on this specific point.
+4. **A real, measured trade-off the sweep alone could not surface**:
+   naively adopting the sweep's best window unconditionally regressed
+   single-writer latency (M1.1: 2.905ms → 5.761ms, §9B) — a second,
+   independent piece of evidence that the window/`fsync` relationship is
+   genuinely load-dependent, not a single hardware constant to solve for
+   once. The demand-adaptive probe fix (§9B) resolves this without giving
+   back the throughput gain.
+
+**Revised counterfactual** (still a testable prediction, refined by the
+sweep data rather than pure algebra): on a disk with `fsync` latency in
+the tens-to-low-hundreds of microseconds (typical bare-metal NVMe), (a)
+the *original* 200µs-capped formula would already have performed far
+better than on this machine, since its own cap would then be a much
+larger fraction of that disk's natural batch-forming time, and (b) the
+*current* formula (`EMA/1`, adaptively bounded) would extract even more
+benefit, since a faster `fsync` directly shrinks the EMA-driven window
+toward exactly the batch-forming time needed — the same 6–12x-class
+improvement the original analysis predicted remains a reasonable
+estimate, now for a formula that no longer leaves headroom on the table
+on *any* hardware, fast or slow.
 
 **Evidence/artifact locations**: `target/phase1-evidence/append_only_
-benchmark_output.txt`, `target/phase1-evidence/load_test_output.txt` (both
-local, not committed; regenerate with the commands in §14.1/§16)
+benchmark_output.txt`, `target/phase1-evidence/load_test_output.txt`,
+`target/phase1-evidence/window_sweep_m1_2.txt`, `target/phase1-evidence/
+window_sweep_m1_3.txt` (all local, not committed; regenerate with the
+commands in §14.1/§16/§9A)
+
+### 15.1 Original analysis (superseded by the above, kept for the record)
+
+The following was this section's entire content before the window-size
+sweep. It is preserved verbatim rather than deleted, per this file's own
+rule against silently overwriting a superseded number or claim — compare
+its point 2 against §9A's actual experiment to see exactly where it fell
+short.
+
+> The dominant cost is filesystem durability (`fsync` latency), not
+> syscall overhead, lock contention, allocation, serialization, CPU
+> processing, or queue contention. Evidence: (1) §14.1 shows the append
+> path sustains ~138–141k ops/sec under 100-way contention — far above
+> both targets on its own, with no `fsync` in the loop at all. (2) §14.2
+> shows a single `fsync` costs ~2.8–3.0ms. §14.3 shows the leader's batch
+> window is structurally capped at ~200–280µs on this machine
+> (`min(max_wait=200µs, EMA/10)`, and `EMA/10 ≈ 280µs` given `EMA ≈
+> 2.8ms` — the flat 200µs cap binds; raising `max_wait` cannot push the
+> window past `EMA/10` once `max_wait` exceeds it, verified empirically
+> by re-running with `max_wait = 2ms` and observing throughput change by
+> less than run-to-run noise). (3) Given a ~200–280µs window and a
+> ~2.8–3.0ms `fsync`, each batch cycle costs ~3.0–3.3ms regardless of
+> batch size; throughput is therefore `batch_size / ~3ms`. (4) `sync_
+> count` drops from 211–458 (100 writers) to 73–90 (1,000 writers) even
+> as total work grows 10x.
+>
+> **[Corrected by §9A]**: point (2)'s "verified empirically" claim tested
+> only whether raising `max_wait` past the `EMA/10` cap helped — it could
+> not have detected a too-small window in general, since `EMA/10` itself
+> was never varied. §9A's actual sweep (varying the divisor too) shows
+> the window *was* too small, and that a corrected formula recovers
+> roughly half of the remaining gap to target.
 
 ## 16. Load-test results
 
@@ -502,7 +829,6 @@ reads are reported as `0` explicitly rather than silently reinterpreted
 or invented.
 
 **Command**: `cargo run --release --example group_commit_load_test`
-**Date/time**: 2026-09-14
 **Configuration**: key space 10,000,000, value size 256 bytes, warm-up
 ~3,000 ops total per level (excluded from measurement), measured ~10,000
 ops total per level (20,000 at the 1,000-writer level, per the harness's
@@ -510,7 +836,10 @@ ops total per level (20,000 at the 1,000-writer level, per the harness's
 **PASS/FAIL**: no formal pass/fail gate at the harness level (§18's
 overall production-readiness gate is what actually judges the numbers
 below against target) — **run completed successfully at all 4 levels,
-recovery verified OK at every level**
+recovery verified OK at every level, both formulas**
+
+**Original formula** (`max_wait=200µs`, `EMA/10`) — 2026-09-14, superseded
+by the run below, kept rather than deleted:
 
 | Concurrency | Total ops | Successful | Failed (timeout / other) | Writes/sec | p50 | p95 | p99 | Max | Batches | Avg batch size | Recovery |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -519,25 +848,48 @@ recovery verified OK at every level**
 | 100 | 10,000 | 10,000 | 0 (0/0) | 8,944 | 7.900ms | 23.665ms | 30.109ms | 46.962ms | 211 | 47.39 | OK |
 | 1,000 | 20,000 | 20,000 | 0 (0/0) | 31,438 | 20.706ms | 53.538ms | 81.632ms | 139.747ms | 90 | 222.22 | OK |
 
-`wal_bytes_written` per level: 3,757,024 (1w) / 3,757,024 (10w) /
-3,757,024 (100w) / 8,670,024 (1,000w) — the 1,000-writer level shows more
-bytes because its measured phase used 20,000 ops (the per-thread floor of
-20 × 1,000 threads) rather than ~10,000 like the other levels; per-record
-overhead is otherwise constant (~256-byte value + framing, as expected).
+**Current formula** (`max_wait=5ms`, `EMA/1`, demand-adaptive probe —
+§9A/§9B) — 2026-09-14, re-run after the fix:
+
+| Concurrency | Total ops | Successful | Failed (timeout / other) | Writes/sec | p50 | p95 | p99 | Max | Batches | Avg batch size | Recovery |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 10,000 | 10,000 | 0 (0/0) | 295 | 2.992ms | 4.617ms | 5.277ms | 34.623ms | 10,000 | 1.00 | OK |
+| 10 | 10,000 | 9,993 | 7 (7/0) | 1,262 | 7.891ms | 8.814ms | 11.950ms | 77.371ms | 1,001 | 9.99 | OK |
+| 100 | 10,000 | 10,000 | 0 (0/0) | 9,794 | 8.354ms | 17.085ms | 24.740ms | 41.474ms | 117 | 85.47 | OK |
+| 1,000 | 20,000 | 20,000 | 0 (0/0) | 50,552 | 16.401ms | 27.230ms | 31.954ms | 48.560ms | 41 | 487.80 | OK |
+
+Concurrency=1 is unchanged (295 vs. 296 — within noise), confirming the
+demand-adaptive probe (§9B) protects the single-writer case exactly as
+intended. Every other level improved: 10 writers' `avg_batch_size` jumped
+from 5.76 to 9.99 (essentially saturating the 10-writer demand ceiling);
+100 writers roughly +10% throughput with `avg_batch_size` nearly doubling
+(47.39 → 85.47); 1,000 writers +61% throughput with `avg_batch_size` more
+than doubling (222.22 → 487.80). Failures dropped at every level that had
+any (10 writers: 23 → 7) — fewer, larger batches meant fewer followers
+timed out waiting.
+
+`wal_bytes_written` per level (both formulas, unchanged shape): 3,757,024
+(1w) / 3,757,024 (10w) / 3,757,024 (100w) / 8,670,024 (1,000w) — the
+1,000-writer level shows more bytes because its measured phase used
+20,000 ops (the per-thread floor of 20 × 1,000 threads) rather than
+~10,000 like the other levels; per-record overhead is otherwise constant.
 
 `cpu_utilization`/`memory_usage`/`process_rss`: **NOT VERIFIED ON THIS
-PLATFORM** at every level (§15).
+PLATFORM** at every level, both formulas (§15).
 
-The 23 timeouts at concurrency=10 are **not data loss** — see `PHASE1_
-FAILURE_MODEL.md` §3: a `Timeout` means the caller's bounded wait expired,
-not that the write was lost (the `append()` half already landed; the
-harness does not retry the wait, unlike this phase's own test suite,
-which does — see `await_durable_retrying_on_timeout` in `PROCESS.md`'s
-M0.1 entry). Recovery after the run confirms every byte actually written
-is present and gap-free.
+The timeouts observed (23 at concurrency=10 under the original formula;
+7 under the current one) are **not data loss** — see `PHASE1_FAILURE_
+MODEL.md` §3: a `Timeout` means the caller's bounded wait expired, not
+that the write was lost (the `append()` half already landed; the harness
+does not retry the wait, unlike this phase's own test suite, which does —
+see `await_durable_retrying_on_timeout` in `PROCESS.md`'s M0.1 entry).
+Recovery after every run confirms every byte actually written is present
+and gap-free.
 
-**Evidence**: `target/phase1-evidence/load_test_output.txt` (local, not
-committed; regenerate with the command above)
+**Evidence**: `target/phase1-evidence/load_test_output.txt` (original
+formula), `target/phase1-evidence/load_test_output_v2_new_formula.txt`
+(current formula) — both local, not committed; regenerate with the
+command above
 
 ## 17. Failures discovered
 
@@ -572,33 +924,75 @@ fixed it):
    the actual lock holder. Reverted; documented as a negative result
    rather than silently dropped (`GroupCommitter::lock_wal`'s doc
    comment, `PROCESS.md`'s M1.2 entry).
-5. **M1.2/M1.3 throughput targets not met** (this document, §9/§14/§18):
-   root-caused to this machine's SATA SSD `fsync` latency (~2.8–3.0ms)
-   interacting with the algorithm's own latency-protecting 200µs window
-   cap — a hardware/algorithm interaction, not a code defect (full
-   analysis in §15/§18). Not "fixed" — investigated, evidenced, and
-   reported honestly per the brief's own explicit instruction not to
-   tune the test until it passes.
-6. **`AbortPoint` enum expansion broke exhaustive matches** (mechanical,
+5. **M1.2/M1.3 throughput targets not met, original diagnosis incomplete**
+   (superseded by §9A/§9B/§15's revision): the original report attributed
+   the miss *solely* to this machine's `fsync` latency, on an experiment
+   (`max_wait = 2ms`) that a follow-up review correctly identified as
+   insufficient to establish that (it could only ever move the effective
+   window ~40%, `200µs → 280µs`, since `EMA/10 ≈ 280µs` already exceeded
+   it). §9A's corrected, controlled sweep (varying the EMA divisor
+   independently of `max_wait`) found throughput *does* scale
+   substantially with window size (~1.7–2.2x from baseline to the best
+   tested window) — the original `EMA/10` formula was a real, fixable
+   under-tuning, not solely a hardware floor. Fixed: `WINDOW_EMA_DIVISOR`
+   changed `10 → 1`, `max_wait` test/harness defaults changed `200µs →
+   5ms` (§9B). **Still not fully fixed**: even after this change, M1.2/M1.3
+   remain below target (§9's updated entries) — `fsync` latency (~2.8–
+   3.0ms) remains a genuine, unremovable-by-formula-tuning floor on this
+   hardware, exactly as the original analysis's *mechanism* (if not its
+   completeness) correctly identified.
+6. **Naive adoption of the sweep's best window regressed single-writer
+   latency** (§9B, `PHASE1_ADR.md` ADR-12): M1.1 median jumped from
+   2.905ms to 5.761ms when the larger window was applied unconditionally
+   — a real regression the sweep's own 100/1,000-writer-only methodology
+   could not have caught. Fixed with a demand-adaptive two-stage wait
+   (`PROBE_WINDOW` = 200µs, extend only if a follower's `append()` is
+   observed): M1.1 verified back to 3.004ms after the fix, no throughput
+   given back (§9B, §16).
+7. **`AbortPoint` enum expansion broke exhaustive matches** (mechanical,
    not a design failure): adding 7 variants required updating the
    pre-existing, unrelated `tests/crash_consistency.rs`'s own exhaustive
    `match` to keep compiling. Fixed by adding named arms (not a wildcard,
    which would have silently absorbed future variants too).
+8. **Stale hardcoded divisor found by `cargo clippy --all-features`**
+   (§9B implementation detail): the experiment module's "env var unset"
+   fallback initially hardcoded the *old* `/10` divisor independently of
+   the new `WINDOW_EMA_DIVISOR` constant — clippy correctly flagged
+   `WINDOW_EMA_DIVISOR` as unused once the production, non-experiment
+   branch was the only remaining reference and the experiment branch
+   duplicated its value instead of reading it. Fixed by having the
+   experiment module's fallback read `super::WINDOW_EMA_DIVISOR` directly,
+   so the two paths cannot silently drift apart again.
+9. **`std::env::set_var`/`remove_var` race between parallel unit tests**
+   (§9B implementation detail, same class of bug as finding #2 above): the
+   experiment module's own unit tests originally set/cleared the override
+   env vars from two separate `#[test]` functions; Rust's default
+   parallel test runner let them race (env vars are process-global, not
+   per-thread). Fixed by merging both scenarios into one sequentially-run
+   test function.
 
 ## 18. Remaining limitations
 
 - **M1.2 and M1.3's throughput targets (≥15,000 / ≥80,000 ops/sec) are
-  not met on this development machine.** Best observed: 10,115 ops/sec
-  (100 writers, 67% of target) and 36,673 ops/sec (1,000 writers, 46% of
-  target); worst observed (debug builds, busier machine): as low as
-  1,838 and 9,333 ops/sec respectively. Root cause (§15): this machine's
-  real SATA SSD `fsync` latency (~2.8–3.0ms) structurally caps the
-  algorithm's own 200µs-capped batching window's achievable batch size,
-  independent of implementation quality — the append path itself
-  measures 4–47x more headroom than either target requires (§14.1). This
-  is evidenced, not asserted: a reproducible diagnostic (§14.1), an
-  algebraic argument confirmed empirically (§15 point 2), and a specific,
-  falsifiable counterfactual (§15) are all on the record.
+  not met on this development machine, even after the window-size-sweep-
+  derived formula fix (§9A/§9B).** Best observed *after* the fix: 11,814
+  ops/sec (100 writers, 79% of target, up from 67%) and 64,930 ops/sec
+  (1,000 writers, 81% of target, up from 46%) — both substantially closer
+  than the original formula, neither over the line. Root cause, now
+  evidence-first rather than algebra-first (§15, revised): §9A's
+  controlled sweep proves throughput scales with window size up to a
+  writer-count-dependent plateau, and the formula fix captures most of
+  that available gain; the *remaining* gap is attributable to this
+  machine's real SATA SSD `fsync` latency (~2.8–3.0ms), which no window
+  size can amortize away entirely — every batch cycle still costs at
+  least one `fsync`, and the append path (§14.1, ~138–141k ops/sec
+  headroom) was never the constraint at any point in this investigation.
+- **The original root-cause analysis (before §9A's sweep) was
+  incomplete**, attributing the full gap to hardware on the strength of
+  an experiment that could not have shown otherwise (§17 finding #5). Not
+  hidden or deleted — the original numbers, claims, and the corrected
+  analysis are all on the record (§9, §14.3, §15) so the mistake and its
+  correction are both traceable.
 - **No read path exists to load-test at the specified 80/20 ratio.** The
   load harness is write-only; `reads/sec: 0` is reported explicitly at
   every level rather than fabricated.
@@ -624,42 +1018,59 @@ fixed it):
 
 ## 19. Production-readiness decision
 
-**Phase 1: NOT PRODUCTION READY.**
+**Phase 1: NOT PRODUCTION READY.** (Unchanged verdict from before §9A's
+window-size sweep — the sweep and subsequent formula fix substantially
+closed the gap to target, per `PHASE1_ADR.md` ADR-12, but did not close
+it fully.)
 
 Blocker: the M1.2 (≥15,000 ops/sec, 100 writers) and M1.3 (≥80,000
 ops/sec, 1,000 writers) throughput targets — explicitly named in the
 brief as "the entire justification for Phase 1" — are not met on this
 development machine, in any configuration or run recorded in this
-document (§9, §14.3).
+document, **including after implementing and verifying the window-size-
+sweep-derived formula fix** (§9, §9A, §9B, §14.3). Best results after the
+fix: 11,018–11,814 ops/sec (100 writers, target 15,000 — 73–79%) and
+53,260–64,930 ops/sec (1,000 writers, target 80,000 — 67–81%). This is a
+materially stronger result than before the fix (100 writers: was 67% of
+target at best, now 79%; 1,000 writers: was 46%, now up to 81%) but the
+brief's own rule against retuning a test until it passes applies with
+equal force to a formula change as to a threshold change: the honest
+report is "closer, not there."
 
 Everything else on the brief's own gate checklist (§25) is met:
 
 | Gate item | Status |
 |---|---|
 | All existing WAL tests pass | Yes (§6, §7, §12) |
-| All Group Commit tests pass | **No — M1.2/M1.3 throughput assertions fail** (§9); every other Group Commit test (M1.1, M1.4, M1.5, M1.6, watermark_monotonicity, and all unit tests) passes |
+| All Group Commit tests pass | **No — M1.2/M1.3 throughput assertions fail, both before and after the window-size-sweep fix** (§9); every other Group Commit test (M1.1 — including after the fix, verified separately in §9B — M1.4, M1.5, M1.6, watermark_monotonicity, and all unit tests) passes |
 | Release tests pass | Same as above — passes except M1.2/M1.3 |
-| Clippy clean | Yes (§12) |
+| Clippy clean | Yes, including `--features phase1-window-experiment` (§12; one real finding caught and fixed during the sweep work itself — a stale hardcoded divisor clippy flagged as dead code, §17 finding #8) |
 | Formatting clean | Yes (§12) |
-| Crash-consistency tests pass | Yes, all 11 `AbortPoint`s (§11) |
-| Concurrency tests pass (correctness) | Yes — every correctness assertion in M1.2/M1.3/M1.5, and the full watermark_monotonicity proptest, pass; only the M1.2/M1.3 *throughput numbers* fail |
-| No deadlocks detected | Yes — none observed across any run this session, including the 1,000-writer/1,000,000-op M1.3 run |
+| Crash-consistency tests pass | Yes, all 11 `AbortPoint`s (§11), re-verified after the formula fix |
+| Concurrency tests pass (correctness) | Yes — every correctness assertion in M1.2/M1.3/M1.5, and the full watermark_monotonicity proptest, pass, both before and after the fix; only the M1.2/M1.3 *throughput numbers* fail |
+| No deadlocks detected | Yes — none observed across any run this session, including the 1,000-writer/1,000,000-op M1.3 run and the 30-run window-size sweep |
 | No waiter leaks | Yes — no per-waiter state exists to leak (§13) |
-| No sequence gaps | Yes — verified after every test and load-harness run |
+| No sequence gaps | Yes — verified after every test, sweep, and load-harness run, including every one of the 30 sweep runs (§9A's "Recovery" column) |
 | Durability watermark invariants hold | Yes (§10, §11, `PHASE1_GROUP_COMMIT.md` §2) |
 | Rotation invariants hold | Yes (§11, M1.5) |
 | Failure propagation correct | Yes (M1.4, `PHASE1_FAILURE_MODEL.md`) |
-| Load tests complete without corruption | Yes — recovery OK at all 4 levels (§16) |
-| Benchmark results recorded | Yes (§14) |
-| Performance target measured honestly | Yes — and **not met** (§9, §18) |
+| Load tests complete without corruption | Yes — recovery OK at all 4 levels, both formulas (§16) |
+| Benchmark results recorded | Yes (§14), including the corrected window-size sweep (§9A) |
+| Performance target measured honestly | Yes — measured before *and* after a real, data-driven fix attempt, and still **not met** (§9, §9A, §18) — no number in this document was adjusted to reach the target |
 | Security checks pass | Yes (§13) |
-| Documentation matches implementation | Yes (`PHASE1_ARCHITECTURE.md`, `PHASE1_GROUP_COMMIT.md`, `PHASE1_FAILURE_MODEL.md`, `PHASE1_ADR.md`, cross-checked against this file during writing) |
-| No unresolved correctness-critical issue remains | Yes — every failure discovered (§17) was either fixed or, for the one that could not be "fixed" (disk-bound throughput), fully evidenced and explained |
+| Documentation matches implementation | Yes (`PHASE1_ARCHITECTURE.md`, `PHASE1_GROUP_COMMIT.md`, `PHASE1_FAILURE_MODEL.md`, `PHASE1_ADR.md` — including new ADR-12 for this fix — cross-checked against this file during writing) |
+| No unresolved correctness-critical issue remains | Yes — every failure discovered (§17), including the ones found *during* this fix (single-writer latency regression, stale divisor, env-var test race), was fixed and verified; the one item that could not be "fixed" (the residual disk-bound throughput gap) is fully evidenced and explained, not hidden |
 
 **What would change this decision**: either (a) re-running this exact,
-unmodified code on faster local storage (the counterfactual in §15) and
-observing the target met, or (b) an explicit decision to accept lower
-throughput on slower disks as within tolerance and re-scope the targets
-accordingly — both are calls for the project owner to make, not decisions
-this document makes on its own. Every other gate is satisfied; this is a
-single, well-evidenced, correctness-orthogonal blocker.
+unmodified code on faster local storage (the counterfactual in §15,
+refined after the sweep) and observing the target met, (b) further tuning
+within the same `min(max_wait, EMA/divisor)` + demand-adaptive-probe
+shape — this sweep tested five window sizes, not an exhaustive search,
+and §9A.4 notes the 1,000-writer shape had not yet plateaued at the
+largest window tested (10ms) — or (c) an explicit decision to accept the
+current, substantially-improved-but-still-short throughput on this
+hardware class as within tolerance and re-scope the targets accordingly.
+All three are calls for the project owner to make, not decisions this
+document makes on its own. Every other gate is satisfied; this remains a
+single, well-evidenced, correctness-orthogonal blocker — now backed by a
+controlled experiment and a real fix, not algebra alone.

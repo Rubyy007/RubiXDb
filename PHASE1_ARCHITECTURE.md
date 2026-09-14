@@ -64,17 +64,30 @@ either lock across the `fsync` syscall.
 `SyncMode::GroupCommit { max_wait, max_batch_bytes }` (a pre-existing
 `WalConfig` field, not introduced by Phase 1) supplies the leader's
 decision parameters. Defaults used throughout this phase's own tests and
-harness: `max_wait = 200 µs`, `max_batch_bytes = 256 KiB` — configuration
+harness: `max_wait = 5 ms`, `max_batch_bytes = 256 KiB` — configuration
 values, not hardcoded constants; a caller may construct a different
 `WalConfig` and get different batching behavior from the same code.
+(Originally `max_wait = 200 µs`; revised after a controlled window-size
+sweep — see `PHASE1_ADR.md` ADR-12 and `PHASE1_TEST_RESULTS.md` §9A for
+the data, not reproduced here since this document carries no results.)
 
-The leader waits `min(max_wait, EMA_fsync_latency / 10)`, or until
-`max_batch_bytes` of appended payload has accumulated, whichever comes
-first. The wait is a tight, periodically-yielding poll
-(`std::hint::spin_loop()` with a `std::thread::yield_now()` every 10,000
-iterations), not `std::thread::sleep` — at this sub-millisecond scale, OS
-timer-resolution overshoot (particularly on Windows) would cost more than
-the window itself is worth amortizing `fsync` latency against.
+The leader's full window is `min(max_wait, EMA_fsync_latency /
+WINDOW_EMA_DIVISOR)` (`WINDOW_EMA_DIVISOR = 1`, i.e. the EMA itself —
+originally `10`; see ADR-12), or until `max_batch_bytes` of appended
+payload has accumulated, whichever comes first — but the leader commits
+to that full window only after a short, demand-adaptive probe
+(`PROBE_WINDOW = 200 µs`, the *original* default) finds evidence that at
+least one other caller has joined the batch (`batch_bytes > 0`, which is
+reset to `0` at leader election and can therefore only become nonzero due
+to another caller's `append()`). If no follower has appeared by the end
+of the probe, the leader proceeds immediately rather than waiting out the
+rest of the full window — protecting a lone, uncontended writer's latency
+from paying for batching benefit that will never materialize (ADR-12).
+The wait is a tight, periodically-yielding poll (`std::hint::spin_loop()`
+with a `std::thread::yield_now()` every 10,000 iterations), not
+`std::thread::sleep` — at this sub-millisecond scale, OS timer-resolution
+overshoot (particularly on Windows) would cost more than the window
+itself is worth amortizing `fsync` latency against.
 
 `FsyncLatencyTracker` (`wal::metrics`) maintains the EMA feeding that
 formula: `new = 0.1 * sample + 0.9 * old`, in a single `AtomicU64`,

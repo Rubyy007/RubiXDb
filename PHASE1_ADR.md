@@ -154,3 +154,92 @@ additions this codebase has always stopped to ask about first, per
 analysis §20 asks for is still produced (see `PHASE1_TEST_RESULTS.md`'s
 profiling section) from the diagnostic measurements already taken, in
 place of a literal flame graph.
+
+## ADR-12: window-size sweep resolves the batch-window formula, via a real experiment
+
+**Context**: this report's original §15 attributed the M1.2/M1.3
+throughput miss entirely to this machine's `fsync` latency, supported by
+an experiment (`max_wait = 2ms`) a follow-up review correctly identified
+as insufficient — it could only ever move the effective window ~40%
+(`200µs → 280µs`, since `EMA/10 ≈ 280µs` already exceeded any larger
+`max_wait`), so it never actually tested "is the window too small,"
+only "does raising `max_wait` past the `EMA/10` cap help."
+
+**Decision**: built a temporary, feature-gated experiment override
+(`phase1-window-experiment` Cargo feature; `PHASE1_EXPERIMENT_MAX_WAIT_US`
+/ `PHASE1_EXPERIMENT_EMA_DIVISOR` env vars, read by a small module in
+`src/wal/group_commit.rs` that reduces to the exact production formula
+when both are unset) and swept five window configurations — baseline
+(~200µs), `max_wait=2ms`/`÷10` (~280µs), and three "uncapped" windows
+(1ms, 3ms, 10ms via a `÷0` sentinel meaning "no EMA cap") — three
+repetitions each, against both the M1.2 (100-writer) and M1.3
+(1,000-writer) workload shapes. Full data: `PHASE1_TEST_RESULTS.md` §9A.
+
+**Finding**: throughput scales substantially with window size (~1.7–2.2x
+from baseline to the best-performing tested window, in both shapes),
+plateauing — and, for 100 writers specifically, *reversing* — once the
+window exceeds what the available writer count can supply. This
+corrected the original report's conclusion: the `EMA/10` formula was a
+real, fixable under-tuning, not solely a hardware floor. `fsync` latency
+remains a genuine, unremovable floor (§9A.4, §15) — the fix narrows the
+gap to target, it does not close it.
+
+**A second finding the sweep itself could not surface**: naively adopting
+the sweep's best-looking window unconditionally regressed the
+*single-writer* case (M1.1: 2.905ms → 5.761ms median) — a real, measured
+trade-off invisible to a sweep that only ever tested 100/1,000 concurrent
+writers. Resolved with a demand-adaptive two-stage wait: probe for
+`PROBE_WINDOW` (200µs, the *original* default) for any evidence of a
+follower (`batch_bytes > 0`, which is reset to `0` at leader election and
+can therefore only be nonzero due to another caller), and only extend
+toward the full sweep-informed window if one has joined. Verified this
+fully restores single-writer latency (§9B) without giving back the
+throughput gain (§9, §16).
+
+**Decision, resulting formula**: `WINDOW_EMA_DIVISOR` changed `10 → 1`
+(`src/wal/group_commit.rs`), and every test/harness `max_wait` in this
+repository changed `200µs → 5ms` (`tests/group_commit/support.rs` and
+sibling configs, `examples/group_commit_load_test.rs`) — chosen because,
+on this machine's measured EMA (~2.8ms), `min(5ms, EMA/1)` lands close to
+the sweep's empirically strongest configuration (~3ms) while remaining
+proportional to `fsync` latency on other hardware (a disk with 50µs
+`fsync` latency yields a ~50µs window here, not a fixed multi-millisecond
+one paid regardless). `PROBE_WINDOW = 200µs` was chosen to match the
+*original* default exactly, since that value was already empirically
+shown (the sweep's own baseline configuration) to be enough time for a
+follower to join under genuine contention.
+
+**Verification**: M1.1/M1.4/M1.5/M1.6/`watermark_monotonicity` all
+re-verified passing after the fix; M1.2/M1.3 re-run three times each,
+improved substantially (100 writers: ~67% of target → ~79%; 1,000
+writers: ~46% → ~81%) but still below target; the full §16 load harness
+and §19 regression commands re-run. Full numbers: `PHASE1_TEST_RESULTS.md`
+§9, §9A, §9B, §12, §16.
+
+**Two real, secondary bugs found and fixed while implementing this**:
+(1) the experiment module's "env var unset" fallback initially hardcoded
+the old `/10` divisor instead of reading the new `WINDOW_EMA_DIVISOR`
+constant — caught by `cargo clippy --all-features` flagging the constant
+as unused, fixed by having the fallback reference it directly so the two
+paths cannot drift apart again; (2) the experiment module's own unit
+tests initially set/cleared the override env vars from two separate
+`#[test]` functions, which Rust's parallel test runner let race (env vars
+are process-global) — the same class of bug as ADR-10's fault-hook leak —
+fixed by merging both scenarios into one sequentially-run test.
+
+**Alternatives considered**: keeping the original formula and accepting
+the hardware-bound conclusion (rejected — the sweep proved that
+conclusion incomplete, and the brief explicitly required running the
+corrected experiment rather than accepting the original, insufficiently-
+supported claim); a fully dynamic/self-tuning window with no fixed
+formula at all (rejected as out of scope for this fix — a `min(max_wait,
+EMA/divisor)` shape plus a demand probe was sufficient to capture most of
+the sweep's gain without a larger redesign).
+
+**Scaffolding disposition**: the `phase1-window-experiment` feature and
+its one gated module remain in the tree (feature-gated, off by default,
+zero effect on any build that doesn't enable it) rather than being
+removed in this same change, since the brief's own instructions describe
+it as "removable in a follow-up commit," not required to be removed
+immediately. Removing it is a pure code-deletion, no-behavior-change
+follow-up whenever desired.

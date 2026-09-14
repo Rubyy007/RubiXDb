@@ -506,3 +506,40 @@ or to pursue a different implementation strategy despite the evidence
 that the append path itself is not the bottleneck (`PHASE1_TEST_
 RESULTS.md` §15's dominant-cost analysis). Not re-litigated here — see
 that document.
+
+---
+
+## 2026-09-14 (Phase 1: window-size sweep resolves the original root-cause claim)
+
+**Implemented:** a follow-up review correctly identified that the prior
+entry's "hardware-bound" conclusion rested on an experiment that could
+not actually establish it (raising `max_wait` past the `EMA/10` cap was
+tested; the cap itself, via the EMA divisor, was never varied). Ran the
+corrected experiment: a temporary, feature-gated (`phase1-window-
+experiment`, off by default) sweep of both `max_wait` and the EMA
+divisor independently, 5 configurations × 3 repetitions × both M1.2/M1.3
+workload shapes (30 runs). Full data and interpretation: `PHASE1_TEST_
+RESULTS.md` §9A.
+
+**Finding:** throughput scales substantially with window size (~1.7–2.2x
+from baseline to the best tested window), plateauing once the window
+exceeds available writer demand. Fixed the production formula
+accordingly (`WINDOW_EMA_DIVISOR` `10 → 1`, test/harness `max_wait`
+`200µs → 5ms`) — then found and fixed a real regression the sweep itself
+couldn't surface (single-writer latency, M1.1: 2.905ms → 5.761ms) with a
+demand-adaptive probe before the leader commits to the full window.
+
+**Tests passing:** 87 lib tests, unchanged. Full `group_commit` suite
+re-verified after the fix: M1.1/M1.4/M1.5/M1.6/`watermark_monotonicity`
+all pass; M1.2/M1.3 improved substantially (100 writers: ~67%→~79% of
+target; 1,000 writers: ~46%→~81%) but still miss their thresholds.
+`cargo clippy`/`cargo fmt --check` clean, including the experiment
+feature.
+
+**Explicitly not done:** M1.2/M1.3 still do not hit their throughput
+targets on this development machine even after the fix — `fsync` latency
+(~2.8–3.0ms on this SATA SSD) remains a genuine floor no window-size
+tuning removes. **Phase 1 production-readiness decision unchanged: NOT
+PRODUCTION READY**, now backed by a controlled experiment and a verified
+fix rather than algebra alone. Full account: `PHASE1_TEST_RESULTS.md`
+§9A/§9B/§15 (revised)/§19; decision record: `PHASE1_ADR.md` ADR-12.

@@ -70,6 +70,33 @@ pub const DEFAULT_MAX_PENDING_WAITERS: usize = 65_536;
 /// hang, so this is a real bound, not best-effort.
 const SHUTDOWN_DRAIN_BOUND: Duration = Duration::from_secs(5);
 
+/// The leader's batch window is `min(max_wait_cap, EMA / WINDOW_EMA_
+/// DIVISOR)`. Originally `10`; changed to `1` (i.e. `EMA / 1`, the EMA
+/// itself) after a controlled window-size sweep (`PHASE1_TEST_RESULTS.md`,
+/// window-size sweep section; decision recorded in `PHASE1_ADR.md`
+/// ADR-12) showed throughput scaling substantially with window size on
+/// this machine — `/10` was leaving most of the available batching
+/// headroom on the table, not merely respecting a hardware limit. At `/1`,
+/// the window on a machine whose `fsync` latency matches this
+/// development environment's (~2.8ms) lands close to the sweep's
+/// empirically strongest configuration (~3ms, tested via the experiment
+/// override, not this constant) while still shrinking proportionally on
+/// faster storage (the whole reason this is EMA-relative rather than a
+/// flat constant): a disk with 50µs `fsync` latency yields a ~50µs window
+/// here, not a fixed multi-millisecond one paid regardless of how fast
+/// the disk actually is.
+const WINDOW_EMA_DIVISOR: u64 = 1;
+
+/// The demand-adaptive probe duration `spin_wait_for_batch_window` waits
+/// before deciding whether to extend toward the full `window` — see that
+/// function's doc comment. Set to the *original* `WINDOW_EMA_DIVISOR = 10`
+/// era's effective default (~200µs on this development machine), since
+/// that was already empirically shown (the window-size sweep's own
+/// baseline configuration) to be enough time for a follower to join under
+/// genuine contention, while being short enough that a lone writer barely
+/// notices paying it.
+const PROBE_WINDOW: Duration = Duration::from_micros(200);
+
 /// A point-in-time snapshot of batching observability counters —
 /// `GroupCommitter::stats()`. All counts are cumulative since
 /// construction; none of them participate in any correctness decision
@@ -739,28 +766,61 @@ impl GroupCommitter {
         Ok((file, batch_max_seq))
     }
 
-    /// The leader's wait window: `min(max_wait_cap, EMA / 10)`, but
-    /// returns early the moment `batch_bytes` reaches `max_batch_bytes`
-    /// (WAL Spec's group-commit extension point's own "whichever comes
-    /// first" rule). Implemented as a tight poll/`spin_loop` rather than
-    /// `thread::sleep` — see `PROCESS.md` §1.6: at this sub-millisecond
-    /// scale, `thread::sleep`'s OS timer-resolution overshoot (particularly
-    /// on Windows) would cost more than the window itself is worth
-    /// amortizing `fsync` latency against. Only one thread is ever the
-    /// leader at a time (enforced by `batch.leader_active`), so this spin
-    /// never contends with itself.
+    /// The leader's wait window: `min(max_wait_cap, EMA / WINDOW_EMA_
+    /// DIVISOR)`, but returns early the moment `batch_bytes` reaches
+    /// `max_batch_bytes` (WAL Spec's group-commit extension point's own
+    /// "whichever comes first" rule). Implemented as a tight poll/
+    /// `spin_loop` rather than `thread::sleep` — see `PROCESS.md` §1.6: at
+    /// this sub-millisecond scale, `thread::sleep`'s OS timer-resolution
+    /// overshoot (particularly on Windows) would cost more than the
+    /// window itself is worth amortizing `fsync` latency against. Only
+    /// one thread is ever the leader at a time (enforced by `batch.
+    /// leader_active`), so this spin never contends with itself.
+    ///
+    /// `WINDOW_EMA_DIVISOR = 1` (i.e. `EMA / 1`, the EMA itself) replaces
+    /// the original `/ 10` — see its own doc comment for the sweep data
+    /// this is derived from (`PHASE1_TEST_RESULTS.md`'s window-size sweep
+    /// section, `PHASE1_ADR.md` ADR-12).
+    ///
+    /// **Two-stage, demand-adaptive wait — not just a longer flat wait.**
+    /// The sweep that justified the larger `window` above was run only
+    /// under real concurrent load (100/1,000 writers); re-running M1.1
+    /// (a single writer, no batching partner ever) with the naively
+    /// larger window regressed its median latency from ~3.1ms to ~5.8ms —
+    /// a real, measured regression, not a hypothetical one (`PHASE1_TEST_
+    /// RESULTS.md`'s window-size sweep section records it). The root
+    /// cause: the EMA/divisor formula encodes *`fsync` latency*, but
+    /// nothing about whether any other caller is actually going to join
+    /// this batch — a lone writer waiting a multi-millisecond window before
+    /// its own `fsync` pays that latency for zero batching benefit.
+    ///
+    /// The fix waits only `PROBE_WINDOW` (the *original* default, ~200µs)
+    /// before checking whether `batch_bytes` — reset to `0` at leader
+    /// election (`await_durable`), so any nonzero value here can only be
+    /// *another* caller's `append()` — shows any follower activity at all.
+    /// If none has appeared by then, the batch is (so far) just the
+    /// leader's own record; there is nothing to gain from waiting the rest
+    /// of `window`, so it stops immediately. If a follower *has* joined,
+    /// the wait extends up to the full `window`, exactly as the sweep
+    /// data justifies — and empirically (same sweep data), under genuine
+    /// 100–1,000-writer contention a follower reliably joins well within
+    /// the first 200µs, so this probe essentially never shortens a batch
+    /// that real contention would have grown.
     fn spin_wait_for_batch_window(&self) {
         super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPre);
         let ema_ns = self.latency.current_ns();
         #[cfg(feature = "phase1-window-experiment")]
         let window = phase1_window_experiment::effective_window(self.max_wait_cap, ema_ns);
         #[cfg(not(feature = "phase1-window-experiment"))]
-        let window = self.max_wait_cap.min(Duration::from_nanos(ema_ns / 10));
+        let window = self
+            .max_wait_cap
+            .min(Duration::from_nanos(ema_ns / WINDOW_EMA_DIVISOR));
         if window.is_zero() {
             super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
             return;
         }
         let deadline = Instant::now() + window;
+        let probe_deadline = Instant::now() + PROBE_WINDOW.min(window);
         // Yield the CPU periodically rather than spinning unconditionally
         // for the whole window: at the algorithm's own default (200 µs
         // cap), a pure spin costs at most ~200 µs of one core regardless
@@ -781,7 +841,12 @@ impl GroupCommitter {
                 super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
                 return;
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
+                return;
+            }
+            if now >= probe_deadline && self.batch_bytes.load(Ordering::Relaxed) == 0 {
                 super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
                 return;
             }
@@ -965,10 +1030,17 @@ mod phase1_window_experiment {
     /// falls back to the real `max_wait_cap` (the production value).
     ///
     /// `PHASE1_EXPERIMENT_EMA_DIVISOR` (parsed as `u64`): overrides the
-    /// production `/ 10` divisor applied to the EMA. `0` is a sentinel
-    /// meaning "no EMA cap at all" — the window becomes exactly
+    /// production `super::WINDOW_EMA_DIVISOR` applied to the EMA. `0` is a
+    /// sentinel meaning "no EMA cap at all" — the window becomes exactly
     /// `max_wait`, unconditionally (models "uncap both" sweep rows).
-    /// Unset or unparseable ⇒ falls back to `10` (the production value).
+    /// Unset or unparseable ⇒ falls back to `super::WINDOW_EMA_DIVISOR`
+    /// (the production value) — kept as one shared constant, not
+    /// duplicated here, so this fallback can never silently drift out of
+    /// sync with the real production formula the way an independently
+    /// hardcoded divisor once did (caught by `cargo clippy --all-features`
+    /// flagging the constant as unused once this module stopped
+    /// referencing it — see `PHASE1_TEST_RESULTS.md`'s window-size sweep
+    /// section for the full account).
     pub(super) fn effective_window(max_wait_cap: Duration, ema_ns: u64) -> Duration {
         let max_wait = std::env::var("PHASE1_EXPERIMENT_MAX_WAIT_US")
             .ok()
@@ -981,7 +1053,7 @@ mod phase1_window_experiment {
         match divisor {
             Some(0) => max_wait,
             Some(d) => max_wait.min(Duration::from_nanos(ema_ns / d)),
-            _ => max_wait.min(Duration::from_nanos(ema_ns / 10)),
+            _ => max_wait.min(Duration::from_nanos(ema_ns / super::WINDOW_EMA_DIVISOR)),
         }
     }
 
@@ -1005,7 +1077,9 @@ mod phase1_window_experiment {
             let ema_ns = 2_800_000u64;
             assert_eq!(
                 effective_window(cap, ema_ns),
-                cap.min(Duration::from_nanos(ema_ns / 10)),
+                cap.min(Duration::from_nanos(
+                    ema_ns / super::super::WINDOW_EMA_DIVISOR
+                )),
                 "unset env vars must reduce to the exact production formula"
             );
 
@@ -1070,7 +1144,10 @@ mod tests {
     fn group_commit_config() -> WalConfig {
         WalConfig {
             sync_mode: SyncMode::GroupCommit {
-                max_wait: Duration::from_micros(200),
+                // 5ms, not the original 200µs — see WINDOW_EMA_DIVISOR's
+                // doc comment and PHASE1_TEST_RESULTS.md's window-size
+                // sweep section for why.
+                max_wait: Duration::from_millis(5),
                 max_batch_bytes: 256 * 1024,
             },
             ..WalConfig::default()

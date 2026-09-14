@@ -30,12 +30,16 @@ pub fn temp_dir(tag: &str) -> PathBuf {
     path
 }
 
-/// The brief's own literal defaults: `min(200 µs, EMA / 10)` leader window,
-/// 256 KiB batch-payload threshold.
+/// `max_wait = 5ms` (not the brief's original literal `200µs`) combined
+/// with `WINDOW_EMA_DIVISOR = 1` (`src/wal/group_commit.rs`) — the
+/// post-window-size-sweep defaults. See `PHASE1_TEST_RESULTS.md`'s
+/// window-size sweep section and `PHASE1_ADR.md` ADR-12 for the data this
+/// is derived from: the original `200µs`/`/10` formula left most of this
+/// machine's available batching headroom on the table.
 pub fn group_commit_config() -> WalConfig {
     WalConfig {
         sync_mode: SyncMode::GroupCommit {
-            max_wait: Duration::from_micros(200),
+            max_wait: Duration::from_millis(5),
             max_batch_bytes: 256 * 1024,
         },
         ..WalConfig::default()

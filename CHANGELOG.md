@@ -18,8 +18,12 @@ trait signatures, or `FileWal`'s single-writer internal model — see
 design and `PHASE1_TEST_RESULTS.md` for full results, benchmark numbers,
 and the production-readiness decision (**not production ready**: the
 100-writer/1,000-writer throughput targets are not met on the
-development machine's disk — a diagnosed hardware/algorithm interaction,
-not a correctness defect; every other gate is met).
+development machine's disk, even after a controlled window-size sweep
+(`PHASE1_ADR.md` ADR-12) substantially closed the gap by fixing the
+leader's batch-window formula (`WINDOW_EMA_DIVISOR` `10 → 1`, `max_wait`
+`200µs → 5ms`, plus a demand-adaptive probe protecting single-writer
+latency) — 100 writers improved from ~67% to ~79% of target, 1,000
+writers from ~46% to ~81%; every other gate is met).
 
 - **`GroupCommitter`** (`src/wal/group_commit.rs`): `append`/
   `await_durable`/`append_durable`/`rotate`/`durable_through`/`stats`/
@@ -49,6 +53,18 @@ not a correctness defect; every other gate is met).
   milestone, plus a proptest), a write-only load-test harness (`examples/
   group_commit_load_test.rs`), and a permanent append-path diagnostic
   (`examples/append_only_benchmark.rs`).
+- **Window-size sweep and batch-window formula fix** (`PHASE1_ADR.md`
+  ADR-12, `PHASE1_TEST_RESULTS.md` §9A/§9B): a temporary, feature-gated
+  experiment (`phase1-window-experiment` Cargo feature, off by default;
+  `examples/window_sweep.rs`) established empirically that the original
+  leader batch-window formula (`min(200µs, EMA/10)`) was substantially
+  under-tuned, not solely limited by disk `fsync` latency as first
+  believed. `WINDOW_EMA_DIVISOR` changed `10 → 1`; every test/harness
+  `max_wait` changed `200µs → 5ms`; a demand-adaptive probe
+  (`PROBE_WINDOW = 200µs`) added so a lone, uncontended writer never
+  pays for batching benefit that will never materialize — a real
+  regression the naive fix introduced and this probe resolves, verified
+  by re-running M1.1.
 
 ### Five follow-up fixes from external review
 

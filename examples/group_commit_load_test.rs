@@ -84,7 +84,9 @@ fn ms(ns: u128) -> f64 {
 fn group_commit_config() -> WalConfig {
     WalConfig {
         sync_mode: SyncMode::GroupCommit {
-            max_wait: Duration::from_micros(200),
+            // 5ms, post-window-size-sweep default — see
+            // PHASE1_TEST_RESULTS.md and PHASE1_ADR.md ADR-12.
+            max_wait: Duration::from_millis(5),
             max_batch_bytes: 256 * 1024,
         },
         ..WalConfig::default()
