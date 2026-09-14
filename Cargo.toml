@@ -5,7 +5,23 @@ edition = "2021"
 description = "RubixDB — embedded, multi-engine database (Phase 0: LSM engine)"
 publish = false
 
+[features]
+test-util = []
+bench = []
+
 [dependencies]
 crc32c = "=0.6.8"
 
 [dev-dependencies]
+proptest = "=1.11.0"
+criterion = "=0.8.2"
+static_assertions = "=1.1.0"
+
+[[bench]]
+name = "wal_bench"
+harness = false
+
+[[bench]]
+name = "append"
+harness = false
+required-features = ["bench"]

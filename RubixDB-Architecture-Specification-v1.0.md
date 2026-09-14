@@ -1,8 +1,8 @@
 # RubixDB Architecture Specification v1.0
 
-**Status:** Draft for implementation sign-off
-**Scope:** Single-node embedded database engine (Rust)
-**Audience:** RubixDB implementers, reviewers of the RubixDB design review
+Status: Draft for implementation sign-off
+Scope: Single-node embedded database engine (Rust)
+Audience: RubixDB implementers, reviewers of the RubixDB design review
 
 ---
 
@@ -24,19 +24,19 @@ This specification covers a single-node, embedded deployment. Distribution, repl
 
 ### 0.2 How to read this document
 
-Sections 1–9 define what RubixDB is — the data model, the engine contract, and the invariants every engine must uphold regardless of routing decisions. Sections 10–13 define the adaptive subsystem — workload observation, cost modeling, routing, and migration. Sections 14–17 define the surrounding systems — query layer, observability, security, and the benchmark protocol that validates the whole thing. Section 18 is a one-page module boundary summary. Anything not nailed down here is an implementation detail the engineer is free to choose; anything nailed down here requires a spec change (and a version bump) to alter.
+Sections 1–9 define what RubixDB *is* — the data model, the engine contract, and the invariants every engine must uphold regardless of routing decisions. Sections 10–13 define the *adaptive* subsystem — workload observation, cost modeling, routing, and migration. Sections 14–17 define the *surrounding* systems — query layer, observability, security, and the benchmark protocol that validates the whole thing. Section 18 is a one-page module boundary summary. Anything not nailed down here is an implementation detail the engineer is free to choose; anything nailed down here requires a spec change (and a version bump) to alter.
 
 ---
 
 ## 1. Design Principles
 
-- **One logical database, three physical engines.** Callers above the Partition Manager never branch on engine type. If application code needs to know whether a partition is Log, LSM, or B+Tree, the abstraction has failed.
-- **Routing happens at partition granularity, never at table granularity.** A table is a namespace; a partition is the unit of physical storage strategy. This avoids all-or-nothing table conversions and lets a single table have hot and cold partitions on different engines simultaneously.
-- **Observe, don't guess.** The router never selects an engine from a static hint ("this looks like a write-heavy table"). It selects from measured workload statistics accumulated over a defined observation window (Section 10).
-- **Migration cost is a gate, not an input.** The router first asks "which engine is theoretically cheapest right now," entirely ignoring the cost of getting there, and only then asks "is switching worth it." Folding migration cost into the primary cost comparison creates a circular dependency (the cost of migrating depends on the current engine, which depends on the last migration decision) and is explicitly rejected as a design (Section 12).
-- **Every engine speaks one recovery language.** WAL format and the crash-recovery procedure are engine-independent at the logical level, even though physical replay differs per engine (Section 8).
-- **Every routing decision must be explainable after the fact.** If RubixDB moves a partition from B+Tree to LSM, an operator must be able to ask "why" and get a concrete answer built from recorded workload statistics and cost estimates (Section 15) — not "the router decided to."
-- **Build order matters and is part of this spec, not just a project-planning artifact.** Engines first, with a real WAL and real recovery. Metadata layer early — before multi-engine coexistence, since the metadata schema shapes everything above it. Unified read layer working across at least two engines before the third is added. Cost model and router added only after real benchmark numbers exist for each engine in isolation — a cost model calibrated against invented numbers is worse than no cost model, because it hides its own wrongness. Migration only after routing is stable. **This ordering is binding: no adaptive-router code should be merged before Sections 3–9 are implemented and passing their own conformance tests.**
+1. **One logical database, three physical engines.** Callers above the Partition Manager never branch on engine type. If application code needs to know whether a partition is Log, LSM, or B+Tree, the abstraction has failed.
+2. **Routing happens at partition granularity, never at table granularity.** A table is a namespace; a partition is the unit of physical storage strategy. This avoids all-or-nothing table conversions and lets a single table have hot and cold partitions on different engines simultaneously.
+3. **Observe, don't guess.** The router never selects an engine from a static hint ("this looks like a write-heavy table"). It selects from measured workload statistics accumulated over a defined observation window (Section 10).
+4. **Migration cost is a gate, not an input.** The router first asks "which engine is theoretically cheapest right now," entirely ignoring the cost of getting there, and only then asks "is switching worth it." Folding migration cost into the primary cost comparison creates a circular dependency (the cost of migrating depends on the current engine, which depends on the last migration decision) and is explicitly rejected as a design (Section 12).
+5. **Every engine speaks one recovery language.** WAL format and the crash-recovery procedure are engine-independent at the logical level, even though physical replay differs per engine (Section 8).
+6. **Every routing decision must be explainable after the fact.** If RubixDB moves a partition from B+Tree to LSM, an operator must be able to ask "why" and get a concrete answer built from recorded workload statistics and cost estimates (Section 15) — not "the router decided to."
+7. **Build order matters and is part of this spec, not just a project-planning artifact.** Engines first, with a real WAL and real recovery. Metadata layer early — before multi-engine coexistence, since the metadata schema shapes everything above it. Unified read layer working across at least two engines before the third is added. Cost model and router added only after real benchmark numbers exist for each engine in isolation — a cost model calibrated against invented numbers is worse than no cost model, because it hides its own wrongness. Migration only after routing is stable. This ordering is binding: no adaptive-router code should be merged before Sections 3–9 are implemented and passing their own conformance tests.
 
 ---
 
@@ -52,13 +52,13 @@ Database
                     └── Records
 ```
 
-- **Database:** the top-level namespace; one RubixDB instance serves one database in v1.
-- **Schema:** a namespace grouping tables (mirrors standard SQL schema/namespace). Optional — a database may use a single implicit default schema.
-- **Table:** a named, typed collection of records sharing one logical schema (column set and types) and one partitioning scheme.
-- **Partition:** the unit of physical storage. Every partition belongs to exactly one table, owns a contiguous or hash-defined key range (partitioning scheme is table-level, chosen at table creation: range or hash), and is backed by exactly one storage engine at any point in time.
-- **Record:** a key/value tuple (Section 7 defines the versioned record format actually stored).
+- **Database**: the top-level namespace; one RubixDB instance serves one database in v1.
+- **Schema**: a namespace grouping tables (mirrors standard SQL `schema`/`namespace`). Optional — a database may use a single implicit `default` schema.
+- **Table**: a named, typed collection of records sharing one logical schema (column set and types) and one partitioning scheme.
+- **Partition**: the unit of physical storage. Every partition belongs to exactly one table, owns a contiguous or hash-defined key range (partitioning scheme is table-level, chosen at table creation: range or hash), and is backed by exactly one storage engine at any point in time.
+- **Record**: a key/value tuple (Section 7 defines the versioned record format actually stored).
 
-A table's partitioning scheme (range vs. hash, and the partition key columns) is fixed at table creation. Which engine backs a given partition is not fixed — that is precisely the dimension RubixDB is adaptive over. Partition boundaries (the key range or hash-bucket assignment) are not changed by the adaptive subsystem in v1; only the physical engine changes. Partition splitting/merging due to size is a separate, orthogonal mechanism (briefly noted in Section 19) and must not be conflated with engine migration.
+A table's partitioning scheme (range vs. hash, and the partition key columns) is fixed at table creation. *Which engine* backs a given partition is not fixed — that is precisely the dimension RubixDB is adaptive over. Partition *boundaries* (the key range or hash-bucket assignment) are not changed by the adaptive subsystem in v1; only the physical engine changes. Partition splitting/merging due to size is a separate, orthogonal mechanism (briefly noted in Section 19) and must not be conflated with engine migration.
 
 ---
 
@@ -83,13 +83,13 @@ CREATING → ACTIVE → (MIGRATING → ACTIVE)* → RETIRING → RETIRED
                  ↘ DEGRADED ↗
 ```
 
-- **CREATING:** partition metadata registered, no engine instance yet initialized. Not visible to reads.
-- **ACTIVE:** normal state. Exactly one engine owns writes and reads.
-- **MIGRATING:** a specific sub-state machine owned by the Migration Manager (Section 13.2), nested inside the partition lifecycle. Reads continue to be served (from the old engine, per Section 13.1); writes are frozen for the freeze-window portion of migration only.
-- **DEGRADED:** the partition's engine failed a health check (e.g., corruption detected, recovery incomplete) or a migration aborted. Reads may be served in a reduced/read-only capacity if a valid generation exists; writes are rejected. Requires operator or automated remediation to return to `ACTIVE`.
-- **RETIRING / RETIRED:** only relevant to the old physical representation during/after a migration (Section 13.1) or to a partition being dropped at the table level.
+- **CREATING**: partition metadata registered, no engine instance yet initialized. Not visible to reads.
+- **ACTIVE**: normal state. Exactly one engine owns writes and reads.
+- **MIGRATING**: a specific sub-state machine owned by the Migration Manager (Section 13.2), nested inside the partition lifecycle. Reads continue to be served (from the old engine, per Section 13.1); writes are frozen for the freeze-window portion of migration only.
+- **DEGRADED**: the partition's engine failed a health check (e.g., corruption detected, recovery incomplete) or a migration aborted. Reads may be served in a reduced/read-only capacity if a valid generation exists; writes are rejected. Requires operator or automated remediation to return to ACTIVE.
+- **RETIRING / RETIRED**: only relevant to the *old* physical representation during/after a migration (Section 13.1) or to a partition being dropped at the table level.
 
-A partition is never in two non-transitional states at once, and status transitions are themselves written through the Metadata Manager's versioned update path (Section 6.3), so a crash mid-transition is recoverable by re-reading metadata rather than by inferring state from file-system contents.
+A partition is never in two non-transitional states at once, and `status` transitions are themselves written through the Metadata Manager's versioned update path (Section 6.3), so a crash mid-transition is recoverable by re-reading metadata rather than by inferring state from file-system contents.
 
 ---
 
@@ -118,7 +118,7 @@ All operations return a `Result` over a shared `EngineError` enum: `NotFound`, `
 
 ### 4.3 Conformance
 
-Every engine implementation must pass a shared conformance test suite that exercises the contract above against all three engines with identical inputs and asserts identical logical outputs (allowing different physical layouts and different performance). This suite is a deliverable of Section 1's build-order principle #7 and must exist and pass before the Unified Read Layer (Section 9) is considered complete.
+Every engine implementation must pass a shared conformance test suite that exercises the contract above against all three engines with identical inputs and asserts identical *logical* outputs (allowing different physical layouts and different performance). This suite is a deliverable of Section 1's build-order principle #7 and must exist and pass before the Unified Read Layer (Section 9) is considered complete.
 
 ---
 
@@ -165,13 +165,13 @@ The Metadata Manager is not optional infrastructure bolted on later — it is th
 | `partition_id` | UUID/ULID | Primary key of this metadata record. |
 | `table_id` | UUID | Owning table. |
 | `key_range` | `(lower: Bytes, upper: Bytes, lower_inclusive: bool, upper_inclusive: bool)` or `bucket_set: Vec<u32>` | Partition boundaries. |
-| `engine` | `enum LOG \| LSM \| BTREE` | Current physical engine. |
-| `generation` | `u64` | Incremented on every engine change / physical rebuild. |
-| `status` | `enum` (Section 3.1) | Lifecycle state. |
-| `physical_location` | `String` (path/handle) | Where this generation's data lives on disk. |
+| `engine` | enum `LOG \| LSM \| BTREE` | Current physical engine. |
+| `generation` | u64 | Incremented on every engine change / physical rebuild. |
+| `status` | enum (Section 3.1) | Lifecycle state. |
+| `physical_location` | String (path/handle) | Where this generation's data lives on disk. |
 | `sequence_range` | `(min_seq: u64, max_seq: u64)` | Sequence numbers known to be represented in this generation. |
 | `migration_state` | `Option<MigrationRecord>` | Present only while `status == MIGRATING`; see Section 13.2. |
-| `schema_version` | `u32` | Table schema version this partition's records conform to. |
+| `schema_version` | u32 | Table schema version this partition's records conform to. |
 | `snapshot_refs` | `Vec<SnapshotHandle>` | Outstanding snapshots holding this generation open; a generation cannot be retired while non-empty (Section 13.1, retire step). |
 | `stats_ref` | pointer/handle | Link to the Workload Analyzer's rolling statistics for this partition (Section 10). |
 
@@ -179,7 +179,7 @@ Example instance (illustrative, not literal wire format):
 
 ```
 Partition P001
-  table_id         = employees
+  table_id        = employees
   key_range        = [0, 250000)
   engine           = LSM
   generation       = 17
@@ -200,7 +200,7 @@ Metadata itself is a small, high-value, low-volume dataset and is stored durably
 
 ### 6.4 Why this layer is mandatory
 
-Ownership, versioning, tombstone lifecycle, and migration state only need to be tracked because multiple engines can coexist per table. Any read must know which physical generation is authoritative for a given key range before it can dispatch to an engine; any recovery procedure must know which generation was mid-migration when the crash occurred; any cost decision must know which stats belong to which partition. The Metadata Manager is the single source of truth all of that depends on.
+Ownership, versioning, tombstone lifecycle, and migration state only need to be tracked *because* multiple engines can coexist per table. Any read must know which physical generation is authoritative for a given key range before it can dispatch to an engine; any recovery procedure must know which generation was mid-migration when the crash occurred; any cost decision must know which stats belong to which partition. The Metadata Manager is the single source of truth all of that depends on.
 
 ---
 
@@ -208,7 +208,7 @@ Ownership, versioning, tombstone lifecycle, and migration state only need to be 
 
 ### 7.1 Global sequence number
 
-RubixDB maintains a single monotonically increasing global logical sequence number (LSN), assigned at write-acceptance time (after WAL durability, before engine apply — see Section 8.2). Every stored record carries the LSN it was written at. This is the one piece of global, cross-engine state the whole versioning and consistency story is built on.
+RubixDB maintains a single monotonically increasing **global logical sequence number (LSN)**, assigned at write-acceptance time (after WAL durability, before engine apply — see Section 8.2). Every stored record carries the LSN it was written at. This is the one piece of global, cross-engine state the whole versioning and consistency story is built on.
 
 ### 7.2 Record format
 
@@ -224,29 +224,27 @@ Record {
 ```
 
 Example:
-
 ```
-101 → "Arun"     → seq 100  (PUT)
-101 → "Arun R."  → seq 150  (PUT)
+101 → "Arun"      → seq 100  (PUT)
+101 → "Arun R."    → seq 150  (PUT)
 ```
-
 The Unified Read Layer (Section 9) resolves multiple versions of the same key by taking the highest `seq` ≤ the read's `as_of_seq` (current time for a normal read; a fixed value for a snapshot read).
 
 ### 7.3 Tombstones
 
-A delete never physically removes a record from an engine's live representation. It writes a tombstone record (`op = DELETE`) at the delete's LSN. A tombstone is eligible for physical removal (during compaction, page reclamation, or segment GC) only when both: (a) no outstanding snapshot (`snapshot_refs`, Section 6.1) has an `as_of_seq` below the tombstone's `seq`, and (b) every older version of that key across every physical generation that could still be read has itself been removed or is provably unreachable (i.e., the tombstone is the oldest remaining trace of the key). This rule is engine-independent and is part of the shared conformance suite (Section 4.3).
+A `delete` never physically removes a record from an engine's live representation. It writes a tombstone record (`op = DELETE`) at the delete's LSN. A tombstone is eligible for physical removal (during compaction, page reclamation, or segment GC) only when **both**: (a) no outstanding snapshot (`snapshot_refs`, Section 6.1) has an `as_of_seq` below the tombstone's `seq`, and (b) every older version of that key across every physical generation that could still be read has itself been removed or is provably unreachable (i.e., the tombstone is the oldest remaining trace of the key). This rule is engine-independent and is part of the shared conformance suite (Section 4.3).
 
 ### 7.4 Consistency guarantees (what RubixDB promises)
 
-These are the guarantees the Unified Read Layer and Query Layer are built against; anything not listed here is explicitly not promised in v1.
+These are the guarantees the Unified Read Layer and Query Layer are built against; anything not listed here is explicitly *not* promised in v1.
 
-- **Read-your-writes:** within a single session/connection, a read issued after a write it depends on is guaranteed to observe that write (the session tracks the LSN of its last write and reads `as_of_seq ≥` that LSN by default).
-- **Ordering:** writes are made durable and become visible in LSN order; no write is ever visible before an earlier-LSN write to the same key.
-- **Snapshot reads:** `snapshot()` fixes an `as_of_seq`; all reads through that snapshot handle observe a consistent point-in-time view across all partitions touched, regardless of which engines back them, for as long as the snapshot handle is held.
-- **Delete visibility:** a delete is visible (i.e., subsequent reads return `None`) as soon as its WAL write is durable, exactly like a put.
-- **Cross-partition atomicity:** not guaranteed in v1 beyond a single partition's single-batch write (a batch of puts/deletes targeting one partition is applied atomically — all-or-nothing — via the engine's normal write path). Multi-partition transactions are Future Work.
-- **Migration-time consistency:** during `MIGRATING` (Section 13.1), reads continue to observe the pre-migration engine's data (frozen at the freeze-point LSN) until the atomic ownership switch; no read ever observes a partially-migrated, mixed-engine view of a single partition. This is the specific guarantee that makes offline migration safe to reason about.
-- **Isolation level:** RubixDB v1 provides snapshot-read consistency for reads issued against an explicit snapshot, and read-committed-equivalent behavior (always the latest durable version as of read time) for ordinary reads. No serializable multi-statement transactions.
+- **Read-your-writes**: within a single session/connection, a read issued after a write it depends on is guaranteed to observe that write (the session tracks the LSN of its last write and reads `as_of_seq ≥` that LSN by default).
+- **Ordering**: writes are made durable and become visible in LSN order; no write is ever visible before an earlier-LSN write to the same key.
+- **Snapshot reads**: `snapshot()` fixes an `as_of_seq`; all reads through that snapshot handle observe a consistent point-in-time view across all partitions touched, regardless of which engines back them, for as long as the snapshot handle is held.
+- **Delete visibility**: a delete is visible (i.e., subsequent reads return `None`) as soon as its WAL write is durable, exactly like a `put`.
+- **Cross-partition atomicity**: not guaranteed in v1 beyond a single partition's single-batch write (a batch of puts/deletes targeting one partition is applied atomically — all-or-nothing — via the engine's normal write path). Multi-partition transactions are Future Work.
+- **Migration-time consistency**: during `MIGRATING` (Section 13.1), reads continue to observe the pre-migration engine's data (frozen at the freeze-point LSN) until the atomic ownership switch; no read ever observes a partially-migrated, mixed-engine view of a single partition. This is the specific guarantee that makes offline migration safe to reason about.
+- **Isolation level**: RubixDB v1 provides snapshot-read consistency for reads issued against an explicit snapshot, and read-committed-equivalent behavior (always the latest durable version as of read time) for ordinary reads. No serializable multi-statement transactions.
 
 ### 7.5 What the Unified Read Layer must never do
 
@@ -312,7 +310,7 @@ Query
 
 ### 9.2 Merge semantics
 
-For a range query spanning multiple partitions, results are merged in key order across partitions (partitions are, by construction, disjoint in key range under range partitioning, so this is a k-way merge, not a conflict resolution). Within a single partition, in the ordinary `ACTIVE` case there is exactly one engine and no merge is needed; the only case requiring intra-partition merge logic is a read arriving during `MIGRATING`, where the read layer must reliably choose the old engine's generation (per Section 7.4's migration-time consistency guarantee) rather than merge old and new — the two generations are never combined.
+For a range query spanning multiple partitions, results are merged in key order across partitions (partitions are, by construction, disjoint in key range under range partitioning, so this is a k-way merge, not a conflict resolution). Within a single partition, in the ordinary `ACTIVE` case there is exactly one engine and no merge is needed; the *only* case requiring intra-partition merge logic is a read arriving during `MIGRATING`, where the read layer must reliably choose the old engine's generation (per Section 7.4's migration-time consistency guarantee) rather than merge old and new — the two generations are never combined.
 
 ### 9.3 Engine-specific read execution
 
@@ -324,7 +322,7 @@ A range query against a B+Tree-backed partition performs an ordered index traver
 
 ### 10.1 Principle
 
-The analyzer measures behavior, not data shape. It does not inspect record contents; it observes the stream of operations against a partition and maintains rolling statistics.
+The analyzer measures *behavior*, not data shape. It does not inspect record contents; it observes the stream of operations against a partition and maintains rolling statistics.
 
 ### 10.2 Signals collected per partition
 
@@ -345,11 +343,11 @@ The analyzer measures behavior, not data shape. It does not inspect record conte
 
 ### 10.3 Observation window
 
-Statistics are maintained over a sliding window, evaluated on a fixed cadence, not reactively per-operation (reacting per-operation would make the router itself a major source of write-path latency and instability).
+Statistics are maintained over a **sliding window**, evaluated on a fixed cadence, not reactively per-operation (reacting per-operation would make the router itself a major source of write-path latency and instability).
 
-v1 default parameters (explicitly tunable research parameters, not fixed constants — Section 12.3):
+**v1 default parameters** (explicitly tunable research parameters, not fixed constants — Section 12.3):
 
-- Window: 60 seconds or 10,000 operations, whichever comes first.
+- Window: 60 seconds *or* 10,000 operations, whichever comes first.
 - Evaluation cadence: every 60 seconds.
 - Statistics use exponential decay across windows (not a hard reset) so a single anomalous window doesn't fully dominate or fully vanish the trend.
 
@@ -363,7 +361,7 @@ Once per evaluation cadence, the analyzer emits a `WorkloadProfile` snapshot per
 
 ### 11.1 Principle
 
-The router does not ask "which engine is fastest in general." It asks "which engine is cheapest for this partition's current, measured `WorkloadProfile`." Cost is estimated per candidate engine, for the workload profile as observed — not benchmarked live against real candidate engines (that would require actually running the workload on all three engines simultaneously, which defeats the purpose).
+The router does not ask "which engine is fastest in general." It asks "which engine is cheapest for *this partition's current, measured* `WorkloadProfile`." Cost is estimated per candidate engine, for the workload profile as observed — not benchmarked live against real candidate engines (that would require actually running the workload on all three engines simultaneously, which defeats the purpose).
 
 ### 11.2 Cost function
 
@@ -375,14 +373,14 @@ TotalCost(engine, profile) =
     + Wc · CompactionCost(engine, profile)
 ```
 
-Where `Ww`, `Wr`, `Ws`, `Wc` are configurable weights (defaulting to equal weighting, tunable per deployment/table via the latency SLO and operator priorities — e.g., a latency-sensitive table weights `Wr` higher; a space-constrained deployment weights `Ws` higher) and each term is a calibrated function of the workload profile's signals, per engine:
+Where `Ww, Wr, Ws, Wc` are configurable weights (defaulting to equal weighting, tunable per deployment/table via the `latency SLO` and operator priorities — e.g., a latency-sensitive table weights `Wr` higher; a space-constrained deployment weights `Ws` higher) and each term is a calibrated function of the workload profile's signals, per engine:
 
-- **`WriteCost(engine, profile)`:** dominated by write rate and key-distribution (sequential writes are near-free for Log and LSM, expensive for B+Tree due to page-split churn under random insertion; random writes are cheap for LSM's append-only MemTable path, expensive for B+Tree, awkward for Log which has no update semantics at all).
-- **`ReadCost(engine, profile)`:** dominated by point-lookup rate, range-scan frequency/width, and update ratio (high update ratio means more versions to skip through on LSM reads; B+Tree point lookups stay flat regardless; Log point lookups degrade with segment count / data size since there's no index).
-- **`SpaceCost(engine, profile)`:** dominated by delete/update ratio (space amplification from retained old versions and tombstones — worst on LSM pre-compaction, near-zero on B+Tree which overwrites in place, grows unbounded on Log until segment GC).
-- **`CompactionCost(engine, profile)`:** zero for Log and B+Tree (no compaction concept as defined here), a function of write rate and current compaction backlog for LSM.
+- `WriteCost(engine, profile)`: dominated by write rate and key-distribution (sequential writes are near-free for Log and LSM, expensive for B+Tree due to page-split churn under random insertion; random writes are cheap for LSM's append-only MemTable path, expensive for B+Tree, awkward for Log which has no update semantics at all).
+- `ReadCost(engine, profile)`: dominated by point-lookup rate, range-scan frequency/width, and update ratio (high update ratio means more versions to skip through on LSM reads; B+Tree point lookups stay flat regardless; Log point lookups degrade with segment count / data size since there's no index).
+- `SpaceCost(engine, profile)`: dominated by delete/update ratio (space amplification from retained old versions and tombstones — worst on LSM pre-compaction, near-zero on B+Tree which overwrites in place, grows unbounded on Log until segment GC).
+- `CompactionCost(engine, profile)`: zero for Log and B+Tree (no compaction concept as defined here), a function of write rate and current compaction backlog for LSM.
 
-Each per-engine cost function is a small set of calibrated coefficients (fit against the benchmark protocol's Section 17 measured amplification and latency numbers for each engine in isolation, not invented) — this is precisely why Section 1.7's build order requires real single-engine benchmark data before the cost model is written.
+Each per-engine cost function is a small set of calibrated coefficients (fit against the benchmark protocol's Section 17 measured amplification and latency numbers for each engine in isolation, *not* invented) — this is precisely why Section 1.7's build order requires real single-engine benchmark data before the cost model is written.
 
 ### 11.3 Two-decision router (see Section 12) consumes this model's output as:
 
@@ -416,19 +414,19 @@ Decision 1 runs every evaluation cycle (Section 10.3) for every `ACTIVE` partiti
 
 ### 12.2 Hysteresis policy
 
-A migration is triggered only when all of the following hold:
+A migration is triggered only when **all** of the following hold:
 
 1. `best_engine != current_engine`.
-2. `improvement > improvement_threshold` (v1 default: 20%).
-3. Condition 1 and 2 have both held for `persistence_cycles` consecutive evaluation cycles (v1 default: 3 consecutive cycles, i.e., ~3 minutes at default 60s cadence).
+2. `improvement > improvement_threshold` (v1 default: **20%**).
+3. Condition 1 and 2 have both held for `persistence_cycles` **consecutive** evaluation cycles (v1 default: **3** consecutive cycles, i.e., ~3 minutes at default 60s cadence).
 4. The partition is currently `ACTIVE` (not already `MIGRATING`, `DEGRADED`, `CREATING`, or `RETIRING`) — see Section 3.1.
-5. No migration of this partition has completed within the cooldown window (v1 default: 10 minutes) — an explicit anti-thrash floor independent of the persistence check, to bound worst-case migration frequency even under a workload that oscillates on a period longer than the persistence window.
+5. No migration of this partition has completed within the cooldown window (v1 default: **10 minutes**) — an explicit anti-thrash floor independent of the persistence check, to bound worst-case migration frequency even under a workload that oscillates on a period longer than the persistence window.
 
-If the best engine changes to a different candidate before the persistence requirement is met, the consecutive-cycle counter resets — persistence is measured against a single consistent `best_engine` choice, not merely "some engine other than current."
+If the best engine changes to a *different* candidate before the persistence requirement is met, the consecutive-cycle counter resets — persistence is measured against a single consistent `best_engine` choice, not merely "some engine other than current."
 
 ### 12.3 Why these values are research parameters, not constants
 
-`improvement_threshold = 20%`, `persistence_cycles = 3`, `window = 60s/10k-ops`, and `cooldown = 10min` are the specification's starting point, carried over from the design review, and are exactly what Section 17's ablation studies (hysteresis on/off, threshold sweep, window-size sweep) exist to validate or revise. They are configuration, not hardcoded — every deployment/table may override them, and the benchmark protocol is expected to produce evidence for different production defaults before v1 ships.
+`improvement_threshold = 20%`, `persistence_cycles = 3`, window = 60s/10k-ops, and `cooldown = 10min` are the specification's starting point, carried over from the design review, and are exactly what Section 17's ablation studies (hysteresis on/off, threshold sweep, window-size sweep) exist to validate or revise. They are configuration, not hardcoded — every deployment/table may override them, and the benchmark protocol is expected to produce evidence for different production defaults before v1 ships.
 
 ### 12.4 What the hysteresis gate prevents
 
@@ -536,7 +534,7 @@ The optimizer's scope in v1 is partition pruning and single-partition push-down 
 
 ### 14.2 Simple Human Interface
 
-The previously-scoped plain-English interface (e.g., `SHOW employees` as sugar for `SELECT * FROM employees;`) is a syntactic front end only — it produces the same AST/Logical Plan as the SQL parser and shares 100% of the pipeline from the Logical Plan stage onward. It must remain a deterministic, grammar-defined parser (not an AI/LLM-based interpretation layer) so that its behavior is testable and its failure mode is a parse error, not a silently-wrong query.
+The previously-scoped plain-English interface (e.g., `SHOW employees` as sugar for `SELECT * FROM employees;`) is a **syntactic front end only** — it produces the same AST/Logical Plan as the SQL parser and shares 100% of the pipeline from the Logical Plan stage onward. It must remain a deterministic, grammar-defined parser (not an AI/LLM-based interpretation layer) so that its behavior is testable and its failure mode is a parse error, not a silently-wrong query.
 
 ---
 
@@ -566,19 +564,19 @@ Every automated routing or migration decision must be reconstructable from Secti
 
 ## 16. Security and Operational Concerns
 
-(Scoped narrowly for v1 — RubixDB is an embedded engine, not a network service, so the surface area is smaller than a client/server database, but it is not zero.)
+*(Scoped narrowly for v1 — RubixDB is an embedded engine, not a network service, so the surface area is smaller than a client/server database, but it is not zero.)*
 
-- **At-rest protection:** WAL segments, SSTables, B+Tree pages, and Log segments are treated as sensitive by default. v1 provides an optional encryption-at-rest hook at the Storage Manager / File Manager layer (Section 8), applied uniformly below all three engines rather than per-engine, so encryption is not something each engine implementer reasons about separately.
-- **Access control:** as an embedded engine, RubixDB inherits the host process's OS-level file permissions for its data directory; it does not implement its own user/auth model in v1 (that belongs to whatever service embeds RubixDB). This boundary is explicit so it isn't silently assumed away.
-- **Integrity:** every WAL record and every engine-level physical block (segment, SSTable block, B+Tree page) carries a checksum (Section 8.1's `crc` field, and engine-specific equivalents), checked on read and on recovery (Section 8.3's "Validate storage" step), so silent corruption is detected rather than propagated into query results.
-- **Operational safety of migration:** the freeze-writes window (Section 13.1) has a configurable maximum duration; if build+validate cannot complete and commit within an operator-configured bound under abnormal conditions, the migration is aborted (Section 13.3) rather than left holding writes indefinitely — availability of writes takes priority over completing a routing optimization.
-- **Resource isolation:** the Workload Analyzer and Cost Model run on a bounded, low-priority background schedule (tied to the evaluation cadence, Section 10.3) and must not compete materially with foreground read/write latency — this is a stated non-functional requirement, validated by the benchmark protocol's latency measurements under the adaptive configuration (Section 17.3) explicitly including analyzer/router overhead, not just engine overhead.
+- **At-rest protection**: WAL segments, SSTables, B+Tree pages, and Log segments are treated as sensitive by default. v1 provides an optional encryption-at-rest hook at the Storage Manager / File Manager layer (Section 8), applied uniformly below all three engines rather than per-engine, so encryption is not something each engine implementer reasons about separately.
+- **Access control**: as an embedded engine, RubixDB inherits the host process's OS-level file permissions for its data directory; it does not implement its own user/auth model in v1 (that belongs to whatever service embeds RubixDB). This boundary is explicit so it isn't silently assumed away.
+- **Integrity**: every WAL record and every engine-level physical block (segment, SSTable block, B+Tree page) carries a checksum (Section 8.1's `crc` field, and engine-specific equivalents), checked on read and on recovery (Section 8.3's "Validate storage" step), so silent corruption is detected rather than propagated into query results.
+- **Operational safety of migration**: the freeze-writes window (Section 13.1) has a configurable maximum duration; if build+validate cannot complete and commit within an operator-configured bound under abnormal conditions, the migration is aborted (Section 13.3) rather than left holding writes indefinitely — availability of writes takes priority over completing a routing optimization.
+- **Resource isolation**: the Workload Analyzer and Cost Model run on a bounded, low-priority background schedule (tied to the evaluation cadence, Section 10.3) and must not compete materially with foreground read/write latency — this is a stated non-functional requirement, validated by the benchmark protocol's latency measurements under the adaptive configuration (Section 17.3) explicitly including analyzer/router overhead, not just engine overhead.
 
 ---
 
 ## 17. Benchmark and Research Protocol
 
-This protocol is designed before the adaptive router is implemented (per Section 1.7's build order) because the cost model's coefficients (Section 11.2) are calibrated from its single-engine results, and because "RubixDB adapts well" is a claim that only means something against a defined control group.
+This protocol is designed *before* the adaptive router is implemented (per Section 1.7's build order) because the cost model's coefficients (Section 11.2) are calibrated from its single-engine results, and because "RubixDB adapts well" is a claim that only means something against a defined control group.
 
 ### 17.1 Control group
 
@@ -592,19 +590,19 @@ Adaptive RubixDB — full system: analyzer + cost model + router +
                     migration, as specified in Sections 10–13
 ```
 
-`Static Router` exists specifically to isolate the value of adaptivity from the value of having three engines to choose from — a static-but-correct initial choice is a much fairer comparison than only comparing against single fixed engines.
+`Static Router` exists specifically to isolate the value of *adaptivity* from the value of *having three engines to choose from* — a static-but-correct initial choice is a much fairer comparison than only comparing against single fixed engines.
 
 ### 17.2 Workloads
 
-YCSB-style workload mixes (read-heavy, write-heavy, mixed, scan-heavy) as a baseline, plus explicit workload transitions within a single run — e.g., append-heavy → update-heavy → range-heavy, each phase held long enough to exceed several evaluation windows (Section 10.3) — because adaptivity specifically cannot be demonstrated against a single unchanging workload; a static router wins trivially there by definition.
+YCSB-style workload mixes (read-heavy, write-heavy, mixed, scan-heavy) as a baseline, plus explicit **workload transitions** within a single run — e.g., append-heavy → update-heavy → range-heavy, each phase held long enough to exceed several evaluation windows (Section 10.3) — because adaptivity specifically cannot be demonstrated against a single unchanging workload; a static router wins trivially there by definition.
 
 ### 17.3 Measurements
 
-Throughput; p50/p99 latency; write amplification; read amplification; space amplification; compaction overhead; migration overhead (frequency, duration, freeze-write impact); memory usage; and time-to-adapt (wall-clock or operation-count from a workload-shape transition to the router completing a migration that improves cost, and the residual cost gap immediately after that migration completes).
+Throughput; p50/p99 latency; write amplification; read amplification; space amplification; compaction overhead; migration overhead (frequency, duration, freeze-write impact); memory usage; and **time-to-adapt** (wall-clock or operation-count from a workload-shape transition to the router completing a migration that improves cost, and the residual cost gap immediately after that migration completes).
 
 ### 17.4 Ablations
 
-Hysteresis enabled vs. disabled (to demonstrate Section 12.4's thrash-prevention claim with a number, not just an argument); observation-window size sweep (Section 10.3's 60s/10k-op defaults vs. alternatives); `improvement_threshold` sweep around the 20% default (Section 12.3); and cost-model weight (`Ww`, `Wr`, `Ws`, `Wc`, Section 11.2) sensitivity. Each ablation must isolate exactly one variable against the same workload transition set from Section 17.2, so results are attributable to the specific mechanism being tested rather than to overall system variance.
+Hysteresis enabled vs. disabled (to demonstrate Section 12.4's thrash-prevention claim with a number, not just an argument); observation-window size sweep (Section 10.3's 60s/10k-op defaults vs. alternatives); `improvement_threshold` sweep around the 20% default (Section 12.3); and cost-model weight (`Ww, Wr, Ws, Wc`, Section 11.2) sensitivity. Each ablation must isolate exactly one variable against the same workload transition set from Section 17.2, so results are attributable to the specific mechanism being tested rather than to overall system variance.
 
 ### 17.5 Acceptance bar
 
@@ -634,19 +632,19 @@ A claim in project documentation or marketing that RubixDB "adapts to workload c
 Explicitly deferred, not forgotten:
 
 - **Online migration** (Section 13.4): snapshot + replay with dual-write and a bounded cutover window, plus a defined rollback procedure if cutover validation fails after dual-write has started.
-- **Multi-partition / multi-statement transactions:** current spec guarantees stop at single-partition batch atomicity (Section 7.4); a cross-partition transaction protocol (likely 2PC-style, given the single-node constraint could still simplify this considerably) is future work.
-- **Schema evolution:** `schema_version` is tracked (Section 6.2) but the actual migration-of-old-partitions-to-new-schema mechanism is not specified in v1.
+- **Multi-partition / multi-statement transactions**: current spec guarantees stop at single-partition batch atomicity (Section 7.4); a cross-partition transaction protocol (likely 2PC-style, given the single-node constraint could still simplify this considerably) is future work.
+- **Schema evolution**: `schema_version` is tracked (Section 6.2) but the actual migration-of-old-partitions-to-new-schema mechanism is not specified in v1.
 - **Partition splitting/merging by size**, independent of engine migration — noted in Section 2 as an orthogonal mechanism, not specified here.
-- **Distributed RubixDB:** replication, sharding across nodes, and distributed consensus for metadata are entirely out of scope for this document (Section 0.1) and would likely require re-examining several "single global LSN" assumptions in Section 7.
-- **Engine auto-discovery:** whether a fourth engine type could be added without a spec revision (the contract in Section 4 is designed to make this possible in principle, but no plug-in registration mechanism is specified in v1).
+- **Distributed RubixDB**: replication, sharding across nodes, and distributed consensus for metadata are entirely out of scope for this document (Section 0.1) and would likely require re-examining several "single global LSN" assumptions in Section 7.
+- **Engine auto-discovery**: whether a fourth engine type could be added without a spec revision (the contract in Section 4 is designed to make this possible in principle, but no plug-in registration mechanism is specified in v1).
 
 ---
 
 ## 20. Glossary
 
-- **LSN:** Logical Sequence Number — the single global, monotonically increasing write-order counter (Section 7.1).
-- **Generation:** a partition's physical-rebuild counter, incremented on every engine change (Section 3).
-- **Tombstone:** a logical delete marker retained until provably safe to remove (Section 7.3).
-- **WorkloadProfile:** the Workload Analyzer's per-partition, per-evaluation-cycle statistics snapshot (Section 10.4).
-- **Hysteresis gate:** the persistence + threshold + cooldown check that must pass before a migration is triggered (Section 12.2).
-- **Freeze window:** the short, write-blocked span at the start of migration, bounded to write-drain time only (Section 13.1).
+- **LSN**: Logical Sequence Number — the single global, monotonically increasing write-order counter (Section 7.1).
+- **Generation**: a partition's physical-rebuild counter, incremented on every engine change (Section 3).
+- **Tombstone**: a logical delete marker retained until provably safe to remove (Section 7.3).
+- **WorkloadProfile**: the Workload Analyzer's per-partition, per-evaluation-cycle statistics snapshot (Section 10.4).
+- **Hysteresis gate**: the persistence + threshold + cooldown check that must pass before a migration is triggered (Section 12.2).
+- **Freeze window**: the short, write-blocked span at the start of migration, bounded to write-drain time only (Section 13.1).
