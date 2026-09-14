@@ -483,20 +483,24 @@ type that implements `Drop` — documented on `into_inner` itself.)
 **Command**: `RGC_TIMING_REPORT=1 cargo test --release --test group_commit
 --features test-util thousand_writers_throughput -- --nocapture`
 
-### 9C.2 Measured result (two runs, ~15s apart, otherwise idle machine)
+### 9C.2 Measured result (three runs across two sessions, disk unchanged at 97–98% full)
 
 | Run | Batches | Mean window (µs) | Mean snapshot (µs) | Mean fsync (µs) | Mean notify (µs) | Mean wake (µs) | Observed ops/sec |
 |---|---|---|---|---|---|---|---|
 | 1 | 1,506 | 23,715.4 | 10,074.2 | 24,776.3 | 297.7 | 953.1 | 11,100 |
 | 2 | 1,483 | 25,038.9 | 11,813.7 | 24,417.5 | 375.3 | 841.4 | 10,788 |
+| 3 (re-confirmed, `df -h` re-checked immediately before: 2.6GB free of 82GB, 97% full — no meaningful change from runs 1–2) | 1,509 | 26,754.3 | 10,713.9 | 25,699.4 | 447.1 | 1,182.1 | 10,226 |
 
 Sanity check (internal consistency, not against the model yet): summing
 all five mean stage durations for run 1 gives `23,715.4 + 10,074.2 +
 24,776.3 + 297.7 + 953.1 = 59,816.7µs ≈ 59.8ms`; independently, `90.088s
-/ 1,506 batches ≈ 59.8ms/batch`. These match almost exactly, so the
-instrumentation itself is trustworthy — the five stages genuinely do sum
-to the observed cycle time, and the discrepancy below is a real
-environmental effect, not an instrumentation bug.
+/ 1,506 batches ≈ 59.8ms/batch`. Run 3: `26,754.3 + 10,713.9 + 25,699.4 +
+447.1 + 1,182.1 = 64,796.8µs ≈ 64.8ms`, vs. `97.789s / 1,509 batches ≈
+64.8ms/batch` — matches equally exactly. Across three independent runs
+the five stages consistently sum to the observed cycle time, so the
+instrumentation itself is trustworthy and the discrepancy below is a
+real, reproducible environmental effect, not measurement noise or an
+instrumentation bug.
 
 ### 9C.3 Comparison against the expected model — disagrees sharply
 
@@ -515,25 +519,30 @@ try_clone` — no I/O of its own, yet averaging over 10ms, which is not
 explained by anything in this codebase's own logic and points to lock
 contention or scheduler pressure rather than the snapshot code itself).
 
-### 9C.4 Root cause identified: this disk is nearly full
+### 9C.4 Root cause identified: this disk is nearly full — re-confirmed, not transient
 
 `df -h` on the volume `%TEMP%` resolves to (`C:`, where every WAL test
 directory in this entire report was created): **82GB total, ~80GB used,
-2.5GB free — 98% full.** This is independent of anything `GroupCommitter`
-does. Near-full SSDs are well documented to suffer materially higher
-write/flush latency than the same drive with more free space, because
-the controller has fewer free blocks available for wear-leveling and
-garbage collection during writes — an ~8x `fsync` slowdown (§14.2's
-~2.8–3.0ms baseline vs. this section's ~24.4–24.8ms) is well within the
-range that phenomenon can produce. This machine's disk was very likely
-already trending toward this state throughout this session (the disk-
-speed variance documented in §9, §12, and §17 was real and reported
-honestly at the time), and appears to have crossed further into
-degraded territory during the extensive testing this and the prior
-follow-up task required (many multi-minute, high-concurrency WAL-writing
-runs in succession). This session's own leftover temp WAL directories
-were checked and found negligible (~96KB total, now removed) — the
-~80GB in use is unrelated to this testing session's own artifacts.
+2.5–2.6GB free — 97–98% full**, checked three times (before run 1,
+before run 2, and again immediately before run 3, across two separate
+follow-up requests in this session) with no meaningful change between
+checks — this is not a transient dip that cleared on its own. This is
+independent of anything `GroupCommitter` does. Near-full SSDs are well
+documented to suffer materially higher write/flush latency than the same
+drive with more free space, because the controller has fewer free blocks
+available for wear-leveling and garbage collection during writes — an
+~8x `fsync` slowdown (§14.2's ~2.8–3.0ms baseline vs. this section's
+~24.4–25.7ms across all three runs) is well within the range that
+phenomenon can produce. This machine's disk was very likely already
+trending toward this state throughout this session (the disk-speed
+variance documented in §9, §12, and §17 was real and reported honestly
+at the time), and appears to have settled into this degraded state
+rather than recovering — three measurements ~1,500 batches apart, on two
+separate occasions, all land in the same range. This session's own
+leftover temp WAL directories were checked and found negligible (~96KB
+total, removed before run 3), confirming the ~80GB in use is unrelated
+to this testing session's own artifacts and is not something this
+report's own test runs can clean up.
 
 ### 9C.5 Why this stops Phase B, per the task's own gate
 
@@ -565,6 +574,19 @@ Phase B's specification (the `filling_active`/`fsyncing_active`
 `BatchState` split) can proceed as designed. If `snapshot`'s anomaly
 persists even on a healthy disk, that needs its own root-cause
 investigation first, separate from pipelining.
+
+**Update (re-confirmed on a follow-up request in this same session,
+before any Phase B work was considered)**: re-ran the identical Phase A
+measurement a third time (run 3 in §9C.2's table) after re-checking disk
+space; it was unchanged (97% full, 2.6GB free — effectively the same
+state as runs 1–2) and the result reproduced the same pattern
+(`window≈26.8ms`, `snapshot≈10.7ms`, `fsync≈25.7ms`, `coordination≈1.6ms`).
+Simply re-running does not clear this condition — the disk needs actual
+free space reclaimed (deleting unrelated data, or moving `%TEMP%`/the
+WAL test directories to a volume with headroom) before a measurement
+representative of steady-state hardware can be taken. **Phase B remains
+not implemented, for the same reason as before, now confirmed three
+times rather than once.**
 
 **Evidence**: `target/phase1-evidence/m1_3_timing_report.txt`,
 `target/phase1-evidence/m1_3_timing_report_rerun.txt` (both local, not
