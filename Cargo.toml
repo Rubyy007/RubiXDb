@@ -1,0 +1,11 @@
+[package]
+name = "rubixdb"
+version = "0.1.0"
+edition = "2021"
+description = "RubixDB — embedded, multi-engine database (Phase 0: LSM engine)"
+publish = false
+
+[dependencies]
+crc32c = "=0.6.8"
+
+[dev-dependencies]
