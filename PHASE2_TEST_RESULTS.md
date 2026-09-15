@@ -307,10 +307,12 @@ negative result is evidence worth keeping, not a mistake to delete.
 
 ## 16. Final commit
 
-Recorded after this document and the rest of Phase 2's deliverables were
-committed together — see `git log --oneline -1` at the time of reading
-this file, or `CHANGELOG.md`'s Phase 2 entry, for the exact hash; this
-document's own git history (`git log -- PHASE2_TEST_RESULTS.md`) is the
-authoritative record of which commit each version of this file's numbers
-belongs to, per this project's standing convention (`PHASE1_TEST_RESULTS.md`
-§1).
+```
+a0e284b02a18cb6c6b86c8b9466d4421127567eb
+```
+
+`git log --oneline -1` at the time this line was written. Every number
+in this document was measured against this exact commit (or its
+immediate parent, `3af3732`, for the Phase 1 baseline in §6) — no result
+here was measured against, or should be compared against, any earlier
+or later commit.
