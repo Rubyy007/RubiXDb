@@ -18,12 +18,38 @@ pub enum WalOp<'a> {
 
 /// The owned form of `WalOp`, returned by recovery (WAL Spec §5's
 /// `WalReplayResult::records: Vec<(u64, WalOpOwned)>`), since replayed
-/// records must outlive the buffer they were decoded from.
+/// records must outlive the buffer they were decoded from. Also used by
+/// Phase 2's `execution::WriteWorkerPool` (`PHASE2_WORKER_POOL_
+/// ARCHITECTURE.md`) to carry a request's payload across the submission
+/// queue to whichever worker thread eventually processes it — a borrowed
+/// `WalOp<'a>` cannot cross that boundary, since the submitting caller's
+/// own stack frame is not guaranteed to outlive the wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalOpOwned {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
     CheckpointMarker { flushed_through_seq: u64 },
+}
+
+impl WalOpOwned {
+    /// Re-borrows this owned op as a `WalOp<'_>` — the form `GroupCommitter::
+    /// append`/`append_durable` actually take. No copy: the returned
+    /// `WalOp` borrows this value's own `Vec<u8>` buffers directly, so a
+    /// payload submitted once (copied from the caller's original slice
+    /// into this `WalOpOwned` at submission time — unavoidable, since the
+    /// caller's own stack frame need not outlive the wait) is never
+    /// copied a second time on its way into the WAL.
+    pub fn as_wal_op(&self) -> WalOp<'_> {
+        match self {
+            WalOpOwned::Put { key, value } => WalOp::Put { key, value },
+            WalOpOwned::Delete { key } => WalOp::Delete { key },
+            WalOpOwned::CheckpointMarker {
+                flushed_through_seq,
+            } => WalOp::CheckpointMarker {
+                flushed_through_seq: *flushed_through_seq,
+            },
+        }
+    }
 }
 
 /// Encodes one full WAL frame for `seq`/`op`, per WAL Spec §2.3/§2.4.

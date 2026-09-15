@@ -8,6 +8,7 @@
 
 pub mod compaction;
 pub mod error;
+pub mod execution;
 pub mod lsm;
 pub mod manifest;
 pub mod memtable;

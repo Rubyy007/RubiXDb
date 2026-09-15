@@ -320,3 +320,24 @@ read performance for functionality that doesn't exist (explicitly
 disallowed by that phase's own brief) or building a read path, which is
 out of Phase 1's scope. Resolved with the user via `AskUserQuestion`
 rather than guessed past; full reasoning in `PHASE1_ADR.md` ADR-11.
+
+## Phase 2: Write Worker Pool (implemented, measured, rejected)
+
+`execution::WriteWorkerPool` (`src/execution/write_pool.rs`) exists in
+the tree, fully implemented and tested, but is **not** part of any
+default or recommended code path — nothing in the default build, test
+suite, or Phase 1's own components calls into it. It was built and
+measured to test whether a bounded worker pool in front of `GroupCommitter`
+could form larger WAL batches than Phase 1's direct-thread model; the
+measured answer was no (a bounded worker pool architecturally caps batch
+size at its own worker count), so it was rejected as a production
+default and kept as a documented negative result — same standing this
+project already gives the rejected pipelining experiment (`PHASE1_ADR.md`
+ADR-14). Documentation follows the same per-phase structure Phase 1
+established: `PHASE2_WORKER_POOL_ARCHITECTURE.md` (design),
+`PHASE2_FAILURE_MODEL.md` (failure semantics), `PHASE2_ADR.md`
+(decisions and rationale), `PHASE2_WORKER_POOL_TEST_PLAN.md` (what was
+tested and what was deliberately not), `PHASE2_PERFORMANCE.md`
+(benchmark shape), and `PHASE2_TEST_RESULTS.md` (the single source of
+truth for Phase 2 results — same rule as Phase 1: no benchmark number or
+pass/fail status lives in any other document for this phase).

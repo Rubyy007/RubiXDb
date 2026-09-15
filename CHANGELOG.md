@@ -294,3 +294,46 @@ this pass.
   rather than improve it, with the change left uncommitted in the tree
   as pipelining's own regression check rather than reverted. See
   `PHASE1_TEST_RESULTS.md` §9E/§9F.1 and `PHASE1_ADR.md` ADR-14.
+
+### Phase 2: Write Worker Pool (implemented, measured, rejected)
+
+Adds `execution::WriteWorkerPool` (`src/execution/write_pool.rs`): a
+bounded queue plus a configurable number of worker threads in front of
+`GroupCommitter`, meant to separate logical client concurrency from
+physical storage execution concurrency. `std`-only (`Mutex`+`Condvar`,
+no new dependency), no change to `GroupCommitter`'s durability logic, no
+WAL format change. Public API: `submit`/`Completion::wait`/
+`wait_timeout`, `shutdown` (three-step: reject new work, drain the
+queue, then finalize the underlying `GroupCommitter`), `stats`,
+`into_inner`. Bounded everywhere: `queue_capacity`, `max_queued_bytes`,
+`submission_timeout` (blocks then `EngineError::Timeout`, never drops a
+write or blocks unboundedly), `shutdown_drain_bound`. A worker panic
+resolves only its own in-flight request with an error (via an RAII
+completion guard) and never loses another queued request; if every
+worker terminates unexpectedly, the pool fails cleanly and drains the
+remaining queue with an explicit error rather than leaving any caller
+blocked forever.
+
+**Measured and rejected as a production default**: a worker-count sweep
+(1/2/4/8/16/32/64, plus a parity point at `worker_count = writer_count`)
+at 100 and 1,000 logical writers found `GroupCommitter`'s batch size
+architecturally capped at the worker count, not the logical writer
+count — throughput regressed by one to two orders of magnitude at every
+worker count meaningfully smaller than the writer count, and even at
+parity (`worker_count = writer_count`) 1,000-writer throughput was 28%
+below Phase 1's existing direct-thread architecture. Kept in the tree as
+a documented, tested, but not-recommended artifact — see `PHASE2_TEST_
+RESULTS.md`/`PHASE2_ADR.md` (ADR-P2-5) for the full evidence and
+decision.
+
+#### Fixed
+
+- The worker pool's request-processing path originally retried nothing:
+  a single-attempt `append` + `await_durable` call could surface a
+  spurious `Timeout` to a caller under real concurrent load even though
+  the underlying write was never lost. Fixed by retrying only `await_
+  durable` (never `append` — appending exactly once means retrying the
+  wait can never duplicate a record), mirroring the retry pattern Phase
+  1's own test harness already established as correct
+  (`tests/group_commit/support.rs::await_durable_retrying_on_timeout`).
+  See `PHASE2_TEST_RESULTS.md` §13 and `PHASE2_ADR.md` ADR-P2-4.

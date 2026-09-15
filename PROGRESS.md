@@ -543,3 +543,58 @@ tuning removes. **Phase 1 production-readiness decision unchanged: NOT
 PRODUCTION READY**, now backed by a controlled experiment and a verified
 fix rather than algebra alone. Full account: `PHASE1_TEST_RESULTS.md`
 §9A/§9B/§15 (revised)/§19; decision record: `PHASE1_ADR.md` ADR-12.
+
+## Phase 2: Write Worker Pool — implemented, measured, rejected
+
+Built `execution::WriteWorkerPool` (`src/execution/write_pool.rs`): a
+bounded queue in front of a fixed number of worker threads, each calling
+the same, unmodified `GroupCommitter::append`/`await_durable` a Phase 1
+direct caller already used — meant to test whether separating logical
+client concurrency (1,000s of callers) from physical storage execution
+concurrency (a small, controlled worker count) could form larger, more
+efficient WAL batches than Phase 1's direct-thread model. `std`-only
+(`Mutex`+`Condvar`, no new dependency), no unsafe code, no change to
+`GroupCommitter`'s durability logic or the WAL format — see `PHASE2_
+WORKER_POOL_ARCHITECTURE.md` for the full design.
+
+**Critical experiment**: worker-count sweep (1/2/4/8/16/32/64, plus a
+parity point at `worker_count = writer_count`) at both 100 and 1,000
+logical writers, same session, same commit as the Phase 1 baseline it
+was compared against. **Finding**: `avg_batch_records` tracks
+`worker_count` almost exactly at every point tested (e.g. 1,000 writers,
+worker_count=64 → avg batch 62.89; worker_count=1,000 → avg batch
+442.48) — a `GroupCommitter` batch can only ever contain requests that
+have already reached `append()`, so a bounded worker pool caps batch
+formation at its own worker count regardless of how many logical writers
+are queued behind it. Even at the pool's best-case configuration
+(`worker_count = writer_count`, eliminating that ceiling entirely), 1,000-
+writer throughput was still 28% below Phase 1's direct-thread number,
+from the pool's own added queue/completion/allocation overhead. Full
+data: `PHASE2_TEST_RESULTS.md` §7–§10; root-cause and decision record:
+`PHASE2_ADR.md` ADR-P2-5.
+
+**Decision: REJECT** the worker pool as a production default — Phase 1's
+existing direct-thread architecture remains faster at every tested and
+reasonably extrapolatable configuration. The code is kept in the tree
+(correctness- and fault-injection-tested, zero interaction with any
+existing Phase 1 code path) as a documented negative result, mirroring
+`PHASE1_ADR.md` ADR-14's own precedent for the rejected pipelining
+experiment — not deleted, and not silently forced into production
+because it looked like the expected next step.
+
+**Fixed during this cycle**: the first implementation retried nothing —
+a single-attempt `append_durable` call could surface a spurious
+`Timeout` under real concurrent load even though the write was never
+lost. Fixed by retrying only `await_durable` (never `append` — zero
+duplicate-record risk), mirroring the retry pattern Phase 1's own test
+harness (`tests/group_commit/support.rs::await_durable_retrying_on_
+timeout`) already established as correct. Full account: `PHASE2_TEST_
+RESULTS.md` §13; decision record: `PHASE2_ADR.md` ADR-P2-4.
+
+**Tests**: 96 lib tests (87 unchanged Phase 1 + 9 new, including two
+fault-injection tests — an injected `fsync` failure and a genuine worker-
+thread panic, both verified to propagate faithfully to the caller
+without hanging or losing other queued requests). Full Phase 1
+regression gate (`cargo test`/`--release`/`--features test-util`/
+clippy/fmt) and crash-consistency suite re-verified with zero
+regressions. Full account: `PHASE2_TEST_RESULTS.md` §4–§5.

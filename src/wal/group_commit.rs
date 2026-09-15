@@ -1484,7 +1484,13 @@ mod batch_timing {
 /// always derived from `FileWal::next_seq()`, never from this counter) —
 /// it happens to be exact here because the layout is simple and stable,
 /// not because exactness is load-bearing.
-fn estimate_frame_len(op: &WalOp<'_>) -> usize {
+/// `pub(crate)`, not private: also used by `execution::write_pool` to
+/// account queued-request bytes against `WriteWorkerPoolConfig::max_
+/// queued_bytes` using the exact same formula this module uses for its
+/// own `batch_bytes`/`max_batch_bytes` accounting, rather than a second,
+/// independently-maintained estimate that could silently drift from this
+/// one.
+pub(crate) fn estimate_frame_len(op: &WalOp<'_>) -> usize {
     const FRAME_HEADER_LEN: usize = 8; // length:u32 LE + crc32c:u32 LE
     const SEQ_AND_OP_TAG_LEN: usize = 9; // seq:u64 LE + op:u8
     let op_body_len = match op {
