@@ -26,5 +26,7 @@ pub use write_pool::{
 // already-shipped, identically-named types: `execution::leader_drain::
 // Completion` is a distinct type from `execution::Completion`
 // (`write_pool::Completion`), even though both serve the same role.
+pub mod batch_coordinator;
 pub(crate) mod common;
 pub mod leader_drain;
+pub mod sharded_ingress;
