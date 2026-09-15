@@ -337,3 +337,66 @@ decision.
   1's own test harness already established as correct
   (`tests/group_commit/support.rs::await_durable_retrying_on_timeout`).
   See `PHASE2_TEST_RESULTS.md` §13 and `PHASE2_ADR.md` ADR-P2-4.
+
+### Phase 2B: three architectures evaluated — target achieved
+
+Adds three further execution-layer architectures, evaluated against
+Phase 2's rejected `WriteWorkerPool` and against each other:
+
+- **`execution::leader_drain`** (Approach A, "Leader Queue Drain"): a
+  worker drains the entire currently-queued backlog at once (not one
+  request per loop iteration, unlike the rejected worker pool), appends
+  every entry, then issues one `await_durable` for the whole batch.
+  `worker_count=1` reached 16,806/95,686 ops/sec (100w/1,000w medians),
+  exceeding both Phase 1 targets on the first attempt. A single-active-
+  drain-leader coordination flag (`draining_active`/`DrainLeaderGuard`)
+  lets `worker_count>1` provide hot-standby redundancy without
+  fragmenting batches (the naive multi-worker failure mode this fixes),
+  at a small cost to 100-writer margin.
+- **`execution::batch_coordinator`** (Approach B, "Dedicated Batch
+  Coordinator", **adopted as the recommended default**): exactly one
+  coordinator thread, no worker-election machinery — structurally
+  simpler than A. Reached 17,512/93,594 ops/sec (100w/1,000w medians,
+  5 independent repetitions each) — the best 100-writer result of any
+  architecture measured, with the least code.
+- **`execution::sharded_ingress`** (Approach C, "Sharded/Per-Core
+  Ingress"): `shard_count` independent ingress queues merged by one
+  coordinator, evaluated once (the operating brief's own conditional
+  framing — evaluate only if A and B fail, which they did not).
+  15,234/96,033 ops/sec — no material improvement over B, confirming
+  the single shared queue was never the bottleneck.
+
+All three preserve the WAL format, `GroupCommitter`'s durability
+contract, and crash-consistency guarantees unchanged. Zero Phase 1/
+Phase 2 regressions across the full cycle. Full account: `PHASE2B_
+FINAL_TEST_RESULTS.md`; design: `PHASE2B_ARCHITECTURE_A/B/C.md`;
+decisions: `PHASE2B_ADR.md`.
+
+**Target achieved**: Approach B reached a median 17,512 durable
+ops/sec at 100 writers (target ≥15,000) and 93,594 at 1,000 writers
+(target ≥80,000) — the first phase in this project's history to meet
+the original Phase 1 throughput targets.
+
+#### Fixed
+
+- Every Phase 2B architecture's batch-processing path originally (in
+  Approach A's first implementation) constructed each request's panic-
+  safety guard (`CompletionGuard`) *after* the one shared `await_
+  durable` call for a batch, rather than before — leaving every entry
+  in a batch unprotected during the call most likely to observe a fault.
+  A panic there hung the corresponding fault-injection test past a
+  60-second timeout. Fixed by constructing every guard before the
+  shared call and keeping them alive across it; Approaches B and C were
+  written after this fix and used the correct ordering from the start.
+  See `PHASE2B_FAILURE_MODEL.md` §2 and `PHASE2B_ADR.md` ADR-P2B-3.
+
+#### Discovered (pre-existing Phase 1 behavior, not a regression)
+
+- A leader/coordinator thread that panics specifically while inside the
+  leader `fsync` call leaves `GroupCommitter`'s own `leader_active` flag
+  (`src/wal/group_commit.rs`) permanently stuck — every architecture's
+  worker/standby redundancy is powerless against this specific failure,
+  since the underlying committer itself becomes globally wedged, not
+  just the one thread that died. Verified the system still fails safely
+  (bounded, no hang, no false acknowledgment) under this condition.
+  See `PHASE2B_FAILURE_MODEL.md` §3.

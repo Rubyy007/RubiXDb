@@ -598,3 +598,75 @@ without hanging or losing other queued requests). Full Phase 1
 regression gate (`cargo test`/`--release`/`--features test-util`/
 clippy/fmt) and crash-consistency suite re-verified with zero
 regressions. Full account: `PHASE2_TEST_RESULTS.md` §4–§5.
+
+## Phase 2B: three architectures evaluated — target achieved
+
+Rejected Phase 2's worker pool showed batch size following worker
+count; `PHASE2_ADR.md` ADR-P2-5 named a specific alternative — let the
+current leader drain *many* already-queued requests before syncing,
+instead of requiring one worker per in-flight request. Phase 2B tested
+that alternative and two further, genuinely distinct architectures:
+
+**Approach A** (`execution::leader_drain`, "Leader Queue Drain"): a
+worker drains the entire currently-queued backlog at once. Attempt A1
+(`worker_count=1`): 16,806 ops/sec median at 100 writers, 95,686 at
+1,000 — **both exceed target on the first attempt**. Attempt A1's own
+sweep found `worker_count>1` *fragments* throughput (concurrent drainers
+split one large batch into several smaller ones — 45,555–65,800 ops/sec
+across worker counts 2–64 at 1,000 writers, all worse than
+`worker_count=1`'s 85,158+). Attempt A2 fixed this with a single-active-
+drain-leader coordination flag (`draining_active`/`DrainLeaderGuard`,
+RAII, panic-safe): `worker_count=2` recovered to 92,172 ops/sec at 1,000
+writers (matching `worker_count=1`) while adding hot-standby redundancy,
+at a small, honestly-recorded cost to 100-writer margin (median 14,652,
+just under target). Attempt A3 not needed.
+
+**Approach B** (`execution::batch_coordinator`, "Dedicated Batch
+Coordinator", **the winner**): structurally simpler than A — exactly
+one coordinator thread, no worker-election machinery, decided at
+construction rather than negotiated at runtime. Matched or beat every
+other architecture: 17,512 ops/sec median at 100 writers (best of any
+architecture measured), 93,594 at 1,000 writers. No optimization
+attempts needed beyond the baseline implementation.
+
+**Approach C** (`execution::sharded_ingress`, "Sharded Ingress"):
+per the operating brief's own conditional framing ("if A and B fail..."),
+evaluated once since neither failed. `shard_count` independent ingress
+queues merged by one coordinator — 15,234 ops/sec median at 100 writers,
+96,033 at 1,000 — no material improvement over Approach B, confirming
+the single shared queue was never the bottleneck. Not adopted.
+
+**A real bug found and fixed during Approach A's development**: the
+first implementation constructed each entry's panic-safety guard
+(`CompletionGuard`) *after* the batch-wide `await_durable` call rather
+than before, leaving every entry in a batch unprotected during the one
+call most likely to observe a fault. A panic there hung the worker-panic
+fault-injection test past a 60-second timeout; fixed by building every
+guard before the shared call. Approaches B and C were written after
+this fix and used the correct ordering from the start.
+
+**Also discovered, not a bug introduced this cycle**: a leader/
+coordinator that panics mid-`fsync` leaves `GroupCommitter`'s own
+`leader_active` flag permanently stuck (pre-existing Phase 1 behavior,
+`src/wal/group_commit.rs`) — meaning Approach A's worker redundancy
+cannot rescue a request submitted *after* this specific failure, since
+the underlying committer itself becomes globally wedged, not just the
+one thread that died. Verified the system still fails safely (bounded,
+no hang, no false acknowledgment) under this condition regardless.
+
+**Winner: Approach B**, selected by the operating brief's own priority
+order (correctness/durability/stability tied across all three;
+throughput favors B outright at 100 writers; complexity — the final
+tiebreaker — favors B decisively, being the simplest of the three).
+Approach A at `worker_count=2` is documented as the recommended
+alternative for deployments requiring hot-standby redundancy.
+
+**Final acceptance**: re-verified from the final clean commit — full
+regression gate, crash-consistency suite (4 total runs across this
+cycle), and 5 independent benchmark repetitions per level for Approach
+B, all reproducible. **100 writers: median 17,512 ops/sec (target
+≥15,000, +16.7%). 1,000 writers: median 93,594 ops/sec (target ≥80,000,
++17.0%). TARGET ACHIEVED** — the first phase in this project's history
+to meet the original Phase 1 throughput targets, with zero durability or
+crash-consistency regressions. Full account: `PHASE2B_FINAL_TEST_
+RESULTS.md`; decisions: `PHASE2B_ADR.md`.

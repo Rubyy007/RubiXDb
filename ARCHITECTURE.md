@@ -341,3 +341,46 @@ tested and what was deliberately not), `PHASE2_PERFORMANCE.md`
 (benchmark shape), and `PHASE2_TEST_RESULTS.md` (the single source of
 truth for Phase 2 results — same rule as Phase 1: no benchmark number or
 pass/fail status lives in any other document for this phase).
+
+## Phase 2B: three further architectures — one adopted
+
+Following Phase 2's rejection (the worker pool capped batch size at its
+own worker count), Phase 2B evaluated three structurally different
+answers to the same problem — how to expose a large number of logical
+write requests to one durable batch without requiring one OS thread per
+request:
+
+- **`execution::leader_drain`** (Approach A, "Leader Queue Drain"): a
+  worker drains the *entire* currently-queued backlog at once, not one
+  request at a time, before appending and syncing. `worker_count=1` is
+  fastest; `worker_count>1` requires an explicit single-active-drain-
+  leader coordination mechanism (`draining_active`/`DrainLeaderGuard`)
+  to avoid fragmenting batches, in exchange for hot-standby redundancy.
+- **`execution::batch_coordinator`** (Approach B, "Dedicated Batch
+  Coordinator", **the recommended default**): structurally simpler than
+  A — exactly one coordinator thread, fixed at construction, with no
+  worker-election machinery at all. Matched or beat every other
+  architecture's throughput with the least code.
+- **`execution::sharded_ingress`** (Approach C, "Sharded/Per-Core
+  Ingress"): `shard_count` independent ingress queues merged by one
+  coordinator. Evaluated once (the operating brief's own §6 makes this
+  approach conditional on A/B failing, and neither did) — confirmed the
+  single shared queue was never the bottleneck in A or B; not adopted.
+
+All three preserve Phase 1's WAL format, `GroupCommitter`'s durability
+contract, and crash-consistency guarantees unchanged — see `PHASE2B_
+FAILURE_MODEL.md` for one genuine, pre-existing Phase 1 limitation
+(a leader/coordinator that panics mid-`fsync` leaves `GroupCommitter`'s
+own `leader_active` flag permanently stuck) discovered, precisely
+diagnosed, and found to be safe-but-unrecoverable-without-reconstruction
+under all three architectures during this cycle. Full documentation:
+`PHASE2B_ARCHITECTURE_A/B/C.md` (design), `PHASE2B_FAILURE_MODEL.md`,
+`PHASE2B_ADR.md` (decisions, including the winner-selection rationale),
+`PHASE2B_PERFORMANCE.md`, and `PHASE2B_FINAL_TEST_RESULTS.md` (the
+single source of truth for Phase 2B results).
+
+**Target status: ACHIEVED.** Approach B reached a median 17,512 durable
+ops/sec at 100 writers (target ≥15,000) and 93,594 at 1,000 writers
+(target ≥80,000), reproducibly across 5 independent repetitions each —
+the first phase in this project's history to meet the original Phase 1
+throughput targets.
