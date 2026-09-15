@@ -12,7 +12,8 @@ MODEL.md`; this file is measurements and verdicts only.
 Starting commit (Phase 2, before Phase 2B):     d4f964a1a62ce0051568176a8baf403691139079
 Approach A committed:                            00eac3e
 Approaches B and C committed:                    1e5ca20
-Formatting fix:                                  6bf53da (final commit — see §21)
+Formatting fix (final acceptance code state):    6bf53da
+Documentation (final commit — see §21):          2d83be2dd19b7c37e8246c1428a4adaf0afb8bc8
 ```
 
 Branch: `master`. Working tree clean at every commit above (verified via
