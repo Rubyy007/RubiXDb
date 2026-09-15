@@ -16,3 +16,15 @@ pub use write_pool::{
     Completion, PoolState, RequestId, WorkerPoolShutdownReport, WorkerPoolStats, WriteWorkerPool,
     WriteWorkerPoolConfig,
 };
+
+// Phase 2B: three further architectures, evaluated against the rejected
+// `write_pool` baseline above — see `PHASE2B_ADR.md`/`PHASE2B_FINAL_
+// TEST_RESULTS.md` for which (if any) was kept. Each has its own
+// `Completion`/`RequestId` pair (`super::common`, `pub(crate)` — not
+// part of this crate's public surface by itself — re-exported from each
+// architecture's own module) rather than reusing `write_pool`'s
+// already-shipped, identically-named types: `execution::leader_drain::
+// Completion` is a distinct type from `execution::Completion`
+// (`write_pool::Completion`), even though both serve the same role.
+pub(crate) mod common;
+pub mod leader_drain;
