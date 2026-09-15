@@ -290,51 +290,125 @@ fn list_segment_ids(canonical_dir: &Path) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
-/// Creates and fully initializes a new segment file: opens it exclusively
-/// (`create_new`, so this can never silently overwrite an existing
-/// segment), writes and fsyncs its 24-byte header, then fsyncs the
-/// containing directory (Group 1.2).
+/// The temp name a segment `id` is written under before being renamed into
+/// place — see `create_new_segment_file`. Suffixed `.tmp` rather than
+/// `.log`, so `parse_segment_file_name` never matches it: a stray temp file
+/// left behind by a crash is simply invisible to `list_segment_ids` and
+/// every recovery/inspection path built on it, never mistaken for a real
+/// (let alone corrupted) segment.
+fn tmp_segment_path(canonical_dir: &Path, id: u64) -> PathBuf {
+    canonical_dir.join(format!(
+        "{SEGMENT_FILE_PREFIX}{id:0width$}.tmp",
+        width = SEGMENT_ID_DIGITS
+    ))
+}
+
+/// Creates and fully initializes a new segment file, crash-atomically with
+/// respect to a hard crash (process abort, power loss), not only a
+/// graceful `Err` return (Group 1.2/1.3, extended): the header is written
+/// and fsynced to a *temporary* name first, and only `fs::rename`d to the
+/// real segment name — a single atomic directory-entry operation on both
+/// NTFS and POSIX filesystems — once it is fully durable. A crash at any
+/// point before the rename therefore leaves nothing at all named `path`;
+/// recovery sees exactly the pre-rotation directory state, never a
+/// zero-byte or headerless file at a real segment's name (which the
+/// directory scan cannot tell apart from genuine corruption — WAL Spec
+/// §6.2 step 1 correctly treats *any* unreadable header as corruption
+/// regardless of position, since a legitimately torn write can only ever
+/// happen at the very tail of the one already-active segment, never to a
+/// segment that has not yet been renamed into existence).
 ///
-/// Atomic w.r.t. partial failure (Group 1.3): if the header write/fsync
-/// fails, the just-created (partially-initialized) file is removed
-/// best-effort before returning the original error, so a segment file
-/// never exists on disk without a valid header — recovery would otherwise
-/// treat it as corruption on the next open. If that cleanup removal also
-/// fails, both errors are folded into the one returned `EngineError` so
-/// neither is silently dropped.
+/// Every fallible step cleans up after itself before returning its error —
+/// the temp file, for a failure at or before the rename; the just-renamed
+/// `path` itself, for a failure after it (the directory fsync) — so any
+/// `Err` from this function leaves no trace at all under `path`, matching
+/// `rotate()`'s own "behaves as if it were never called" contract. If a
+/// cleanup removal itself also fails, both errors are folded into the one
+/// returned `EngineError` so neither is silently dropped.
 fn create_new_segment_file(path: &Path, id: u64, canonical_dir: &Path) -> Result<File> {
+    let tmp_path = tmp_segment_path(canonical_dir, id);
+    // Best-effort: a prior crash between this id's temp file being created
+    // and its rename below could leave a stale temp file behind. Clear it
+    // first so `create_new` below fails only for a genuine, unexpected
+    // collision, not a harmless leftover from an earlier aborted attempt
+    // at this exact id (`rotate` never reuses an id, but a retried
+    // `rotate()` call after a *returned* error, as opposed to a hard
+    // crash, could otherwise collide with its own previous attempt).
+    let _ = fs::remove_file(&tmp_path);
+
     let mut file = OpenOptions::new()
         .create_new(true)
         .read(true)
         .write(true)
-        .open(path)?;
+        .open(&tmp_path)?;
 
-    // Group 1.3: every failure from here on (header write, header fsync,
-    // *or* the directory fsync) must clean up the just-created file the
-    // same way — "any failure after create_new(true)" per spec, not just
-    // a header-write failure specifically. `init_result` folds all three
-    // fallible steps into one `Result` so exactly one cleanup path
-    // handles all of them.
     let init_result = file
         .write_all(&encode_segment_header(id))
-        .and_then(|()| file.sync_all())
-        .and_then(|()| fsync_dir(canonical_dir));
+        .and_then(|()| file.sync_all());
 
     if let Err(init_err) = init_result {
         drop(file);
-        return Err(match fs::remove_file(path) {
+        return Err(match fs::remove_file(&tmp_path) {
             Ok(()) => init_err.into(),
             Err(remove_err) => EngineError::Io(io::Error::new(
                 init_err.kind(),
                 format!(
                     "segment {id} initialization failed ({init_err}) and removing the \
-                     partially-created file also failed ({remove_err})"
+                     partially-created temp file also failed ({remove_err})"
+                ),
+            )),
+        });
+    }
+
+    // Close the temp-path handle before renaming: on Windows, an open
+    // handle without `FILE_SHARE_DELETE` (not part of `std::fs::File`'s
+    // default share mode) can make a rename of that same file fail — using
+    // a fresh handle after the rename (below) sidesteps the platform
+    // restriction entirely instead of depending on share-mode details.
+    drop(file);
+
+    if let Err(rename_err) = fs::rename(&tmp_path, path) {
+        return Err(match fs::remove_file(&tmp_path) {
+            Ok(()) => rename_err.into(),
+            Err(remove_err) => EngineError::Io(io::Error::new(
+                rename_err.kind(),
+                format!(
+                    "segment {id} rename into place failed ({rename_err}) and removing the \
+                     temp file also failed ({remove_err})"
+                ),
+            )),
+        });
+    }
+
+    // The rename is the directory-entry change Group 1.2's "fsync the
+    // directory" rule protects; nothing was fsynced for the directory
+    // before this point because, before the rename, the directory did not
+    // yet reference this segment at all. On failure, `path` already names
+    // a fully header-valid segment file — but per this function's
+    // documented "leaves no trace" contract on any `Err` return (matched
+    // by `rotate_surfaces_dir_fsync_failure_and_leaves_state_unchanged`),
+    // remove it best-effort before returning, same as every earlier
+    // failure path above.
+    if let Err(dir_err) = fsync_dir(canonical_dir) {
+        return Err(match fs::remove_file(path) {
+            Ok(()) => dir_err.into(),
+            Err(remove_err) => EngineError::Io(io::Error::new(
+                dir_err.kind(),
+                format!(
+                    "segment {id} directory fsync failed ({dir_err}) and removing the \
+                     renamed-into-place file also failed ({remove_err})"
                 ),
             )),
         });
     }
 
     fire_abort_hook(AbortPoint::AfterHeader);
+
+    // Re-open at the final path rather than reusing the temp-path handle:
+    // `SegmentIo::append` writes positionally (`write_all_at`), never
+    // relying on the handle's seek offset, so a fresh handle is exactly as
+    // usable as the original one would have been.
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
     Ok(file)
 }
 
@@ -909,10 +983,10 @@ pub enum AbortPoint {
     /// Immediately after `sync()`'s `fsync` call completes.
     AfterSync,
     /// `GroupCommitter::await_durable`: immediately before a caller that
-    /// found no active filling leader attempts to become one (before
-    /// `filling_active` is set).
+    /// found no active leader attempts to become one (before
+    /// `leader_active` is set).
     BeforeLeader,
-    /// `GroupCommitter::await_durable`: immediately after `filling_active`
+    /// `GroupCommitter::await_durable`: immediately after `leader_active`
     /// is flipped to `true` (under `batch`), before the batch-window wait
     /// begins.
     AfterLeaderElection,

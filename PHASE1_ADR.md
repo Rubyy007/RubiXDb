@@ -318,12 +318,26 @@ handoff at a time (the next batch cannot even be elected until this
 handoff releases `filling_active`). Full design: `PHASE1_GROUP_COMMIT.md`
 §1 (updated state machine: `FILLING`/`FSYNCING` replace `LEADER_ACTIVE`).
 
-**Decision (adoption): reverted to the pre-pipelining serial design as
-the default is recommended, not yet unilaterally executed** — see
-`PHASE1_TEST_RESULTS.md` §9E.5. The implementation remains in the tree,
-correctness-verified, because the measurement is only valid on the
-environment it was taken on (Windows/NTFS) and a different platform
-could plausibly reach a different conclusion (§9E.4).
+**Decision (adoption), update — executed**: §9E.5's recommendation (a)
+has now been carried out. `src/wal/group_commit.rs` and `src/wal/mod.rs`
+were restored to their pre-pipelining state (`git checkout 00fc5d0 --
+src/wal/group_commit.rs src/wal/mod.rs`, commit `<this cycle>`) — the
+serial `leader_active` design, with §9D's contention-free timing
+instrumentation kept. Reason for executing now rather than continuing to
+carry the regression: a routine post-optimization regression check
+(`PROCESS.md`'s own gate, §21/§27 of the operating brief this cycle
+follows) found the pipelined code was still the *only* code path in the
+tree — despite being documented as "not adopted," there was no serial
+fallback to actually fall back to. That is a real discrepancy between the
+record and the shipped artifact, not just an open recommendation; leaving
+it uncorrected would mean the default build kept paying pipelining's
+measured throughput cost indefinitely. See `PHASE1_TEST_RESULTS.md` §9F
+for the revert's own verification (regression gate + M1.2/M1.3
+re-measurement, matching §9D.4 within run-to-run noise). The pipelined
+design is still recoverable from git history (`a2c2dc0`) if a future
+Linux measurement or the `FlushFileBuffers` investigation in §9E.4
+reverses this conclusion — nothing about this revert prevents revisiting
+it, only stops it from being the silent default.
 
 **Finding**: correctness is fully intact — every invariant in
 `PHASE1_GROUP_COMMIT.md` §2 still holds (the poisoning-discovered-at-
@@ -357,3 +371,74 @@ work in §9E.5's option (b)).
 
 **Verification**: see `PHASE1_TEST_RESULTS.md` §9E.2 (correctness) and
 §9E.3 (performance, reproduced twice).
+
+## ADR-15: `create_new_segment_file` writes to a temp name and renames into place, not `create_new` at the final name directly
+
+**Context**: while re-verifying the crash-consistency suite as part of
+the ADR-14 revert's own regression gate (§21/§27 of the operating
+brief), `m1_6_crash_consistency::crash_consistency_across_abort_points`
+failed **deterministically** (8/8 runs, both before and after the
+revert — so not caused by it) at `DuringBatchWaitPre`/`DuringBatchWaitPost`,
+with `corrupted_segments = [2]`. This had previously been reported as
+PASS (`PHASE1_TEST_RESULTS.md` §11, 2026-09-14); it is not known whether
+the underlying window was newly introduced or always present and merely
+unlucky to hit before. Full investigation and evidence:
+`PHASE1_TEST_RESULTS.md` §9F.
+
+**Root cause**: `create_new_segment_file` (`src/wal/mod.rs`) created the
+new segment file with `OpenOptions::create_new(true)` **at its real,
+final name**, then wrote and fsynced the 24-byte header, then fsynced the
+directory. A process-wide crash between file creation and the header
+write — a real window, not a fabricated one, and unrelated to which
+`AbortPoint` the test happened to be targeting, since `std::process::
+abort()` can strike any thread mid-flight — left a genuine 0-byte file
+at the segment's real name. `scan_directory`'s header-validation step
+(WAL Spec §6.2 step 1) correctly treats an unreadable header as
+corruption *regardless of position*, since only the single active
+(last) segment is allowed to show a legitimately torn shape — so this
+was not a misclassification, but the window that produced the
+zero-byte file in the first place should not have existed.
+
+**Decision**: `create_new_segment_file` now writes and fsyncs the header
+to a **temporary name** (`wal-<id>.tmp` — `tmp_segment_path`, deliberately
+using a suffix `parse_segment_file_name` never matches, so a leftover
+temp file is invisible to every recovery/listing path regardless of this
+fix), closes that handle, `fs::rename`s it into place (one atomic
+directory-entry operation on both NTFS and POSIX), fsyncs the directory,
+then re-opens the final path for the handle it returns. `SegmentIo::
+append` writes positionally (`write_all_at`), never relying on the
+handle's seek offset, so the fresh post-rename handle is exactly as
+usable as the original would have been. A crash at any point before the
+rename now leaves nothing at all under the segment's real name — recovery
+sees exactly the pre-rotation directory state, never a headerless file
+masquerading as a real (and, if non-last, corrupted) segment. Every
+fallible step (temp-file init, rename, directory fsync) cleans up after
+itself on `Err`, preserving `create_new_segment_file`'s and `rotate()`'s
+existing "behaves as if never called" contract on failure — including
+`rotate_surfaces_dir_fsync_failure_and_leaves_state_unchanged`, which now
+asserts against a post-rename cleanup path instead of a pre-rename one
+but keeps the same observable guarantee.
+
+**Alternatives considered**: leave the file at its final name and add an
+`AbortPoint`-style hook *between* creation and header-write so at least
+the instrumented test suite could no longer land in this window by
+chance (rejected — this would hide the bug from `std::process::abort()`
+at arbitrary points and from a real power loss, which is the actual
+threat model `tests/crash_consistency.rs`'s own doc comment describes;
+it would make the test pass without making the window disappear).
+Loosening `scan_directory`'s "any non-last torn/corrupt segment stops the
+scan" rule to specifically tolerate a *fully empty* non-last segment
+(rejected — indistinguishable on-disk from a segment that started
+receiving a header write and was truncated after a few bytes, which is
+genuine corruption; weakening the general rule to special-case zero bytes
+would be exactly the kind of correctness-for-convenience trade the
+operating brief's §19 forbids).
+
+**Verification**: `PHASE1_TEST_RESULTS.md` §9F — 87/87 lib tests (both
+build configurations), `cargo clippy --all-targets --all-features -- -D
+warnings` clean, `cargo fmt --check` clean, `tests/crash_consistency.rs`
+(the pre-Phase-1 suite) still passes, and `m1_6_crash_consistency::
+crash_consistency_across_abort_points` passes 8/8 consecutive runs after
+the fix (was 0/8 before it, both pre- and post-ADR-14-revert). Full
+`group_commit` suite: 6/8 pass — the same M1.2/M1.3 throughput misses as
+always (§18), nothing new.

@@ -277,3 +277,20 @@ this pass.
   which would flag this codebase's own correct typography as an error).
 - Added "# Safety" and "# Durability" sections to `wal::mod`'s
   module-level doc comment.
+
+#### Fixed
+
+- `create_new_segment_file` (rotation and initial-segment creation) now
+  writes and fsyncs a new segment's header to a temporary file name and
+  `fs::rename`s it into place, instead of writing the header directly at
+  the segment's final name. A crash between file creation and header
+  write previously left a zero-byte file at a real segment name, which
+  recovery correctly (but undesirably) reported as a corrupted segment.
+  Found by a deterministic `crash_consistency_across_abort_points`
+  failure; see `PHASE1_TEST_RESULTS.md` §9F.2 and `PHASE1_ADR.md` ADR-15.
+- Reverted the `filling_active`/`fsyncing_active` batch-pipelining split
+  back to the single-phase `leader_active` design: measured to regress
+  throughput on this project's development environment (Windows/NTFS)
+  rather than improve it, with the change left uncommitted in the tree
+  as pipelining's own regression check rather than reverted. See
+  `PHASE1_TEST_RESULTS.md` §9E/§9F.1 and `PHASE1_ADR.md` ADR-14.

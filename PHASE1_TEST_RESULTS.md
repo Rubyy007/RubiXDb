@@ -834,6 +834,233 @@ not Windows/NTFS.
 `target/phase1-evidence/m1_3_pipelined_isolated_rerun.txt` (both local,
 not committed; regenerate with the command in §9E.3).
 
+## 9F. This cycle: §9E.5's revert executed, plus a real crash-consistency bug found and fixed along the way
+
+**Date/commit**: 2026-09-15, this session (`PHASE1_ADR.md` ADR-14's
+"update — executed" and ADR-15). Continues directly from §9E — nothing
+in §9A–§9E is revised by this section; it is a new cycle layered on top,
+per this document's standing rule against silently overwriting prior
+results.
+
+### 9F.1 Executing ADR-14's revert (Phase B pipelining → serial)
+
+**What was found**: §9E.5 recommended reverting to the pre-pipelining
+serial design as the shipped default, "unless there is a reason to
+expect the target deployment environment is not Windows/NTFS" — no such
+reason exists. But `src/wal/group_commit.rs` and `src/wal/mod.rs` at the
+start of this cycle still had `filling_active`/`fsyncing_active` as the
+*only* code path; there was no serial fallback in the tree to actually
+select. A recommendation had been written down; the code had not been
+changed to match it. This is exactly the class of gap the operating
+brief's §27 ("Measure → ... → Compare → Keep or Revert" — not "→ Compare
+→ write down what you'd keep or revert") exists to catch.
+
+**Change**: `git checkout 00fc5d0 -- src/wal/group_commit.rs
+src/wal/mod.rs` — commit `00fc5d0` is exactly §9D's "fixed
+instrumentation, serial `leader_active`" state (confirmed by inspection
+before applying: `grep leader_active` at that commit shows the pre-split
+design; the pipelining commit `a2c2dc0`'s diff to `mod.rs` beyond that
+point is doc-comment wording only, no behavior). No other file
+references `filling_active`/`fsyncing_active`/`begin_fsyncing_phase`
+outside these two files (verified by repo-wide grep), so the revert is
+self-contained.
+
+**Verification — regression gate** (§21 of the operating brief):
+
+| Check | Result |
+|---|---|
+| `cargo build --lib` (with/without `--features test-util`) | clean |
+| `cargo test --lib` | 87/87 |
+| `cargo test --lib --release --features test-util` | 87/87 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `tests/crash_consistency.rs` (pre-Phase-1 suite) | 2/2 |
+| `group_commit` suite (M1.1–M1.6, watermark_monotonicity) | 6/8 — same pre-existing M1.2/M1.3 throughput misses as every prior cycle; **no new failures** *before* §9F.2's fix is applied (see below — one failure below was already latent, not introduced by this revert) |
+
+**Re-measured M1.2/M1.3, isolated, environment healthy (`TEMP` on the
+97GB-free `E:` volume, not the 97%-full `C:` volume — see §9F.2's
+sidebar)**:
+
+| Level | This cycle (post-revert) | §9D.4 (pre-pipelining baseline) | §9E.3 (pipelined, rejected) |
+|---|---|---|---|
+| M1.2 (100 writers) | 10,708–10,784 ops/sec | 10,480 ops/sec | 8,349 ops/sec |
+| M1.3 (1,000 writers) | 61,691–63,204 ops/sec | 63,293 ops/sec | 36,899–39,625 ops/sec |
+
+Both levels land within normal run-to-run variance of §9D.4 (§18 already
+documents up to ~5x variance across sessions depending on machine load;
+this cycle's spread is far tighter, ~2-3%) and clearly above the
+pipelined numbers — the revert recovers the performance §9E measured
+being given up, exactly as predicted.
+
+### 9F.2 A real crash-consistency bug, found by the revert's own regression gate
+
+Running the full `group_commit` suite as part of verifying the revert
+(above) surfaced `m1_6_crash_consistency::crash_consistency_across_
+abort_points` failing — **deterministically, 100% of runs**, not the
+flaky/rare kind of failure a race condition usually produces:
+
+```
+thread 'm1_6_crash_consistency::crash_consistency_across_abort_points' panicked:
+abort point DuringBatchWaitPost must never leave corruption behind, got [2]
+```
+
+**First check: is this caused by the revert?** No. The identical test
+was run against the pre-revert (`a2c2dc0`, pipelined) tree via `git
+stash` and failed too — same symptom, different `AbortPoint` name
+(`DuringBatchWaitPre`), same `corrupted_segments = [2]`. This confirms
+the bug is independent of ADR-14's decision and predates this cycle. It
+directly contradicts §11's prior report of this same test (2026-09-14:
+"PASS — all 11 points"); it is not established here whether the
+underlying window is newly introduced by something between that date and
+this session, or whether it was always present and simply not hit by
+that day's particular run timing — the fix in this section closes the
+window either way, so that question was not pursued further.
+
+**Root cause** (inspecting the preserved failing run's WAL directory,
+`TEMP` not cleaned up because the test panics before its own cleanup
+line runs): segment 1 = 144 bytes (valid, several records), **segment 2
+= 0 bytes**, segment 3 = 24 bytes (a bare header, no records).
+`create_new_segment_file` (`src/wal/mod.rs`) created the new segment
+file with `create_new(true)` **at its real, final name**, then wrote and
+fsynced its header, then fsynced the directory. `std::process::abort()`
+is process-wide — it can strike *any* thread at *any* instant, not only
+at the specific `AbortPoint` the test happens to be targeting that run —
+so a crash landing in the real window between file-creation and
+header-write (opened by the rotator thread this test always spawns,
+mirroring M1.5) left a genuine zero-byte file at the segment's real
+name. `scan_directory`'s header-validation step correctly treats *any*
+unreadable header as corruption regardless of position (WAL Spec §6.2
+step 1 — only the single active/last segment may legitimately show a
+torn shape), discards it, and — per its own documented Tier-2 fallback
+(`src/wal/mod.rs`, `scan_directory`, "a fresh segment is opened after the
+highest known ID") — opens segment 3 fresh so the returned `FileWal` is
+still usable. Every piece of that response is correct *given* a
+zero-byte segment 2 exists; the bug is that the window producing it
+should not have existed at all.
+
+**Fix**: `create_new_segment_file` now writes+fsyncs the header to a
+temporary name (`wal-<id>.tmp`) first, closes that handle, `fs::rename`s
+it into place (one atomic directory-entry operation on NTFS and POSIX
+alike), fsyncs the directory, then re-opens the final path for the
+handle it returns (`SegmentIo::append` writes positionally via
+`write_all_at`, never relying on the handle's seek offset, so a fresh
+post-rename handle works identically). A crash before the rename now
+leaves nothing at all under the segment's real name. Full design
+rationale and alternatives considered: `PHASE1_ADR.md` ADR-15. No wire
+format change, no validation weakened, no recovery semantics changed —
+only where a new segment's bytes physically land before they are
+complete.
+
+**Verification**:
+
+| Check | Before fix | After fix |
+|---|---|---|
+| `crash_consistency_across_abort_points`, 8 consecutive runs | 0/8 (deterministic failure, both pre- and post-ADR-14-revert) | **8/8** |
+| `cargo test --lib` (both build configs) | — | 87/87, unaffected |
+| `cargo clippy --all-targets --all-features -- -D warnings` | — | clean |
+| `cargo fmt --check` | — | clean |
+| `tests/crash_consistency.rs` | — | 2/2, unaffected |
+| `rotate_surfaces_dir_fsync_failure_and_leaves_state_unchanged` (updated for the new cleanup path — see ADR-15) | — | pass |
+| Full `group_commit` suite | 5/8 (M1.2, M1.3, M1.6 all failing) | 6/8 (only the pre-existing M1.2/M1.3 throughput misses remain) |
+| M1.2/M1.3 throughput, same run | 10,784 / 63,204 ops/sec | 10,708 / 61,691 ops/sec — unchanged within noise; the fix touches only rotation, not the append/fsync hot path |
+
+**Why this matters for §19/§20 of the operating brief**: this phase's
+own §11 had, until this cycle, reported crash consistency as an
+unconditional PASS. That was not true at the moment this cycle began —
+a real, deterministic window existed where a crash during rotation could
+produce a segment the recovery path classifies as corrupted (and works
+around, but only after flagging it) rather than cleanly absent. Finding
+and fixing this before it shipped, as a direct consequence of following
+the brief's own regression-gate requirement after an unrelated
+performance change, is the process working as intended, not a detour
+from the performance work.
+
+**Evidence**: `target/phase1-evidence/m1_2_3_after_pipelining_revert.txt`
+(full suite immediately after the revert, before §9F.2's fix — shows the
+pre-existing M1.6 failure), `target/phase1-evidence/group_commit_suite_
+after_rotation_atomicity_fix.txt` (full suite after the fix).
+
+## 9G. Thread-count saturation sweep (operating brief §8)
+
+**Question**: is 1,000 OS threads actually the right execution model, or
+does throughput saturate (or even regress) at a lower thread count on
+this hardware — the brief explicitly asks not to assume more threads
+means more throughput, and to find the smallest concurrency level that
+gives the highest stable throughput.
+
+**Method**: `examples/group_commit_load_test.rs`'s `CONCURRENCY_LEVELS`
+const was temporarily widened from the spec-mandated `[1, 10, 100,
+1_000]` to `[1, 10, 32, 64, 100, 128, 256, 512, 1_000]` for one run, then
+reverted to the original array before this cycle's commit (`git diff`
+against that file is empty as committed — this section is the only
+record of the sweep). Same harness, same per-level warm-up/measured
+op-count targets as every other §16 run (`WARMUP_OPS_TOTAL_TARGET` =
+3,000, `MEASURED_OPS_TOTAL_TARGET` = 10,000, both divided across however
+many threads are active at that level — so higher levels get fewer
+ops/thread, not more total measured work; see the caveat below).
+
+| Concurrency | Total ops | Writes/sec | p50 | p95 | p99 | Max | Batches | Avg batch size | Recovery |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 10,000 | 246 | — | — | — | — | — | — | OK |
+| 10 | 10,000 | 1,091 | — | — | — | — | — | — | OK |
+| 32 | 10,016 | 3,257 | — | — | — | — | — | — | OK |
+| 64 | 10,048 | 6,254 | — | — | — | — | — | — | OK |
+| 100 | 10,000 | 7,175 | — | — | — | — | — | — | OK |
+| 128 | 10,112 | 11,537 | — | — | — | — | — | — | OK |
+| 256 | 9,984 | 20,928 | 9.791ms | 18.128ms | 20.082ms | 30.493ms | 51 | 195.76 | OK |
+| 512 | 10,240 | 39,574 | 10.293ms | 16.724ms | 21.657ms | 26.002ms | 25 | 409.60 | OK |
+| 1,000 | 20,000 | 41,646 | 17.903ms | 38.490ms | 45.644ms | 62.305ms | 38 | 526.32 | OK |
+
+(p50–max/batch columns omitted for the lower levels to keep the table
+focused on the question this section asks — full per-level output,
+including those columns for every level, is in the evidence file below.)
+
+**Finding**: throughput is **monotonically increasing with concurrency
+across the entire swept range, 1 through 1,000 — no saturation point and
+no regression at any intermediate level**. 128, 256, and 512 writers each
+underperform 1,000; there is no thread count in this range at which fewer
+threads win. This directly answers §8's question in the negative for
+this workload/hardware: **1,000 threads is not merely "not harmful," it
+is the best-performing level actually tested.** The mechanism is
+consistent with this WAL's whole design: Group Commit's throughput is
+gated by `durable_ops_per_sync`, and `avg_batch_size` scales with
+concurrency (51 batches at 195.76 avg size at 256 writers → 25 batches at
+409.60 at 512 → 38 batches at 526.32 at 1,000, `sync_count` falling even
+as total ops roughly doubles at each step) — more concurrent demand keeps
+directly feeding larger batches per `fsync`, exactly the lever §6/§15
+identify as the one that matters on an `fsync`-latency-bound system. This
+is the opposite of a scheduler-oversubscription regression (§7's
+hypothesis to test for): CPU/context-switch overhead was not directly
+measurable (no profiler authorized, ADR-11), but if it were the dominant
+cost at high thread counts, throughput would be expected to plateau or
+fall past some level, which it does not, anywhere in this sweep.
+
+**Caveat — this sweep is not directly comparable to §9/§14/§16's
+dedicated M1.2/M1.3 numbers**, and should not be read as a replacement
+for them: this harness's per-level total-op target (~10,000, ~20,000 at
+1,000 writers) means higher concurrency levels get *fewer* ops per
+thread (10 at 1,000 writers) than the dedicated M1.2/M1.3 tests (1,000
+ops/thread) — less time for `WINDOW_EMA_DIVISOR`'s adaptive window to
+reach steady state, which is almost certainly why this sweep's 100-writer
+number (7,175 ops/sec) and 1,000-writer number (41,646 ops/sec) are both
+well below the dedicated tests' same-level numbers (10,708–10,784 and
+61,691–63,204 respectively, §9F.1). The sweep's *shape* (monotonic
+increase, no saturation) is still a valid answer to §8's question; its
+*absolute* numbers are a ramp-up-dominated harness artifact, not this
+system's steady-state ceiling — use §9/§14/§16 for that.
+
+**Conclusion**: no change is warranted to the concurrency architecture.
+§9 (thread-per-caller with leader/follower batching) remains the right
+execution model on this hardware for this workload shape; there is no
+evidence in this sweep that a fixed worker-pool or thread-per-core
+redesign (§9 of the operating brief) would outperform it, and the
+brief's own gate for such a redesign ("if profiling proves OS-thread
+scheduling is a major bottleneck") is not met — nothing measured here
+points at scheduling as a bottleneck at all.
+
+**Evidence**: `target/phase1-evidence/thread_count_saturation_sweep.txt`
+(full output, all 9 levels, every column).
+
 ## 10. Property-test results
 
 **Command**: `cargo test --release --test group_commit --features
@@ -857,16 +1084,28 @@ there was no failure.)
 
 ## 11. Crash-consistency results (per `AbortPoint`)
 
+**Superseded by §9F.2 — read that section first.** This section's
+original 2026-09-14 PASS result, below, is kept verbatim rather than
+deleted (this file's own rule), but it was **not actually reliable**: a
+real bug (non-atomic new-segment-file creation, §9F.2/`PHASE1_ADR.md`
+ADR-15) meant this exact test failed deterministically, 8/8 runs, when
+re-run on 2026-09-15 — on the code as it stood *before* this cycle's fix,
+i.e. this section's original PASS should be read as "passed that day, on
+that run's timing, not as a structural guarantee" rather than as evidence
+the window did not exist. §9F.2 documents the fix; re-verification after
+it: **8/8 consecutive PASS**, same command, same 11 points.
+
 **Command**: `cargo test --release --test group_commit --features
 test-util crash_consistency_across_abort_points -- --nocapture`
-**Date/time**: 2026-09-14
+**Date/time**: 2026-09-14 (original run, see the correction above)
 **Configuration**: 100 writer threads per abort point, real child-process
 `std::process::abort()`, `GroupCommitter` with defaults, plus a rotator
 thread so `DuringRotationPre`/`Post` are genuinely reachable
 **Observed result**: `test result: ok. 1 passed; 0 failed; finished in
 1.12s` (all 11 abort points run as sub-invocations within the single
 parent test)
-**PASS/FAIL**: **PASS** — all 11 points
+**PASS/FAIL**: **PASS** — all 11 points, as measured that day (see
+correction above for why this was not the full picture)
 
 | `AbortPoint` | Real, reachable boundary | Result |
 |---|---|---|
@@ -1348,6 +1587,18 @@ fixed it):
    parallel test runner let them race (env vars are process-global, not
    per-thread). Fixed by merging both scenarios into one sequentially-run
    test function.
+10. **Non-atomic new-segment-file creation could leave a zero-byte
+    segment at a real segment name if a crash landed between file
+    creation and header write** (§9F.2, `PHASE1_ADR.md` ADR-15): found by
+    a deterministic (8/8) `crash_consistency_across_abort_points` failure
+    while re-verifying correctness after the pipelining-revert in §9F.1 —
+    unrelated to that revert (reproduced on the pre-revert tree too).
+    `create_new_segment_file` previously used `create_new(true)` directly
+    at the segment's final name; a crash before the header write left a
+    file recovery correctly (but undesirably) classified as corruption.
+    Fixed by writing the header to a temporary name and `fs::rename`-ing
+    it into place only once fully durable, closing the window entirely.
+    No wire-format, validation, or recovery-semantics change.
 
 ## 18. Remaining limitations
 
@@ -1424,7 +1675,7 @@ Everything else on the brief's own gate checklist (§25) is met:
 | Release tests pass | Same as above — passes except M1.2/M1.3 |
 | Clippy clean | Yes, including `--features phase1-window-experiment` (§12; one real finding caught and fixed during the sweep work itself — a stale hardcoded divisor clippy flagged as dead code, §17 finding #8) |
 | Formatting clean | Yes (§12) |
-| Crash-consistency tests pass | Yes, all 11 `AbortPoint`s (§11), re-verified after the formula fix |
+| Crash-consistency tests pass | Yes, all 11 `AbortPoint`s — **but see §9F.2/ADR-15**: this was actually false on 2026-09-15 (a real non-atomic-segment-creation bug, unrelated to the formula/window work, made this test fail deterministically) until fixed and re-verified 8/8 in this cycle; current code is genuinely green |
 | Concurrency tests pass (correctness) | Yes — every correctness assertion in M1.2/M1.3/M1.5, and the full watermark_monotonicity proptest, pass, both before and after the fix; only the M1.2/M1.3 *throughput numbers* fail |
 | No deadlocks detected | Yes — none observed across any run this session, including the 1,000-writer/1,000,000-op M1.3 run and the 30-run window-size sweep |
 | No waiter leaks | Yes — no per-waiter state exists to leak (§13) |
@@ -1452,3 +1703,19 @@ All three are calls for the project owner to make, not decisions this
 document makes on its own. Every other gate is satisfied; this remains a
 single, well-evidenced, correctness-orthogonal blocker — now backed by a
 controlled experiment and a real fix, not algebra alone.
+
+**Update, this cycle (§9F)**: two changes since the paragraph above was
+written, neither changing the verdict. (1) ADR-14's revert recommendation
+was executed — the shipped default is once again the serial design
+measured in §9D.4, not the pipelined design §9E measured regressing.
+Throughput is unchanged within noise (10,708–10,784 / 61,691–63,204
+ops/sec — still short of target, same as always). (2) A real
+crash-consistency bug (non-atomic new-segment-file creation, §9F.2, ADR-
+15) was found by this cycle's own regression gate and fixed; it was
+unrelated to throughput and did not exist because of any performance
+work — but it means the "Crash-consistency tests pass" row above was not
+actually true at the start of this cycle, and is now genuinely true
+again, re-verified 8/8. Both changes reinforce rather than alter the
+verdict: **Phase 1 remains NOT PRODUCTION READY**, blocked on M1.2/M1.3
+throughput alone, with every other gate item independently re-confirmed
+current as of this cycle.

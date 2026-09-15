@@ -176,44 +176,13 @@ impl ShutdownReport {
 /// minimal (`PROCESS.md` §1.10): no per-waiter registry is needed, since
 /// every waiter independently re-derives its own outcome from
 /// `durable_through`/`poisoned` after every wake.
-///
-/// **Pipelining (§9D/ADR-13's follow-on):** a batch's lifecycle has two
-/// independently-gated phases, `filling` (election through the window
-/// wait through the sync-target snapshot) and `fsyncing` (the `fsync`
-/// syscall itself through watermark publication). They used to be one
-/// phase (`leader_active`) held by the same thread start-to-finish,
-/// which meant batch `N+1`'s window could not even begin until batch
-/// `N`'s `fsync` had completed — the entire cycle was strictly
-/// serialized (`window + snapshot + fsync`, back to back, per batch).
-/// Splitting them lets batch `N+1`'s leader start filling (accepting
-/// appends, running its own window wait) the moment batch `N`'s
-/// snapshot is taken — while batch `N`'s `fsync` is still in flight —
-/// so the *window* portion of consecutive batches overlaps with the
-/// *fsync* portion of the batch ahead of it. `fsync` itself stays
-/// strictly one-at-a-time (`fsyncing_active`): only the window/snapshot
-/// work overlaps, not the syscall. See `run_as_leader`'s doc comment for
-/// the exact handoff and `PHASE1_GROUP_COMMIT.md` §1 for the updated
-/// state machine.
 #[derive(Debug, Default)]
 struct BatchState {
-    /// A thread is currently inside the batch-window wait (and the
-    /// snapshot that follows it). No other thread may start a window
-    /// while this is true — this is the mutual-exclusion boundary for
-    /// "filling" a batch, not for the whole batch lifecycle. Only ever
-    /// set by a thread that just transitioned `false -> true` under this
-    /// lock (electing itself the new filling leader); only ever cleared
-    /// by that same thread, at the filling→fsyncing handoff (see
-    /// `run_as_leader`), which happens *before* its own `fsync` starts,
-    /// not after it finishes.
-    filling_active: bool,
-    /// A thread is currently executing `fsync`. Filling of the next
-    /// batch may proceed concurrently (see `filling_active`); only
-    /// `fsync` itself is serialized system-wide, so at most one thread
-    /// ever holds this at a time. Set by the same thread, in the same
-    /// critical section, that clears `filling_active` (an atomic
-    /// handoff — see `run_as_leader`); cleared by that thread once its
-    /// `fsync` returns, success or failure.
-    fsyncing_active: bool,
+    /// `true` while some thread is between "elected leader" and "finished
+    /// this batch" (success or failure). Only ever set by a thread that
+    /// just transitioned `false -> true` under this lock; only ever
+    /// cleared by that same thread once its batch concludes.
+    leader_active: bool,
     /// Set once, permanently, the first time a leader's `fsync` fails.
     /// Never cleared — per the algorithm, a poisoned `GroupCommitter` stays
     /// poisoned until it is dropped and a fresh one is constructed. Stores
@@ -558,9 +527,9 @@ impl GroupCommitter {
                 return Err(Self::shutting_down_error(seq));
             }
 
-            if !guard.filling_active {
+            if !guard.leader_active {
                 super::fire_abort_hook(super::AbortPoint::BeforeLeader);
-                guard.filling_active = true;
+                guard.leader_active = true;
                 self.batch_bytes.store(0, Ordering::Relaxed);
                 super::fire_abort_hook(super::AbortPoint::AfterLeaderElection);
                 drop(guard);
@@ -695,7 +664,7 @@ impl GroupCommitter {
 
         let deadline = Instant::now() + SHUTDOWN_DRAIN_BOUND;
         let mut guard = self.lock_batch();
-        while guard.filling_active || guard.fsyncing_active {
+        while guard.leader_active {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -738,26 +707,11 @@ impl GroupCommitter {
     }
 
     /// Runs the leader side of one batch: wait for the batch window (or
-    /// enough accumulated bytes) to close, snapshot a sync target, hand off
-    /// to the fsyncing phase, `fsync` it *outside* the `wal` lock, then
-    /// publish the outcome to every waiter. Called with `batch.
-    /// filling_active` already `true` (set by the caller in `await_durable`
-    /// under `batch`, which this function itself never re-locks until the
-    /// filling→fsyncing handoff below).
-    ///
-    /// **Pipelining handoff.** Filling (window + snapshot) and fsyncing are
-    /// two separately-gated phases (`BatchState`'s doc comment). The moment
-    /// this leader's snapshot is taken, `begin_fsyncing_phase` atomically
-    /// clears `filling_active` — letting the *next* batch's leader start
-    /// its own window immediately, even while this batch's `fsync` is
-    /// still ahead of it in line — and either claims `fsyncing_active` for
-    /// this thread (if no other `fsync` is currently in flight) or blocks
-    /// until the one currently in flight finishes. `fsync` itself is never
-    /// run concurrently with another `fsync`: only the window/snapshot
-    /// work of consecutive batches overlaps with the `fsync` ahead of
-    /// them, not the syscall itself. In the steady state this turns the
-    /// per-batch cycle from `window + snapshot + fsync` (strictly serial)
-    /// into `max(window + snapshot, previous batch's fsync)`.
+    /// enough accumulated bytes) to close, snapshot a sync target, `fsync`
+    /// it *outside* the `wal` lock, then publish the outcome to every
+    /// waiter. Called with `batch.leader_active` already `true` (set by
+    /// the caller in `await_durable` under `batch`, which this function
+    /// itself never re-locks until the batch concludes).
     fn run_as_leader(&self) -> Result<()> {
         let durable_through_before_batch = self.durable_through.load(Ordering::Acquire);
 
@@ -783,35 +737,11 @@ impl GroupCommitter {
             Ok(t) => t,
             Err(e) => {
                 self.stat_sync_attempts.fetch_add(1, Ordering::Relaxed);
-                // Snapshot failed before any handoff happened: this batch
-                // never claimed `fsyncing_active`, so only `filling_active`
-                // (and `poisoned`) need clearing/setting here — see
-                // `finish_filling_with_error`.
-                self.finish_filling_with_error(Self::io_kind_of(&e));
+                self.finish_batch_with_error(Self::io_kind_of(&e));
                 return Err(e);
             }
         };
         let t_snapshot_ended = self.timing.now_ns();
-
-        // Filling -> fsyncing handoff (see this method's doc comment).
-        // If another batch's `fsync` is still in flight, this blocks
-        // until it finishes: `fsync` stays strictly one-at-a-time.
-        // `filling_active` is cleared in the same critical section that
-        // claims `fsyncing_active`, so the next batch's leader can never
-        // be elected before this batch has secured its own turn to
-        // `fsync` — preserving FIFO `fsync` order across batches without
-        // a separate queue.
-        if let Err(kind) = self.begin_fsyncing_phase() {
-            // Another batch already poisoned this committer while this
-            // one was filling or waiting for its `fsync` turn — this
-            // batch's own snapshot is now moot. Report the same poisoned
-            // error every other caller would see, rather than attempting
-            // a doomed `fsync` of our own; `finish_fsyncing_*` is not
-            // called here because this batch never claimed
-            // `fsyncing_active` in the first place (see
-            // `begin_fsyncing_phase`'s doc comment).
-            return Err(Self::poisoned_error(kind));
-        }
 
         // `AbortPoint::BeforeSync`/`AfterSync` (`super::AbortPoint`) are
         // fired here, not just inside `FileWal::sync()` (which this leader
@@ -855,52 +785,15 @@ impl GroupCommitter {
                     t_fsync_ended,
                     t_notify_sent,
                 );
-                self.finish_fsyncing_ok();
+                self.finish_batch_ok();
                 Ok(())
             }
             Err(io_err) => {
                 let kind = io_err.kind();
-                self.finish_fsyncing_with_error(kind);
+                self.finish_batch_with_error(kind);
                 Err(EngineError::Io(io_err))
             }
         }
-    }
-
-    /// Filling → fsyncing handoff (see `run_as_leader`'s doc comment).
-    /// Blocks on `condvar` (no timeout — bounded in practice by the
-    /// previous leader's `fsync` actually completing, the same trust this
-    /// module already places in `fsync` returning; this is an internal
-    /// leader-to-leader handoff, not a user-facing wait, so it does not
-    /// need `await_durable`'s bounded-`Timeout` contract) until no other
-    /// batch's `fsync` is in flight. Then, in that same critical section:
-    /// clears `filling_active` (releasing the next batch's leader to
-    /// start filling) and either claims `fsyncing_active` for this thread
-    /// and returns `Ok(())`, or — if this committer was poisoned by that
-    /// other batch while this one waited — leaves `fsyncing_active`
-    /// unclaimed and returns the poisoned `io::ErrorKind` instead.
-    /// Either way, `filling_active` is always released here, and
-    /// `notify_all` always follows: the next filling leader (and any
-    /// follower re-checking `poisoned`) must not wait for this batch's
-    /// own `fsync` — or poisoned bailout — to also finish first.
-    fn begin_fsyncing_phase(&self) -> std::result::Result<(), io::ErrorKind> {
-        let mut guard = self.lock_batch();
-        while guard.fsyncing_active {
-            guard = self
-                .condvar
-                .wait(guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        let outcome = match guard.poisoned {
-            Some(kind) => Err(kind),
-            None => {
-                guard.fsyncing_active = true;
-                Ok(())
-            }
-        };
-        guard.filling_active = false;
-        drop(guard);
-        self.condvar.notify_all();
-        outcome
     }
 
     /// Briefly locks `wal` to obtain a cloned handle to the active
@@ -922,8 +815,8 @@ impl GroupCommitter {
     /// this sub-millisecond scale, `thread::sleep`'s OS timer-resolution
     /// overshoot (particularly on Windows) would cost more than the
     /// window itself is worth amortizing `fsync` latency against. Only
-    /// one thread is ever filling a batch at a time (enforced by `batch.
-    /// filling_active`), so this spin never contends with itself.
+    /// one thread is ever the leader at a time (enforced by `batch.
+    /// leader_active`), so this spin never contends with itself.
     ///
     /// `WINDOW_EMA_DIVISOR = 1` (i.e. `EMA / 1`, the EMA itself) replaces
     /// the original `/ 10` — see its own doc comment for the sweep data
@@ -1049,27 +942,10 @@ impl GroupCommitter {
         file.sync_all()
     }
 
-    /// Aborts this batch during its filling phase — before the
-    /// filling→fsyncing handoff — because the sync-target snapshot itself
-    /// failed (a poisoned `SegmentIo`, most likely). `fsyncing_active` was
-    /// never claimed by this batch (the handoff never happened), so only
-    /// `filling_active` needs clearing.
-    fn finish_filling_with_error(&self, kind: io::ErrorKind) {
+    fn finish_batch_ok(&self) {
         {
             let mut guard = self.lock_batch();
-            guard.filling_active = false;
-            guard.poisoned = Some(kind);
-        }
-        self.condvar.notify_all();
-    }
-
-    /// A successful `fsync`. `filling_active` was already released at the
-    /// filling→fsyncing handoff (`begin_fsyncing_phase`), so only
-    /// `fsyncing_active` needs clearing here.
-    fn finish_fsyncing_ok(&self) {
-        {
-            let mut guard = self.lock_batch();
-            guard.fsyncing_active = false;
+            guard.leader_active = false;
         }
         self.condvar.notify_all();
     }
@@ -1077,12 +953,10 @@ impl GroupCommitter {
     /// Sets `poisoned` (permanently — never cleared by any later
     /// successful batch, per the algorithm) and wakes every waiter so none
     /// of them can be left blocked on a batch that will never complete.
-    /// `filling_active` was already released at the filling→fsyncing
-    /// handoff, so only `fsyncing_active` needs clearing here.
-    fn finish_fsyncing_with_error(&self, kind: io::ErrorKind) {
+    fn finish_batch_with_error(&self, kind: io::ErrorKind) {
         {
             let mut guard = self.lock_batch();
-            guard.fsyncing_active = false;
+            guard.leader_active = false;
             guard.poisoned = Some(kind);
         }
         self.condvar.notify_all();
