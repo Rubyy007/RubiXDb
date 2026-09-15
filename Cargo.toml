@@ -18,6 +18,16 @@ bench = []
 # one gated module in src/wal/group_commit.rs) without touching any
 # production code path.
 phase1-window-experiment = []
+# TEMPORARY, experiment-only — see FINAL_WAL_TEST.md's spin-wait A/B
+# section and PHASE1_ADR.md. Not enabled by default, not depended on by
+# any other feature. Gates a runtime, env-var-driven override of the
+# leader's batch-window wait *mechanism* (spin/yield vs. sleep-based vs.
+# hybrid) — orthogonal to `phase1-window-experiment`, which controls the
+# window's *duration*, not how the wait is implemented. Reduces to the
+# exact production spin/yield behavior when its env var is unset, and is
+# fully removable (this feature plus its one gated branch in
+# `src/wal/group_commit.rs`) without touching any production code path.
+phase1-waitmode-experiment = []
 
 [dependencies]
 crc32c = "=0.6.8"

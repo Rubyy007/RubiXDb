@@ -97,6 +97,27 @@ const WINDOW_EMA_DIVISOR: u64 = 1;
 /// notices paying it.
 const PROBE_WINDOW: Duration = Duration::from_micros(200);
 
+/// How often `spin_wait_for_batch_window`'s production wait mechanism
+/// calls `yield_now()` instead of `spin_loop()` — see that function's doc
+/// comment. Shared with `phase1_waitmode_experiment`'s `Spin` mode (the
+/// experiment's own reduction to exactly this production behavior), so
+/// the two can never silently drift apart the way an independently
+/// hardcoded divisor once did (`PHASE1_TEST_RESULTS.md` §17 finding #8).
+const YIELD_EVERY: u32 = 10_000;
+
+/// The production wait step: `spin_loop()` every iteration except every
+/// `YIELD_EVERY`th, which yields instead. Factored out of `spin_wait_for_
+/// batch_window`'s loop body so `phase1_waitmode_experiment`'s `Spin` mode
+/// can call the exact same code rather than a duplicated copy of it.
+#[cfg_attr(feature = "phase1-waitmode-experiment", allow(dead_code))]
+fn wait_step_production(iterations: u32) {
+    if iterations.is_multiple_of(YIELD_EVERY) {
+        std::thread::yield_now();
+    } else {
+        std::hint::spin_loop();
+    }
+}
+
 /// A point-in-time snapshot of batching observability counters —
 /// `GroupCommitter::stats()`. All counts are cumulative since
 /// construction; none of them participate in any correctness decision
@@ -875,7 +896,20 @@ impl GroupCommitter {
         // trying to grow this very batch) without meaningfully coarsening
         // the wait granularity at the sub-millisecond scale this window
         // normally runs at.
-        const YIELD_EVERY: u32 = 10_000;
+        //
+        // **`phase1-waitmode-experiment` (FINAL_WAL_TEST.md's spin-wait
+        // A/B):** the paragraph above justified spin+periodic-yield
+        // against a ~200µs window, where the cost of *any* wait mechanism
+        // is small in absolute terms. The production window is now
+        // milliseconds (`PHASE1_ADR.md` ADR-12), which is large enough
+        // that a sleep-based wait's coarser granularity might no longer
+        // cost more than the CPU/scheduling overhead of spinning for the
+        // whole window saves — an empirical question, not decided here.
+        // `wait_step` below is the *only* thing this experiment changes;
+        // reduces to the exact spin/yield behavior above, unconditionally,
+        // whenever the feature is off or its env var is unset/invalid.
+        #[cfg(feature = "phase1-waitmode-experiment")]
+        let wait_mode = phase1_waitmode_experiment::effective_wait_mode();
         let mut iterations: u32 = 0;
         loop {
             if self.batch_bytes.load(Ordering::Relaxed) >= self.max_batch_bytes {
@@ -892,11 +926,10 @@ impl GroupCommitter {
                 return;
             }
             iterations += 1;
-            if iterations.is_multiple_of(YIELD_EVERY) {
-                std::thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
+            #[cfg(feature = "phase1-waitmode-experiment")]
+            phase1_waitmode_experiment::wait_step(wait_mode, iterations, now, probe_deadline);
+            #[cfg(not(feature = "phase1-waitmode-experiment"))]
+            wait_step_production(iterations);
         }
     }
 
@@ -1134,6 +1167,131 @@ mod phase1_window_experiment {
 
             std::env::remove_var("PHASE1_EXPERIMENT_MAX_WAIT_US");
             std::env::remove_var("PHASE1_EXPERIMENT_EMA_DIVISOR");
+        }
+    }
+}
+
+/// **Experiment-only — see `FINAL_WAL_TEST.md`'s spin-wait A/B section.**
+/// Only compiled with the `phase1-waitmode-experiment` Cargo feature (not
+/// enabled by default, not depended on by any other feature) — a normal
+/// build or `cargo test` never sees this module. Its one purpose is to
+/// answer, empirically, whether `spin_wait_for_batch_window`'s spin+
+/// periodic-yield design — originally justified against a ~200µs window
+/// (`PHASE1_ADR.md` ADR-12) — is still the right choice now that the
+/// production window is milliseconds, by measuring two alternatives
+/// against it under identical benchmark conditions.
+///
+/// **Fully removable**: delete this module, delete `wait_step`'s one
+/// `#[cfg(feature = "phase1-waitmode-experiment")]` call site in `spin_
+/// wait_for_batch_window`, and the `#[cfg_attr(..., allow(dead_code))]`
+/// on `wait_step_production` — a no-op relative to production behavior,
+/// since `Spin` mode below calls that exact same function.
+#[cfg(feature = "phase1-waitmode-experiment")]
+mod phase1_waitmode_experiment {
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum WaitMode {
+        /// Reduces to exactly `wait_step_production` — the production
+        /// behavior, unconditionally, whenever the env var is unset,
+        /// unparseable, or explicitly `"spin"`.
+        Spin,
+        /// `thread::sleep(quantum)` every iteration instead of spinning —
+        /// tests whether Windows' coarser sleep-timer granularity costs
+        /// more than spinning saves, now that the window itself is
+        /// milliseconds rather than sub-millisecond.
+        Sleep,
+        /// `Spin` through the demand-adaptive probe phase (mirrors the
+        /// production algorithm's own early-decision point — no follower
+        /// yet by `probe_deadline` means the batch is likely just the
+        /// leader's own record, where spin's lower latency matters most),
+        /// then `Sleep` for the remainder once the batch has committed to
+        /// the full window.
+        Hybrid,
+    }
+
+    /// `PHASE1_EXPERIMENT_WAIT_MODE`: `"spin"` (default/fallback,
+    /// unset/unparseable also fall back here), `"sleep"`, or `"hybrid"`.
+    pub(super) fn effective_wait_mode() -> WaitMode {
+        match std::env::var("PHASE1_EXPERIMENT_WAIT_MODE").as_deref() {
+            Ok("sleep") => WaitMode::Sleep,
+            Ok("hybrid") => WaitMode::Hybrid,
+            _ => WaitMode::Spin,
+        }
+    }
+
+    /// `PHASE1_EXPERIMENT_SLEEP_QUANTUM_US` (microseconds, parsed as
+    /// `u64`): the `thread::sleep` duration `Sleep`/`Hybrid` modes use per
+    /// iteration. Unset or unparseable ⇒ `200µs` (matches `PROBE_WINDOW`,
+    /// a reasonable a priori granularity — swept independently in
+    /// `FINAL_WAL_TEST.md` rather than hardcoded blindly).
+    fn sleep_quantum() -> Duration {
+        std::env::var("PHASE1_EXPERIMENT_SLEEP_QUANTUM_US")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(Duration::from_micros(200))
+    }
+
+    /// One wait-loop iteration's action, dispatched on `mode`. `now` and
+    /// `probe_deadline` are the caller's own already-computed values (no
+    /// extra `Instant::now()` call here) — `Hybrid` compares them to
+    /// decide which phase it is in.
+    pub(super) fn wait_step(
+        mode: WaitMode,
+        iterations: u32,
+        now: Instant,
+        probe_deadline: Instant,
+    ) {
+        match mode {
+            WaitMode::Spin => super::wait_step_production(iterations),
+            WaitMode::Sleep => std::thread::sleep(sleep_quantum()),
+            WaitMode::Hybrid => {
+                if now < probe_deadline {
+                    super::wait_step_production(iterations);
+                } else {
+                    std::thread::sleep(sleep_quantum());
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Each test below only ever sets/clears its own distinct env var
+        // name, so — unlike `phase1_window_experiment`'s tests, which
+        // share two vars across one scenario — there is no cross-test
+        // race to guard against here even under Rust's default parallel
+        // test runner; each still cleans up its own var when done, purely
+        // so a later, unrelated test run never inherits a stale value.
+        #[test]
+        fn effective_wait_mode_matches_env_var_or_falls_back_to_spin() {
+            std::env::remove_var("PHASE1_EXPERIMENT_WAIT_MODE");
+            assert_eq!(effective_wait_mode(), WaitMode::Spin);
+
+            std::env::set_var("PHASE1_EXPERIMENT_WAIT_MODE", "sleep");
+            assert_eq!(effective_wait_mode(), WaitMode::Sleep);
+
+            std::env::set_var("PHASE1_EXPERIMENT_WAIT_MODE", "hybrid");
+            assert_eq!(effective_wait_mode(), WaitMode::Hybrid);
+
+            std::env::set_var("PHASE1_EXPERIMENT_WAIT_MODE", "garbage");
+            assert_eq!(effective_wait_mode(), WaitMode::Spin);
+
+            std::env::remove_var("PHASE1_EXPERIMENT_WAIT_MODE");
+        }
+
+        #[test]
+        fn sleep_quantum_matches_env_var_or_falls_back_to_200us() {
+            std::env::remove_var("PHASE1_EXPERIMENT_SLEEP_QUANTUM_US");
+            assert_eq!(sleep_quantum(), Duration::from_micros(200));
+
+            std::env::set_var("PHASE1_EXPERIMENT_SLEEP_QUANTUM_US", "500");
+            assert_eq!(sleep_quantum(), Duration::from_micros(500));
+
+            std::env::remove_var("PHASE1_EXPERIMENT_SLEEP_QUANTUM_US");
         }
     }
 }
