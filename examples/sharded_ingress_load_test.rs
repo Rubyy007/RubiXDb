@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rubixdb::execution::sharded_ingress::{
-    Completion, ShardedIngressConfig, ShardedIngressPool,
-};
+use rubixdb::execution::sharded_ingress::{Completion, ShardedIngressConfig, ShardedIngressPool};
 use rubixdb::wal::{FileWal, SyncMode, Wal, WalConfig, WalOpOwned};
 use rubixdb::EngineError;
 
@@ -57,7 +55,9 @@ fn submit_retrying(pool: &ShardedIngressPool, key: &[u8], value: &[u8]) -> Compl
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: sharded_ingress_load_test <writer_count> <shard_count> [per_thread=1000]");
+        eprintln!(
+            "usage: sharded_ingress_load_test <writer_count> <shard_count> [per_thread=1000]"
+        );
         std::process::exit(2);
     }
     let writer_count: usize = args[1].parse().expect("writer_count must be a usize");
@@ -162,8 +162,9 @@ fn main() {
         (stats.processing_ns_total as f64 / denom) / 1_000_000.0
     );
 
-    let pool = Arc::try_unwrap(pool)
-        .unwrap_or_else(|_| panic!("no other Arc<ShardedIngressPool> reference should remain here"));
+    let pool = Arc::try_unwrap(pool).unwrap_or_else(|_| {
+        panic!("no other Arc<ShardedIngressPool> reference should remain here")
+    });
     drop(pool.into_inner().unwrap());
 
     let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
