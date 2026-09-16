@@ -641,7 +641,7 @@ impl WriteWorkerPool {
             approx_bytes,
             enqueued_at: Instant::now(),
         });
-        guard.queued_bytes += approx_bytes;
+        guard.queued_bytes = guard.queued_bytes.saturating_add(approx_bytes);
         drop(guard);
         self.shared.submitted.fetch_add(1, Ordering::Relaxed);
         self.shared.not_empty.notify_one();

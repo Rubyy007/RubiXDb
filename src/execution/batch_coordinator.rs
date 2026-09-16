@@ -426,7 +426,7 @@ impl BatchCoordinatorPool {
             approx_bytes,
             enqueued_at: Instant::now(),
         });
-        guard.queued_bytes += approx_bytes;
+        guard.queued_bytes = guard.queued_bytes.saturating_add(approx_bytes);
         drop(guard);
         self.shared.submitted.fetch_add(1, Ordering::Relaxed);
         self.shared.not_empty.notify_one();
@@ -558,7 +558,9 @@ impl Drop for BatchCoordinatorPool {
 fn drain_available(guard: &mut QueueState, max_drain: usize) -> Vec<QueueEntry> {
     let take = guard.entries.len().min(max_drain.max(1));
     let drained: Vec<QueueEntry> = guard.entries.drain(..take).collect();
-    let drained_bytes: usize = drained.iter().map(|e| e.approx_bytes).sum();
+    let drained_bytes: usize = drained
+        .iter()
+        .fold(0usize, |acc, e| acc.saturating_add(e.approx_bytes));
     guard.queued_bytes = guard.queued_bytes.saturating_sub(drained_bytes);
     drained
 }
@@ -900,6 +902,175 @@ mod tests {
             "a burst larger than queue_capacity must eventually observe backpressure, \
              not silently accept unbounded work"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3B §9: large-payload byte accounting must be accurate and
+    /// must never let a request bypass `max_queued_bytes` — not because
+    /// of overflow, an accounting mismatch between the admission check
+    /// (`submit`'s `saturating_add` comparison) and the actual increment
+    /// (`saturating_add` as of this phase — previously a raw `+=`; see
+    /// `PHASE3B_ADR.md`), or a second hidden allocation this harness
+    /// can't see. A blocked coordinator (installed fault hook that never
+    /// returns) keeps every submitted entry queued for the whole test,
+    /// so `stats().queued_bytes` is a stable, checkable quantity rather
+    /// than a moving target the coordinator is concurrently draining.
+    #[test]
+    fn large_payload_byte_accounting_is_accurate_and_respects_the_limit() {
+        const PAYLOAD_LEN: usize = 200 * 1024; // 200 KiB, well under DEFAULT_MAX_RECORD_LEN
+        const MAX_ENTRIES_THAT_FIT: usize = 3;
+
+        let dir = temp_dir("large_payload");
+        let committer = test_committer(&dir);
+        // Block the coordinator inside its fsync call so a first, already
+        // in-flight entry never drains further and every later
+        // submission stays observably queued for the rest of this test.
+        let blocked = Arc::new(AtomicU64::new(0));
+        {
+            let blocked = Arc::clone(&blocked);
+            committer.install_fsync_fault_hook(move || {
+                while blocked.load(Ordering::Acquire) == 0 {
+                    thread::yield_now();
+                }
+                Ok(())
+            });
+        }
+        let config = BatchCoordinatorConfig {
+            queue_capacity: 64,
+            // Sized so exactly MAX_ENTRIES_THAT_FIT full-size payloads
+            // fit *in the queue behind the one already in flight*, and a
+            // further one does not.
+            max_queued_bytes: PAYLOAD_LEN * MAX_ENTRIES_THAT_FIT + 1024,
+            submission_timeout: Duration::from_millis(200),
+            ..small_config()
+        };
+        let pool = BatchCoordinatorPool::new(committer, config).unwrap();
+        let value = vec![7u8; PAYLOAD_LEN];
+
+        // One entry, submitted alone, to become the coordinator's
+        // in-flight (blocked) batch. A deterministic barrier — polling a
+        // real observable state transition, not a fixed sleep — waits
+        // until the coordinator has genuinely entered its (now blocked)
+        // fsync call before this test submits anything else, so exactly
+        // one entry (never zero, never more) is ever "in flight" rather
+        // than still sitting in `queued_bytes`.
+        let in_flight = pool
+            .submit(WalOpOwned::Put {
+                key: b"in-flight".to_vec(),
+                value: value.clone(),
+            })
+            .unwrap();
+        let barrier_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if pool.stats().committer_stats.sync_attempts >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < barrier_deadline,
+                "the coordinator never reached its (blocked) fsync call before the deadline; \
+                 test harness bug, not the code under test"
+            );
+            thread::yield_now();
+        }
+
+        let mut completions = Vec::new();
+        let mut accepted = 0usize;
+        loop {
+            match pool.submit(WalOpOwned::Put {
+                key: format!("k{accepted}").into_bytes(),
+                value: value.clone(),
+            }) {
+                Ok(c) => {
+                    completions.push(c);
+                    accepted += 1;
+                }
+                Err(EngineError::Timeout { .. }) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+            if accepted > MAX_ENTRIES_THAT_FIT + 2 {
+                // Safety valve against a real accounting bypass turning
+                // this into an unbounded loop — a bypass must show up as
+                // a clean assertion failure below, not a hung test.
+                break;
+            }
+        }
+
+        assert_eq!(
+            accepted, MAX_ENTRIES_THAT_FIT,
+            "with the coordinator provably blocked on a single in-flight entry, byte \
+             accounting must admit exactly as many further large payloads as configured \
+             capacity allows — neither fewer (undercounting/over-rejecting) nor more \
+             (a bypass of max_queued_bytes)"
+        );
+
+        let stats = pool.stats();
+        let expected_queued_bytes = PAYLOAD_LEN * MAX_ENTRIES_THAT_FIT;
+        assert!(
+            stats.queued_bytes >= expected_queued_bytes,
+            "queued_bytes ({}) must account for at least the {} payload bytes actually \
+             queued, not undercount them",
+            stats.queued_bytes,
+            expected_queued_bytes
+        );
+        assert!(
+            stats.queued_bytes <= PAYLOAD_LEN * MAX_ENTRIES_THAT_FIT + 1024,
+            "queued_bytes ({}) must never exceed the configured max_queued_bytes bound — \
+             a real overflow/accounting bypass would show up here",
+            stats.queued_bytes
+        );
+
+        // Release the coordinator and let everything drain normally.
+        blocked.store(1, Ordering::Release);
+        assert!(in_flight.wait().is_ok());
+        for c in completions {
+            assert!(c.wait().is_ok());
+        }
+        let report = pool.shutdown();
+        assert!(report.fully_drained);
+        drop(pool);
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+        assert!(replay.corrupted_segments.is_empty());
+        assert_eq!(replay.records.len(), MAX_ENTRIES_THAT_FIT + 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3B §8: rapid construct/submit/shutdown cycles must not leak
+    /// threads, hang, or leave the WAL directory in a state the next
+    /// cycle can't reopen — a coarse but real defense against resource
+    /// exhaustion from a caller that legitimately cycles pools quickly
+    /// (e.g. reconnect/retry logic after a transient failure elsewhere).
+    #[test]
+    fn rapid_submit_shutdown_cycles_do_not_leak_or_hang() {
+        let dir = temp_dir("rapid_cycles");
+        for cycle in 0..25 {
+            let config = WalConfig {
+                sync_mode: SyncMode::GroupCommit {
+                    max_wait: Duration::from_millis(5),
+                    max_batch_bytes: 256 * 1024,
+                },
+                ..WalConfig::default()
+            };
+            let (wal, _) = FileWal::open_for_recovery(&dir, config).unwrap();
+            let committer = GroupCommitter::new(wal).unwrap();
+            let pool = BatchCoordinatorPool::new(committer, small_config()).unwrap();
+            let completion = pool
+                .submit(WalOpOwned::Put {
+                    key: format!("cycle{cycle}").into_bytes(),
+                    value: b"v".to_vec(),
+                })
+                .unwrap();
+            assert!(completion.wait().is_ok());
+            let started = Instant::now();
+            let report = pool.shutdown();
+            assert!(report.fully_drained);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "shutdown must remain bounded across repeated cycles, cycle {cycle}"
+            );
+        }
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+        assert!(replay.corrupted_segments.is_empty());
+        assert_eq!(replay.records.len(), 25);
         let _ = fs::remove_dir_all(&dir);
     }
 

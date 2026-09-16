@@ -362,7 +362,7 @@ impl ShardedIngressPool {
             approx_bytes,
             enqueued_at: Instant::now(),
         });
-        guard.queued_bytes += approx_bytes;
+        guard.queued_bytes = guard.queued_bytes.saturating_add(approx_bytes);
         drop(guard);
         self.shared.submitted.fetch_add(1, Ordering::Relaxed);
         self.shared.not_empty.notify_one();
@@ -494,7 +494,9 @@ fn drain_all_shards(shared: &PoolShared, max_per_shard: usize) -> Vec<QueueEntry
         let mut guard = shard.lock().unwrap_or_else(|p| p.into_inner());
         let take = guard.entries.len().min(max_per_shard.max(1));
         let drained: Vec<QueueEntry> = guard.entries.drain(..take).collect();
-        let drained_bytes: usize = drained.iter().map(|e| e.approx_bytes).sum();
+        let drained_bytes: usize = drained
+            .iter()
+            .fold(0usize, |acc, e| acc.saturating_add(e.approx_bytes));
         guard.queued_bytes = guard.queued_bytes.saturating_sub(drained_bytes);
         drop(guard);
         merged.extend(drained);
