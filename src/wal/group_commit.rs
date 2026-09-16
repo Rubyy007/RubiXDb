@@ -143,6 +143,14 @@ pub struct GroupCommitStats {
     /// Callers currently inside `await_durable` at the moment of this
     /// snapshot (leader or follower).
     pub pending_waiters: usize,
+    /// The highest `seq` this `FileWal` has assigned so far (`next_seq()
+    /// - 1`) — may exceed `durable_through` if a batch is in flight.
+    pub highest_sequence: u64,
+    /// Segment rotations observed since this `GroupCommitter` was
+    /// constructed (explicit `rotate()` calls and `FileWal::append`'s own
+    /// automatic mid-append rotation both count identically — see
+    /// `initial_segment_id`'s doc comment).
+    pub segment_rotations: u64,
 }
 
 impl GroupCommitStats {
@@ -343,6 +351,14 @@ pub struct GroupCommitter {
     /// needed. Monotone: only ever advanced via `fetch_max`, never
     /// decreased, never reset short of dropping this `GroupCommitter`.
     durable_through: AtomicU64,
+    /// `wal.current_segment_id()` at construction — `stats()`'s
+    /// `segment_rotations` is `current_segment_id() - this`, both
+    /// monotonically non-decreasing, so the delta is exactly the number
+    /// of rotations (explicit `rotate()` calls or `FileWal::append`'s own
+    /// automatic mid-append rotation, WAL Spec §3.4 — both advance
+    /// `active_id` identically) this `GroupCommitter` has observed since
+    /// it was constructed, not since the WAL directory was first created.
+    initial_segment_id: u64,
     batch: Mutex<BatchState>,
     condvar: Condvar,
     latency: FsyncLatencyTracker,
@@ -502,9 +518,11 @@ impl GroupCommitter {
             }
         };
         let initial_durable_through = wal.durable_seq();
+        let initial_segment_id = wal.current_segment_id();
         let committer = GroupCommitter {
             wal: Mutex::new(wal),
             durable_through: AtomicU64::new(initial_durable_through),
+            initial_segment_id,
             batch: Mutex::new(BatchState::default()),
             condvar: Condvar::new(),
             latency: FsyncLatencyTracker::new(),
@@ -753,6 +771,8 @@ impl GroupCommitter {
     /// (a handful of `Relaxed` atomic loads); safe to call at any time,
     /// including concurrently with active writers.
     pub fn stats(&self) -> GroupCommitStats {
+        let current_segment_id = self.current_segment_id();
+        let highest_sequence = self.next_seq().saturating_sub(1);
         GroupCommitStats {
             sync_attempts: self.stat_sync_attempts.load(Ordering::Relaxed),
             sync_successes: self.stat_sync_successes.load(Ordering::Relaxed),
@@ -762,6 +782,8 @@ impl GroupCommitter {
             window_wait_samples: self.stat_window_wait_samples.load(Ordering::Relaxed),
             durable_through: self.durable_through(),
             pending_waiters: self.pending_waiters.load(Ordering::Relaxed),
+            highest_sequence,
+            segment_rotations: current_segment_id.saturating_sub(self.initial_segment_id),
         }
     }
 
@@ -1826,6 +1848,21 @@ mod tests {
         assert!(after.avg_batch_records() >= 1.0);
         assert_eq!(after.durable_through, 20);
         assert_eq!(after.pending_waiters, 0);
+        assert_eq!(
+            after.highest_sequence, 20,
+            "highest_sequence must track next_seq() - 1"
+        );
+        assert_eq!(
+            after.segment_rotations, 0,
+            "no rotation occurred in this scenario"
+        );
+
+        committer.rotate().unwrap();
+        let after_rotate = committer.stats();
+        assert_eq!(
+            after_rotate.segment_rotations, 1,
+            "an explicit rotate() must be reflected in segment_rotations"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
