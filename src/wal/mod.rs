@@ -1013,7 +1013,31 @@ pub fn replay_streaming(
     config: &WalConfig,
     mut on_record: impl FnMut(u64, WalOp<'_>) -> Result<()>,
 ) -> Result<WalReplaySummary> {
-    let canonical_dir = canonicalize_existing_dir(&FileWal::wal_dir(dir))?;
+    // A WAL directory that has never been created yet has nothing to
+    // replay — the same "empty WAL" outcome `scan_directory`'s own
+    // `ids.is_empty()` branch already returns for an *existing* empty
+    // directory, extended here to "doesn't exist yet" too, so a caller
+    // (e.g. `LsmEngine::open` on a brand-new engine) can call this
+    // *before* `FileWal::open_for_recovery` has ever created the
+    // directory or taken its exclusive lock — deliberately, since taking
+    // this function's own shared lock only works while no exclusive lock
+    // is held, including by this same process (`ARCHITECTURE.md`'s
+    // "Cross-process file locking" section: `try_lock` blocks even a
+    // second same-process opener).
+    let canonical_dir = match canonicalize_existing_dir(&FileWal::wal_dir(dir)) {
+        Ok(p) => p,
+        Err(EngineError::NotFound) => {
+            return Ok(WalReplaySummary {
+                last_valid_position: WalPosition {
+                    segment_id: 1,
+                    offset: SEGMENT_HEADER_LEN as u64,
+                    seq: 0,
+                },
+                ..WalReplaySummary::default()
+            });
+        }
+        Err(e) => return Err(e),
+    };
     let _lock = acquire_shared_lock_if_present(&lock_file_path(&canonical_dir))?;
 
     let ids = list_segment_ids(&canonical_dir)?;
@@ -1790,6 +1814,43 @@ mod tests {
         assert_eq!(summary.records_replayed, 0);
         assert_eq!(summary.corrupted_segments_count, 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that has never had a WAL created in it at all (not
+    /// even an empty one — `open_for_recovery` was never called) must
+    /// behave identically to an already-existing-but-empty WAL: nothing
+    /// to replay, not an error. This is what lets a caller (e.g.
+    /// `LsmEngine::open`) call this function *before* `FileWal::open_
+    /// for_recovery` has ever touched the directory — see this
+    /// function's own doc comment for why that ordering matters (the
+    /// exclusive lock `open_for_recovery` takes would otherwise block
+    /// this function's own shared-lock attempt, even from the same
+    /// process).
+    #[test]
+    fn replay_streaming_on_a_never_created_directory_is_empty_not_an_error() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rubixdb_wal_modtest_never_created_{nanos}"));
+        assert!(
+            !dir.exists(),
+            "this test requires a genuinely nonexistent directory"
+        );
+
+        let mut received = 0u64;
+        let summary = replay_streaming(&dir, &WalConfig::default(), |_seq, _op| {
+            received += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(received, 0);
+        assert_eq!(summary.records_replayed, 0);
+        assert_eq!(summary.corrupted_segments_count, 0);
+        assert!(
+            !dir.exists(),
+            "a read-only replay must never create the directory it's asked to read"
+        );
     }
 
     /// A callback that fails partway through must stop the walk and

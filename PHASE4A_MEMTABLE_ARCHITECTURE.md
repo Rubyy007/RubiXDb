@@ -68,30 +68,49 @@ principle as the WAL." The MemTable type itself takes `&mut self` for
 every mutating method; synchronization is the *caller's* responsibility
 (the LSM facade, `src/lsm/mod.rs`), exactly as the spec assigns it.
 
-**Why this is correct, not merely convenient, for Phase 4A's own write
-path**: every write reaching the MemTable has already been serialized
-through the **Dedicated Batch Coordinator** — the one coordinator
-thread is the *only* thread that ever calls `MemTable::insert` for the
-active memtable (operating brief §31's own instruction: "must continue
-using the production Dedicated Batch Coordinator rather than creating
-unnecessary OS threads inside MemTable" already implies this). There is
-never write-write contention on the active MemTable to design around at
-all — mirroring exactly the reasoning that made batching (not a
-lock-free WAL) the actual fix for the coordinator's own historical
-throughput problem (`PHASE2_ADR.md`).
+**Revised from an earlier draft of this document, which overclaimed
+"only the coordinator thread ever calls `insert`"** — corrected here
+rather than left inaccurate. The actual design: `crate::lsm`'s write
+path (`put`/`delete`) submits to the existing `BatchCoordinatorPool`
+(unmodified — §2 below explains why touching it was avoidable) and
+**waits on the returned `Completion` on the calling thread**, exactly
+like every existing caller of that pool already does; the `MemTable::
+insert` call for that one entry happens on **that same calling thread**,
+immediately after its own `Completion::wait()` confirms WAL durability,
+not on the coordinator thread. With many concurrent logical writers,
+this means multiple caller threads can indeed call `insert` around the
+same time — serialized by `RwLock<MemTable>` (below), not by thread
+affinity.
+
+**Why this is still correct, not merely lock-protected**: `MemTable`'s
+map is keyed by the full `(user_key, seq)` pair, and every `seq` is
+globally unique (assigned once, by the WAL, per operating brief §8) —
+two different entries' `insert` calls can never target the same key,
+so **the order in which concurrent callers acquire the write lock and
+insert does not affect the resulting map's logical content** (`BTreeMap`
+insertion of distinct keys is commutative). The single-writer principle
+the underlying `MemTable` type itself relies on (spec §1.5: no *internal*
+synchronization) is about never mutating *one* `MemTable` instance from
+two threads *without* external synchronization — `RwLock` supplies
+exactly that, regardless of which particular thread calls in. This was
+verified, not merely asserted: `src/lsm/mod.rs`'s own concurrency tests
+(operating brief §31) submit through real concurrent callers at 1/10/
+100/1,000 logical writers and confirm the final MemTable state is
+correct regardless of completion/insert interleaving.
 
 **Reads** (arbitrary caller threads calling `get`/`get_as_of`/`range`
-concurrently with the coordinator's own writes) do need synchronization
-against the single writer. `src/lsm/mod.rs` wraps the active MemTable
-in `RwLock<MemTable>` — write path takes the write lock only for the
-`insert` call itself (memory-speed, never held across the WAL
-`await_durable` wait that precedes it — see `PHASE4A_ARCHITECTURE.md`
-§5), reads take the read lock only for the specific lookup/iteration
-call. A frozen (immutable) MemTable needs **no lock at all** for reads
-— once `freeze()` consumes `self` and returns `Arc<MemTable>`, Rust's
-own ownership rules make it compile-time-impossible to mutate again
-(spec §1.2's own stated guarantee), so concurrent readers of an
-`Arc<MemTable>` need nothing beyond the `Arc` itself.
+concurrently with concurrent writers' own inserts) need the same
+`RwLock` — `src/lsm/mod.rs` wraps the active MemTable in `RwLock<
+MemTable>`: the write path takes the write lock only for the `insert`
+call itself (memory-speed, never held across the WAL `await_durable`
+wait that precedes it — that wait already completed, on the calling
+thread, *before* this lock is even requested; see `PHASE4A_
+ARCHITECTURE.md` §5), reads take the read lock only for the specific
+lookup/iteration call. A frozen (immutable) MemTable needs **no lock at
+all** for reads — once `freeze()` consumes `self` and returns `Arc<
+MemTable>`, Rust's own ownership rules make it compile-time-impossible
+to mutate again (spec §1.2's own stated guarantee), so concurrent
+readers of an `Arc<MemTable>` need nothing beyond the `Arc` itself.
 
 **No lock-free/unsafe concurrent structure was introduced** — per
 operating brief §11's own explicit instruction ("do not implement
