@@ -6,6 +6,58 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Phase 4A: MemTable + RUBIC format foundation (MEMTABLE NOT YET READY -- blockers remain)
+
+Extends the write path: `Logical Writers -> Dedicated Batch Coordinator
+-> Group Commit -> Durable WAL -> MemTable`. Began explicitly before
+Phase 3C's own WAL certification had completed (its long soak was
+still running) -- documented basis: this phase touches no WAL/
+coordinator internals.
+
+- **`RUBIC_FORMAT_SPECIFICATION.md`** (new): the RUBIC storage-format
+  family's governance layer. Not Parquet. Not a renaming of the
+  existing WAL. References (does not re-invent) the already-specified
+  RUBIC SSTable byte layout; genuinely undecided items marked
+  `UNDEFINED -- RESERVED FOR SSTABLE DESIGN`.
+- **`src/memtable/mod.rs`** (new): `MemTable`/`MemtableValue`, exactly
+  per `RubixDB-LSM-Engine-Specification-v1.0.md` §1 ("Status: Final") --
+  `BTreeMap<(Vec<u8>, u64), MemtableValue>`, `get_as_of` via
+  `range(...).next_back()`, documented size accounting, compile-time-
+  enforced `freeze() -> Arc<MemTable>`. No `SkipList` evaluation: the
+  spec leaves no degree of freedom there.
+- **`wal::replay_streaming`** (new, additive): bounded-memory WAL
+  replay, implementing the callback-replay direction `PHASE3C_ADR.md`
+  ADR-P3C-1 already analyzed. `open_for_recovery`/`WalReplayResult`/
+  `walk_segment`/`scan_directory` unchanged. Fixed a real same-process
+  lock-ordering bug found while wiring this up (a not-yet-created WAL
+  directory now correctly replays as empty rather than erroring).
+- **`src/lsm/mod.rs`** (`LsmEngine`, new): Phase-4A-scoped write-path
+  facade -- `put`/`delete`/`get`/`get_as_of`, WAL-durability-before-
+  MemTable-apply ordering enforced and verified (a direct fsync-failure
+  test, plus 25/25 real external-process-kill crash cycles each showing
+  `active_entries == highest_sequence == durable_through` exactly).
+  Freeze-to-immutable with bounded backpressure (`EngineError::
+  CapacityExceeded`).
+- **`examples/lsm_crash_cycle_child.rs`/`lsm_crash_cycle_test.rs`**
+  (new): real external-process-kill crash tests at the WAL/MemTable
+  boundary, mirroring Phase 3C's own proven design.
+- **`examples/memtable_bench.rs`/`lsm_load_test.rs`** (new): performance
+  harnesses. MemTable-only measured cleanly (1.45M puts/sec, get
+  p50=400ns); the full WAL-vs-WAL+MemTable comparison explicitly
+  deferred, not fabricated, after a smoke-scale attempt showed clear
+  contamination from the still-running background soak.
+
+170/170 lib tests pass (130 + 40 new: 13 MemTable unit tests, 2
+property tests x 1,000 cases, 6 `replay_streaming` tests, 19 `LsmEngine`
+tests), clippy and fmt clean. Full design: `PHASE4A_ARCHITECTURE.md`/
+`PHASE4A_MEMTABLE_ARCHITECTURE.md`; failure model: `PHASE4A_FAILURE_
+MODEL.md`; decisions: `PHASE4A_ADR.md`; results and final decision
+(authoritative): `PHASE4A_TEST_RESULTS.md` -- **MEMTABLE NOT YET READY
+FOR RUBIC SSTABLE IMPLEMENTATION -- BLOCKERS REMAIN** (the WAL-vs-
+WAL+MemTable performance comparison is not run; Phase 3C's own WAL
+certification had not completed). No correctness defect found; nothing
+tested this phase needs to be redone once those two items close.
+
 ### Phase 3C: final WAL/coordinator release certification (long soak in progress)
 
 Targets Phase 3B's own six named blockers directly.

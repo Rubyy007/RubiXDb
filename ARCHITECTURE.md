@@ -495,3 +495,59 @@ final certification decision (`PHASE3C_TEST_RESULTS.md` §26: **WAL
 FOUNDATION CERTIFIED FOR LSM INTEGRATION** or **WAL FOUNDATION NOT YET
 CERTIFIED**) are not yet recorded — see that document directly for the
 authoritative, current status.
+
+## Phase 4A: MemTable + RUBIC format foundation (implemented, not yet certified)
+
+Per `PHASE4A_ARCHITECTURE.md` §0: begun explicitly *before* Phase 3C's
+own certification had completed (the long soak was still running), on
+the documented basis that Phase 4A touches no WAL/coordinator internals
+at all — the two efforts are independent. Extends the write path:
+
+```text
+Logical Writers -> Dedicated Batch Coordinator -> Group Commit -> Durable WAL -> MemTable
+```
+
+- **`RUBIC_FORMAT_SPECIFICATION.md`** (new): the RUBIC storage-format
+  family's governance/conventions layer — not Parquet, not the WAL
+  renamed. The already-specified RUBIC SSTable byte layout
+  (`RubixDB-LSM-Engine-Specification-v1.0.md` §2, "Status: Final") is
+  referenced, not re-invented; genuinely undecided items (future
+  extension mechanism, metadata multi-versioning, footer reserved-byte
+  policy) are marked `UNDEFINED — RESERVED FOR SSTABLE DESIGN` rather
+  than guessed.
+- **`src/memtable/mod.rs`**: `MemTable`/`MemtableValue`, implemented
+  exactly per the existing, final LSM Engine Spec §1 — `BTreeMap<(Vec<u8>,
+  u64), MemtableValue>`, `get_as_of` via `range(...).next_back()`,
+  documented size accounting, and the compile-time-enforced
+  `freeze() -> Arc<MemTable>` pattern. No `SkipList` evaluation was
+  performed — the spec leaves no degree of freedom there.
+- **`wal::replay_streaming`** (new, additive — `open_for_recovery`/
+  `WalReplayResult`/`walk_segment`/`scan_directory` unchanged): a
+  bounded-memory WAL replay API, implementing the callback-replay
+  direction `PHASE3C_ADR.md` ADR-P3C-1 already analyzed, closing that
+  phase's own recovery-memory blocker for the MemTable-rebuild use case
+  specifically.
+- **`src/lsm/mod.rs`** (`LsmEngine`, Phase-4A-scoped — no `sstables`/
+  `manifest`/compaction): wires `BatchCoordinatorPool` (unmodified) and
+  `MemTable` together, enforcing WAL-durability-before-MemTable-apply
+  ordering. Verified both by a direct fsync-failure unit test and by
+  25/25 real external-process-kill crash cycles (`examples/lsm_crash_
+  cycle_test.rs`), every cycle showing `active_entries == highest_
+  sequence == durable_through` exactly.
+
+**170/170 lib tests pass**, clippy and fmt clean throughout. Full
+design: `PHASE4A_ARCHITECTURE.md`/`PHASE4A_MEMTABLE_ARCHITECTURE.md`;
+failure model: `PHASE4A_FAILURE_MODEL.md`; decisions: `PHASE4A_ADR.md`;
+results and current status (authoritative): `PHASE4A_TEST_RESULTS.md`.
+
+**Final decision: MEMTABLE NOT YET READY FOR RUBIC SSTABLE
+IMPLEMENTATION — BLOCKERS REMAIN**, stated per operating brief §42's own
+"do not certify based only on unit tests" instruction. Two explicit
+blockers, neither a correctness defect: the full multi-threaded WAL-vs-
+WAL+MemTable performance comparison was not run (a smoke-scale attempt
+was visibly contaminated by the still-running background soak and was
+discarded, not reported as evidence — `PHASE4A_ADR.md` ADR-P4A-6); and
+Phase 3C's own WAL certification had not completed. Every correctness/
+durability/crash-recovery/concurrency property actually tested this
+phase passed cleanly and does not need to be redone once those two
+items close.

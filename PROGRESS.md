@@ -1032,3 +1032,114 @@ soak harnesses, not yet wired in as a library feature) — `PHASE3C_
 ADR.md` ADR-P3C-4.
 
 **Open Tier 3 question currently blocking further work:** none.
+
+---
+
+## 2026-09-16 (Phase 4A: MemTable + RUBIC format foundation)
+
+**Implemented:** began Phase 4A explicitly before Phase 3C's own WAL
+certification had completed — its long soak was still running, launched
+under commit `383cac7` — on the documented basis that Phase 4A touches
+no WAL/`GroupCommitter`/`BatchCoordinatorPool` internals at all
+(`PHASE4A_ARCHITECTURE.md` §0). The soak continued running, healthy,
+throughout all of this phase's own work (last checked at t≈4,111s of
+its 14,400s first phase: 17,067 ops/sec, RSS flat ~8.7 MB, zero errors).
+
+Wrote `RUBIC_FORMAT_SPECIFICATION.md` first, per the operating brief's
+own "define before implementing persistent storage" instruction — a
+family-policy/governance document, not a reinvention of the already-
+specified RUBIC SSTable byte layout (`RubixDB-LSM-Engine-Specification-
+v1.0.md` §2, "Status: Final," referenced not duplicated) and explicitly
+not a renaming of the existing WAL format (an already-established
+compatibility boundary — any future formal absorption into the RUBIC
+family would need its own separate, versioned decision).
+
+Implemented `src/memtable/mod.rs` exactly per the existing, final LSM
+Engine Spec §1 — `BTreeMap<(Vec<u8>, u64), MemtableValue>`, `get_as_of`
+via `range(...).next_back()`, documented size accounting
+(`ENTRY_OVERHEAD = 32`), and the compile-time-enforced `freeze() ->
+Arc<MemTable>` pattern (no `&mut` method reachable on the frozen
+handle — Rust's own ownership rules, not a runtime flag). No `SkipList`
+evaluation performed: the spec is "Final," prescribes `BTreeMap` by
+exact type, and leaves no degree of freedom to evaluate against it. 13
+unit tests (every item in the spec's own §1.6 checklist) plus 2
+property tests (1,000 cases each) comparing against a deliberately
+naive reference model.
+
+Added `wal::replay_streaming` (`src/wal/mod.rs`) — a new, additive,
+bounded-memory WAL replay API implementing the callback-replay
+direction `PHASE3C_ADR.md` ADR-P3C-1 already analyzed but did not build.
+`open_for_recovery`/`WalReplayResult`/`walk_segment`/`scan_directory`
+are byte-for-byte unchanged (verified: the full pre-existing 90-test WAL
+suite passes unmodified). **A real bug found and fixed while wiring
+this up**: the first version failed on a brand-new engine's not-yet-
+created WAL directory, and calling `open_for_recovery` first to fix
+that was not viable either — its exclusive lock blocks `replay_
+streaming`'s own shared-lock attempt, even from the same process (this
+project's own cross-process-locking design, verified when that
+mechanism was first built in an earlier phase). Fixed by treating a
+not-yet-existing directory as "nothing to replay," matching `scan_
+directory`'s own existing-empty-directory behavior.
+
+Implemented `src/lsm/mod.rs` (`LsmEngine`) — the Phase-4A-scoped write-
+path facade (no `sstables`/`manifest`/compaction, extended in Phase
+4B): `put`/`delete`/`get`/`get_as_of`, wired to the unmodified
+`BatchCoordinatorPool` for durability and `MemTable` for state,
+enforcing the exact WAL-durability-before-MemTable-apply ordering.
+**Corrected a design claim mid-implementation, before it became load-
+bearing**: an earlier architecture-doc draft assumed only the
+coordinator thread would ever call `MemTable::insert`; the actual
+design applies each entry on whichever caller thread's own `Completion::
+wait()` returns, synchronized by `RwLock<MemTable>` rather than thread
+affinity — still correct, because `(user_key, seq)` keys are globally
+unique, so concurrent inserts of different keys commute regardless of
+application order. Verified by concurrency tests at 1/10/100/1,000
+logical writers through the real, unmodified `BatchCoordinatorPool`
+(operating brief §31's own explicit requirement), all passing with zero
+lost/duplicate records.
+
+Built real crash tests at the WAL/MemTable boundary
+(`examples/lsm_crash_cycle_child.rs`/`lsm_crash_cycle_test.rs`),
+mirroring Phase 3C's own proven external-process-kill design
+(`PHASE3C_ADR.md` ADR-P3C-3) but pointed at `LsmEngine`: 25/25 cycles
+recovered cleanly, and at **every single cycle**,
+`active_entries == highest_sequence == durable_through` exactly —
+the strongest evidence this phase has that the recovered MemTable
+always contains precisely the WAL's own durable record count, under
+real abrupt kills, not just a unit-test-level fsync-failure injection.
+
+Measured MemTable-only performance cleanly (`examples/memtable_bench.rs`,
+single-threaded, not meaningfully affected by the concurrent background
+soak): 1.45M puts/sec, get p50=400ns/p99=1,200ns, ~74M entries/sec
+ordered iteration. **Did not** measure the full multi-threaded WAL-vs-
+WAL+MemTable comparison cleanly — a 20-writer smoke attempt
+(`examples/lsm_load_test.rs`) was visibly contaminated by the
+concurrently-running background soak (1,479 ops/sec, an order of
+magnitude below expectation) and was explicitly discarded as evidence,
+not reported as a real number (`PHASE4A_ADR.md` ADR-P4A-6) — the same
+contamination-avoidance discipline Phase 3C's own `PHASE3C_TEST_PLAN.md`
+§1 rule 5 already established.
+
+**Tests passing: VERIFIED.** `cargo test --lib`: 170/170 (130
+pre-existing + 40 new across MemTable/replay_streaming/LsmEngine).
+`cargo test --lib --features test-util`: 170/170. `cargo clippy
+--all-targets --all-features -- -D warnings`: clean. `cargo fmt
+--check`: clean. Zero regressions at any of the 11 commits this phase.
+`cargo test --release --lib` was not re-run in isolation at the end of
+this phase (deferred alongside the performance comparison to avoid the
+background soak's own release-binary conflict) — recorded as an open
+item, not silently skipped.
+
+**Final decision** (`PHASE4A_TEST_RESULTS.md` §12, stated per operating
+brief §42's own "do not certify based only on unit tests" instruction):
+**MEMTABLE NOT YET READY FOR RUBIC SSTABLE IMPLEMENTATION — BLOCKERS
+REMAIN.** Two explicit blockers, neither a correctness defect: the full
+WAL-vs-WAL+MemTable performance comparison is not run; Phase 3C's own
+WAL certification had not completed when this phase's work concluded.
+Every correctness/durability/crash-recovery/concurrency property
+actually tested this phase passed cleanly and does not need to be
+redone once those two items close — the recommended next step is
+closing them (let the Phase 3C soak finish, then re-run the deferred
+comparison on the resulting idle machine), not redoing correctness work.
+
+**Open Tier 3 question currently blocking further work:** none.
