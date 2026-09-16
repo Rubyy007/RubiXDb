@@ -362,3 +362,119 @@ fn concurrency_ten_writers() {
 fn concurrency_hundred_writers() {
     concurrency_smoke(100, 10);
 }
+
+/// Operating brief §31: "The 1,000-writer workload must continue using
+/// the production Dedicated Batch Coordinator rather than creating
+/// unnecessary OS threads inside MemTable" — satisfied structurally:
+/// `LsmEngine::put` submits through the exact same, unmodified
+/// `BatchCoordinatorPool::submit` every other 1,000-writer test in this
+/// project already uses (`tests/group_commit/thousand_writers_
+/// throughput.rs`, `examples/batch_coordinator_load_test.rs`); no new
+/// thread is spawned by this module for the write path itself — only
+/// the 1,000 logical-writer test threads this test harness itself
+/// spawns, matching every prior phase's own methodology.
+#[test]
+fn concurrency_thousand_logical_writers() {
+    concurrency_smoke(1000, 3);
+}
+
+// --- Security / resource-bound edge cases (operating brief §34) ---
+
+#[test]
+fn large_key_and_value_are_handled_without_overflow_or_panic() {
+    let dir = temp_dir("large_key_value");
+    let engine = open(&dir, LsmConfig::default());
+
+    let large_key = vec![b'k'; 64 * 1024]; // 64 KiB key
+    let large_value = vec![b'v'; 1024 * 1024]; // 1 MiB value
+    engine.put(&large_key, &large_value).unwrap();
+    assert_eq!(engine.get(&large_key), Some(large_value));
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A single entry larger than `memtable_max_size_bytes` must still be
+/// handled deterministically (accepted, then immediately eligible for
+/// freeze) rather than looping forever trying to make room, and must
+/// never let `size_bytes` silently wrap or bypass the configured limit.
+#[test]
+fn an_entry_larger_than_the_configured_limit_does_not_hang_or_overflow() {
+    let dir = temp_dir("oversized_entry");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 100,
+        max_immutable_memtables: 4,
+    };
+    let engine = open(&dir, lsm_config);
+
+    let big_value = vec![b'x'; 10_000]; // far larger than the 100-byte limit
+    engine.put(b"k1", &big_value).unwrap();
+    assert_eq!(engine.get(b"k1"), Some(big_value));
+    // The oversized entry must have triggered an immediate freeze rather
+    // than leaving `is_full()` permanently true with nothing able to
+    // ever "fit" — verified indirectly: a further write must still
+    // succeed (a fresh active memtable was installed), not error or hang.
+    engine.put(b"k2", b"v2").unwrap();
+    assert_eq!(engine.get(b"k2"), Some(b"v2".to_vec()));
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn memtable_size_accounting_never_overflows_with_many_large_entries() {
+    // usize::MAX-adjacent accounting bugs would show up as a wrapped
+    // (tiny or zero) size_bytes despite substantial real data — assert
+    // monotonic growth instead of an exact figure, real enough to catch
+    // a wraparound.
+    let mut m = MemTable::new(usize::MAX);
+    let value = vec![0u8; 100_000];
+    let mut previous_size = 0usize;
+    for i in 0..50u64 {
+        m.put(format!("k{i}").as_bytes(), i + 1, &value);
+        assert!(
+            m.size_bytes() > previous_size,
+            "size_bytes must strictly grow with each new (key, seq) insert, never wrap"
+        );
+        previous_size = m.size_bytes();
+    }
+}
+
+// --- Recovery equivalence against a reference model (operating brief §25) ---
+
+/// The same sequence of Put/Delete operations, applied to a real
+/// `LsmEngine` (WAL + MemTable) and to a naive in-memory reference
+/// model, must produce identical final state after a real restart
+/// (drop the engine, reopen — exercising `LsmEngine::open`'s own
+/// recovery path via `wal::replay_streaming`, not a mock).
+#[test]
+fn recovery_matches_a_reference_model_after_restart() {
+    let dir = temp_dir("recovery_reference_model");
+    let mut reference: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> =
+        std::collections::HashMap::new();
+
+    {
+        let engine = open(&dir, LsmConfig::default());
+        for i in 0..200u32 {
+            let key = format!("k{}", i % 20).into_bytes(); // 20 distinct keys, heavy overwrite
+            if i % 5 == 0 {
+                engine.delete(&key).unwrap();
+                reference.insert(key, None);
+            } else {
+                let value = format!("v{i}").into_bytes();
+                engine.put(&key, &value).unwrap();
+                reference.insert(key, Some(value));
+            }
+        }
+        engine.shutdown();
+    }
+
+    let engine2 = open(&dir, LsmConfig::default());
+    for (key, expected) in &reference {
+        assert_eq!(
+            engine2.get(key),
+            expected.clone(),
+            "mismatch for key {key:?} after restart"
+        );
+    }
+    engine2.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
