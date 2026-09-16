@@ -38,8 +38,7 @@ historical Phase 2B document's own numbers directly.**
 ## 3. Post-Increment-3A (leader-failure fix applied)
 
 Same commands, same methodology, after `LeaderFailureGuard` and its
-tests were added (this increment's commit — see `PHASE3_TEST_RESULTS.md`
-§1 for the exact hash).
+tests were added (commit `efad213ffbb72cfdc267ac0e490d9cb5980714ef`).
 
 | Level | Runs (ops/sec) | Median |
 |---|---|---|

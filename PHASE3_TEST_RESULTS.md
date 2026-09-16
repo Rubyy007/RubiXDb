@@ -14,7 +14,7 @@ only.
 Phase 3 baseline (last Phase 2B commit, frozen before any Phase 3 code):
     7c808eb677b3b31a7e2ba4a65f123892a6610e6b
 Increment 3A (leader-failure P0 fix) committed:
-    <recorded in the immediately-following "record final commit hash" commit>
+    efad213ffbb72cfdc267ac0e490d9cb5980714ef
 ```
 
 Branch: `master`. Working tree clean before and after this increment
