@@ -193,6 +193,30 @@ impl ShutdownReport {
     }
 }
 
+/// Why a `GroupCommitter` is poisoned (`BatchState::poisoned`) — see
+/// `PHASE3_FAILURE_MODEL.md` §2 for the full leader-failure state machine.
+/// Both variants are permanent and terminal: a poisoned `GroupCommitter`
+/// stays poisoned until it is dropped and a fresh one is constructed
+/// (`FileWal::open_for_recovery` re-scans from disk, per this project's
+/// standing "no in-process repair" rule — `wal::mod`'s poison-on-rollback-
+/// failure precedent).
+#[derive(Debug, Clone, Copy)]
+enum PoisonReason {
+    /// The leader's `fsync` call returned `Err` (a real I/O failure, not a
+    /// panic) — the original Phase 1 poisoning path.
+    FsyncFailed(io::ErrorKind),
+    /// The leader thread unwound (panicked) somewhere between being
+    /// elected and calling `finish_batch_ok`/`finish_batch_with_error` —
+    /// detected by `LeaderFailureGuard::drop`, not by any `Result` the
+    /// leader itself returned (it never got the chance to return one).
+    /// Whether the underlying `fsync` syscall itself had already
+    /// completed at the moment of the panic is unknown and unknowable
+    /// from here — see `LeaderFailureGuard`'s doc comment for why
+    /// poisoning unconditionally, rather than trying to guess, is the
+    /// only fail-closed choice.
+    LeaderPanicked,
+}
+
 /// Coordination state guarded by `GroupCommitter::batch`. Deliberately
 /// minimal (`PROCESS.md` §1.10): no per-waiter registry is needed, since
 /// every waiter independently re-derives its own outcome from
@@ -202,15 +226,91 @@ struct BatchState {
     /// `true` while some thread is between "elected leader" and "finished
     /// this batch" (success or failure). Only ever set by a thread that
     /// just transitioned `false -> true` under this lock; only ever
-    /// cleared by that same thread once its batch concludes.
+    /// cleared by that same thread once its batch concludes — including
+    /// via `LeaderFailureGuard` if the leader thread panics instead of
+    /// returning, so this can never be left permanently `true` (the P0
+    /// leader-failure issue `PHASE3_FAILURE_MODEL.md` fixes).
     leader_active: bool,
-    /// Set once, permanently, the first time a leader's `fsync` fails.
-    /// Never cleared — per the algorithm, a poisoned `GroupCommitter` stays
-    /// poisoned until it is dropped and a fresh one is constructed. Stores
-    /// only `io::ErrorKind` (not the original `io::Error`, which is not
-    /// `Clone`) so every subsequent caller can synthesize an equivalent,
-    /// same-class error (`GroupCommitter::poisoned_error`).
-    poisoned: Option<io::ErrorKind>,
+    /// Set once, permanently, the first time a leader's batch fails
+    /// (`fsync` error or leader panic). Never cleared — see `PoisonReason`.
+    poisoned: Option<PoisonReason>,
+}
+
+/// **P0 fix (Phase 3): a panicking leader must not leave `leader_active`
+/// stuck `true` forever.** Armed the instant a thread is elected leader
+/// (`await_durable`, under `batch`, before `run_as_leader` is called) and
+/// disarmed only after `run_as_leader` returns normally — by which point
+/// it has *already* called `finish_batch_ok`/`finish_batch_with_error`
+/// itself, so a normal return makes this guard's own `Drop` a deliberate
+/// no-op. If the leader thread instead panics anywhere inside `run_as_
+/// leader` (a real, exercised scenario — see `do_leader_fsync`'s test-only
+/// fault-injection hook, and Phase 2B's own finding that a leader
+/// panicking mid-`fsync` left `leader_active` stuck: `PHASE2B_FAILURE_
+/// MODEL.md` §3), the guard is still armed when Rust unwinds through it,
+/// and its `Drop` runs the same "conclude this batch" bookkeeping `finish_
+/// batch_with_error` would have — clearing `leader_active` and poisoning
+/// the committer — during the unwind itself, before the panic propagates
+/// any further up the caller's stack. Mirrors `execution::common::
+/// CompletionGuard`'s existing pattern exactly (armed-unless-explicitly-
+/// disarmed, fallback logic in `Drop`) — not a new abstraction.
+///
+/// **Why poison unconditionally, rather than just clearing `leader_active`
+/// and letting a new leader be elected?** A panic mid-`run_as_leader` can
+/// land before the `fsync` call, during it, or after it succeeded but
+/// before `durable_through` was published — this guard cannot distinguish
+/// those cases (the panic could originate from a test-injected hook at
+/// any of them, or a genuine future bug). Poisoning is the same fail-
+/// closed answer this module already gives a *failed* `fsync`
+/// (`finish_batch_with_error`): every waiter gets a prompt, bounded,
+/// clearly-labeled error instead of silently racing a next leader against
+/// a batch whose outcome was never actually confirmed. Recovery relies on
+/// the existing WAL recovery contract (discard this `GroupCommitter`,
+/// reopen via `FileWal::open_for_recovery`, which re-scans from disk and
+/// only ever trusts bytes a `fsync` actually completed) — no new recovery
+/// mechanism is introduced here, per this project's own standing rule
+/// that `GroupCommitter` must not duplicate `FileWal`'s recovery logic.
+struct LeaderFailureGuard<'a> {
+    committer: &'a GroupCommitter,
+    armed: bool,
+}
+
+impl<'a> LeaderFailureGuard<'a> {
+    fn new(committer: &'a GroupCommitter) -> Self {
+        LeaderFailureGuard {
+            committer,
+            armed: true,
+        }
+    }
+
+    /// Called only after `run_as_leader` has returned normally (`Ok` or
+    /// `Err`) — both of those paths already called `finish_batch_ok`/
+    /// `finish_batch_with_error` themselves, so disarming here just
+    /// prevents this guard's `Drop` from redundantly repeating that work,
+    /// not from correcting it.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeaderFailureGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Reached only via unwind (panic) — `run_as_leader` never returns
+        // without disarming first. Same shape as `finish_batch_with_error`,
+        // deliberately not a call to it: that function takes an `io::
+        // ErrorKind` this call site does not have (there was no `io::Error`
+        // — there was no return at all).
+        {
+            let mut guard = self.committer.lock_batch();
+            guard.leader_active = false;
+            if guard.poisoned.is_none() {
+                guard.poisoned = Some(PoisonReason::LeaderPanicked);
+            }
+        }
+        self.committer.condvar.notify_all();
+    }
 }
 
 /// RAII guard for one reserved slot in `GroupCommitter::pending_waiters` —
@@ -537,8 +637,8 @@ impl GroupCommitter {
             if self.durable_through.load(Ordering::Acquire) >= seq {
                 return Ok(());
             }
-            if let Some(kind) = guard.poisoned {
-                return Err(Self::poisoned_error(kind));
+            if let Some(reason) = guard.poisoned {
+                return Err(Self::poisoned_error(reason));
             }
             // Re-checked every iteration (not just on entry): a follower
             // already waiting when shutdown() is called is woken by its
@@ -554,7 +654,15 @@ impl GroupCommitter {
                 self.batch_bytes.store(0, Ordering::Relaxed);
                 super::fire_abort_hook(super::AbortPoint::AfterLeaderElection);
                 drop(guard);
-                return self.run_as_leader();
+                // Armed for the whole `run_as_leader` call so a leader
+                // panic (not just a returned `Err`) still clears
+                // `leader_active` and poisons the committer instead of
+                // wedging it forever — see `LeaderFailureGuard`'s doc
+                // comment (the Phase 3 P0 fix).
+                let leader_failure_guard = LeaderFailureGuard::new(self);
+                let result = self.run_as_leader();
+                leader_failure_guard.disarm();
+                return result;
             }
 
             let wait_timeout = self.follower_wait_timeout();
@@ -572,8 +680,8 @@ impl GroupCommitter {
                 if self.durable_through.load(Ordering::Acquire) >= seq {
                     return Ok(());
                 }
-                if let Some(kind) = guard.poisoned {
-                    return Err(Self::poisoned_error(kind));
+                if let Some(reason) = guard.poisoned {
+                    return Err(Self::poisoned_error(reason));
                 }
                 return Err(EngineError::Timeout {
                     detail: format!(
@@ -990,18 +1098,35 @@ impl GroupCommitter {
         {
             let mut guard = self.lock_batch();
             guard.leader_active = false;
-            guard.poisoned = Some(kind);
+            guard.poisoned = Some(PoisonReason::FsyncFailed(kind));
         }
         self.condvar.notify_all();
     }
 
-    fn poisoned_error(kind: io::ErrorKind) -> EngineError {
-        EngineError::Io(io::Error::new(
-            kind,
-            "group-commit leader's fsync failed; this GroupCommitter is \
-             poisoned and must be discarded (drop it and open a fresh one) \
-             — see PROCESS.md §1",
-        ))
+    fn poisoned_error(reason: PoisonReason) -> EngineError {
+        match reason {
+            PoisonReason::FsyncFailed(kind) => EngineError::Io(io::Error::new(
+                kind,
+                "group-commit leader's fsync failed; this GroupCommitter is \
+                 poisoned and must be discarded (drop it and open a fresh one) \
+                 — see PROCESS.md §1",
+            )),
+            PoisonReason::LeaderPanicked => EngineError::Io(io::Error::other(
+                "group-commit leader thread panicked before it could complete this batch \
+                 (the fsync outcome is unknown); this GroupCommitter is poisoned and must be \
+                 discarded (drop it and open a fresh one, which re-scans the WAL from disk) \
+                 — see PHASE3_FAILURE_MODEL.md",
+            )),
+        }
+    }
+
+    /// `true` once this `GroupCommitter` has been poisoned (an `fsync`
+    /// failure or a leader panic) — see `PoisonReason`. Exposed for
+    /// observability/tests; every caller-visible effect of poisoning is
+    /// already reachable via `await_durable`'s own `Err`, so nothing in
+    /// this module's own correctness depends on this accessor.
+    pub fn is_poisoned(&self) -> bool {
+        self.lock_batch().poisoned.is_some()
     }
 
     fn io_kind_of(err: &EngineError) -> io::ErrorKind {
@@ -1504,7 +1629,7 @@ pub(crate) fn estimate_frame_len(op: &WalOp<'_>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::WalConfig;
+    use crate::wal::{WalConfig, WalOpOwned};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as AtomicOrdering};
@@ -1894,6 +2019,271 @@ mod tests {
         assert!(matches!(err2, EngineError::Io(_)));
 
         committer.clear_fsync_fault_hook();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **Phase 3 P0 leader-panic test** (`PHASE3_FAILURE_MODEL.md` §4;
+    /// the required "Leader Panic Test" this project's Phase 3 brief
+    /// mandates). Deterministic — no reliance on timing races — via
+    /// `install_fsync_fault_hook`'s panic injection. Verifies, in one
+    /// place, every property the brief requires:
+    ///
+    /// 1. records durable *before* the panic remain durable (never
+    ///    un-published, never lost);
+    /// 2. the panicking caller's own `await_durable` returns promptly
+    ///    (never hangs);
+    /// 3. the committer transitions to the documented terminal state
+    ///    (`is_poisoned() == true`, `PoisonReason::LeaderPanicked`);
+    /// 4. a later write, submitted after the panic, fails fast (bounded,
+    ///    immediate — not a multi-second wait for a leader that will
+    ///    never come) rather than being silently dropped or falsely
+    ///    acknowledged;
+    /// 5. after discarding this poisoned committer and reopening the same
+    ///    WAL directory (the documented recovery path — "process
+    ///    restart"), recovery succeeds, sees exactly the pre-panic
+    ///    records, gap-free and duplicate-free, and a fresh `GroupCommitter`
+    ///    over the reopened `FileWal` works normally again.
+    #[test]
+    fn leader_panic_clears_leader_active_poisons_and_recovers_cleanly_on_reopen() {
+        let dir = temp_dir("leader_panic");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = GroupCommitter::new(wal).unwrap();
+
+        // One record durable *before* the panic — must survive it.
+        let pos1 = committer
+            .append_durable(WalOp::Put {
+                key: b"before-panic",
+                value: b"v1",
+            })
+            .unwrap();
+        assert!(committer.durable_through() >= pos1.seq);
+
+        // Arm the panic and become leader for a second record.
+        committer.install_fsync_fault_hook(|| panic!("injected leader panic (Phase 3 P0 test)"));
+        let pos2 = committer
+            .append(WalOp::Put {
+                key: b"during-panic",
+                value: b"v2",
+            })
+            .unwrap();
+
+        let leader_started = Instant::now();
+        let leader_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            committer.await_durable(pos2.seq)
+        }));
+        assert!(
+            leader_result.is_err(),
+            "the injected panic must actually unwind through await_durable, not be swallowed"
+        );
+        assert!(
+            leader_started.elapsed() < Duration::from_secs(1),
+            "the panicking leader's own call must return (via unwind) promptly, not hang: {:?}",
+            leader_started.elapsed()
+        );
+
+        // Property 1: the pre-panic record is still durable.
+        assert!(
+            committer.durable_through() >= pos1.seq,
+            "a record durable before the leader panic must remain durable after it"
+        );
+
+        // Property 3: documented terminal state, not a silently-true
+        // `leader_active` — `LeaderFailureGuard::drop` ran during the
+        // unwind above, before `catch_unwind` even returned.
+        assert!(
+            committer.is_poisoned(),
+            "a leader panic must poison the committer, not leave it silently usable"
+        );
+
+        // Property 2/4: a *different* caller, after the panic, must fail
+        // fast — bounded and immediate, never hanging and never silently
+        // treated as durable.
+        let follower_started = Instant::now();
+        let follower_err = committer.await_durable(pos2.seq).unwrap_err();
+        assert!(
+            matches!(follower_err, EngineError::Io(_)),
+            "a poisoned committer must report a clear error, not Ok or a bare timeout: \
+             {follower_err:?}"
+        );
+        assert!(
+            follower_started.elapsed() < Duration::from_millis(500),
+            "a poisoned committer must fail immediately, not after riding out a follower \
+             timeout waiting for a leader that will never be elected again: {:?}",
+            follower_started.elapsed()
+        );
+
+        // A fresh write submitted after the panic must also fail fast,
+        // never silently dropped and never falsely acknowledged.
+        let pos3 = committer
+            .append(WalOp::Put {
+                key: b"after-panic",
+                value: b"v3",
+            })
+            .unwrap();
+        assert!(committer.await_durable(pos3.seq).is_err());
+
+        committer.clear_fsync_fault_hook();
+
+        // Property 5: recovery via the existing WAL contract. `pos2`'s
+        // and `pos3`'s bytes were `append()`ed (written, not just
+        // buffered in memory) before the panic/poison, so the segment
+        // file itself may contain them even though this process's own
+        // `durable_through` watermark never advanced past `pos1` — that
+        // is exactly why recovery re-scans from disk rather than trusting
+        // any in-memory state (`wal::mod`'s own recovery contract) and
+        // why this test asserts *at least* the durably-acknowledged
+        // prefix survives, not that later, never-confirmed bytes are
+        // absent.
+        drop(committer);
+        let (wal, replay) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        assert!(
+            replay.corrupted_segments.is_empty(),
+            "a leader panic must never leave the WAL itself corrupted"
+        );
+        assert!(
+            !replay.records.is_empty(),
+            "the pre-panic durable record must survive a real reopen, not just the in-memory \
+             watermark"
+        );
+        for (i, (seq, _)) in replay.records.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                (i as u64) + 1,
+                "recovered sequences must be gap-free and in order, panic or not"
+            );
+        }
+        assert_eq!(
+            replay.records.first().map(|(_, op)| op.clone()),
+            Some(WalOpOwned::Put {
+                key: b"before-panic".to_vec(),
+                value: b"v1".to_vec(),
+            }),
+            "the durably-acknowledged pre-panic record must be exactly what was written"
+        );
+
+        // A brand-new GroupCommitter over the reopened WAL must work
+        // normally — the panic/poison never permanently disables this
+        // WAL directory, only the one `GroupCommitter` instance that
+        // witnessed the panic.
+        let fresh_committer = GroupCommitter::new(wal).unwrap();
+        let pos4 = fresh_committer
+            .append_durable(WalOp::Put {
+                key: b"after-reopen",
+                value: b"v4",
+            })
+            .unwrap();
+        assert!(fresh_committer.durable_through() >= pos4.seq);
+        assert!(!fresh_committer.is_poisoned());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Multiple concurrent callers must all be woken and fail promptly
+    /// when whichever one of them wins the leader race panics — not each
+    /// independently discovering the poison only after riding out its own
+    /// `condvar` timeout. **Which specific caller becomes leader is a
+    /// runtime race** (the algorithm elects whoever's `await_durable`
+    /// first observes `leader_active == false`, unrelated to `seq` order
+    /// — see `await_durable`'s own doc comment), so this test does not
+    /// assume it is any particular one: every caller shares the same
+    /// panicking fault hook, and the assertions below only require that
+    /// *exactly one* of them panics (whichever won) and every other one
+    /// fails fast and cleanly (a poisoned-committer error, not a hang, not
+    /// a false `Ok`).
+    #[test]
+    fn concurrent_followers_all_fail_fast_when_the_leader_panics() {
+        let dir = temp_dir("leader_panic_followers");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = Arc::new(GroupCommitter::new(wal).unwrap());
+
+        const CALLERS: usize = 17;
+        let callers_ready = Arc::new(StdAtomicU64::new(0));
+        {
+            let callers_ready = Arc::clone(&callers_ready);
+            committer.install_fsync_fault_hook(move || {
+                // Blocks until every caller below has at least reached the
+                // point of calling `append`/being spawned, so the panic
+                // (fired by whichever one wins the leader race) genuinely
+                // happens with the rest already concurrently in flight —
+                // not a race between "spawn threads" and "the leader's own
+                // fsync" that could vary run to run.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while callers_ready.load(AtomicOrdering::Acquire) < CALLERS as u64 {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "callers never reached their wait before the deadline; \
+                             test harness bug, not the code under test"
+                        );
+                    }
+                    thread::yield_now();
+                }
+                panic!("injected leader panic with concurrent followers waiting");
+            });
+        }
+
+        let mut positions = Vec::with_capacity(CALLERS);
+        for i in 0..CALLERS {
+            positions.push(
+                committer
+                    .append(WalOp::Put {
+                        key: format!("caller-{i}").as_bytes(),
+                        value: b"v",
+                    })
+                    .unwrap(),
+            );
+        }
+
+        let overall_started = Instant::now();
+        let handles: Vec<_> = positions
+            .iter()
+            .map(|pos| {
+                let committer = Arc::clone(&committer);
+                let callers_ready = Arc::clone(&callers_ready);
+                let seq = pos.seq;
+                thread::spawn(move || {
+                    callers_ready.fetch_add(1, AtomicOrdering::AcqRel);
+                    let started = Instant::now();
+                    // `thread::spawn` already isolates a child panic —
+                    // `join()` below observes it as `Err`, no explicit
+                    // `catch_unwind` needed here.
+                    let result = committer.await_durable(seq);
+                    (result, started.elapsed())
+                })
+            })
+            .collect();
+
+        let mut panicked = 0usize;
+        let mut failed_cleanly = 0usize;
+        for h in handles {
+            match h.join() {
+                Err(_) => panicked += 1,
+                Ok((Ok(()), _)) => {
+                    panic!("no caller of a batch whose leader panicked may observe a successful Ok")
+                }
+                Ok((Err(err), elapsed)) => {
+                    failed_cleanly += 1;
+                    assert!(
+                        matches!(err, EngineError::Io(_)),
+                        "a caller that lost the leader race must see a clear poisoned-committer \
+                         error, not a bare timeout: {err:?}"
+                    );
+                    assert!(
+                        elapsed < Duration::from_secs(1),
+                        "a follower must be woken and fail promptly once the leader panics and \
+                         poisons the committer, not wait out its own condvar timeout: {elapsed:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            panicked, 1,
+            "exactly one caller wins the leader race and panics; every other one must observe \
+             the poison as a normal Err, not also panic"
+        );
+        assert_eq!(failed_cleanly, CALLERS - 1);
+        assert!(overall_started.elapsed() < Duration::from_secs(6));
+
+        assert!(committer.is_poisoned());
         let _ = fs::remove_dir_all(&dir);
     }
 

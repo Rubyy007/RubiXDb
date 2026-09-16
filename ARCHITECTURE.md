@@ -384,3 +384,36 @@ ops/sec at 100 writers (target ≥15,000) and 93,594 at 1,000 writers
 (target ≥80,000), reproducibly across 5 independent repetitions each —
 the first phase in this project's history to meet the original Phase 1
 throughput targets.
+
+## Phase 3: production hardening + MemTable integration (in progress)
+
+Phase 3's scope (production hardening of the Phase 2B write path, then
+MemTable integration) is large enough that it is being executed as a
+sequence of independently-verified increments rather than one pass —
+see `PHASE3_ARCHITECTURE.md` for the full rationale and current scope
+boundary, `PHASE3_FAILURE_MODEL.md` §5 for the explicit list of what
+remains outstanding at any point in time.
+
+**Increment 3A (complete): the P0 leader-failure fix.** Phase 2B's own
+failure model (`PHASE2B_FAILURE_MODEL.md` §3) diagnosed, but did not
+fix, a real availability gap: a leader thread panicking mid-batch left
+`GroupCommitter`'s `leader_active` flag (`src/wal/group_commit.rs`)
+stuck `true` forever, degrading every future caller to a repeated-
+timeout failure mode instead of a clean error. Fixed with
+`LeaderFailureGuard`, an RAII guard (same established pattern as
+`execution::common::CompletionGuard`) that poisons the committer
+immediately if the leader thread unwinds instead of completing its
+batch normally — no new recovery mechanism, no change to the WAL
+format, no change to which architecture (`execution::batch_coordinator`,
+the Phase 2B winner) is used. Full design: `PHASE3_FAILURE_MODEL.md`;
+decision record: `PHASE3_ADR.md` ADR-P3-1; results: `PHASE3_TEST_
+RESULTS.md`; benchmarks (100w/1,000w targets both still met after the
+fix): `PHASE3_PERFORMANCE.md`.
+
+**Explicitly not yet done** (Phase 3 operating brief's remaining
+scope — `PHASE3_FAILURE_MODEL.md` §5 has the full itemized list): the
+rest of Stage A's production hardening (full fault-injection matrix,
+coordinator lifecycle formalization, shutdown determinism audit, soak
+testing, repeated crash testing, resource-exhaustion testing, a
+production metrics/logging layer) and all of Stage B (MemTable
+integration) — neither started.

@@ -670,3 +670,91 @@ B, all reproducible. **100 writers: median 17,512 ops/sec (target
 to meet the original Phase 1 throughput targets, with zero durability or
 crash-consistency regressions. Full account: `PHASE2B_FINAL_TEST_
 RESULTS.md`; decisions: `PHASE2B_ADR.md`.
+
+---
+
+## 2026-09-16 (Phase 3, Increment 3A: the P0 leader-failure fix)
+
+**Implemented:** Phase 3's operating brief is large (production
+hardening of the Phase 2B write path, then MemTable integration —
+`PHASE3_ARCHITECTURE.md` has the full scope). Per this project's own
+"focused commits, one verified thing at a time" discipline, it is being
+executed as a sequence of increments rather than one pass; this entry
+covers the first, the P0 item the brief itself flags ahead of
+everything else (§5): a leader thread panicking mid-batch left
+`GroupCommitter`'s `leader_active` flag (`src/wal/group_commit.rs`)
+stuck `true` forever — a real, previously-diagnosed-but-unfixed gap
+from Phase 2B (`PHASE2B_FAILURE_MODEL.md` §3).
+
+Before any code change: froze the Phase 3 baseline per the brief's own
+§3 requirement — recorded `git status`/`git rev-parse HEAD`/`git log`
+(clean tree, commit `7c808eb`, the last Phase 2B commit) and re-ran the
+winning Approach B benchmark at that exact commit: 100 writers median
+17,918 ops/sec, 1,000 writers median 97,434 ops/sec (both exceed
+target, consistent with `PHASE2B_FINAL_TEST_RESULTS.md`'s own historical
+17,512/93,594 within this machine's documented noise band). Full
+numbers: `PHASE3_PERFORMANCE.md` §2.
+
+Fix: `LeaderFailureGuard` (`src/wal/group_commit.rs`), an RAII guard —
+the same established pattern `execution::common::CompletionGuard`
+already uses — armed the instant a caller is elected leader and
+disarmed only once `run_as_leader` returns normally. If the leader
+thread instead panics, the guard's `Drop` (running during the unwind)
+clears `leader_active` and poisons the committer
+(`PoisonReason::LeaderPanicked`, a new enum replacing `BatchState::
+poisoned`'s previous bare `io::ErrorKind`), so every other caller —
+already-waiting follower or a later request — fails fast and cleanly
+instead of riding out a timeout against a leader that will never be
+elected again. No new recovery mechanism: the documented path is still
+"discard this `GroupCommitter`, call `FileWal::open_for_recovery` again,
+construct a fresh one" — unchanged from Phase 1's own model, verified
+end-to-end by a new test that does exactly this and confirms the
+pre-panic durable record survives a real reopen. Full state-machine
+design and the "why poison unconditionally" analysis: `PHASE3_FAILURE_
+MODEL.md`; decision record: `PHASE3_ADR.md` ADR-P3-1.
+
+Two pre-existing Phase 2B tests
+(`execution::leader_drain::tests::one_worker_panicking_...`/`::a_
+second_request_after_the_leader_panics_...`) had doc comments and
+implicit timing assumptions describing the old, now-fixed behavior
+(~5s shutdown cost, a second request only failing after its full retry
+budget) — updated in place with new timing assertions (`< 1s`) that
+lock in the fix rather than leaving stale documentation next to
+passing-but-now-misleading tests.
+
+**Tests passing: VERIFIED.** `cargo test --lib`: 117/117 (115
+pre-existing + 2 new: `leader_panic_clears_leader_active_poisons_and_
+recovers_cleanly_on_reopen`, `concurrent_followers_all_fail_fast_when_
+the_leader_panics`). `cargo test --release --lib`: 117/117. `cargo test
+--lib --features test-util`: 117/117. `cargo clippy --all-targets
+--all-features -- -D warnings`: clean. `cargo fmt --check`: clean (two
+unrelated pre-existing trailing-newline nits in `src/wal/mod.rs`/
+`src/wal/recovery.rs` fixed as a drive-by, zero logic change). `cargo
+test --release --test crash_consistency --features test-util`: 2/2.
+`cargo test --release --test group_commit --features test-util`: 6/8 —
+only the pre-existing, unrelated Phase 1 direct-thread M1.2/M1.3
+throughput misses, unchanged and unaffected by this fix. Full table:
+`PHASE3_TEST_RESULTS.md`.
+
+Post-fix benchmark (Approach B, same methodology): 100 writers median
+15,329 ops/sec (target ≥15,000, +2.2% — down from the pre-fix 17,918
+but still passing; attributed to this machine's own documented
+run-to-run variance, not the fix itself, since the fix's cost on the
+non-panicking hot path is one `bool` write plus one `bool` check, not
+plausibly a double-digit-percent effect — flagged honestly rather than
+asserted away, see `PHASE3_PERFORMANCE.md` §3 for the full reasoning).
+1,000 writers median 93,733 ops/sec (target ≥80,000, +17.2% — matching
+Phase 2B's own historical number almost exactly). **Both Phase 2B
+throughput targets remain met.**
+
+**Explicitly not done yet:** the rest of Phase 3's Stage A (full
+fault-injection point matrix beyond the one leader-panic scenario,
+coordinator-lifecycle formalization, shutdown-determinism audit, soak
+testing, repeated crash testing, resource-exhaustion testing, a
+production metrics/logging layer) and all of Stage B (MemTable
+integration, not started). Full itemized list: `PHASE3_FAILURE_MODEL.md`
+§5.
+
+**Open Tier 3 question currently blocking further work:** none — the
+next increment (continuing Stage A hardening, or beginning Stage B) has
+no unresolved Tier 3 question yet identified.

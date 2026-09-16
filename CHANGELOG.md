@@ -6,6 +6,48 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Phase 3, Increment 3A: leader-failure P0 fix
+
+Fixes a real availability gap `PHASE2B_FAILURE_MODEL.md` §3 diagnosed
+but did not fix: a leader thread panicking mid-batch left
+`GroupCommitter`'s `leader_active` flag (`src/wal/group_commit.rs`)
+stuck `true` forever, degrading every future caller (on any
+architecture — Approach A/B/C, or a direct caller) to a repeated-timeout
+failure mode instead of a clean, bounded error.
+
+- **`LeaderFailureGuard`** (new, `src/wal/group_commit.rs`): an RAII
+  guard, armed the instant a caller is elected leader, disarmed only
+  once `run_as_leader` returns normally. If the leader thread instead
+  panics, the guard's `Drop` clears `leader_active` and poisons the
+  committer during the unwind itself — mirrors `execution::common::
+  CompletionGuard`'s existing pattern, not a new abstraction.
+- **`PoisonReason`** (new enum, replaces `BatchState::poisoned`'s
+  previous bare `io::ErrorKind`): `FsyncFailed(io::ErrorKind)` (the
+  original Phase 1 poisoning path, unchanged) or `LeaderPanicked` (new).
+  The `Err` a poisoned `GroupCommitter` returns now says which.
+- **`GroupCommitter::is_poisoned() -> bool`** (new, public): observability
+  accessor: poisoning was already externally observable via `await_
+  durable`'s `Err`; this makes it queryable without a live batch.
+- No change to the WAL format, `durable_through`'s semantics, sequence
+  allocation, rotation, or `FileWal`'s recovery contract. No new
+  dependency, no `unsafe` code. Recovery from a poisoned `GroupCommitter`
+  is unchanged from Phase 1's own documented model: discard it, reopen
+  the WAL directory (`FileWal::open_for_recovery` re-scans from disk),
+  construct a fresh one — verified end-to-end by a new test.
+- Two pre-existing `execution::leader_drain` tests, whose doc comments
+  and implicit timing assumptions described the old, now-fixed behavior
+  (~5s shutdown cost; a second request only failing after its full
+  retry budget), were updated in place with new `< 1s` timing
+  assertions locking in the fix, rather than left stale next to
+  passing-but-now-misleading documentation.
+
+Full design and the leader-failure state machine: `PHASE3_FAILURE_
+MODEL.md`; decision record: `PHASE3_ADR.md` ADR-P3-1; results: `PHASE3_
+TEST_RESULTS.md`; benchmarks: `PHASE3_PERFORMANCE.md` (both the
+100-writer and 1,000-writer Phase 2B throughput targets remain met
+after this fix, using the same Approach B/Dedicated Batch Coordinator
+architecture, unchanged).
+
 ### Phase 1: Group Commit
 
 Adds `wal::group_commit::GroupCommitter`, a leader-follower group commit

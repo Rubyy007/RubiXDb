@@ -36,9 +36,17 @@ and use the corrected ordering from the start.
 
 ## 3. A pre-existing Phase 1 limitation, newly and precisely diagnosed this cycle
 
+**Status: FIXED in Phase 3** (`PHASE3_FAILURE_MODEL.md` §1–§3,
+`LeaderFailureGuard` in `src/wal/group_commit.rs`, ADR-P3-1). The
+description below is kept verbatim as the historical record of what was
+found and diagnosed in Phase 2B — it no longer describes current
+behavior. Post-Phase-3, a leader panic clears `leader_active` and
+poisons the committer immediately (fail-fast), instead of leaving it
+permanently `true`.
+
 **Not a bug in any Phase 2B architecture — a characteristic of
 `GroupCommitter` itself** (`src/wal/group_commit.rs`), inherited
-unchanged by all three:
+unchanged by all three, at the time this document was written:
 
 A leader/coordinator thread that panics **specifically while inside the
 leader `fsync` call** (`GroupCommitter::do_leader_fsync`, reached via

@@ -926,42 +926,46 @@ mod tests {
             })
             .unwrap();
         assert!(completion.wait().is_err());
-        // `pool.shutdown()` genuinely takes ~5s here — this is *expected*
-        // and *correct*, not this module's own bug: a leader that panics
-        // mid-`fsync` (this test's injected fault) never reaches
-        // `finish_batch_ok`/`finish_batch_with_error`, so `GroupCommitter`'s
-        // own `leader_active` flag is left permanently `true` — a
-        // pre-existing Phase 1 characteristic (`src/wal/group_commit.rs`'s
-        // `SHUTDOWN_DRAIN_BOUND`), not something introduced by leader-
-        // drain. `GroupCommitter::shutdown()` faithfully waits its own
-        // fixed 5s bound for that flag to clear before giving up and
-        // returning anyway, exactly as documented. See `PHASE2B_FAILURE_
-        // MODEL.md` for the full account (found and diagnosed by this
-        // test) — not a hang (bounded, always returns) and not a
-        // regression from this cycle, but worth recording plainly.
+        // **Phase 3 P0 fix** (`src/wal/group_commit.rs`'s `LeaderFailureGuard`,
+        // `PHASE3_FAILURE_MODEL.md`): a leader that panics mid-`fsync`
+        // (this test's injected fault) no longer leaves `GroupCommitter`'s
+        // `leader_active` permanently `true`. The guard's `Drop` clears it
+        // and poisons the committer during the unwind itself, so `pool.
+        // shutdown()` below now returns promptly instead of paying the
+        // full fixed `SHUTDOWN_DRAIN_BOUND` (5s) this test used to
+        // document as expected, pre-fix, Phase 1 behavior.
+        let shutdown_started = Instant::now();
         let report = pool.shutdown();
         assert!(matches!(
             report.pool_state,
             PoolState::Stopped | PoolState::Failed
         ));
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(1),
+            "shutdown must return promptly once the leader-panic guard has cleared \
+             leader_active — no more waiting out SHUTDOWN_DRAIN_BOUND, took {:?}",
+            shutdown_started.elapsed()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// **Important, honestly-recorded limitation, not a bug**: a
-    /// standby worker (Attempt A2's redundancy) cannot rescue a *later*
-    /// request after the active drain-leader panics mid-`fsync`,
-    /// because the underlying `GroupCommitter`'s own `leader_active`
-    /// flag (`src/wal/group_commit.rs`) is left permanently `true` —
-    /// shared, process-wide state this pool has no access to reset.
-    /// Every subsequent caller (including a request a surviving standby
-    /// drains afterward) becomes a *follower* forever, since no new
-    /// leader can ever be elected, and eventually times out. This test
-    /// locks in that the system still behaves *safely* under that
-    /// condition — bounded, not hanging, not duplicating, not falsely
-    /// acknowledging — even though it cannot self-heal without
+    /// **Updated for the Phase 3 P0 fix** (`PHASE3_FAILURE_MODEL.md`): a
+    /// standby worker (Attempt A2's redundancy) still cannot rescue a
+    /// *later* request after the active drain-leader panics mid-`fsync` —
+    /// that was never the failure this test documents. What changed is
+    /// *why* the second request fails and *how fast*: pre-fix,
+    /// `GroupCommitter`'s `leader_active` flag was left permanently
+    /// `true`, so every later caller became a follower forever and only
+    /// failed after riding out its own timeout. Post-fix,
+    /// `LeaderFailureGuard` poisons the `GroupCommitter` the moment the
+    /// leader panics, so the second request now fails **immediately**
+    /// (a poisoned-committer error, not a timeout) rather than after
+    /// `await_retry_budget`. Either way, self-healing still requires
     /// reconstructing the `GroupCommitter` (Phase 1's own documented
     /// recovery model, `PHASE1_GROUP_COMMIT.md` — unchanged here, since
-    /// this module has no documented reason to alter it).
+    /// this module has no documented reason to alter it) — this test
+    /// locks in that the system behaves *safely* (bounded, not hanging,
+    /// not duplicating, not falsely acknowledging) either way.
     #[test]
     fn a_second_request_after_the_leader_panics_still_fails_safely_not_permanently_blocked() {
         let dir = temp_dir("worker_panic_second_request");
@@ -995,20 +999,27 @@ mod tests {
                 value: b"v".to_vec(),
             })
             .unwrap();
+        let second_started = Instant::now();
         let second_result = second.wait();
         assert!(
             second_result.is_err(),
-            "a second request cannot become durable once the underlying GroupCommitter's \
-             leader_active is permanently stuck — it must still fail cleanly, not hang: {second_result:?}"
+            "a second request cannot become durable once the underlying GroupCommitter is \
+             poisoned by the leader panic — it must still fail cleanly, not hang: {second_result:?}"
+        );
+        assert!(
+            second_started.elapsed() < Duration::from_secs(1),
+            "post-fix, a poisoned GroupCommitter must fail a new request immediately, not after \
+             riding out await_retry_budget — took {:?}",
+            second_started.elapsed()
         );
 
-        // This test's own teardown (implicit `pool` `Drop` below) still
-        // costs ~5s: `LeaderDrainPool::shutdown()`, once `workers_alive`
-        // reaches 0, always finalizes the underlying `GroupCommitter` —
-        // and *that* call pays `GroupCommitter`'s own fixed `SHUTDOWN_
-        // DRAIN_BOUND` (5s) waiting for the permanently-stuck `leader_
-        // active` to clear before giving up anyway. Expected, bounded,
-        // pre-existing Phase 1 behavior — not a hang, not new here.
+        // This test's own teardown (implicit `pool` `Drop` below) is now
+        // fast: `LeaderDrainPool::shutdown()` finalizes the underlying
+        // `GroupCommitter` once `workers_alive` reaches 0, and that call
+        // no longer waits out `SHUTDOWN_DRAIN_BOUND` (5s) — `leader_active`
+        // was already cleared by `LeaderFailureGuard` when the leader
+        // panicked. Pre-Phase-3, this teardown cost ~5s; that is no longer
+        // expected or correct.
         let _ = fs::remove_dir_all(&dir);
     }
 }
