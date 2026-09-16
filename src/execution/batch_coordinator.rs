@@ -699,7 +699,15 @@ fn process_batch(
     shared
         .drain_entries_total
         .fetch_add(batch_len, Ordering::Relaxed);
-    let batch_bytes: u64 = batch.iter().map(|e| e.approx_bytes as u64).sum();
+    // Saturating fold, not `.sum()` — consistent with `drain_available`'s
+    // own `drained_bytes` treatment (`PHASE3B_ADR.md` ADR-P3B-2): defense
+    // in depth on a corruption-adjacent accumulation, even though it is
+    // not currently reachable (bounded by `max_drain_per_batch *
+    // DEFAULT_MAX_RECORD_LEN`, far below `u64::MAX` for any realistic
+    // configuration).
+    let batch_bytes: u64 = batch
+        .iter()
+        .fold(0u64, |acc, e| acc.saturating_add(e.approx_bytes as u64));
     shared.bytes_total.fetch_add(batch_bytes, Ordering::Relaxed);
     fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::AfterDrain);
 
