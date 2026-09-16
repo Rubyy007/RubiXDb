@@ -6,6 +6,47 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Phase 3, Increment 3B: coordinator fault matrix + resource/rotation/shutdown hardening (soak in progress)
+
+Completes the coordinator-level half of Phase 3's production-hardening
+scope, distinct from Increment 3A's `GroupCommitter`-level leader-panic
+fix.
+
+- **`CoordinatorFaultPoint`** (new, `src/execution/batch_coordinator.rs`):
+  7 deterministically injectable points in the Dedicated Batch
+  Coordinator's own batch-processing loop (`BeforeBatchFormation`,
+  `AfterDrain`, `AfterAppend`, `BeforeAwaitDurable`, `AfterDurable`,
+  `BeforeCompletion`, `DuringShutdown`), plus `install_coordinator_
+  fault_hook`/`clear_coordinator_fault_hook` (`test-util`-gated).
+- **Fixed a real completion-safety gap**, found while wiring up the
+  `AfterDrain` test: `process_batch` previously only protected a
+  dequeued entry with a `CompletionGuard` once the append loop
+  individually reached it — a coordinator panic between dequeue and
+  that point would have dropped every entry in the batch with callers
+  hanging forever. Every entry now gets its guard as `process_batch`'s
+  first action.
+- **`queued_bytes` accounting hardened to saturating arithmetic** across
+  `batch_coordinator`/`leader_drain`/`sharded_ingress`/`write_pool` —
+  consistency fix, not currently exploitable, matching this project's
+  own `wal_test.md` §3.7 precedent.
+- **New tests**: large-payload byte accounting (deterministic barrier),
+  rapid submit/shutdown cycling, frequent rotation under sustained load
+  through the full production path, shutdown racing active submission,
+  and 7 coordinator-panic tests (one per fault point).
+- **Observability**: `BatchCoordinatorStats::{queue_capacity,
+  queued_bytes_capacity}`, `GroupCommitStats::{highest_sequence,
+  segment_rotations}` (new fields, zero new contention). Full metric-
+  list audit and explicit gap accounting: `PHASE3B_TEST_RESULTS.md` §7.
+- **`examples/soak_test.rs`** (new): sustained-workload harness against
+  the production `BatchCoordinatorPool` with low-contention per-thread
+  latency sampling and periodic aggregation, RSS tracking, and a
+  start/mid/end drift comparison.
+
+128/128 lib tests pass (117 + 11 new), clippy and fmt clean, zero
+regressions. Full design: `PHASE3B_ARCHITECTURE.md`; failure model:
+`PHASE3B_FAILURE_MODEL.md`; decisions: `PHASE3B_ADR.md`; results
+(authoritative completion status): `PHASE3B_TEST_RESULTS.md`.
+
 ### Phase 3, Increment 3A: leader-failure P0 fix
 
 Fixes a real availability gap `PHASE2B_FAILURE_MODEL.md` §3 diagnosed

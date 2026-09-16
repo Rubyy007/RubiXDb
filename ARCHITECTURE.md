@@ -410,10 +410,37 @@ decision record: `PHASE3_ADR.md` ADR-P3-1; results: `PHASE3_TEST_
 RESULTS.md`; benchmarks (100w/1,000w targets both still met after the
 fix): `PHASE3_PERFORMANCE.md`.
 
-**Explicitly not yet done** (Phase 3 operating brief's remaining
-scope — `PHASE3_FAILURE_MODEL.md` §5 has the full itemized list): the
-rest of Stage A's production hardening (full fault-injection matrix,
-coordinator lifecycle formalization, shutdown determinism audit, soak
-testing, repeated crash testing, resource-exhaustion testing, a
-production metrics/logging layer) and all of Stage B (MemTable
-integration) — neither started.
+**Increment 3B (in progress/mostly complete): coordinator-level fault
+matrix, overflow-safety hardening, resource/rotation/shutdown coverage,
+observability audit, soak testing.** Extends Phase 3A's `GroupCommitter`-
+level leader-panic fix with the *coordinator*-level fault matrix the
+brief's Section 6 asks for — `CoordinatorFaultPoint`, 7 deterministically
+injectable points in `execution::batch_coordinator`'s own batch-
+processing loop, distinct from `GroupCommitter`'s existing leader-`fsync`-
+only hook. Wiring this up surfaced and fixed a real, previously-untested
+completion-safety gap: entries dequeued from the shared queue had no
+panic-safety net until individually reached by the append loop — fixed
+by building every entry's `CompletionGuard` as `process_batch`'s first
+action. Also: `queued_bytes` accounting hardened to saturating
+arithmetic across all four `execution::*` architectures (defense in
+depth, not currently exploitable); new tests for large-payload byte
+accounting, rapid submit/shutdown cycling, frequent rotation under
+sustained load through the full production path, and shutdown racing
+active submission; a grounded observability audit against the brief's
+full metric list with a few safe, zero-new-contention additions
+(`queue_capacity`, `highest_sequence`, `segment_rotations`); a bounded-
+duration soak test (`examples/soak_test.rs`) against the production
+`BatchCoordinatorPool`. Full design: `PHASE3B_ARCHITECTURE.md`;
+failure model: `PHASE3B_FAILURE_MODEL.md`; decisions: `PHASE3B_ADR.md`;
+results: `PHASE3B_TEST_RESULTS.md` (the authoritative source for
+whether Phase 3B is complete or has open blockers — check it directly
+rather than assuming from this summary).
+
+**Explicitly not yet done** (see `PHASE3B_TEST_RESULTS.md`'s own
+itemized gap list for the authoritative, current version of this):
+a true multi-hour soak (a bounded ~15-minute-per-level run was
+performed instead), periodic forced-crash-during-soak testing,
+dedicated pathological-WAL recovery stress beyond Phase 0/1's existing
+coverage, a full from-scratch production metrics layer (most of the
+brief's Section 15 counter list), and all of Stage B (MemTable
+integration) — not started.

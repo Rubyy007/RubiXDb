@@ -758,3 +758,106 @@ integration, not started). Full itemized list: `PHASE3_FAILURE_MODEL.md`
 **Open Tier 3 question currently blocking further work:** none — the
 next increment (continuing Stage A hardening, or beginning Stage B) has
 no unresolved Tier 3 question yet identified.
+
+---
+
+## 2026-09-16 (Phase 3, Increment 3B: coordinator fault matrix + resource/rotation/shutdown hardening)
+
+**Implemented:** continuing Phase 3's own "small, independently-verified
+increments" discipline (`PHASE3_ADR.md` ADR-P3-2), this entry covers
+Increment 3B: completing the coordinator-level half of Phase 3's
+production-hardening scope (the operating brief's Section 6, distinct
+from Increment 3A's `GroupCommitter`-level leader-panic fix), plus
+resource-exhaustion, rotation-stress, shutdown, and observability
+coverage.
+
+Froze the baseline at commit `68d70ea` (last Phase 3A commit, clean
+tree) — 100w median 17,582 ops/sec, 1000w median 92,671 ops/sec, both
+comfortably above target, zero failures/timeouts across 6 runs. Full
+numbers: `PHASE3B_TEST_RESULTS.md` §2.
+
+Added `CoordinatorFaultPoint` (`src/execution/batch_coordinator.rs`):
+7 deterministically injectable points in the Dedicated Batch
+Coordinator's own batch-processing loop (before batch formation, after
+drain, after append, before/after awaiting durability, before
+completion, during shutdown) — none of which `GroupCommitter`'s
+existing leader-`fsync`-only fault hook can reach. Wiring up the
+`AfterDrain` test **surfaced a real, previously-untested correctness
+gap**: `process_batch` only gave a dequeued entry its `CompletionGuard`
+once the append loop individually reached it — a coordinator panic
+between dequeue and that point would have dropped every entry in the
+batch with callers hanging forever (the shared queue's own panic-safety
+fallback, `CoordinatorAliveGuard`, only covers entries still in the
+queue, not ones already handed to a local batch). Fixed by building
+every entry's guard as `process_batch`'s first action, before any other
+work. 7 new tests (one per fault point) all pass, verifying no caller
+hangs, no universal false success, the pool reaches a terminal state,
+and the WAL remains recoverable at every point. Full design: `PHASE3B_
+FAILURE_MODEL.md`; decision record: `PHASE3B_ADR.md` ADR-P3B-1.
+
+Also fixed a smaller, related gap found during the same audit:
+`queued_bytes += approx_bytes` (raw addition) was inconsistent with the
+saturating-arithmetic admission check right beside it, across all four
+`execution::*` architectures — not currently exploitable (the admission
+check already bounds accepted totals well below `usize::MAX`) but
+inconsistent with this project's own established "never raw arithmetic
+on a corruption-adjacent value" precedent (`wal_test.md` §3.7). Fixed
+consistently across `batch_coordinator`/`leader_drain`/`sharded_
+ingress`/`write_pool`. `PHASE3B_ADR.md` ADR-P3B-2.
+
+New tests: large-payload byte accounting (200 KiB payloads, a
+deterministic atomic-counter barrier — not sleep timing — pins down
+exactly one in-flight entry before measuring `queued_bytes`), rapid
+submit/shutdown cycling (25 iterations), frequent automatic rotation
+under sustained concurrent load through the *full production path*
+(extends the pre-existing `tests/group_commit/rotation_mid_batch.rs`
+M1.5 coverage, which only exercises `GroupCommitter` directly, not the
+coordinator sitting in front of it), and `shutdown()` racing active
+submission.
+
+Observability: audited existing `GroupCommitStats`/
+`BatchCoordinatorStats` against the operating brief's full metric list
+(Section 15) — added the genuinely safe, zero-new-contention gaps
+(`queue_capacity`, `queued_bytes_capacity`, `highest_sequence`,
+`segment_rotations`); explicitly did **not** attempt a full from-scratch
+metrics layer this increment (`PHASE3B_ADR.md` ADR-P3B-3) — recorded as
+an open item, not silently marked done. `examples/soak_test.rs`'s own
+latency-sampling design (per-thread local slots, periodic aggregation
+by a dedicated sampler thread) stands as a validated low-contention
+reference for that future work — the same shape Phase 1's own
+`batch_timing` module already proved necessary at this project's scale.
+
+Soak test: built `examples/soak_test.rs` against the production
+`BatchCoordinatorPool`; ran 100 writers for 900s (15 minutes) — **not**
+the brief's requested multi-hour duration, flagged explicitly rather
+than hidden or extrapolated (`PHASE3B_ADR.md` ADR-P3B-4). Result: zero
+errors, zero timeouts, zero backpressure rejections across 15,495,498
+completed ops; `queue_depth` was `0` at every sample (the coordinator
+never fell behind); RSS *decreased* slightly over the run (no leak
+trend); throughput at the end was *higher* than at the start (no
+degradation trend); post-shutdown recovery: exact record count, zero
+corruption, gap-free sequences, ~73s recovery time for 15.5M records
+(consistent with this project's own Phase 0 recovery-throughput
+benchmark). The 1,000-writer soak run was still in progress at the time
+this entry was written — see `PHASE3B_TEST_RESULTS.md` for its result
+once complete, and for the final post-hardening benchmark comparison
+and Section 29 completion decision.
+
+**Tests passing: VERIFIED.** `cargo test --lib`: 128/128 (117
+pre-existing + 11 new). `cargo test --release --lib`: 128/128. `cargo
+test --lib --features test-util`: 128/128. `cargo clippy --all-targets
+--all-features -- -D warnings`: clean. `cargo fmt --check`: clean.
+Zero regressions at any commit this increment.
+
+**Explicitly not done yet this increment:** a true multi-hour soak
+(bounded ~15-min-per-level run performed instead); periodic forced-
+crash-during-soak testing (Section 12); dedicated pathological-WAL
+recovery stress beyond Phase 0/1's existing coverage (Section 13); a
+full production metrics layer (most of Section 15's counter list) and
+its on/off performance comparison (Section 16); `cargo-audit`/
+`cargo-deny` (neither installed — manual `Cargo.lock` review performed
+instead); the 1,000-writer soak result and final post-hardening
+benchmark comparison (in progress as of this entry). Full itemized
+list, kept current: `PHASE3B_TEST_RESULTS.md`.
+
+**Open Tier 3 question currently blocking further work:** none.
