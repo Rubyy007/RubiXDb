@@ -1307,4 +1307,89 @@ mod tests {
         assert_eq!(replay.records.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// Phase 3B §14 (rotation stress): `tests/group_commit/rotation_mid_
+    /// batch.rs` (M1.5) already proves rotation mid-batch is safe at the
+    /// `GroupCommitter` level directly; this test exercises the same
+    /// property through the full production path — `BatchCoordinatorPool`
+    /// submitting under sustained concurrent load against a WAL
+    /// configured with a deliberately small `max_segment_size`, so
+    /// automatic rotation happens *many* times over the run (not just
+    /// once), interleaved with real concurrent submissions from many
+    /// threads. Verifies: many rotations actually occurred, every
+    /// completion succeeded, and the reopened WAL is uncorrupted with a
+    /// gap-free, complete, in-order sequence — i.e. sequence continuity,
+    /// durability ordering, and recovery all hold across many rotation
+    /// boundaries under real load, not just one.
+    #[test]
+    fn frequent_rotation_under_sustained_concurrent_load_recovers_correctly() {
+        let dir = temp_dir("rotation_stress");
+        let config = WalConfig {
+            max_segment_size: 16 * 1024, // deliberately small: forces frequent rotation
+            sync_mode: SyncMode::GroupCommit {
+                max_wait: Duration::from_millis(5),
+                max_batch_bytes: 256 * 1024,
+            },
+            ..WalConfig::default()
+        };
+        let (wal, _) = FileWal::open_for_recovery(&dir, config).unwrap();
+        let committer = GroupCommitter::new(wal).unwrap();
+        let pool_config = BatchCoordinatorConfig {
+            queue_capacity: 512,
+            max_queued_bytes: 8 * 1024 * 1024,
+            submission_timeout: Duration::from_secs(5),
+            shutdown_drain_bound: Duration::from_secs(10),
+            await_retry_budget: Duration::from_secs(5),
+            max_drain_per_batch: 4096,
+        };
+        let pool = Arc::new(BatchCoordinatorPool::new(committer, pool_config).unwrap());
+
+        const THREADS: usize = 20;
+        const PER_THREAD: usize = 100;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let pool = Arc::clone(&pool);
+                thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let completion = submit_retrying(
+                            &pool,
+                            format!("t{t}-{i}").as_bytes(),
+                            b"a moderately sized value to help fill segments faster",
+                        );
+                        completion.wait().expect("write must become durable");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let segments_touched = pool.committer.current_segment_id();
+        assert!(
+            segments_touched > 5,
+            "expected many rotations under this configuration (segments_touched={segments_touched}); \
+             this test does not actually exercise frequent rotation otherwise"
+        );
+
+        let report = pool.shutdown();
+        assert!(report.fully_drained);
+        let pool = Arc::try_unwrap(pool).unwrap_or_else(|_| panic!("outstanding Arc<Pool> ref"));
+        drop(pool.into_inner().unwrap());
+
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+        assert!(
+            replay.corrupted_segments.is_empty(),
+            "frequent rotation under load must never corrupt the WAL"
+        );
+        assert_eq!(replay.records.len(), THREADS * PER_THREAD);
+        for (i, (seq, _)) in replay.records.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                (i as u64) + 1,
+                "sequences must remain gap-free and in order across many rotation boundaries"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
