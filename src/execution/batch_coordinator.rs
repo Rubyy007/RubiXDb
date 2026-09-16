@@ -105,6 +105,14 @@ pub struct BatchCoordinatorStats {
     pub submitted: u64,
     pub completed_ok: u64,
     pub completed_err: u64,
+    /// Phase 3C (operating brief §10): the subset of `completed_err`
+    /// specifically caused by `await_durable` exhausting its retry
+    /// budget (`await_retry_budget`) — i.e. genuinely timed out waiting
+    /// for durability, as opposed to a poisoned committer or another
+    /// I/O failure. A request counted here is also counted in
+    /// `completed_err`; this is a sub-classification, not a separate
+    /// bucket.
+    pub writes_timed_out: u64,
     pub rejected_backpressure: u64,
     pub queue_depth: usize,
     pub queue_capacity: usize,
@@ -115,7 +123,23 @@ pub struct BatchCoordinatorStats {
     pub processing_ns_total: u64,
     pub drain_batches: u64,
     pub drain_entries_total: u64,
+    /// Phase 3C (operating brief §10's `bytes_per_batch`): sum of every
+    /// batch's total estimated byte size (`estimate_frame_len` summed
+    /// across the batch's entries) — divide by `drain_batches` for the
+    /// mean, mirroring `avg_batch_records`'s existing shape.
+    pub bytes_total: u64,
     pub committer_stats: GroupCommitStats,
+}
+
+impl BatchCoordinatorStats {
+    /// Mean bytes per drained batch, or `0.0` if none have run yet.
+    pub fn avg_bytes_per_batch(&self) -> f64 {
+        if self.drain_batches == 0 {
+            0.0
+        } else {
+            (self.bytes_total as f64) / (self.drain_batches as f64)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -151,11 +175,13 @@ struct PoolShared {
     submitted: std::sync::atomic::AtomicU64,
     completed_ok: std::sync::atomic::AtomicU64,
     completed_err: std::sync::atomic::AtomicU64,
+    writes_timed_out: std::sync::atomic::AtomicU64,
     rejected_backpressure: std::sync::atomic::AtomicU64,
     queue_wait_ns_total: std::sync::atomic::AtomicU64,
     processing_ns_total: std::sync::atomic::AtomicU64,
     drain_batches: std::sync::atomic::AtomicU64,
     drain_entries_total: std::sync::atomic::AtomicU64,
+    bytes_total: std::sync::atomic::AtomicU64,
     /// Phase 3B deterministic coordinator fault-injection seam — see
     /// `CoordinatorFaultPoint`. Scoped to this instance's `PoolShared`
     /// (not a process-wide global), matching `GroupCommitter::fsync_
@@ -287,11 +313,13 @@ impl BatchCoordinatorPool {
             submitted: std::sync::atomic::AtomicU64::new(0),
             completed_ok: std::sync::atomic::AtomicU64::new(0),
             completed_err: std::sync::atomic::AtomicU64::new(0),
+            writes_timed_out: std::sync::atomic::AtomicU64::new(0),
             rejected_backpressure: std::sync::atomic::AtomicU64::new(0),
             queue_wait_ns_total: std::sync::atomic::AtomicU64::new(0),
             processing_ns_total: std::sync::atomic::AtomicU64::new(0),
             drain_batches: std::sync::atomic::AtomicU64::new(0),
             drain_entries_total: std::sync::atomic::AtomicU64::new(0),
+            bytes_total: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-util"))]
             coordinator_fault_hook: Mutex::new(None),
         });
@@ -519,6 +547,7 @@ impl BatchCoordinatorPool {
             submitted: self.shared.submitted.load(Ordering::Relaxed),
             completed_ok: self.shared.completed_ok.load(Ordering::Relaxed),
             completed_err: self.shared.completed_err.load(Ordering::Relaxed),
+            writes_timed_out: self.shared.writes_timed_out.load(Ordering::Relaxed),
             rejected_backpressure: self.shared.rejected_backpressure.load(Ordering::Relaxed),
             queue_depth,
             queue_capacity: self.config.queue_capacity,
@@ -529,6 +558,7 @@ impl BatchCoordinatorPool {
             processing_ns_total: self.shared.processing_ns_total.load(Ordering::Relaxed),
             drain_batches: self.shared.drain_batches.load(Ordering::Relaxed),
             drain_entries_total: self.shared.drain_entries_total.load(Ordering::Relaxed),
+            bytes_total: self.shared.bytes_total.load(Ordering::Relaxed),
             committer_stats: self.committer.stats(),
         }
     }
@@ -669,6 +699,8 @@ fn process_batch(
     shared
         .drain_entries_total
         .fetch_add(batch_len, Ordering::Relaxed);
+    let batch_bytes: u64 = batch.iter().map(|e| e.approx_bytes as u64).sum();
+    shared.bytes_total.fetch_add(batch_bytes, Ordering::Relaxed);
     fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::AfterDrain);
 
     let started = Instant::now();
@@ -713,6 +745,14 @@ fn process_batch(
         let max_seq = max_position.seq;
         fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::BeforeAwaitDurable);
         let outcome = await_durable_retrying(committer, max_seq, await_retry_budget);
+        // A genuine `writes_timed_out` sub-classification (operating
+        // brief §10): `await_durable_retrying` only ever returns `Err
+        // (EngineError::Timeout { .. })` itself when its own retry
+        // budget expired on a `Timeout` outcome — every other failure
+        // (poisoned committer, a real I/O error) returns a different
+        // variant. Computed once per batch, not per entry, since every
+        // entry in a batch shares one outcome.
+        let batch_timed_out = matches!(outcome, Err(EngineError::Timeout { .. }));
         fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::AfterDurable);
         fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::BeforeCompletion);
         for &(i, position) in &appended {
@@ -721,9 +761,16 @@ fn process_batch(
                 Err(e) => Err(respread_error(e)),
             };
             match &result {
-                Ok(_) => shared.completed_ok.fetch_add(1, Ordering::Relaxed),
-                Err(_) => shared.completed_err.fetch_add(1, Ordering::Relaxed),
-            };
+                Ok(_) => {
+                    shared.completed_ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    shared.completed_err.fetch_add(1, Ordering::Relaxed);
+                    if batch_timed_out {
+                        shared.writes_timed_out.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             guards[i]
                 .take()
                 .expect("each index's guard is taken at most once")
@@ -814,6 +861,57 @@ mod tests {
         assert!(replay.corrupted_segments.is_empty());
         assert_eq!(replay.records.len(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3C observability additions: `bytes_total` (and its
+    /// `avg_bytes_per_batch` accessor) must reflect real batch byte
+    /// sizes, and `writes_timed_out` must specifically count only the
+    /// `await_durable` retry-budget-exhausted case, not every failure.
+    #[test]
+    fn bytes_total_and_writes_timed_out_reflect_real_activity() {
+        let dir = temp_dir("bytes_and_timeouts");
+        let pool = BatchCoordinatorPool::new(test_committer(&dir), small_config()).unwrap();
+        let completion = pool
+            .submit(WalOpOwned::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            })
+            .unwrap();
+        assert!(completion.wait().is_ok());
+
+        let stats = pool.stats();
+        assert!(stats.drain_batches >= 1);
+        assert!(stats.bytes_total > 0);
+        assert!(stats.avg_bytes_per_batch() > 0.0);
+        assert_eq!(
+            stats.writes_timed_out, 0,
+            "a successful write must never be counted as timed out"
+        );
+
+        // An fsync failure (not a timeout) must NOT be counted in
+        // writes_timed_out, even though it does count in completed_err —
+        // this is the sub-classification's whole point.
+        let dir2 = temp_dir("bytes_and_timeouts_fsync_fail");
+        let committer2 = test_committer(&dir2);
+        committer2
+            .install_fsync_fault_hook(|| Err(std::io::Error::other("injected fsync failure")));
+        let pool2 = BatchCoordinatorPool::new(committer2, small_config()).unwrap();
+        let c2 = pool2
+            .submit(WalOpOwned::Put {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+            })
+            .unwrap();
+        assert!(c2.wait().is_err());
+        let stats2 = pool2.stats();
+        assert!(stats2.completed_err >= 1);
+        assert_eq!(
+            stats2.writes_timed_out, 0,
+            "an fsync failure is not a timeout and must not be counted as one"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
     }
 
     fn submit_retrying(pool: &BatchCoordinatorPool, key: &[u8], value: &[u8]) -> Completion {
