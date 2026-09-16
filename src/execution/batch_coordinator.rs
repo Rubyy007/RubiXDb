@@ -1312,6 +1312,53 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Phase 3B §7: `shutdown()` called while requests are still actively
+    /// queued (not yet drained, not blocked by any fault) must still
+    /// process every one of them to a real outcome — the documented
+    /// drain contract (`ShutdownReportBC::fully_drained`) — rather than
+    /// abandoning anything mid-flight. No sleep between submit and
+    /// shutdown: the race between "still queued" and "already drained"
+    /// is deliberately left to run naturally on each execution, and
+    /// either ordering must still end with every request accounted for.
+    #[test]
+    fn shutdown_while_queue_is_actively_populated_still_drains_every_request() {
+        let dir = temp_dir("shutdown_while_populated");
+        let pool = BatchCoordinatorPool::new(test_committer(&dir), small_config()).unwrap();
+        const N: usize = 6;
+        let completions: Vec<Completion> = (0..N)
+            .map(|i| {
+                pool.submit(WalOpOwned::Put {
+                    key: format!("k{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                })
+                .unwrap()
+            })
+            .collect();
+        // shutdown() is called immediately, before waiting on any
+        // completion — whether the coordinator has already drained these
+        // N entries or not at this exact instant is a genuine race, and
+        // shutdown's own documented contract (drain what was accepted,
+        // then stop) must hold either way.
+        let report = pool.shutdown();
+        assert!(
+            report.fully_drained,
+            "shutdown must fully drain requests that were already accepted, even if it races \
+             their submission"
+        );
+        for c in completions {
+            assert!(
+                c.wait().is_ok(),
+                "every request accepted before shutdown was requested must still reach a real, \
+                 successful outcome — never abandoned mid-flight"
+            );
+        }
+        drop(pool);
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+        assert!(replay.corrupted_segments.is_empty());
+        assert_eq!(replay.records.len(), N);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Phase 3B §14 (rotation stress): `tests/group_commit/rotation_mid_
     /// batch.rs` (M1.5) already proves rotation mid-batch is safe at the
     /// `GroupCommitter` level directly; this test exercises the same
