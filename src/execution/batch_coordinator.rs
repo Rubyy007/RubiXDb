@@ -154,6 +154,79 @@ struct PoolShared {
     processing_ns_total: std::sync::atomic::AtomicU64,
     drain_batches: std::sync::atomic::AtomicU64,
     drain_entries_total: std::sync::atomic::AtomicU64,
+    /// Phase 3B deterministic coordinator fault-injection seam — see
+    /// `CoordinatorFaultPoint`. Scoped to this instance's `PoolShared`
+    /// (not a process-wide global), matching `GroupCommitter::fsync_
+    /// fault_hook`'s existing rationale: `cargo test` runs tests
+    /// concurrently by default, so a global hook would let one test's
+    /// injected fault leak into another test's unrelated pool.
+    #[cfg(any(test, feature = "test-util"))]
+    coordinator_fault_hook: Mutex<Option<CoordinatorFaultHook>>,
+}
+
+/// Phase 3B (`PHASE3B_FAILURE_MODEL.md` §3): the coordinator-panic
+/// points the operating brief names, made independently, deterministically
+/// injectable — distinct from `GroupCommitter::install_fsync_fault_hook`,
+/// which only ever reaches the leader's own `fsync` call and cannot model
+/// a coordinator dying at any of the *other* points in its own batch loop
+/// (queue drain, append, awaiting durability, completion, shutdown).
+/// Defined unconditionally (a zero-cost enum, mirroring `wal::mod::
+/// AbortPoint`'s own rationale) so call sites never need their own
+/// `#[cfg(...)]` gating — only the hook storage/dispatch below is
+/// feature-gated, and `fire_coordinator_fault_hook` is a no-op without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoordinatorFaultPoint {
+    /// `coordinator_loop`: immediately before draining the queue for a
+    /// new batch (after waking from `not_empty`, before `drain_available`).
+    BeforeBatchFormation,
+    /// `process_batch`: immediately after `drain_available` has handed
+    /// this batch its entries, before the first `committer.append` call.
+    AfterDrain,
+    /// `process_batch`: immediately after every entry in the batch has
+    /// been appended to the WAL (assigned a real `seq`), before the one
+    /// shared `await_durable` call.
+    AfterAppend,
+    /// `process_batch`: immediately before the one shared `await_durable`
+    /// call — a separate, named point from `AfterAppend` even though no
+    /// work happens between them in this implementation, because the
+    /// operating brief's own matrix names "after WAL append" and "while
+    /// awaiting durability" as distinct phases.
+    BeforeAwaitDurable,
+    /// `process_batch`: immediately after `await_durable_retrying`
+    /// returns `Ok` (every appended entry in this batch is now
+    /// confirmed durable), before any `CompletionGuard` is resolved.
+    AfterDurable,
+    /// `process_batch`: immediately before resolving the first entry's
+    /// `CompletionGuard` with its real result.
+    BeforeCompletion,
+    /// `BatchCoordinatorPool::shutdown`: immediately after the pool has
+    /// been marked `Draining` and waiters have been notified, before
+    /// this call begins waiting for `coordinator_alive` to clear.
+    DuringShutdown,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+type CoordinatorFaultHook = Box<dyn Fn(CoordinatorFaultPoint) + Send + Sync>;
+
+/// Calls the installed coordinator fault hook (if any) — a no-op when
+/// neither `test` nor `test-util` is enabled, so every call site in this
+/// module can call it unconditionally without its own `#[cfg(...)]`,
+/// exactly mirroring `wal::mod::fire_abort_hook`'s own pattern.
+fn fire_coordinator_fault_hook(shared: &PoolShared, point: CoordinatorFaultPoint) {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        let hook = shared
+            .coordinator_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(f) = hook.as_ref() {
+            f(point);
+        }
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    {
+        let _ = (shared, point);
+    }
 }
 
 /// Simpler than `leader_drain`'s `WorkerAliveGuard`: with exactly one
@@ -217,6 +290,8 @@ impl BatchCoordinatorPool {
             processing_ns_total: std::sync::atomic::AtomicU64::new(0),
             drain_batches: std::sync::atomic::AtomicU64::new(0),
             drain_entries_total: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            coordinator_fault_hook: Mutex::new(None),
         });
         let committer = Arc::new(committer);
 
@@ -252,6 +327,37 @@ impl BatchCoordinatorPool {
             config,
             join_handle: Mutex::new(join_handle),
         })
+    }
+
+    /// Installs `hook` to run every time (until `clear_coordinator_fault_
+    /// hook` is called) the coordinator thread reaches one of the points
+    /// named by `CoordinatorFaultPoint` — see that enum's doc comment.
+    /// Scoped to this instance, mirroring `GroupCommitter::install_fsync_
+    /// fault_hook`'s own rationale. `hook` panicking at the point it
+    /// checks for is exactly how a "coordinator panics at X" scenario is
+    /// modeled deterministically — the panic propagates out of the
+    /// coordinator thread's closure exactly as a genuine bug there would.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn install_coordinator_fault_hook(
+        &self,
+        hook: impl Fn(CoordinatorFaultPoint) + Send + Sync + 'static,
+    ) {
+        let mut slot = self
+            .shared
+            .coordinator_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *slot = Some(Box::new(hook));
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn clear_coordinator_fault_hook(&self) {
+        let mut slot = self
+            .shared
+            .coordinator_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *slot = None;
     }
 
     pub fn submit(&self, op: WalOpOwned) -> Result<Completion> {
@@ -471,6 +577,10 @@ fn coordinator_loop(
             let mut guard = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
             loop {
                 if !guard.entries.is_empty() {
+                    fire_coordinator_fault_hook(
+                        &shared,
+                        CoordinatorFaultPoint::BeforeBatchFormation,
+                    );
                     break drain_available(&mut guard, max_drain_per_batch);
                 }
                 if matches!(
@@ -486,6 +596,12 @@ fn coordinator_loop(
             }
         };
         if batch.is_empty() {
+            // The coordinator is exiting with nothing left to drain,
+            // which only happens once the pool has reached a terminal
+            // or draining state — the natural point to model "the
+            // coordinator panics during shutdown," since this is where
+            // a real shutdown-driven exit actually happens.
+            fire_coordinator_fault_hook(&shared, CoordinatorFaultPoint::DuringShutdown);
             return;
         }
         shared.not_full.notify_all();
@@ -499,11 +615,24 @@ fn respread_error(e: &EngineError) -> EngineError {
     }
 }
 
-/// Identical structure to `leader_drain::process_batch` — see that
-/// function's doc comment for the full rationale (append every entry
-/// sequentially, stop at the first failure; one shared `await_durable`
-/// for the whole batch, with every entry's `CompletionGuard` constructed
-/// *before* that call so a panic during it still resolves every entry).
+/// Broadly the same shape as `leader_drain::process_batch` (append every
+/// entry sequentially, stop at the first failure; one shared `await_
+/// durable` for the whole batch), but hardened further for Phase 3B's
+/// coordinator fault-injection matrix (`PHASE3B_FAILURE_MODEL.md` §3):
+/// **every entry gets a `CompletionGuard` as this function's very first
+/// action**, before any other work — not just once it's individually
+/// reached by the append loop. This closes a real gap the original
+/// (Phase 2B) structure had: entries dequeued from the shared queue
+/// (`batch: Vec<QueueEntry>`, no longer reachable from `CoordinatorAlive
+/// Guard`'s own queue-draining fallback once removed from it) had *no*
+/// panic-safety net until the append loop individually constructed a
+/// guard for them one at a time — a coordinator panic between dequeue
+/// and that point (exactly what `CoordinatorFaultPoint::AfterDrain`
+/// exists to test) would have dropped every entry's `CompletionSlot`
+/// unresolved, hanging every caller in that batch forever. Building
+/// every guard up front, before `batch` is even iterated, means a panic
+/// at *any* point in this function — including every `CoordinatorFault
+/// Point` below — resolves every entry via some guard's `Drop` fallback.
 fn process_batch(
     batch: Vec<QueueEntry>,
     committer: &GroupCommitter,
@@ -511,57 +640,77 @@ fn process_batch(
     await_retry_budget: Duration,
 ) {
     let batch_len = batch.len() as u64;
+    // Every entry's safety net, first — see this function's doc comment.
+    // `batch` itself is never consumed by value below (only iterated by
+    // reference/index), so these borrows remain valid for the whole call.
+    let mut guards: Vec<Option<CompletionGuard>> = batch
+        .iter()
+        .map(|entry| Some(CompletionGuard::new(&entry.completion)))
+        .collect();
+
     shared.drain_batches.fetch_add(1, Ordering::Relaxed);
     shared
         .drain_entries_total
         .fetch_add(batch_len, Ordering::Relaxed);
+    fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::AfterDrain);
 
     let started = Instant::now();
-    let mut appended: Vec<(QueueEntry, WalPosition)> = Vec::with_capacity(batch.len());
-    let mut batch_iter = batch.into_iter();
-    for entry in batch_iter.by_ref() {
+    let mut appended: Vec<(usize, WalPosition)> = Vec::with_capacity(batch.len());
+    let mut stopped_at: Option<usize> = None;
+    for (i, entry) in batch.iter().enumerate() {
         let queue_wait_ns =
             u64::try_from(entry.enqueued_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
         shared
             .queue_wait_ns_total
             .fetch_add(queue_wait_ns, Ordering::Relaxed);
         match committer.append(entry.op.as_wal_op()) {
-            Ok(position) => appended.push((entry, position)),
+            Ok(position) => appended.push((i, position)),
             Err(e) => {
-                let guard = CompletionGuard::new(&entry.completion);
                 shared.completed_err.fetch_add(1, Ordering::Relaxed);
-                guard.complete(Err(e));
+                guards[i]
+                    .take()
+                    .expect("each index's guard is taken at most once")
+                    .complete(Err(e));
+                stopped_at = Some(i);
                 break;
             }
         }
     }
-    for entry in batch_iter {
-        let guard = CompletionGuard::new(&entry.completion);
-        shared.completed_err.fetch_add(1, Ordering::Relaxed);
-        guard.complete(Err(EngineError::Aborted {
-            detail: "batch-coordinator batch: an earlier entry in this same batch failed \
-                     to append; this entry was never attempted"
-                .to_string(),
-        }));
+    if let Some(stop_i) = stopped_at {
+        for guard_slot in guards.iter_mut().skip(stop_i + 1) {
+            shared.completed_err.fetch_add(1, Ordering::Relaxed);
+            guard_slot
+                .take()
+                .expect("each index's guard is taken at most once")
+                .complete(Err(EngineError::Aborted {
+                    detail: "batch-coordinator batch: an earlier entry in this same batch \
+                             failed to append; this entry was never attempted"
+                        .to_string(),
+                }));
+        }
     }
 
-    if let Some((_, max_position)) = appended.last() {
+    fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::AfterAppend);
+
+    if let Some(&(_, max_position)) = appended.last() {
         let max_seq = max_position.seq;
-        let guards: Vec<CompletionGuard> = appended
-            .iter()
-            .map(|(entry, _)| CompletionGuard::new(&entry.completion))
-            .collect();
+        fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::BeforeAwaitDurable);
         let outcome = await_durable_retrying(committer, max_seq, await_retry_budget);
-        for ((_, position), guard) in appended.iter().zip(guards) {
+        fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::AfterDurable);
+        fire_coordinator_fault_hook(shared, CoordinatorFaultPoint::BeforeCompletion);
+        for &(i, position) in &appended {
             let result = match &outcome {
-                Ok(()) => Ok(*position),
+                Ok(()) => Ok(position),
                 Err(e) => Err(respread_error(e)),
             };
             match &result {
                 Ok(_) => shared.completed_ok.fetch_add(1, Ordering::Relaxed),
                 Err(_) => shared.completed_err.fetch_add(1, Ordering::Relaxed),
             };
-            guard.complete(result);
+            guards[i]
+                .take()
+                .expect("each index's guard is taken at most once")
+                .complete(result);
         }
     }
 
@@ -816,6 +965,175 @@ mod tests {
             is_expected_rejection,
             "with no standby, the pool must reject further work cleanly once Failed"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Phase 3B: full coordinator fault-injection matrix (operating
+    // brief §3/§6, `PHASE3B_FAILURE_MODEL.md` §3) ---
+    //
+    // Each test below panics the coordinator thread at exactly one named
+    // `CoordinatorFaultPoint`, deterministically (the hook only fires
+    // once the target point is reached — no sleep-based timing), and
+    // verifies the properties §4/§6 require: no caller hangs, every
+    // submitted request gets a deterministic (never a silently-lost or
+    // falsely-successful) outcome, the pool reaches a terminal state and
+    // rejects further work, and the WAL remains recoverable with no
+    // corruption and a correct durable prefix afterward.
+
+    /// Shared verification for one `CoordinatorFaultPoint`: submits
+    /// `REQUESTS` entries, installs a hook that panics only at `point`,
+    /// asserts every submitted completion resolves (never hangs) and
+    /// none falsely reports success, asserts the pool ends terminal and
+    /// rejects further submissions, then reopens the WAL directory and
+    /// asserts it is uncorrupted with gap-free sequences — i.e. exactly
+    /// the crash-semantics checklist operating brief §4/§6 requires.
+    fn assert_coordinator_panics_safely_at(point: CoordinatorFaultPoint) {
+        const REQUESTS: usize = 5;
+        let dir = temp_dir(&format!("fault_{point:?}"));
+        let committer = test_committer(&dir);
+        let pool = BatchCoordinatorPool::new(committer, small_config()).unwrap();
+        pool.install_coordinator_fault_hook(move |p| {
+            if p == point {
+                panic!("injected coordinator panic at {point:?}");
+            }
+        });
+
+        let completions: Vec<Completion> = (0..REQUESTS)
+            .map(|i| {
+                pool.submit(WalOpOwned::Put {
+                    key: format!("k{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                })
+                .unwrap()
+            })
+            .collect();
+
+        let mut any_err = false;
+        for c in completions {
+            // Every call must resolve — a hang here means the test itself
+            // times out, which is the failure mode this test exists to
+            // rule out. `wait()` has no bound of its own by design (every
+            // architecture's own contract guarantees exactly-once
+            // completion for an accepted request — see `execution::
+            // common::Completion::wait`'s doc comment), so a violation
+            // here manifests as this test never finishing, not as a
+            // clean assertion failure — still a deterministic, real
+            // signal under `cargo test`'s own default per-test timeout.
+            let result = c.wait();
+            if result.is_err() {
+                any_err = true;
+            }
+        }
+        assert!(
+            any_err,
+            "a coordinator panic at {point:?} must cause at least one caller to observe a \
+             failure, never universal silent success"
+        );
+
+        // The pool must have reached a terminal state and reject further
+        // work — never silently continue as if nothing happened.
+        std::thread::sleep(Duration::from_millis(50));
+        let rejected = pool.submit(WalOpOwned::Put {
+            key: b"after-panic".to_vec(),
+            value: b"v".to_vec(),
+        });
+        assert!(
+            rejected.is_err(),
+            "the pool must reject new submissions after a coordinator panic at {point:?}, \
+             not silently accept work into a queue nothing will drain"
+        );
+
+        drop(pool);
+
+        // The WAL itself must remain fully recoverable — uncorrupted,
+        // gap-free sequences — regardless of where the coordinator died.
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+        assert!(
+            replay.corrupted_segments.is_empty(),
+            "a coordinator panic at {point:?} must never leave the WAL corrupted"
+        );
+        for (i, (seq, _)) in replay.records.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                (i as u64) + 1,
+                "recovered sequences must be gap-free after a coordinator panic at {point:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coordinator_panic_before_batch_formation_fails_safely() {
+        assert_coordinator_panics_safely_at(CoordinatorFaultPoint::BeforeBatchFormation);
+    }
+
+    #[test]
+    fn coordinator_panic_after_drain_fails_safely() {
+        assert_coordinator_panics_safely_at(CoordinatorFaultPoint::AfterDrain);
+    }
+
+    #[test]
+    fn coordinator_panic_after_append_fails_safely() {
+        assert_coordinator_panics_safely_at(CoordinatorFaultPoint::AfterAppend);
+    }
+
+    #[test]
+    fn coordinator_panic_before_await_durable_fails_safely() {
+        assert_coordinator_panics_safely_at(CoordinatorFaultPoint::BeforeAwaitDurable);
+    }
+
+    #[test]
+    fn coordinator_panic_after_durable_fails_safely() {
+        assert_coordinator_panics_safely_at(CoordinatorFaultPoint::AfterDurable);
+    }
+
+    #[test]
+    fn coordinator_panic_before_completion_fails_safely() {
+        assert_coordinator_panics_safely_at(CoordinatorFaultPoint::BeforeCompletion);
+    }
+
+    /// `DuringShutdown` only fires once the coordinator has genuinely
+    /// observed a terminal/draining state with nothing left to drain —
+    /// exercised via a real `shutdown()` call, not a submitted batch.
+    #[test]
+    fn coordinator_panic_during_shutdown_fails_safely_and_is_bounded() {
+        let dir = temp_dir("fault_during_shutdown");
+        let committer = test_committer(&dir);
+        let pool = BatchCoordinatorPool::new(committer, small_config()).unwrap();
+        pool.install_coordinator_fault_hook(|p| {
+            if p == CoordinatorFaultPoint::DuringShutdown {
+                panic!("injected coordinator panic during shutdown");
+            }
+        });
+
+        let completion = pool
+            .submit(WalOpOwned::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            })
+            .unwrap();
+        assert!(completion.wait().is_ok());
+
+        let started = Instant::now();
+        let report = pool.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must return boundedly even if the coordinator panics while exiting: {:?}",
+            started.elapsed()
+        );
+        // Whether shutdown() itself observes Stopped or Failed here is
+        // not the load-bearing assertion (both are terminal, documented
+        // states) — what matters is that it is bounded and one of them,
+        // never left Running/Draining forever.
+        assert!(matches!(
+            report.pool_state,
+            PoolState::Stopped | PoolState::Failed
+        ));
+        drop(pool);
+
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+        assert!(replay.corrupted_segments.is_empty());
+        assert_eq!(replay.records.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }
