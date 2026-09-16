@@ -935,3 +935,100 @@ B's own correctness will need to be judged against.
 next increment (closing Phase 3B's remaining blockers, or beginning
 Stage B against the user's own risk tolerance for the open items) has
 no unresolved Tier 3 question yet identified.
+
+---
+
+## 2026-09-16 (Phase 3C: final WAL/coordinator release certification — in progress)
+
+**Implemented:** targets exactly Phase 3B's own six named blockers
+(`PHASE3B_TEST_RESULTS.md` §11). Froze the baseline at commit `4221e2f`
+(clean tree): 100w median 17,872 ops/sec, 1000w median 91,517 ops/sec.
+
+Added `GroupCommitter`/`BatchCoordinatorPool::purge_before` (mirrors
+the existing `rotate()` wrapper exactly), enabling realistic bounded-
+WAL checkpointing during a genuinely long soak — without it, a true
+multi-hour run at full throughput would generate far more records than
+the recovery-memory limitation (`PHASE3B_ADR.md` ADR-P3B-5) can safely
+recover at the end. Launched a true 4-hour-per-writer-level soak
+(`examples/long_soak_test.rs`, 100 writers then 1,000 writers) in the
+background with periodic checkpointing — running as of this entry; see
+`PHASE3C_TEST_RESULTS.md` §3 for its current, live status.
+
+Closed, with real evidence, while the soak ran: periodic forced-crash-
+during-soak testing (`examples/crash_cycle_test.rs` — spawns a real
+child process, kills it externally at a randomized, seeded, reproducible
+delay via `Child::kill()`, a genuinely new fault-injection class
+distinct from every prior in-process mechanism since it is truly
+asynchronous and uncooperative; 40/40 cycles recovered cleanly, zero
+corruption, monotonic gap-free sequences — also the first real test,
+under actual external-kill conditions, of this project's cross-process
+file-lock release-on-death guarantee); pathological recovery stress
+(`tests/pathological_recovery_matrix.rs`, 9 fixtures, 9/9 pass, against
+the existing unmodified recovery contract — two fixtures are genuinely
+new coverage beyond Phase 0/1's own extensive corruption testing: an
+out-of-range length field at the recovery boundary specifically, and an
+unrecognized op-tag byte with a recomputed valid CRC, isolating the
+op-decode failure path from the CRC-mismatch path); the recovery-memory
+finding quantified with real swept data (`examples/recovery_memory_
+scaling.rs`, 1M/5M/10M/15M records: RSS scales linearly at ~134 bytes/
+record, recovery throughput stays flat at ~184-186K records/sec
+regardless of scale — confirms and precisely characterizes what was
+previously a single anecdotal data point) and formally analyzed for a
+future redesign (streaming iterator / callback-based replay / bounded
+replay batches — `PHASE3C_ADR.md` ADR-P3C-1, analysis only, deliberately
+not implemented this phase, per the operating brief's own explicit
+instruction not to quietly change recovery semantics); two further
+genuine, low-contention observability fields (`BatchCoordinatorStats::
+bytes_total`/`avg_bytes_per_batch`, `writes_timed_out` — a real
+sub-classification of `completed_err`, verified distinct from an fsync
+failure by a dedicated test); a completed security/dependency review
+(zero `unsafe` code and zero payload logging across every Phase 3C
+addition; `Cargo.lock` fully reviewed, no new production dependency
+this phase; `cargo-audit`/`cargo-deny` not installed — network access
+to crates.io returned HTTP 403 in this environment, judged unreliable
+to depend on, decision documented rather than silently skipped).
+
+**A real methodological mistake made and corrected mid-session,
+recorded honestly rather than hidden:** partway through this phase, a
+benchmark run was attempted while the background long soak was still
+actively running its own 100 concurrent writer threads — the resulting
+numbers (~9,000-10,000 ops/sec, well below every historical baseline)
+were an artifact of CPU contention on this machine's 4-physical/8-
+logical-core hardware, not a code regression. Recognized before being
+reported as evidence, discarded, and a new rule added to `PHASE3C_TEST_
+PLAN.md` §1 (never benchmark concurrently with an active background
+soak) before any further measurement was taken. The same contention
+also produced one transient dip in the soak's own throughput/latency
+data around t≈601-742s of the 100-writer run (ops/sec briefly down to
+1,842, p99 up to ~795ms) — investigated, not dismissed: zero requests
+were lost (`completed_err=0` throughout), and throughput/latency
+recovered fully and immediately once the concurrent load ended,
+recorded in `PHASE3C_TEST_RESULTS.md` §3 as evidence the system
+degrades proportionally and recovers promptly under real external
+contention, not as a defect.
+
+**Tests passing: VERIFIED** (debug profile; release-profile and
+`tests/group_commit`/`tests/crash_consistency` re-runs deferred until
+the background soak's binaries are no longer running, to avoid both a
+file-lock conflict and contaminating either measurement). `cargo test
+--lib`: 130/130 (129 pre-existing + 1 new). `cargo test --lib
+--features test-util`: 130/130. `cargo clippy --all-targets
+--all-features -- -D warnings`: clean. `cargo fmt --check`: clean.
+`cargo test --test pathological_recovery_matrix`: 9/9. Zero regressions
+at any commit this increment.
+
+**Explicitly not done yet this increment:** the long soak itself has
+not yet completed (§3 of `PHASE3C_TEST_RESULTS.md` is a live, in-
+progress section, updated in place as data arrives, not a placeholder);
+the final post-hardening benchmark comparison and full release
+regression gate are deferred until the soak finishes and the machine is
+genuinely idle; the final certification decision (§26: **WAL FOUNDATION
+CERTIFIED FOR LSM INTEGRATION** or **WAL FOUNDATION NOT YET CERTIFIED**)
+is not yet recorded — `PHASE3C_TEST_RESULTS.md` explicitly defers it
+rather than guessing ahead of the evidence. A production percentile
+(`p50`/`p95`/`p99`) `commit_latency` metric remains unbuilt in the
+library itself (a validated per-thread-local-slot design exists in the
+soak harnesses, not yet wired in as a library feature) — `PHASE3C_
+ADR.md` ADR-P3C-4.
+
+**Open Tier 3 question currently blocking further work:** none.

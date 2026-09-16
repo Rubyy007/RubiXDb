@@ -6,6 +6,51 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Phase 3C: final WAL/coordinator release certification (long soak in progress)
+
+Targets Phase 3B's own six named blockers directly.
+
+- **`GroupCommitter`/`BatchCoordinatorPool::purge_before`** (new):
+  mirrors the existing `rotate()` wrapper, delegating to `FileWal::
+  purge_before` under the `wal` lock. Safe to call concurrently with
+  ongoing writes. Enables realistic checkpointing during a genuinely
+  long soak.
+- **`examples/crash_cycle_child.rs` + `crash_cycle_test.rs`** (new):
+  periodic forced-crash-during-soak testing via a real external
+  process kill (`Child::kill()`, randomized/seeded/reproducible delay)
+  against a real child process running the production
+  `BatchCoordinatorPool` — a genuinely new, asynchronous, uncooperative
+  fault-injection class. 40/40 cycles recovered cleanly, zero
+  corruption, monotonic gap-free sequences.
+- **`examples/long_soak_test.rs`** (new): extends Phase 3B's
+  `soak_test.rs` with periodic checkpointing and CPU sampling
+  alongside RSS. A true 4-hour-per-writer-level run (100w then 1000w)
+  launched against the production `BatchCoordinatorPool`.
+- **`tests/pathological_recovery_matrix.rs`** (new): 9 consolidated
+  fixture tests against the existing, unmodified recovery contract —
+  9/9 pass, including two genuinely new corruption classes beyond
+  Phase 0/1's own coverage.
+- **`examples/recovery_memory_scaling.rs`** (new): quantifies
+  `PHASE3B_ADR.md` ADR-P3B-5's finding with real swept data (1M-15M
+  records) — RSS scales linearly at ~134 bytes/record, recovery
+  throughput stays flat regardless of scale. `PHASE3C_ADR.md`
+  ADR-P3C-1 analyzes (does not implement) a future streaming/callback/
+  bounded-batch recovery API redesign.
+- **`BatchCoordinatorStats::{bytes_total, writes_timed_out}`** (new):
+  two more genuine, low-contention observability fields.
+- Security/dependency review completed: zero `unsafe` code, zero
+  payload logging in any Phase 3C addition; `Cargo.lock` fully
+  reviewed (no new production dependency); `cargo-audit`/`cargo-deny`
+  not installed (crates.io network access unavailable this session,
+  decision documented).
+
+130/130 lib tests pass, clippy and fmt clean. Full design:
+`PHASE3C_ARCHITECTURE.md`; failure model: `PHASE3C_FAILURE_MODEL.md`;
+decisions: `PHASE3C_ADR.md`; results and current status (authoritative
+— the long soak, final benchmark comparison, and final certification
+decision were still in progress at this entry's own commit time):
+`PHASE3C_TEST_RESULTS.md`.
+
 ### Phase 3, Increment 3B: coordinator fault matrix + resource/rotation/shutdown hardening (soak run complete — PHASE 3B INCOMPLETE, blockers remain)
 
 Completes the coordinator-level half of Phase 3's production-hardening

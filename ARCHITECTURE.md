@@ -461,3 +461,37 @@ of this phase's scope). All of Stage B (MemTable integration) — not
 started; per `PHASE3B_TEST_RESULTS.md` §11's own recommendation, Stage
 B should not begin until at least the soak-duration and periodic-crash-
 testing blockers close.
+
+## Phase 3C: final WAL/coordinator release certification (in progress)
+
+Directly targets Phase 3B's own six named blockers. `GroupCommitter`/
+`BatchCoordinatorPool::purge_before` (new, mirrors the existing
+`rotate()` wrapper) enables realistic bounded-WAL checkpointing during
+a true multi-hour soak, closing the loop between the soak-duration
+blocker and the recovery-memory blocker without weakening either test
+(`PHASE3C_ADR.md` ADR-P3C-2). A true 4-hour-per-writer-level soak
+(`examples/long_soak_test.rs`) was launched and is evaluated in
+`PHASE3C_TEST_RESULTS.md` §3 (in progress at the time of this entry).
+
+**Closed this phase**: periodic forced-crash-during-soak testing (40/40
+external-process-kill cycles, zero corruption — `examples/crash_cycle_
+test.rs`, a genuinely new fault-injection class: an asynchronous,
+uncooperative external kill, distinct from every prior in-process
+mechanism); pathological recovery stress (9 fixtures, `tests/
+pathological_recovery_matrix.rs`); the recovery-memory finding
+quantified with real swept data (1M-15M records, linear ~134 bytes/
+record, `examples/recovery_memory_scaling.rs`) and formally analyzed
+for a future streaming/callback/bounded-batch redesign (`PHASE3C_ADR.md`
+ADR-P3C-1 — analysis only, not implemented, per the operating brief's
+own instruction); two more genuine observability fields
+(`bytes_total`/`avg_bytes_per_batch`, `writes_timed_out`); a completed
+security/dependency review (no new production dependency, `cargo-audit`/
+`cargo-deny` still not installed — network access to crates.io was
+unavailable in this environment this session).
+
+**Still open at the time of this entry**: the long soak itself (§3) has
+not yet completed, so the final performance re-verification and the
+final certification decision (`PHASE3C_TEST_RESULTS.md` §26: **WAL
+FOUNDATION CERTIFIED FOR LSM INTEGRATION** or **WAL FOUNDATION NOT YET
+CERTIFIED**) are not yet recorded — see that document directly for the
+authoritative, current status.
