@@ -28,6 +28,9 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod property_tests;
+
 /// A value stored in the memtable for one `(user_key, seq)` pair — either
 /// a live value or a tombstone marking a deletion. Maps directly from
 /// `crate::wal::WalOpOwned::{Put{value,..} -> Put(value), Delete{..} ->
