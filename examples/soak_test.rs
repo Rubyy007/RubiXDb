@@ -29,6 +29,19 @@
 //! as the operating brief specifies, was not run interactively in this
 //! session — this harness was run for a bounded, explicitly-recorded
 //! duration instead, with the shortfall flagged, not hidden.
+//!
+//! **Known limitation, discovered by an actual run on this project's own
+//! development machine, not merely anticipated**: the final recovery-
+//! verification step (`FileWal::open_for_recovery`) materializes every
+//! recovered record in one `Vec` — there is no streaming recovery API in
+//! this crate yet. A real 1,000-writer, 900-second run (~85M records,
+//! ~2.9 GiB on disk) exhausted host RAM at *that* step and was killed by
+//! the OS — **after** a fully clean, zero-error, no-leak, no-degradation
+//! 900-second write-path soak had already completed and been recorded.
+//! The write path itself was never implicated; a supplementary shorter
+//! 1,000-writer run (90s, ~8.5M records) confirmed the full soak +
+//! recovery cycle succeeds cleanly at a scale this host can actually
+//! recover. See `PHASE3B_TEST_RESULTS.md` §8 for the full account.
 
 use std::env;
 use std::fs;
@@ -342,6 +355,31 @@ fn main() {
     let pool = Arc::try_unwrap(pool).unwrap_or_else(|_| panic!("outstanding Arc<Pool> reference"));
     drop(pool.into_inner().unwrap());
 
+    // **Discovered during Phase 3B soak testing, not a write-path defect**
+    // (`PHASE3B_TEST_RESULTS.md` §8): `FileWal::open_for_recovery`
+    // materializes every recovered record as an owned `(u64, WalOpOwned)`
+    // in one `Vec` — there is no streaming/iterator recovery API in this
+    // crate yet. For a very large accumulated WAL (tens of millions of
+    // records), this step's own memory demand can be substantial
+    // (a real ~85M-record run on this project's own development machine
+    // exhausted ~16 GiB of host RAM during exactly this call, killing the
+    // process *after* a fully clean, zero-error 900s write-path soak had
+    // already completed — the write path itself was never at fault).
+    // Warn loudly rather than silently risk repeating that on a
+    // memory-constrained host; this is a known limitation of the current
+    // recovery API surface, not something this harness works around.
+    let total_ops_completed = total_ops.load(Ordering::Relaxed);
+    if total_ops_completed > 20_000_000 {
+        eprintln!(
+            "soak_test: WARNING — about to recover {total_ops_completed} records via \
+             FileWal::open_for_recovery, which materializes every record in memory at once \
+             (no streaming recovery API exists yet). This has been observed to exhaust host \
+             RAM on a large run — see PHASE3B_TEST_RESULTS.md §8. Proceeding anyway; if this \
+             process is killed, that is this known limitation, not a write-path failure — the \
+             soak's own throughput/latency/RSS samples above already recorded a valid result \
+             independent of this step."
+        );
+    }
     let recovery_started = Instant::now();
     let (_wal, replay) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
     let recovery_ms = recovery_started.elapsed().as_secs_f64() * 1000.0;

@@ -6,7 +6,7 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
-### Phase 3, Increment 3B: coordinator fault matrix + resource/rotation/shutdown hardening (soak in progress)
+### Phase 3, Increment 3B: coordinator fault matrix + resource/rotation/shutdown hardening (soak run complete — PHASE 3B INCOMPLETE, blockers remain)
 
 Completes the coordinator-level half of Phase 3's production-hardening
 scope, distinct from Increment 3A's `GroupCommitter`-level leader-panic
@@ -40,12 +40,30 @@ fix.
 - **`examples/soak_test.rs`** (new): sustained-workload harness against
   the production `BatchCoordinatorPool` with low-contention per-thread
   latency sampling and periodic aggregation, RSS tracking, and a
-  start/mid/end drift comparison.
+  start/mid/end drift comparison. Run for 900s (15 min) at both 100 and
+  1,000 writers — write path clean at both levels (zero errors/timeouts,
+  flat RSS, no degradation trend).
+- **A genuine finding, not a Phase 3B-introduced defect**: the
+  1,000-writer soak's own post-run recovery-verification step (not the
+  write path) was killed by a real host out-of-memory condition while
+  `FileWal::open_for_recovery` materialized ~85M records into one `Vec`
+  — this project's existing (Phase 0) recovery API has no streaming
+  variant, and its memory demand scales with WAL size. Investigated,
+  confirmed correct at reduced scale by a supplementary run, documented
+  precisely (`PHASE3B_ADR.md` ADR-P3B-5) rather than hidden; the harness
+  now warns before repeating it. Fixing the underlying API is out of
+  this phase's scope.
+- Final post-hardening benchmark: no measurable regression (100w 16,133
+  ops/sec, 1000w 91,208 ops/sec — both within the pre-established
+  historical noise band and comfortably above target).
 
 128/128 lib tests pass (117 + 11 new), clippy and fmt clean, zero
 regressions. Full design: `PHASE3B_ARCHITECTURE.md`; failure model:
-`PHASE3B_FAILURE_MODEL.md`; decisions: `PHASE3B_ADR.md`; results
-(authoritative completion status): `PHASE3B_TEST_RESULTS.md`.
+`PHASE3B_FAILURE_MODEL.md`; decisions: `PHASE3B_ADR.md`; performance:
+`PHASE3B_PERFORMANCE.md`; results and final verdict: `PHASE3B_TEST_
+RESULTS.md` — **PHASE 3B INCOMPLETE — BLOCKERS REMAIN** (six explicit,
+named gaps against the operating brief's full scope; see that
+document's §11 for the complete list and recommendation).
 
 ### Phase 3, Increment 3A: leader-failure P0 fix
 

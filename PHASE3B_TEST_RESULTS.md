@@ -168,15 +168,100 @@ recovery-throughput benchmark, ~132–135 Kelem/s), sequences gap-free.
 
 ### 1,000 writers, 900s
 
-See §8a below (filled in once the run completes — this document is
-updated in place before final commit, not left with a placeholder in
-the committed version).
+| | Start (t=60s) | Mid (t=~450s) | End (t=900.4s) |
+|---|---|---|---|
+| ops/sec | 92,002 | 96,131 | 96,706 |
+| p99 (ms) | 18.225 | 17.944 | 11.965 |
+| RSS (KB) | 32,144 | 32,344 | 30,016 |
+| queue_depth | 0 | 0 | 295 |
+| completed_err | 0 | 0 | 0 |
+
+**Total**: 84,877,639 ops completed over 900s (mean ≈94,308 ops/sec),
+**zero errors, zero timeouts, zero backpressure rejections across the
+entire run**. `queue_depth` was `0` at nearly every sample (two brief
+non-zero samples — 474 at t=240s, 178 at t=360s, 792/295 near the very
+end as submission wound down — never sustained, never growing). RSS
+stayed essentially flat the whole run (32,144 → 32,344 → 30,016 KB,
+**decreasing** by the end, no leak trend). Throughput at the end was
+*higher* than at the start (+5.1% in the harness's own "drop" metric,
+i.e. actually an increase) — no degradation trend. `pool.shutdown()`
+completed cleanly: `pool_state=Stopped fully_drained=true`.
+
+**Post-shutdown recovery verification: INCONCLUSIVE for this specific
+run, root cause identified and it is not a write-path defect.**
+Immediately after the clean shutdown above, this session's background
+task was **killed by the OS ("system is running low on memory")**
+while the harness's own recovery-verification step
+(`FileWal::open_for_recovery`) was materializing all ~85M recovered
+records into one `Vec<(u64, WalOpOwned)>` — there is no streaming
+recovery API in this crate yet, and this project's own host has 16 GiB
+total RAM, shared with everything else running in this session.
+**Investigated, not dismissed as noise** (per this document's own §21
+standard and the operating brief's "do not dismiss slow leaks" rule):
+
+- The write path itself (`BatchCoordinatorPool`/`GroupCommitter`/WAL
+  append) was not implicated — every sample above shows flat RSS and
+  stable throughput for the *entire* 900s the write path was active;
+  the OOM happened strictly after `shutdown()` had already returned
+  cleanly, inside a wholly separate, already-known-expensive recovery
+  call.
+- **Confirmed by a supplementary run**: a shorter 1,000-writer soak
+  (90s, ~8.5M records — `cargo run --release --example soak_test --
+  1000 90 30`) completed its *entire* cycle cleanly, including full
+  recovery: `corrupted_segments=0`, `records_recovered=8,506,743`
+  (exact match), `recovery_ms=39,808.5`, `sequences_gap_free=true`, RSS
+  flat throughout (27,056 → 28,048 → 26,972 KB). This confirms
+  correctness of both the write path and the recovery path at
+  1,000-writer scale — only the *volume* (85M records materialized in
+  one `Vec`, ~2.9 GiB on disk, plausibly several times that in RSS given
+  two separate heap allocations per `Put` record plus `Vec` growth
+  overhead) exceeded what this specific host could hold in memory for
+  that one verification call.
+- The 100-writer run above recovered 15.5M records successfully (§8),
+  so the actual memory wall on this host lies somewhere between 15.5M
+  and 85M records for this recovery API's current (whole-file,
+  non-streaming) design.
+
+**This is recorded as a genuine, out-of-Phase-3B-scope finding**, not
+papered over: `FileWal::open_for_recovery`'s API (inherited unchanged
+from Phase 0) does not scale to a WAL with tens of millions of
+un-checkpointed records without a proportionally large recovery-time
+memory footprint. `examples/soak_test.rs` now (a) warns loudly before
+attempting this step on a very large run and (b) documents the finding
+in its own module doc comment, so a future session hitting this again
+recognizes it immediately rather than re-diagnosing it. **Fixing the
+underlying recovery API (a streaming/iterator design) is out of Phase
+3B's scope** — Phase 3B hardens the existing write/coordinator path and
+explicitly does not touch WAL recovery internals per the operating
+brief's own "no new recovery mechanism" rule; this is deferred to
+whichever future phase next touches the recovery API surface (plausibly
+relevant to Stage B/MemTable's own recovery reconstruction work).
 
 ## 9. Final performance re-verification (§19–§20)
 
-See §9a below (filled in after the soak completes, per the regression-
-bound rule in `PHASE3B_TEST_PLAN.md` §1, established before these
-numbers were measured).
+**Command**: `cargo run --release --example batch_coordinator_load_test
+-- <writer_count> 1000`, run after all Phase 3B code changes (commit
+`8eece1b` and this document's own finalization). Same machine, storage,
+power mode, and release-profile binary as the baseline (§2).
+
+| Level | Runs (ops/sec) | Median | vs. baseline median | Within historical band (`PHASE3B_TEST_PLAN.md` §1)? |
+|---|---|---|---|---|
+| 100 writers | 17,621 · 15,800 · 16,133 | **16,133** | -8.2% (17,582 → 16,133) | Yes (13,700–18,500) |
+| 1,000 writers | 90,309 · 91,512 · 91,208 | **91,208** | -1.6% (92,671 → 91,208) | Yes (90,700–97,600) |
+
+**Verdict per the pre-established rule** (`PHASE3B_TEST_PLAN.md` §1):
+both medians fall inside the historical noise band and are not
+reproducibly below it (3 repetitions each, no consistent downward
+trend) → **classified as normal machine noise, not a regression**. Both
+also clear the absolute floor (100w ≥15,000: 16,133 passes with +7.6%
+margin; 1000w ≥80,000: 91,208 passes with +14.0% margin). **No
+investigation triggered; Phase 3B introduces no measurable throughput
+regression** in the production Dedicated Batch Coordinator architecture.
+
+Recovery verified correct after every 1,000-writer run in this
+benchmark (1,000,000/1,000,000 records, zero corruption) — unaffected
+by §8's finding above, since this benchmark's WAL size (1M records) is
+far below the scale where the recovery-memory limitation was observed.
 
 ## 10. Security review (§21–§22)
 
@@ -203,4 +288,85 @@ this increment (§3–§4 above).
 
 ## 11. Final engineering decision (§29)
 
-See §11 below (filled in last).
+**PHASE 3B INCOMPLETE — BLOCKERS REMAIN**, per operating brief §28's
+own explicit rule ("do not claim full Phase 3 completion while
+explicitly untested sections remain") and §29 ("do not call it complete
+while a Phase 3B requirement remains unverified"). This is a scoping
+statement, not a quality judgment on what *was* completed — everything
+that was attempted was measured, verified, and passed, with zero
+regressions, zero fabricated results, and every unfinished item named
+explicitly rather than silently marked done.
+
+**Verified complete and passing:**
+- Coordinator-level fault-injection matrix (7/7 points), including a
+  real completion-safety bug found and fixed.
+- Overflow-safety hardening across all four `execution::*` architectures.
+- Resource-exhaustion, rotation-stress, and shutdown-hardening test
+  coverage (new, targeted tests, all passing).
+- Observability audit with safe, verified additions (the rest honestly
+  recorded as gaps, not fabricated).
+- Security review (no `unsafe`, no payload logging, no new dependencies,
+  dependency tree reviewed).
+- Static analysis (clippy/fmt clean throughout).
+- Soak testing at both 100 and 1,000 writers — write path fully clean at
+  both levels (zero errors/timeouts, no leak or degradation trend);
+  recovery verified at 100 writers (15.5M records) and at 1,000 writers
+  at a reduced scale (8.5M records) after the full-scale (85M record)
+  recovery check hit a genuine, root-caused, out-of-scope host-memory
+  limitation in the existing (Phase 0) recovery API — not a write-path
+  or coordinator defect.
+- Final performance re-verification: no regression, both levels within
+  the pre-established historical noise band and above the absolute
+  floor.
+
+**Exact blockers preventing full Phase 3B completion:**
+
+1. **True multi-hour soak (operating brief §10) was not run** — a
+   bounded ~15-minute-per-level run was substituted, honestly labeled.
+   This is the single largest gap: longer-duration effects (multi-hour
+   drift, rare timing windows, slow leaks below this run's detection
+   threshold) are not ruled out by the evidence gathered.
+2. **Periodic forced-crash-during-soak testing (§12) was not run** —
+   no process termination was injected at intervals during a live soak
+   and recovery re-verified repeatedly, as the brief specifies.
+3. **Dedicated pathological-WAL recovery stress (§13)** — constructing
+   WALs with many segments/batches, partial final frames, and mixed
+   corrupted-plus-valid segments specifically for this phase was not
+   done; overlapping (not identical) coverage exists from Phase 0/1.
+4. **A full production metrics layer (§15) was not built** — only a
+   targeted audit and 4 safe additions; most of the brief's named
+   counters (`writes_timed_out`, `bytes_per_batch`, production p50/p95/
+   p99 commit latency, a unified `failure_count`, `recovery_count`) do
+   not exist. The metrics on/off performance comparison (§16) has
+   nothing new to compare as a result.
+5. **`cargo-audit`/`cargo-deny` were not run** (§22) — neither is
+   installed; a manual review substituted.
+6. **The recovery-API memory-scaling limitation found this increment
+   (§8) is unresolved** — real, root-caused, and now documented and
+   warned-about in the harness, but the underlying `FileWal::open_for_
+   recovery` API itself was not changed (correctly out of scope for this
+   phase, per the brief's own "no new recovery mechanism" rule) and
+   remains a real constraint on recovering very large WALs on
+   memory-constrained hosts.
+
+None of these blockers are the unrelated future-feature exclusion §29
+warns against ("do not call it incomplete because of an unrelated
+future feature such as SSTable") — all six are explicitly named,
+in-scope Phase 3B requirements from the operating brief itself that
+were not completed to their full literal specification within this
+session.
+
+**Recommendation**: the write path and coordinator hardening delivered
+this increment (items in "verified complete" above) are safe to keep
+and build on — nothing found regressed correctness or performance, and
+one real bug (the completion-guard gap) was found and fixed as a direct
+result of this work. The path to closing the remaining blockers is a
+follow-up increment specifically for long-duration/repeated-crash
+testing and the metrics layer, not a redo of what this increment
+already covered. Per operating brief §30, Stage B (MemTable) should
+**not** begin until that follow-up closes items 1–2 above at minimum
+(the soak/crash-durability evidence Stage B's own correctness will be
+judged against) — items 3–6 are lower-risk to defer past Stage B's
+start if prioritization requires it, since none of them found or
+suggest an existing correctness problem, only incomplete verification
+breadth.

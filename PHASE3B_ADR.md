@@ -147,3 +147,51 @@ in `PHASE3B_TEST_RESULTS.md`, not conflated.
 **Consequences**: The final Phase 3B engineering decision (`PHASE3B_
 TEST_RESULTS.md` §9) accounts for this explicitly as an open item, not
 a silently-accepted risk.
+
+## ADR-P3B-5: the recovery-memory-scaling finding is documented and warned about, not fixed, this increment
+
+**Status**: Accepted (explicit, documented, out-of-scope finding).
+
+**Context**: The 1,000-writer, 900-second soak run's write path
+completed perfectly cleanly (`PHASE3B_TEST_RESULTS.md` §8), but this
+session's own background task was killed by the OS afterward, during
+the harness's own post-run recovery-verification call
+(`FileWal::open_for_recovery`) attempting to materialize ~85M recovered
+records into one `Vec<(u64, WalOpOwned)>` on a 16 GiB host. Investigated
+before deciding how to respond (per this project's own "do not dismiss
+slow leaks/failures without investigation" standard): a supplementary
+shorter run (90s, ~8.5M records) confirmed the *entire* write+recovery
+cycle is correct at 1,000-writer scale — only the *volume* of records
+materialized in one call exceeded what this host could hold for that
+one verification step. The write path (`BatchCoordinatorPool`/
+`GroupCommitter`/`FileWal::append`) was never implicated.
+
+**Decision**: Document the finding precisely (`PHASE3B_TEST_RESULTS.md`
+§8, this ADR, and `examples/soak_test.rs`'s own doc comment plus a
+runtime warning before attempting recovery on a large run) rather than
+either (a) silently omitting it, or (b) attempting to fix the
+underlying `FileWal::open_for_recovery` API (a streaming/iterator
+redesign) within this increment.
+
+**Why not fix the recovery API now?** Two reasons, both from the
+operating brief's own explicit rules: first, "do not create a new
+recovery mechanism inside Group Commit" generalizes naturally to "do
+not redesign WAL recovery internals as a side effect of a coordinator-
+hardening phase" — this is real, standalone WAL-layer work (Phase 0's
+own API surface) that deserves its own scoped, measured increment, not
+a rushed change bolted onto Phase 3B's actual scope. Second, "do not
+make speculative performance optimizations" — a streaming recovery API
+is a real, valuable future improvement, but designing it correctly
+(what does a streaming `WalReplayResult` even mean for a caller that
+needs the full picture before deciding whether the WAL is corrupted?
+where does gap-detection happen mid-stream vs. at the end?) is a design
+question this session has not scoped, let alone measured.
+
+**Consequences**: `PHASE3B_TEST_RESULTS.md` §11 names this as one of
+the six explicit blockers to "PHASE 3B COMPLETE," not swept in with a
+qualifier. Whoever next touches WAL recovery internals (plausibly
+Stage B/MemTable's own recovery reconstruction work, which the
+operating brief's own §26 already anticipates needing to "recover WAL,
+reconstruct MemTable state") should read this ADR first — the memory
+wall observed here (somewhere between 15.5M and 85M records on a 16 GiB
+host) is directly relevant to how that work should be designed.

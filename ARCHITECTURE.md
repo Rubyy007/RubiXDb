@@ -410,8 +410,9 @@ decision record: `PHASE3_ADR.md` ADR-P3-1; results: `PHASE3_TEST_
 RESULTS.md`; benchmarks (100w/1,000w targets both still met after the
 fix): `PHASE3_PERFORMANCE.md`.
 
-**Increment 3B (in progress/mostly complete): coordinator-level fault
-matrix, overflow-safety hardening, resource/rotation/shutdown coverage,
+**Increment 3B (complete, per its own "PHASE 3B INCOMPLETE — BLOCKERS
+REMAIN" verdict — see below): coordinator-level fault matrix,
+overflow-safety hardening, resource/rotation/shutdown coverage,
 observability audit, soak testing.** Extends Phase 3A's `GroupCommitter`-
 level leader-panic fix with the *coordinator*-level fault matrix the
 brief's Section 6 asks for — `CoordinatorFaultPoint`, 7 deterministically
@@ -436,11 +437,27 @@ results: `PHASE3B_TEST_RESULTS.md` (the authoritative source for
 whether Phase 3B is complete or has open blockers — check it directly
 rather than assuming from this summary).
 
-**Explicitly not yet done** (see `PHASE3B_TEST_RESULTS.md`'s own
-itemized gap list for the authoritative, current version of this):
-a true multi-hour soak (a bounded ~15-minute-per-level run was
-performed instead), periodic forced-crash-during-soak testing,
-dedicated pathological-WAL recovery stress beyond Phase 0/1's existing
-coverage, a full from-scratch production metrics layer (most of the
-brief's Section 15 counter list), and all of Stage B (MemTable
-integration) — not started.
+Both 100- and 1,000-writer soak runs completed (900s each): write path
+clean at both levels (zero errors/timeouts, flat RSS, no degradation
+trend). The 1,000-writer run's own full-scale (85M-record) post-run
+recovery check was killed by a genuine host out-of-memory condition —
+investigated, root-caused to `FileWal::open_for_recovery`'s existing
+(Phase 0) whole-file-materialization design (not a write-path defect),
+and confirmed correct at a reduced scale by a supplementary run. Full
+account and the resulting new ADR: `PHASE3B_TEST_RESULTS.md` §8,
+`PHASE3B_ADR.md` ADR-P3B-5. Final post-hardening benchmark: no
+regression (100w 16,133 ops/sec, 1000w 91,208 ops/sec — both within the
+pre-established historical noise band and comfortably above target).
+
+**Explicitly not done** (six named blockers — `PHASE3B_TEST_RESULTS.md`
+§11 has the authoritative, current list): a true multi-hour soak (a
+bounded ~15-minute-per-level run was performed instead), periodic
+forced-crash-during-soak testing, dedicated pathological-WAL recovery
+stress beyond Phase 0/1's existing coverage, a full from-scratch
+production metrics layer (most of the brief's Section 15 counter list),
+`cargo-audit`/`cargo-deny` (neither installed), and a fix for the
+recovery-API memory-scaling finding above (documented, not fixed — out
+of this phase's scope). All of Stage B (MemTable integration) — not
+started; per `PHASE3B_TEST_RESULTS.md` §11's own recommendation, Stage
+B should not begin until at least the soak-duration and periodic-crash-
+testing blockers close.

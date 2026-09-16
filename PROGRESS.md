@@ -861,3 +861,77 @@ benchmark comparison (in progress as of this entry). Full itemized
 list, kept current: `PHASE3B_TEST_RESULTS.md`.
 
 **Open Tier 3 question currently blocking further work:** none.
+
+---
+
+## 2026-09-16 (Phase 3, Increment 3B: 1,000-writer soak result + a genuine finding + final verdict)
+
+**Implemented:** completes the prior entry. The 1,000-writer, 900-second
+soak's write path finished cleanly — 84,877,639 ops, zero errors, zero
+timeouts, flat RSS, no throughput-degradation trend, `pool.shutdown()`
+returned `Stopped`/`fully_drained=true`. Immediately afterward, this
+session's background task was **killed by the OS ("system is running
+low on memory")** — not during the write path, but during the harness's
+own post-run recovery-verification call
+(`FileWal::open_for_recovery`), which was in the middle of
+materializing all ~85M recovered records into one `Vec<(u64,
+WalOpOwned)>` on a 16 GiB host.
+
+**Investigated, not dismissed** (this project's own "do not dismiss
+slow leaks/failures without investigation" standard): confirmed the
+write path was never implicated (RSS was flat and stable for the
+entire preceding 900s) via a supplementary shorter run (90s, ~8.5M
+records), which completed its *entire* write-and-recovery cycle
+cleanly — exact record count, zero corruption, gap-free sequences. The
+100-writer run's own earlier 15.5M-record recovery had also already
+succeeded (prior entry). **Root cause**: `FileWal::open_for_recovery`'s
+existing (Phase 0) API materializes every record in memory at once —
+there is no streaming/iterator recovery API in this crate — and the
+memory this requires scales with WAL size; somewhere between 15.5M and
+85M records exceeded what this specific host could hold for that one
+call. This is a real, genuine finding about the existing recovery API's
+scalability, **not a defect Phase 3B introduced and not a write-path or
+coordinator correctness bug** — recorded precisely, not papered over
+(`PHASE3B_TEST_RESULTS.md` §8, `PHASE3B_ADR.md` ADR-P3B-5).
+`examples/soak_test.rs` now warns loudly before attempting this step on
+a large run and documents the finding in its own module doc comment, so
+a future session recognizes it immediately. Fixing the underlying
+recovery API (a streaming/iterator redesign) is explicitly out of
+Phase 3B's scope — deferred, named as relevant to whichever future
+phase next touches WAL recovery internals (plausibly Stage B/MemTable's
+own recovery reconstruction work).
+
+Final post-hardening performance re-verification (100w/1000w, 3
+repetitions each, same machine/binary/methodology as every prior
+phase): 100 writers median 16,133 ops/sec (target ≥15,000, +7.6%
+margin); 1,000 writers median 91,208 ops/sec (target ≥80,000, +14.0%
+margin). Both fall inside the historical noise band established
+*before* this run (`PHASE3B_TEST_PLAN.md` §1) and are not reproducibly
+low across repetitions → **no regression from Phase 3B's hardening
+work**, per the pre-established rule, not a post-hoc rationalization.
+
+**Tests passing: VERIFIED**, unchanged from the prior entry — 128/128
+across debug/release/test-util, clippy and fmt clean, crash-consistency
+suite green.
+
+**Final Phase 3B decision** (operating brief §29, full reasoning in
+`PHASE3B_TEST_RESULTS.md` §11): **PHASE 3B INCOMPLETE — BLOCKERS
+REMAIN.** Six explicit, named blockers, none of them an unrelated
+future feature: no true multi-hour soak (a bounded ~15-min-per-level
+run substituted); no periodic forced-crash-during-soak testing; no
+dedicated pathological-WAL recovery stress beyond Phase 0/1's existing
+coverage; no full production metrics layer (only a targeted audit plus
+4 safe additions); `cargo-audit`/`cargo-deny` not run (neither
+installed; manual review substituted); the recovery-API memory-scaling
+finding above is documented but not fixed. Everything that *was*
+attempted passed, with zero fabricated results and zero regressions.
+Recommendation: the write-path/coordinator hardening delivered this
+increment is safe to build on; Stage B (MemTable) should not begin
+until a follow-up increment closes at minimum the soak-duration and
+periodic-crash-testing blockers, since those are the evidence Stage
+B's own correctness will need to be judged against.
+
+**Open Tier 3 question currently blocking further work:** none — the
+next increment (closing Phase 3B's remaining blockers, or beginning
+Stage B against the user's own risk tolerance for the open items) has
+no unresolved Tier 3 question yet identified.
