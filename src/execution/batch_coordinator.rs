@@ -541,6 +541,17 @@ impl BatchCoordinatorPool {
             .pool_state
     }
 
+    /// Delegates to `GroupCommitter::purge_before` — safe to call
+    /// concurrently with ongoing submissions (see that method's doc
+    /// comment). Not part of the coordinator's own batch-processing
+    /// state at all; exposed here purely so a caller (e.g. a long-running
+    /// soak or a real deployment's own checkpoint policy) doesn't need to
+    /// separately hold a `GroupCommitter` reference just to bound the
+    /// WAL's on-disk/recoverable footprint over time.
+    pub fn purge_before(&self, watermark_seq: u64) -> Result<Vec<u64>> {
+        self.committer.purge_before(watermark_seq)
+    }
+
     pub fn into_inner(self) -> Result<GroupCommitter> {
         self.shutdown();
         let committer = Arc::clone(&self.committer);

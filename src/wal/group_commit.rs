@@ -751,6 +751,24 @@ impl GroupCommitter {
         wal.rotate()
     }
 
+    /// Delegates to `FileWal::purge_before` (WAL Spec §10) under the same
+    /// `wal` lock `append`/the leader's snapshot use — safe to call
+    /// concurrently with ongoing writes: `purge_before` never removes the
+    /// currently-active segment, only sealed segments whose highest `seq`
+    /// is below `watermark_seq`, so it cannot race a batch's own
+    /// in-flight append or `fsync`. Added for Phase 3C's long-duration
+    /// soak testing (`PHASE3C_TEST_PLAN.md`), which periodically
+    /// checkpoints/truncates old, already-durable segments during a
+    /// multi-hour run — mirroring how a real deployment bounds its own
+    /// WAL footprint — rather than letting the WAL grow unbounded for the
+    /// run's entire duration (which would make the existing, known
+    /// recovery-memory limitation, `PHASE3B_ADR.md` ADR-P3B-5,
+    /// unavoidable at multi-hour scale).
+    pub fn purge_before(&self, watermark_seq: u64) -> Result<Vec<u64>> {
+        let mut wal = self.lock_wal();
+        wal.purge_before(watermark_seq)
+    }
+
     pub fn next_seq(&self) -> u64 {
         self.lock_wal().next_seq()
     }
@@ -2353,6 +2371,83 @@ mod tests {
         drop(wal);
         let (_wal, result) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
         assert_eq!(result.records.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3C: `purge_before` must be safe to call concurrently with
+    /// ongoing writes (it never touches the active segment — see
+    /// `FileWal::purge_before`'s own doc comment) and must genuinely
+    /// bound the WAL's on-disk footprint: after purging everything below
+    /// the current durable watermark, only the most recent (still-active)
+    /// segment's records remain recoverable.
+    #[test]
+    fn purge_before_bounds_wal_footprint_under_concurrent_writes() {
+        let dir = temp_dir("purge_concurrent");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = Arc::new(GroupCommitter::new(wal).unwrap());
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 200;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let committer = Arc::clone(&committer);
+                thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let position = committer
+                            .append(WalOp::Put {
+                                key: format!("t{t}-{i}").as_bytes(),
+                                value: b"v",
+                            })
+                            .unwrap();
+                        await_durable_retrying_on_timeout(&committer, position.seq);
+                        // Force frequent rotation so there is real,
+                        // multi-segment purge work to do, not just a
+                        // single active segment.
+                        if i.is_multiple_of(20) {
+                            let _ = committer.rotate();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = THREADS * PER_THREAD;
+        assert_eq!(committer.durable_through(), total as u64);
+
+        let segments_before_purge = committer.current_segment_id();
+        assert!(
+            segments_before_purge > 1,
+            "this test must actually exercise multiple segments to be meaningful"
+        );
+
+        // Purge everything below the current durable watermark — only
+        // the active segment's own records should remain recoverable.
+        let removed = committer.purge_before(committer.durable_through()).unwrap();
+        assert!(
+            !removed.is_empty(),
+            "purging below the full durable watermark must remove at least the sealed segments"
+        );
+
+        let committer = Arc::into_inner(committer).expect("no outstanding Arc clones remain");
+        let wal = committer.into_inner();
+        drop(wal);
+        let (_wal, result) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+        assert!(result.corrupted_segments.is_empty());
+        // Every remaining record must still be gap-free relative to its
+        // own seq (purge never corrupts what it keeps), and every kept
+        // record's seq must be one that was genuinely written.
+        for (seq, _) in &result.records {
+            assert!(*seq >= 1 && *seq <= total as u64);
+        }
+        assert!(
+            result.records.len() < total,
+            "purge must have actually reduced the recoverable record count \
+             (before={total}, after={})",
+            result.records.len()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
