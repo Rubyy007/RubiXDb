@@ -74,6 +74,7 @@ fn main() {
     let lsm_config = LsmConfig {
         memtable_max_size_bytes: 512 * 1024 * 1024,
         max_immutable_memtables: 8,
+        ..LsmConfig::default()
     };
     let engine = Arc::new(LsmEngine::open(&dir, wal_config, pool_config, lsm_config).unwrap());
 

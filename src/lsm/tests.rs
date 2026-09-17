@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -53,7 +53,7 @@ fn put_then_get_round_trips() {
     let engine = open(&dir, LsmConfig::default());
     let seq = engine.put(b"k1", b"v1").unwrap();
     assert_eq!(seq, 1);
-    assert_eq!(engine.get(b"k1"), Some(b"v1".to_vec()));
+    assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -64,7 +64,7 @@ fn delete_then_get_returns_not_found() {
     let engine = open(&dir, LsmConfig::default());
     engine.put(b"k1", b"v1").unwrap();
     engine.delete(b"k1").unwrap();
-    assert_eq!(engine.get(b"k1"), None);
+    assert_eq!(engine.get(b"k1").unwrap(), None);
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -77,10 +77,10 @@ fn put_delete_put_resolves_to_the_newest_write() {
     let seq2 = engine.delete(b"k1").unwrap();
     let seq3 = engine.put(b"k1", b"v3").unwrap();
 
-    assert_eq!(engine.get_as_of(b"k1", seq1), Some(b"v1".to_vec()));
-    assert_eq!(engine.get_as_of(b"k1", seq2), None);
-    assert_eq!(engine.get_as_of(b"k1", seq3), Some(b"v3".to_vec()));
-    assert_eq!(engine.get(b"k1"), Some(b"v3".to_vec()));
+    assert_eq!(engine.get_as_of(b"k1", seq1).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(engine.get_as_of(b"k1", seq2).unwrap(), None);
+    assert_eq!(engine.get_as_of(b"k1", seq3).unwrap(), Some(b"v3".to_vec()));
+    assert_eq!(engine.get(b"k1").unwrap(), Some(b"v3".to_vec()));
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -99,11 +99,17 @@ fn snapshot_reads_remain_stable_across_later_writes() {
     engine.put(b"k2", b"v-after-snapshot").unwrap();
 
     // The snapshot must still see exactly the state as of its own boundary.
-    assert_eq!(engine.get_as_of(b"k1", snapshot), Some(b"v1".to_vec()));
-    assert_eq!(engine.get_as_of(b"k2", snapshot), None);
+    assert_eq!(
+        engine.get_as_of(b"k1", snapshot).unwrap(),
+        Some(b"v1".to_vec())
+    );
+    assert_eq!(engine.get_as_of(b"k2", snapshot).unwrap(), None);
     // "Now" (no snapshot) sees the latest.
-    assert_eq!(engine.get(b"k1"), Some(b"v2".to_vec()));
-    assert_eq!(engine.get(b"k2"), Some(b"v-after-snapshot".to_vec()));
+    assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(
+        engine.get(b"k2").unwrap(),
+        Some(b"v-after-snapshot".to_vec())
+    );
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -115,6 +121,7 @@ fn freeze_triggers_at_the_configured_threshold_and_data_remains_visible() {
     let lsm_config = LsmConfig {
         memtable_max_size_bytes: 200,
         max_immutable_memtables: 8,
+        ..LsmConfig::default()
     };
     let engine = open(&dir, lsm_config);
 
@@ -131,7 +138,7 @@ fn freeze_triggers_at_the_configured_threshold_and_data_remains_visible() {
     // of which memtable (active or immutable) it now lives in.
     for i in 0..20u32 {
         assert_eq!(
-            engine.get(format!("k{i:03}").as_bytes()),
+            engine.get(format!("k{i:03}").as_bytes()).unwrap(),
             Some(format!("v{i:03}").into_bytes())
         );
     }
@@ -145,8 +152,17 @@ fn immutable_backpressure_rejects_further_freezes_past_the_limit() {
     let lsm_config = LsmConfig {
         memtable_max_size_bytes: 80, // freezes almost every write
         max_immutable_memtables: 2,
+        ..LsmConfig::default()
     };
     let engine = open(&dir, lsm_config);
+    // Phase 4B's background flush thread now actively drains `immutables`
+    // (`PHASE4B_ADR.md` ADR-P4B-5) -- without slowing it down, this
+    // tiny-payload workload's real disk I/O for each flush can easily
+    // keep pace with (or outrun) this single thread's own WAL-durability-
+    // bound write rate, so backpressure might never trigger at all. A
+    // deliberate artificial delay makes the "flush cannot keep up" case
+    // this test exists to cover reproducible instead of timing-dependent.
+    engine.set_flush_delay_for_test(Duration::from_millis(200));
 
     let mut saw_capacity_error = false;
     for i in 0..40u32 {
@@ -175,8 +191,14 @@ fn memory_accounting_remains_correct_across_freeze() {
     let lsm_config = LsmConfig {
         memtable_max_size_bytes: 150,
         max_immutable_memtables: 8,
+        ..LsmConfig::default()
     };
     let engine = open(&dir, lsm_config);
+    // Same reasoning as the backpressure test above: pause the background
+    // flush thread so the immutable memtable this test creates is still
+    // observable when the assertions below run, rather than racing real
+    // disk I/O (`PHASE4B_ADR.md` ADR-P4B-5).
+    engine.set_flush_delay_for_test(Duration::from_millis(200));
 
     for i in 0..10u32 {
         engine.put(format!("k{i}").as_bytes(), b"value").unwrap();
@@ -206,10 +228,23 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
     let committer = crate::wal::GroupCommitter::new(wal).unwrap();
     committer.install_fsync_fault_hook(|| Err(std::io::Error::other("injected fsync failure")));
     let pool = BatchCoordinatorPool::new(committer, small_pool_config()).unwrap();
+    // No flush thread for this raw-constructed, WAL-fault-injection-only
+    // engine: nothing in this test ever freezes a memtable, so a `Sender`
+    // whose `Receiver` is immediately dropped (never joined, never sent
+    // to) is harmless -- `shutdown`'s `flush_handle.take()` finds `None`
+    // and skips the join.
+    let (flush_sender, _unused_receiver) = mpsc::channel();
     let engine = LsmEngine {
         pool: Arc::new(pool),
         active: RwLock::new(MemTable::new(LsmConfig::default().memtable_max_size_bytes)),
-        immutables: RwLock::new(VecDeque::new()),
+        immutables: Arc::new(RwLock::new(VecDeque::new())),
+        sstables: Arc::new(RwLock::new(Vec::new())),
+        next_sstable_id: Arc::new(AtomicU64::new(1)),
+        sstables_dir: dir.join("sstables"),
+        flush_sender,
+        flush_handle: Mutex::new(None),
+        flush_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        flush_delay_ms: Arc::new(AtomicU64::new(0)),
         config: LsmConfig::default(),
     };
 
@@ -219,7 +254,7 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         "a WAL durability failure must propagate as an error"
     );
     assert_eq!(
-        engine.get(b"k1"),
+        engine.get(b"k1").unwrap(),
         None,
         "a write that never became durable must never be visible in the MemTable"
     );
@@ -240,9 +275,13 @@ fn recovery_reconstructs_the_memtable_from_the_wal_after_restart() {
     }
 
     let engine2 = open(&dir, LsmConfig::default());
-    assert_eq!(engine2.get(b"k1"), None, "k1 was deleted before shutdown");
-    assert_eq!(engine2.get(b"k2"), Some(b"v2".to_vec()));
-    assert_eq!(engine2.get(b"k3"), Some(b"v3".to_vec()));
+    assert_eq!(
+        engine2.get(b"k1").unwrap(),
+        None,
+        "k1 was deleted before shutdown"
+    );
+    assert_eq!(engine2.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(engine2.get(b"k3").unwrap(), Some(b"v3".to_vec()));
     engine2.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -260,9 +299,18 @@ fn recovery_reconstructs_multiple_versions_correctly_across_a_restart() {
     }
 
     let engine2 = open(&dir, LsmConfig::default());
-    assert_eq!(engine2.get_as_of(b"k1", seq1), Some(b"v1".to_vec()));
-    assert_eq!(engine2.get_as_of(b"k1", seq2), Some(b"v2".to_vec()));
-    assert_eq!(engine2.get_as_of(b"k1", seq3), Some(b"v3".to_vec()));
+    assert_eq!(
+        engine2.get_as_of(b"k1", seq1).unwrap(),
+        Some(b"v1".to_vec())
+    );
+    assert_eq!(
+        engine2.get_as_of(b"k1", seq2).unwrap(),
+        Some(b"v2".to_vec())
+    );
+    assert_eq!(
+        engine2.get_as_of(b"k1", seq3).unwrap(),
+        Some(b"v3".to_vec())
+    );
     engine2.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -293,7 +341,7 @@ fn recovery_across_multiple_wal_segments_and_rotation() {
         LsmEngine::open(&dir, wal_config, small_pool_config(), LsmConfig::default()).unwrap();
     for i in 0..100u32 {
         assert_eq!(
-            engine2.get(format!("k{i:04}").as_bytes()),
+            engine2.get(format!("k{i:04}").as_bytes()).unwrap(),
             Some(format!("v{i:04}").into_bytes())
         );
     }
@@ -328,7 +376,7 @@ fn concurrency_smoke(writer_count: usize, per_writer: usize) {
         for i in 0..per_writer {
             let key = format!("t{t}-k{i}");
             let expected = format!("t{t}-v{i}").into_bytes();
-            if engine.get(key.as_bytes()) != Some(expected) {
+            if engine.get(key.as_bytes()).unwrap() != Some(expected) {
                 missing += 1;
             }
         }
@@ -388,7 +436,7 @@ fn large_key_and_value_are_handled_without_overflow_or_panic() {
     let large_key = vec![b'k'; 64 * 1024]; // 64 KiB key
     let large_value = vec![b'v'; 1024 * 1024]; // 1 MiB value
     engine.put(&large_key, &large_value).unwrap();
-    assert_eq!(engine.get(&large_key), Some(large_value));
+    assert_eq!(engine.get(&large_key).unwrap(), Some(large_value));
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -403,18 +451,19 @@ fn an_entry_larger_than_the_configured_limit_does_not_hang_or_overflow() {
     let lsm_config = LsmConfig {
         memtable_max_size_bytes: 100,
         max_immutable_memtables: 4,
+        ..LsmConfig::default()
     };
     let engine = open(&dir, lsm_config);
 
     let big_value = vec![b'x'; 10_000]; // far larger than the 100-byte limit
     engine.put(b"k1", &big_value).unwrap();
-    assert_eq!(engine.get(b"k1"), Some(big_value));
+    assert_eq!(engine.get(b"k1").unwrap(), Some(big_value));
     // The oversized entry must have triggered an immediate freeze rather
     // than leaving `is_full()` permanently true with nothing able to
     // ever "fit" — verified indirectly: a further write must still
     // succeed (a fresh active memtable was installed), not error or hang.
     engine.put(b"k2", b"v2").unwrap();
-    assert_eq!(engine.get(b"k2"), Some(b"v2".to_vec()));
+    assert_eq!(engine.get(b"k2").unwrap(), Some(b"v2".to_vec()));
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -470,11 +519,168 @@ fn recovery_matches_a_reference_model_after_restart() {
     let engine2 = open(&dir, LsmConfig::default());
     for (key, expected) in &reference {
         assert_eq!(
-            engine2.get(key),
+            engine2.get(key).unwrap(),
             expected.clone(),
             "mismatch for key {key:?} after restart"
         );
     }
     engine2.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- RUBIC SSTable flush integration (Phase 4B) ---
+
+fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A flush must eventually move a frozen memtable's data into a
+/// published, independently-readable SSTable, and the key must remain
+/// correctly readable via `LsmEngine::get` throughout (`PHASE4B_
+/// ARCHITECTURE.md` §4-§5) — whether it's currently served from
+/// `immutables` or from `sstables` is an implementation detail the
+/// caller never needs to know.
+#[test]
+fn flush_moves_data_into_a_published_sstable_that_remains_readable() {
+    let dir = temp_dir("flush_publishes_sstable");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 100,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+
+    for i in 0..30u32 {
+        engine
+            .put(format!("k{i:03}").as_bytes(), format!("v{i:03}").as_bytes())
+            .unwrap();
+    }
+
+    assert!(
+        wait_until(|| engine.sstable_count() >= 1, Duration::from_secs(5)),
+        "at least one flush must publish an SSTable within a reasonable time"
+    );
+    assert!(
+        engine.next_sstable_id() >= 2,
+        "an id must have been consumed"
+    );
+
+    for i in 0..30u32 {
+        assert_eq!(
+            engine.get(format!("k{i:03}").as_bytes()).unwrap(),
+            Some(format!("v{i:03}").into_bytes()),
+            "key must remain correctly readable regardless of which tier now holds it"
+        );
+    }
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Per `PHASE4B_ADR.md` ADR-P4B-1 (no Manifest, no WAL purge this
+/// phase): after a restart, published SSTables from before the restart
+/// must be rediscovered, AND the WAL must still independently reproduce
+/// every record via the unchanged full-replay path — the two are
+/// deliberately redundant, and either one alone must already answer
+/// every read correctly.
+#[test]
+fn sstables_are_rediscovered_after_restart_and_reads_remain_correct() {
+    let dir = temp_dir("sstable_restart");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 100,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let sstables_before;
+    {
+        let engine = open(&dir, lsm_config.clone());
+        for i in 0..30u32 {
+            engine
+                .put(format!("k{i:03}").as_bytes(), format!("v{i:03}").as_bytes())
+                .unwrap();
+        }
+        // Wait for every freeze this loop triggered to be fully flushed
+        // (not just "at least one") before reading a stable count --
+        // otherwise a flush still in flight at the moment of the read
+        // would land between this capture and `shutdown()`'s own full
+        // drain, making the two counts legitimately differ.
+        assert!(wait_until(
+            || engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ));
+        sstables_before = engine.sstable_count();
+        engine.shutdown();
+    }
+    assert!(sstables_before >= 1);
+
+    let engine2 = open(&dir, lsm_config);
+    assert_eq!(
+        engine2.sstable_count(),
+        sstables_before,
+        "every previously-published SSTable must be rediscovered on restart"
+    );
+    for i in 0..30u32 {
+        assert_eq!(
+            engine2.get(format!("k{i:03}").as_bytes()).unwrap(),
+            Some(format!("v{i:03}").into_bytes())
+        );
+    }
+    engine2.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `PHASE4B_ADR.md` ADR-P4B-2: a corrupt, previously-published SSTable
+/// must make `LsmEngine::open` fail closed, not silently start with
+/// reduced read coverage.
+#[test]
+fn open_fails_closed_when_a_published_sstable_is_corrupt() {
+    let dir = temp_dir("sstable_open_fails_closed");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 100,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    {
+        let engine = open(&dir, lsm_config.clone());
+        for i in 0..30u32 {
+            engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        assert!(wait_until(
+            || engine.sstable_count() >= 1,
+            Duration::from_secs(5)
+        ));
+        engine.shutdown();
+    }
+
+    let sstables_dir = dir.join("sstables");
+    let mut corrupted_any = false;
+    for entry in fs::read_dir(&sstables_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sst") {
+            let mut bytes = fs::read(&path).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF; // footer_crc32c's last byte
+            fs::write(&path, bytes).unwrap();
+            corrupted_any = true;
+        }
+    }
+    assert!(
+        corrupted_any,
+        "test setup must have produced at least one .sst file"
+    );
+
+    let result = LsmEngine::open(&dir, test_wal_config(), small_pool_config(), lsm_config);
+    assert!(
+        matches!(result, Err(EngineError::Corruption { .. })),
+        "open() must fail closed on a corrupt published SSTable, not silently exclude it"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
