@@ -10,17 +10,38 @@
 //! rename, and after full publication.
 //!
 //! After each kill, the parent reopens via `LsmEngine::open` (exercising
-//! `sstable::discover`'s startup sweep and the unchanged WAL replay path)
-//! and verifies:
-//! 1. `open()` never returns an error (a genuinely interrupted flush must
-//!    always leave either nothing, a `.tmp` file the sweep deletes, or a
-//!    fully valid `.sst` -- never something that fails validation,
-//!    `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §3.4).
+//! the Manifest-authoritative startup sweep, `PHASE5_MANIFEST_
+//! ARCHITECTURE.md` §4, and the checkpoint-bounded WAL replay path) and
+//! verifies:
+//! 1. `open()` never returns an error (a genuinely interrupted flush or
+//!    checkpoint/purge must always leave either nothing, a `.tmp` file
+//!    the sweep deletes, or fully durable, Manifest-consistent state --
+//!    never something that fails validation, `RUBIC_SSTABLE_FORMAT_
+//!    SPECIFICATION.md` §3.4 / `RUBIC_MANIFEST_FORMAT_SPECIFICATION.md`
+//!    §4).
 //! 2. No `*.sst.tmp` file survives the sweep.
 //! 3. The recovered `highest_sequence`/`durable_through` watermark never
 //!    goes backward across cycles (no acknowledged durable write lost).
-//! 4. Every SSTable discovered actually opens and answers a lookup
-//!    without error (already implied by (1), asserted directly too).
+//! 4. The Manifest checkpoint never goes backward across cycles
+//!    (`RUBIC_MANIFEST_FORMAT_SPECIFICATION.md` §5's monotonic durable
+//!    boundary) -- a real, cross-process-crash exercise of the same
+//!    property `manifest::state`'s own unit tests check in isolation.
+//! 5. `active_entry_count() + recovery_stats().checkpoint_markers_
+//!    replayed == highest_sequence - checkpoint_seq` exactly -- the
+//!    bounded-replay invariant (LSM Engine Spec §7.4): every record
+//!    above the checkpoint is accounted for as either a real applied
+//!    entry or a replayed-but-no-op `CHECKPOINT_MARKER`, never
+//!    anything else, never a gap. An earlier version of this test
+//!    guessed at the marker count (0 or 1) instead of measuring it via
+//!    `RecoveryStats`, which surfaced a real bug (a retried flush
+//!    attempt could durably resubmit a *second* marker for the same
+//!    logical flush) but then produced its own false failures once that
+//!    bug was fixed, because a crashed-and-abandoned flush attempt can
+//!    legitimately leave an orphaned marker with no corresponding
+//!    checkpoint for arbitrarily many restart cycles until a later
+//!    flush's checkpoint eventually subsumes it -- always safe (no data
+//!    loss), just not predictable in count without measuring it
+//!    directly. See `PHASE5_ADR.md`.
 //!
 //! Usage: `sstable_flush_crash_test <num_cycles> <writer_count>
 //! [seed=42] [min_delay_ms=1] [max_delay_ms=60]`
@@ -152,6 +173,7 @@ fn main() {
     let mut failures = 0u32;
     let mut last_highest_seq = 0u64;
     let mut last_durable_through = 0u64;
+    let mut last_checkpoint_seq = 0u64;
     let mut max_sstables_seen = 0usize;
 
     for cycle in 1..=num_cycles {
@@ -180,6 +202,12 @@ fn main() {
                 let orphaned_tmp = find_orphaned_tmp_files(&sstables_dir);
                 let sstable_count = engine.sstable_count();
                 max_sstables_seen = max_sstables_seen.max(sstable_count);
+                let checkpoint_seq = engine.checkpoint_seq();
+                let active_entries = engine.active_entry_count();
+                let recovery_stats = engine.recovery_stats();
+                let expected_active_entries = highest_seq
+                    .saturating_sub(checkpoint_seq)
+                    .saturating_sub(recovery_stats.checkpoint_markers_replayed);
 
                 let mut ok =
                     highest_seq >= last_highest_seq && durable_through >= last_durable_through;
@@ -190,7 +218,26 @@ fn main() {
                          survived discover(): {orphaned_tmp:?}"
                     );
                 }
-                if !ok && orphaned_tmp.is_empty() {
+                if checkpoint_seq < last_checkpoint_seq {
+                    ok = false;
+                    println!(
+                        "sstable_flush_crash_test: cycle {cycle} FAIL checkpoint regressed: \
+                         {checkpoint_seq} < {last_checkpoint_seq}"
+                    );
+                }
+                if active_entries as u64 != expected_active_entries {
+                    ok = false;
+                    println!(
+                        "sstable_flush_crash_test: cycle {cycle} FAIL bounded-replay invariant \
+                         violated: active_entries={active_entries} != highest_seq({highest_seq}) \
+                         - checkpoint_seq({checkpoint_seq}) = {expected_active_entries}"
+                    );
+                }
+                if !ok
+                    && orphaned_tmp.is_empty()
+                    && checkpoint_seq >= last_checkpoint_seq
+                    && active_entries as u64 == expected_active_entries
+                {
                     println!(
                         "sstable_flush_crash_test: cycle {cycle} FAIL watermark went backward: \
                          highest_seq {highest_seq} < {last_highest_seq} or durable_through \
@@ -201,9 +248,10 @@ fn main() {
                     println!(
                         "sstable_flush_crash_test: cycle {cycle} OK kill_delay_ms={kill_delay_ms} \
                          highest_seq={highest_seq} durable_through={durable_through} \
-                         active_entries={} immutable_count={} sstable_count={sstable_count} \
+                         checkpoint_seq={checkpoint_seq} active_entries={active_entries} \
+                         orphaned_markers={} immutable_count={} sstable_count={sstable_count} \
                          recovery_ms={recovery_ms:.1}",
-                        engine.active_entry_count(),
+                        recovery_stats.checkpoint_markers_replayed,
                         engine.immutable_count(),
                     );
                 } else {
@@ -211,6 +259,7 @@ fn main() {
                 }
                 last_highest_seq = highest_seq;
                 last_durable_through = durable_through;
+                last_checkpoint_seq = checkpoint_seq;
                 engine.shutdown();
             }
             Err(e) => {
@@ -227,7 +276,7 @@ fn main() {
     println!(
         "sstable_flush_crash_test: SUMMARY cycles={num_cycles} successful={} failed={failures} \
          final_highest_seq={last_highest_seq} final_durable_through={last_durable_through} \
-         max_sstables_seen_in_one_cycle={max_sstables_seen}",
+         final_checkpoint_seq={last_checkpoint_seq} max_sstables_seen_in_one_cycle={max_sstables_seen}",
         num_cycles - failures
     );
 
