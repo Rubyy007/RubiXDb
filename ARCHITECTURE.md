@@ -286,15 +286,35 @@ the missing section just means there's no spec text to consult first. Raised
 to the user; not re-raised here as a separate open question since it's fully
 recorded in this entry.
 
+**Resolved, Phase 4B (2026-09-17)**: plain `File` I/O, confirmed by the
+user — see "What is intentionally not decided yet," below, for the full
+rationale. The prefix-compression/restart-point deferral referenced by
+the same §2.3/§10 pointer remains a deliberate, separate scope cut
+(`RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §2.4), not reopened here.
+
 ## What is intentionally not decided yet
 
-- Whether `SSTable` reads use plain `File` I/O or `mmap` (LSM Engine Spec
-  §2.8's `file: File, // or a memory-mapped view; see Section 10`) — Tier 3
-  per the build prompt's explicit list; blocks the start of the SSTable step
-  (Phase 0, Step 3), not the WAL step.
 - Compaction is otherwise fully specified (LSM Engine Spec §5) — trigger
   count, strategy, and the tombstone-safety rule are all pinned; nothing
   left open there beyond the defaults already given.
+
+**Resolved (Phase 4B, 2026-09-17)**: `SSTable` reads use plain `File`
+I/O (positional reads via Unix `read_at`/Windows `seek_read`, no
+`unsafe`, no shared file cursor — safe for concurrent readers sharing
+one `Arc<SsTable>`), not `mmap`. This closes the Tier-3 question raised
+above and in `PROGRESS.md`'s 2026-09-14 entry, which had gone unanswered
+since. The reader was already implemented this way (bounded memory
+achieved via eager footer/index/bloom + lazy per-block reads, not via
+`mmap`'s OS-page-cache-backed alternative) before this question was
+re-raised and confirmed with the user explicitly — rationale: no new
+dependency, no `unsafe` at the mmap boundary (unavoidable in Rust for a
+memory-mapped file whose backing store isn't under Rust's own control),
+no cross-platform truncation/SIGBUS-class hazard class to reason about,
+and the measured block-read cost (`PHASE4B_PERFORMANCE.md` §2: p99
+34µs) is already four orders of magnitude below WAL `fsync` latency,
+the same margin every prior phase's own MemTable-vs-WAL comparison
+already established — `mmap`'s main advantage (avoiding a syscall per
+read) has no shown benefit at this project's measured scale.
 
 ## Phase 1: Group Commit
 
@@ -551,3 +571,86 @@ Phase 3C's own WAL certification had not completed. Every correctness/
 durability/crash-recovery/concurrency property actually tested this
 phase passed cleanly and does not need to be redone once those two
 items close.
+
+## Phase 4B: RUBIC SSTable (implemented, RUBIC SSTABLE READY FOR MANIFEST)
+
+Per `PHASE4B_ADR.md` ADR-P4B-0: begun explicitly while both Phase 3C
+("Deferred") and Phase 4A ("NOT YET READY — BLOCKERS REMAIN") remained
+uncertified, on the same documented, no-shared-internals basis Phase 4A
+itself used. Extends the write path:
+
+```text
+... -> MemTable -> Immutable MemTable -> RUBIC SSTable
+```
+
+**The Manifest is explicitly out of scope** (operating brief §52).
+Because the already-final `RubixDB-LSM-Engine-Specification-v1.0.md`
+ties safe WAL-purge/replay-boundary behavior to the Manifest's
+`SET_CHECKPOINT` edit, this was a genuine stop-and-ask decision
+(`PHASE4B_ADR.md` ADR-P4B-1): the user chose "SSTable as a pure
+read-path addition" — the WAL is never purged/truncated by a flush, and
+`wal::replay_streaming`'s full-replay recovery is completely unchanged
+from Phase 4A. This has a valuable safety corollary: a corrupt or
+missing SSTable can never cause data loss this phase (the WAL still has
+everything), so `LsmEngine::open` fails closed on a corrupt discovered
+SSTable rather than silently degrading read coverage.
+
+- **`RUBIC_SSTABLE_FORMAT_SPECIFICATION.md`** (new): consolidates the
+  already-final byte layout (`RubixDB-LSM-Engine-Specification-v1.0.md`
+  §2-§3) and resolves the Manifest-free decisions Phase 4B actually
+  needed — directory-scan SSTable-id recovery, "exists and validates"
+  as the liveness rule (no `ADD`/`REMOVE` tracking needed without
+  compaction), and reuse of the WAL's own already-tested `fsync_dir`
+  platform primitive via a one-line `pub(crate)` visibility export
+  rather than a second, divergent implementation.
+- **`src/sstable/`** (new — `format.rs`, `bloom.rs`, `writer.rs`,
+  `reader.rs`): byte-exact encode/decode for every structure (records,
+  data blocks, bloom filter block, sparse index block, 72-byte footer),
+  a bloom filter using the spec-mandated XXH64 double-hashing scheme
+  (new dependency `xxhash-rust` — pure Rust, zero transitive
+  dependencies, the only new dependency this phase), an atomic
+  tmp-file-then-fsync-then-rename-then-dir-fsync writer, and a
+  bounded-memory reader (footer/index/bloom eager at `open()`, data
+  blocks lazy, positional reads so concurrent readers sharing one
+  `Arc<SsTable>` need no lock — resolves the long-open "`mmap` vs. plain
+  `File` I/O" Tier-3 question above in favor of plain `File` I/O,
+  confirmed by the user).
+- **`src/lsm/mod.rs`** (extended, not replaced): a new background flush
+  thread drains `immutables` into published SSTables (bounded retry,
+  never drops an `ImmutableMemTable`); `sstables: Arc<RwLock<Vec<Arc<
+  SsTable>>>>` extends the read path (`get`/`get_as_of`, now fallible —
+  a real, necessary API change once a read can fail closed on SSTable
+  corruption) to check `active -> immutables -> sstables` in strict
+  recency order, per the LSM spec's own `ReadView` merge rule.
+- **A real correctness bug found and fixed by this phase's own property
+  test**: `SsTable::get_versioned`'s original `Vec::binary_search_by`
+  could return any matching index on a tie (multiple consecutive blocks
+  sharing an identical `last_key`, from a key's version run spanning a
+  block boundary), silently skipping earlier blocks holding older
+  versions of the query key. Fixed via `Vec::partition_point` (leftmost-
+  match guarantee); a matching over-strict index-ordering validation bug
+  was found and relaxed at the same time. Full account:
+  `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §2.6, `PHASE4B_TEST_RESULTS.md`
+  §7.
+- **`examples/sstable_flush_crash_child.rs`/`sstable_flush_crash_test.rs`**
+  (new): 140/140 real external-process-kill crash cycles across two
+  seeds, zero failures, against the flush pipeline specifically (tiny
+  memtable/block configuration so kills land throughout the flush state
+  machine).
+- **`examples/sstable_bench.rs`/`lsm_flush_load_test.rs`** (new):
+  closes Phase 4A's own `ADR-P4A-6` gap — the integrated WAL-only vs.
+  WAL+MemTable vs. WAL+MemTable+SSTable-flush comparison, measured
+  clean on a verified-idle machine.
+
+**216/216 lib tests pass** (170 + 46 new), clippy and fmt clean
+throughout. Full design: `PHASE4B_ARCHITECTURE.md`; failure model:
+`PHASE4B_FAILURE_MODEL.md`; decisions: `PHASE4B_ADR.md`; performance:
+`PHASE4B_PERFORMANCE.md`; results and current status (authoritative):
+`PHASE4B_TEST_RESULTS.md`.
+
+**Final decision: RUBIC SSTABLE READY FOR MANIFEST**, conditioned —
+exactly as Phase 4A's own certification was — on Phase 3C's long-soak
+certification eventually landing clean; that item remains open and
+independent of this phase's own work (Phase 4B modifies no WAL/
+coordinator code). Next phase per operating brief §55: Manifest /
+SSTable lifecycle management, followed by Compaction.

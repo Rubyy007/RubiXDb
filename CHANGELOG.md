@@ -6,6 +6,66 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Phase 4B: RUBIC SSTable (RUBIC SSTABLE READY FOR MANIFEST)
+
+Extends the write path: `... -> MemTable -> Immutable MemTable -> RUBIC
+SSTable`. Began explicitly before Phase 3C's own WAL certification had
+completed (still "Deferred") and while Phase 4A's own certification
+remained "NOT YET READY -- BLOCKERS REMAIN" -- documented, provisional
+basis: this phase touches no WAL/coordinator internals either, and its
+own required benchmark (below) closes one of Phase 4A's two blockers
+directly.
+
+The Manifest is explicitly out of scope this phase (a genuine stop-and-
+ask decision was made about the resulting WAL-purge/replay-boundary gap
+-- see `PHASE4B_ADR.md` ADR-P4B-1): SSTable is a purely additional,
+purely derived read-path source; the WAL is never purged/truncated by a
+flush, so a corrupt or missing SSTable can never cause data loss this
+phase, only reduced read-path availability (`LsmEngine::open` fails
+closed on a corrupt discovered SSTable rather than silently degrading).
+
+- **`RUBIC_SSTABLE_FORMAT_SPECIFICATION.md`** (new): consolidates the
+  already-final LSM-spec byte layout (magic `"RBXSST01"`, CRC32C,
+  4096-byte target blocks, 10-bits/key XXH64 bloom filter, 72-byte
+  footer) and resolves the Manifest-free decisions this phase needed
+  (directory-scan id recovery, "exists and validates" liveness, reused
+  WAL `fsync_dir` platform primitive).
+- **`src/sstable/`** (new): `format.rs`/`bloom.rs`/`writer.rs`/
+  `reader.rs` -- byte-exact encode/decode, atomic tmp-file-then-rename
+  publication, bounded-memory reader (index/bloom eager, data blocks
+  lazy, lock-free concurrent positional reads). New dependency:
+  `xxhash-rust` (pure Rust, zero transitive deps -- the spec-mandated
+  XXH64 hash for the bloom filter).
+- **`src/lsm/mod.rs`** (extended): background flush thread draining
+  `immutables` into published SSTables; read path (`get`/`get_as_of`,
+  now fallible) extended to check `active -> immutables -> sstables` in
+  recency order; bounded flush retry; a test-only flush-delay hook.
+- **A real correctness bug found and fixed**: `SsTable::get_versioned`'s
+  `binary_search_by` could skip earlier blocks holding older versions
+  of a key whose version run spans a block boundary (a tie-breaking gap
+  `binary_search_by` doesn't guarantee against) -- found by this
+  phase's own property test, fixed via `partition_point`. Full account:
+  `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §2.6, `PHASE4B_TEST_RESULTS.md`
+  §7.
+- **`examples/sstable_flush_crash_child.rs`/`sstable_flush_crash_test.rs`**
+  (new): 140/140 real external-process-kill crash cycles (two seeds),
+  zero failures, against the flush pipeline specifically.
+- **`examples/sstable_bench.rs`/`lsm_flush_load_test.rs`** (new):
+  SSTable write 102.40 MB/sec / 1.38M records/sec, point lookup
+  p50=12µs/p99=34µs; the WAL-only vs. WAL+MemTable vs.
+  WAL+MemTable+SSTable-flush comparison Phase 4A's own `ADR-P4A-6`
+  deferred -- at the LSM spec's realistic 4 MiB default memtable, flush
+  overhead at 1,000 writers is within noise of the WAL-only baseline.
+
+216/216 lib tests pass (170 + 46 new: 43 in `src/sstable/`, 3 new
+`LsmEngine` flush-integration tests), clippy and fmt clean. Full design:
+`PHASE4B_ARCHITECTURE.md`; failure model: `PHASE4B_FAILURE_MODEL.md`;
+decisions: `PHASE4B_ADR.md`; performance: `PHASE4B_PERFORMANCE.md`;
+results and final decision (authoritative): `PHASE4B_TEST_RESULTS.md`
+-- **RUBIC SSTABLE READY FOR MANIFEST**, conditioned (exactly as Phase
+4A's own certification was) on Phase 3C's long-soak certification
+eventually landing clean.
+
 ### Phase 4A: MemTable + RUBIC format foundation (MEMTABLE NOT YET READY -- blockers remain)
 
 Extends the write path: `Logical Writers -> Dedicated Batch Coordinator

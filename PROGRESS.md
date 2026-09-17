@@ -1143,3 +1143,115 @@ closing them (let the Phase 3C soak finish, then re-run the deferred
 comparison on the resulting idle machine), not redoing correctness work.
 
 **Open Tier 3 question currently blocking further work:** none.
+
+---
+
+## 2026-09-17
+
+**Implemented:** RUBIC SSTable (Phase 4B) — the immutable, persistent,
+sorted on-disk table format, its writer/reader, and the flush
+integration into `LsmEngine`, per `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md`
+and `PHASE4B_ARCHITECTURE.md`.
+
+Before any code: inspected `PHASE3C_TEST_RESULTS.md` and
+`PHASE4A_TEST_RESULTS.md` directly rather than assuming their status —
+found Phase 3C still explicitly "Deferred" and Phase 4A explicitly
+"NOT YET READY — BLOCKERS REMAIN," and proceeded on that documented,
+provisional basis (`PHASE4B_ADR.md` ADR-P4B-0), the same posture Phase
+4A itself used against a then-incomplete Phase 3C.
+
+**The one genuine stop-and-ask decision this phase**: the already-final
+`RubixDB-LSM-Engine-Specification-v1.0.md` ties safe WAL-purge/replay-
+boundary behavior to the Manifest's `SET_CHECKPOINT` edit, but Manifest
+is explicitly out of scope this phase. Asked the user directly rather
+than silently choosing; the answer selected was: SSTable is a purely
+additional, purely derived read-path source this phase — the WAL is
+never purged or truncated by a flush, and recovery keeps doing the
+exact full `wal::replay_streaming` reconstruction Phase 4A already did,
+unchanged (`PHASE4B_ADR.md` ADR-P4B-1). This has a valuable, direct
+safety corollary: a corrupt or missing SSTable can never cause data
+loss this phase, because the WAL, untouched, still holds everything —
+only that one file's read-path *availability* is at risk, so
+`LsmEngine::open` fails closed on a corrupt discovered SSTable
+(ADR-P4B-2) rather than silently degrading.
+
+Wrote `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` consolidating the
+already-final byte layout (magic `"RBXSST01"`, CRC32C, 4096-byte target
+blocks, 10-bits/key bloom filter, 72-byte footer — all already decided
+by the LSM spec, not re-derived) plus the Manifest-free resolutions this
+phase actually needed: directory-scan-based SSTable id recovery,
+"exists and validates" as the liveness rule, and reuse of the WAL's own
+already-tested `fsync_dir` platform primitive (one-line `pub(crate)`
+visibility export, `PHASE4B_ADR.md` ADR-P4B-4) rather than a second,
+divergent Windows/Unix implementation.
+
+Implemented `src/sstable/` (`format.rs`, `bloom.rs`, `writer.rs`,
+`reader.rs`): byte-exact encode/decode for every structure, a bloom
+filter using the spec-mandated XXH64 double-hashing scheme (new
+dependency `xxhash-rust`, pure Rust, zero transitive deps — the only
+new dependency this phase, `PHASE4B_ADR.md` ADR-P4B-3), an atomic
+tmp-file-then-rename writer, and a bounded-memory reader (footer/index/
+bloom eager, data blocks lazy, positional reads so concurrent readers
+never need a lock on the shared file handle). Wired into `LsmEngine`
+(`src/lsm/mod.rs`): a new background flush thread drains `immutables`,
+publishes SSTables, and extends the read path (`get_as_of`, now
+fallible — a real, necessary API change once SSTable reads can fail
+closed on corruption) to check `active` -> `immutables` -> `sstables` in
+strict recency order.
+
+**A real correctness bug found and fixed by this phase's own property
+test**: `SsTable::get_versioned`'s original `Vec::binary_search_by`
+does not guarantee finding the *leftmost* match when consecutive blocks
+share an identical `last_key` (a key's version run spanning a block
+boundary) — it silently skipped earlier blocks holding older versions
+of the query key. `sstable::tests::property::
+sstable_matches_memtable_reference` (a 64-case proptest against a
+`MemTable` reference) caught this directly; fixed by switching to
+`Vec::partition_point`, and a matching over-strict "last_key must be
+strictly ascending" validation bug in `format::decode_index_block` was
+found and relaxed to "non-decreasing" at the same time. Both are
+recorded in detail in `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §2.6 and
+`PHASE4B_TEST_RESULTS.md` §7 so neither is ever silently reintroduced.
+
+Built real crash tests for the flush pipeline
+(`examples/sstable_flush_crash_child.rs`/`sstable_flush_crash_test.rs`),
+the same external-process-`Child::kill()` methodology every prior
+phase's own crash-cycle harness uses, but with a deliberately tiny
+memtable/block configuration so kills land throughout the flush state
+machine across many cycles: **140/140 cycles across two seeds, zero
+failures** — `open()` never errored, no orphaned `.sst.tmp` ever
+survived the discovery sweep, and the durability watermark never
+regressed.
+
+Measured performance cleanly (machine verified idle first): SSTable
+write 102.40 MB/sec / 1.38M records/sec, point lookup p50=12µs/p99=34µs,
+ordered iteration ~5M records/sec. Closed the exact gap Phase 4A's own
+`ADR-P4A-6` left open — the integrated WAL-only vs. WAL+MemTable vs.
+WAL+MemTable+SSTable-flush comparison, at 100 and 1,000 writers: under
+the LSM spec's own realistic 4 MiB default memtable, flush overhead at
+1,000 writers is within noise of the WAL-only baseline (98,666 vs.
+97,564 ops/sec); under a deliberately tiny 65,536-byte memtable (a
+stress configuration producing 622 SSTables from the same 1,000,000
+records), flush's real disk-I/O contention cost becomes clearly
+measurable (56,609 ops/sec) — reported as a configuration guideline,
+not a defect. One performance oddity (100-writer, small-memtable
+"flush faster than no-flush") is recorded as an open, not-fully-
+explained item rather than picked apart with a story that isn't fully
+supported by evidence (`PHASE4B_PERFORMANCE.md` §3.3/§5).
+
+**Tests passing: VERIFIED.** `cargo test --lib`: 216/216 (170
+pre-existing + 46 new: 43 in `src/sstable/`, 3 new `LsmEngine` flush-
+integration tests, plus 2 pre-existing tests updated to use a new
+test-only flush-delay hook rather than left racy against the new
+background flush thread). `cargo test --lib --features test-util`:
+216/216. `cargo test --release --lib`: 216/216. `cargo clippy
+--all-targets --all-features -- -D warnings`: clean. `cargo fmt
+--check`: clean.
+
+**Final decision** (`PHASE4B_TEST_RESULTS.md` §10): **RUBIC SSTABLE
+READY FOR MANIFEST**, conditioned — exactly as Phase 4A's own
+certification was — on Phase 3C's long-soak certification eventually
+landing clean; that item remains open and independent of this phase's
+own work.
+
+**Open Tier 3 question currently blocking further work:** none.
