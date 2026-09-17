@@ -29,7 +29,7 @@
 //! and mutate them without borrowing `LsmEngine` itself across a thread
 //! boundary.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use crate::error::{EngineError, Result};
 use crate::execution::batch_coordinator::{BatchCoordinatorConfig, BatchCoordinatorPool};
+use crate::manifest::{self, Manifest, ManifestEdit, ManifestState};
 use crate::memtable::{MemTable, MemtableValue, DEFAULT_MAX_SIZE_BYTES};
 use crate::sstable::{self, RecordValue, SsTable, SsTableWriterConfig};
 use crate::wal::{self, FileWal, GroupCommitter, Wal, WalConfig, WalOp, WalOpOwned};
@@ -82,6 +83,39 @@ impl Default for LsmConfig {
     }
 }
 
+/// Recovery observability (operating brief: "recovery duration,"
+/// "recovery WAL records replayed," "recovery Manifest records
+/// replayed") — computed once, during `LsmEngine::open`, and retained
+/// for the engine's lifetime. Never influences any correctness
+/// decision — purely diagnostic.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecoveryStats {
+    /// Every WAL record `wal::replay_streaming` visited, whether
+    /// applied, skipped by the checkpoint, or a replayed checkpoint
+    /// marker — `wal_records_applied + wal_records_skipped_by_
+    /// checkpoint + checkpoint_markers_replayed == wal_records_visited`
+    /// always.
+    pub wal_records_visited: u64,
+    /// Put/Delete records actually applied to the freshly-reconstructed
+    /// active MemTable (`seq` above the checkpoint).
+    pub wal_records_applied: u64,
+    /// Records with `seq <= checkpoint_seq` — already durably
+    /// represented by the Manifest-authoritative SSTable set, correctly
+    /// not replayed twice.
+    pub wal_records_skipped_by_checkpoint: u64,
+    /// `CHECKPOINT_MARKER` records visited above the checkpoint boundary
+    /// — always a no-op for MemTable state (`RUBIC_MANIFEST_FORMAT_
+    /// SPECIFICATION.md` §6), but real, durable WAL records in their own
+    /// right (e.g. from a flush that wrote its marker but crashed before
+    /// its `SET_CHECKPOINT` durably landed — `PHASE5_FAILURE_MODEL.md`
+    /// §3 covers this exact case: safe, harmless, never data loss).
+    pub checkpoint_markers_replayed: u64,
+    /// Valid edits replayed from the `MANIFEST` file at startup.
+    pub manifest_edits_replayed: u64,
+    /// Wall-clock time for the complete `LsmEngine::open` call.
+    pub recovery_duration: Duration,
+}
+
 /// A resolved read result — `Some(value)` for a live `Put`, `None` for
 /// "not found" (no version at or before the query's `as_of_seq`, or the
 /// newest visible version is a tombstone — operating brief §9/§14's own
@@ -108,6 +142,18 @@ pub struct LsmEngine {
     sstables: Arc<RwLock<Vec<Arc<SsTable>>>>,
     next_sstable_id: Arc<AtomicU64>,
     sstables_dir: PathBuf,
+    /// The Manifest — authoritative record of live SSTables and the
+    /// durable checkpoint boundary (`RUBIC_MANIFEST_FORMAT_
+    /// SPECIFICATION.md`, `PHASE5_MANIFEST_ARCHITECTURE.md`). Shared
+    /// with the background flush thread, the only other appender.
+    manifest: Arc<Mutex<Manifest>>,
+    /// The current durable checkpoint (`flushed_through_seq`), `0` if
+    /// none has ever been recorded — mirrors, does not replace, the
+    /// Manifest's own on-disk `SET_CHECKPOINT` state (Section 5 of the
+    /// architecture doc: belt-and-suspenders monotonicity, plus cheap
+    /// observability without re-reading the Manifest file).
+    checkpoint_seq: Arc<AtomicU64>,
+    recovery_stats: RecoveryStats,
     flush_sender: mpsc::Sender<FlushMsg>,
     flush_handle: Mutex<Option<JoinHandle<()>>>,
     /// Checked by the flush thread between bounded-retry backoff sleeps
@@ -133,27 +179,52 @@ pub struct LsmEngine {
 }
 
 impl LsmEngine {
-    /// Opens (or creates) the WAL directory at `dir`, reconstructs the
-    /// `GroupCommitter`/`BatchCoordinatorPool` exactly as any existing
-    /// caller of those types already would (no change to that path), and
-    /// recovers the MemTable via `wal::replay_streaming` — bounded
-    /// memory, not `open_for_recovery`'s own full-materialization API
-    /// (`PHASE4A_MEMTABLE_ARCHITECTURE.md` §10).
+    /// Opens (or creates) the WAL directory at `dir`. Startup ordering
+    /// (`PHASE5_MANIFEST_ARCHITECTURE.md` §4 has the full derivation):
+    ///
+    /// 1. `manifest::replay_readonly` (shared lock, read-only) — obtains
+    ///    the checkpoint boundary needed to filter WAL replay, *before*
+    ///    any exclusive lock is taken (preserves the same same-process
+    ///    lock-ordering constraint `PHASE4A_ADR.md` ADR-P4A-3 already
+    ///    established for `wal::replay_streaming`).
+    /// 2. `wal::replay_streaming` (shared lock, unchanged bounded-memory
+    ///    design) — now discards any record already covered by the
+    ///    checkpoint (LSM Engine Spec §7.1 step 5), entirely inside this
+    ///    call's own closure; no signature change to the WAL module.
+    /// 3. `FileWal::open_for_recovery` (exclusive lock, unchanged).
+    /// 4. `Manifest::open_after_exclusive_lock` (re-replay under
+    ///    exclusive protection) + the SSTable-directory reconciliation
+    ///    sweep — the only write-capable part of Manifest recovery,
+    ///    which is why it must wait for the exclusive lock.
     pub fn open(
         dir: &Path,
         wal_config: WalConfig,
         pool_config: BatchCoordinatorConfig,
         lsm_config: LsmConfig,
     ) -> Result<Self> {
+        let recovery_started = std::time::Instant::now();
         let mut active = MemTable::new(lsm_config.memtable_max_size_bytes);
 
-        // Read-only streaming pass, reconstructing the MemTable — must
-        // happen *before* `FileWal::open_for_recovery` below takes the
-        // directory's exclusive lock (this call only ever takes a shared
-        // one, matching `inspect`'s own contract), so there is no lock
-        // ordering conflict between the two.
+        let readonly_manifest = manifest::replay_readonly(dir)?;
+        let checkpoint_at_replay = readonly_manifest.state.checkpoint_seq();
+
+        let mut wal_records_visited: u64 = 0;
+        let mut wal_records_applied: u64 = 0;
+        let mut wal_records_skipped_by_checkpoint: u64 = 0;
+        let mut checkpoint_markers_replayed: u64 = 0;
         let _summary = wal::replay_streaming(dir, &wal_config, |seq, op| {
-            apply_wal_op(&mut active, seq, op);
+            wal_records_visited += 1;
+            if seq <= checkpoint_at_replay {
+                wal_records_skipped_by_checkpoint += 1;
+                return Ok(());
+            }
+            match op {
+                WalOp::CheckpointMarker { .. } => checkpoint_markers_replayed += 1,
+                _ => {
+                    apply_wal_op(&mut active, seq, op);
+                    wal_records_applied += 1;
+                }
+            }
             Ok(())
         })?;
 
@@ -161,18 +232,22 @@ impl LsmEngine {
         let committer = GroupCommitter::new(file_wal)?;
         let pool = Arc::new(BatchCoordinatorPool::new(committer, pool_config)?);
 
-        // No Manifest this phase (`PHASE4B_ADR.md` ADR-P4B-1): liveness is
-        // "exists under `sstables/` and validates"
-        // (`RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §3.3). A validation
-        // failure here fails `open()` closed rather than silently
-        // excluding the file (ADR-P4B-2) — safe to do because the WAL,
-        // untouched by any flush, still holds every record regardless.
         let sstables_dir = dir.join("sstables");
-        let (discovered_tables, next_id) = sstable::discover(&sstables_dir)?;
+        let (mut manifest_handle, replay_result) = Manifest::open_after_exclusive_lock(dir)?;
+        let manifest_edits_replayed = replay_result.edit_count;
+        let mut manifest_state = replay_result.state;
+        let checkpoint_seq_value = manifest_state.checkpoint_seq();
+        let (reconciled_tables, next_id) = reconcile_sstables_with_manifest(
+            &sstables_dir,
+            &mut manifest_handle,
+            &mut manifest_state,
+        )?;
 
         let immutables = Arc::new(RwLock::new(VecDeque::new()));
-        let sstables = Arc::new(RwLock::new(discovered_tables));
+        let sstables = Arc::new(RwLock::new(reconciled_tables));
         let next_sstable_id = Arc::new(AtomicU64::new(next_id));
+        let manifest = Arc::new(Mutex::new(manifest_handle));
+        let checkpoint_seq = Arc::new(AtomicU64::new(checkpoint_seq_value));
 
         let (flush_sender, flush_receiver) = mpsc::channel::<FlushMsg>();
         let flush_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -190,7 +265,19 @@ impl LsmEngine {
             lsm_config.max_flush_retries,
             Arc::clone(&flush_stop),
             Arc::clone(&flush_delay_ms),
+            Arc::clone(&pool),
+            Arc::clone(&manifest),
+            Arc::clone(&checkpoint_seq),
         );
+
+        let recovery_stats = RecoveryStats {
+            wal_records_visited,
+            wal_records_applied,
+            wal_records_skipped_by_checkpoint,
+            checkpoint_markers_replayed,
+            manifest_edits_replayed,
+            recovery_duration: recovery_started.elapsed(),
+        };
 
         Ok(LsmEngine {
             pool,
@@ -199,6 +286,9 @@ impl LsmEngine {
             sstables,
             next_sstable_id,
             sstables_dir,
+            manifest,
+            checkpoint_seq,
+            recovery_stats,
             flush_sender,
             flush_handle: Mutex::new(Some(flush_handle)),
             flush_stop,
@@ -391,6 +481,55 @@ impl LsmEngine {
         self.next_sstable_id.load(Ordering::SeqCst)
     }
 
+    /// The current durable Manifest checkpoint (`flushed_through_seq`),
+    /// `0` if none has ever been recorded — `RUBIC_MANIFEST_FORMAT_
+    /// SPECIFICATION.md` §5's monotonic durable boundary. Observability
+    /// only; the write path never derives correctness decisions from
+    /// this accessor (it reads the flush thread's own already-durable
+    /// value, never the other way around).
+    pub fn checkpoint_seq(&self) -> u64 {
+        self.checkpoint_seq.load(Ordering::Acquire)
+    }
+
+    /// Observability for the `LsmEngine::open` call that produced this
+    /// instance — `RecoveryStats`'s own doc comment has the field-by-
+    /// field detail.
+    pub fn recovery_stats(&self) -> RecoveryStats {
+        self.recovery_stats
+    }
+
+    /// Manifest inspection surface (operating brief: "engineers to
+    /// inspect... without mutating storage") — every accessor here is
+    /// read-only, reads the already-open, already-locked `Manifest`
+    /// handle, and is safe to call from a running engine or a
+    /// diagnostic tool built on top of it.
+    pub fn manifest_record_count(&self) -> u64 {
+        self.manifest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_count()
+    }
+
+    pub fn manifest_size_bytes(&self) -> Result<u64> {
+        self.manifest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .size_bytes()
+    }
+
+    pub fn manifest_last_edit(&self) -> Option<ManifestEdit> {
+        self.manifest
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_edit()
+    }
+
+    /// Live SSTable ids currently in the read path, newest-first —
+    /// inspection only.
+    pub fn live_sstable_ids(&self) -> Vec<u64> {
+        self.lock_sstables_read().iter().map(|t| t.id()).collect()
+    }
+
     /// Read-only access to the underlying pool's own stats — reuses the
     /// existing, unmodified observability surface rather than
     /// duplicating it.
@@ -453,17 +592,171 @@ fn resolve_sstable(value: RecordValue) -> GetResult {
     }
 }
 
-/// The background flush thread body (`PHASE4B_ADR.md` ADR-P4B-5):
-/// drains `immutables` oldest-first as messages arrive, building and
-/// atomically publishing each one's SSTable
-/// (`RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §3.4), then moving it from
-/// `immutables` into `sstables`. Never calls `wal::purge_before` and
-/// never touches the WAL (`PHASE4B_ADR.md` ADR-P4B-1). A failed flush
-/// (`PHASE4B_ARCHITECTURE.md` §6) is retried with a short backoff for
-/// `max_retries` attempts, then with a longer fixed backoff
-/// indefinitely — the `ImmutableMemTable` is never dropped and never
-/// silently abandoned; only `flush_stop` can end the loop early, and
-/// only between backoff waits.
+fn wrap_sstable_path_error(e: EngineError, path: &Path) -> EngineError {
+    match e {
+        EngineError::Corruption { detail } => EngineError::Corruption {
+            detail: format!("sstable {}: {detail}", path.display()),
+        },
+        EngineError::Unsupported { operation } => EngineError::Unsupported {
+            operation: format!("sstable {}: {operation}", path.display()),
+        },
+        other => other,
+    }
+}
+
+/// The Manifest-authoritative directory reconciliation sweep
+/// (`PHASE5_MANIFEST_ARCHITECTURE.md` §4 step 6a, `RUBIC_SSTABLE_
+/// FORMAT_SPECIFICATION.md` §3.3 / LSM Engine Spec §7.2). Only runs
+/// while the caller already holds the exclusive directory lock (via
+/// `Manifest::open_after_exclusive_lock`'s own contract, transitively).
+///
+/// For every `*.sst` file found:
+/// - in `state.live_sstables`: open + validate (fail closed on
+///   corruption, per `PHASE4B_ADR.md` ADR-P4B-2's precedent — a corrupt
+///   *live* SSTable is escalated, never silently excluded);
+/// - in `state.ever_added` but not live (a removed table a crash left
+///   physically undeleted — unreachable this phase, since nothing
+///   issues `REMOVE_SSTABLE` without Compaction, but handled per spec
+///   for forward compatibility): deleted;
+/// - in neither (durable, valid, but never acknowledged — the crash-
+///   between-fsync-and-manifest-write case): validated, a fresh
+///   `ADD_SSTABLE` is durably appended for it now, and it joins the
+///   live set.
+///
+/// After the scan: any id `state.live_sstables` claims live but that
+/// had no corresponding file on disk fails `open()` closed — "never
+/// silently omit a missing live table."
+fn reconcile_sstables_with_manifest(
+    sstables_dir: &Path,
+    manifest: &mut Manifest,
+    state: &mut ManifestState,
+) -> Result<(Vec<Arc<SsTable>>, u64)> {
+    std::fs::create_dir_all(sstables_dir)?;
+
+    let mut seen_ids: HashSet<u64> = HashSet::new();
+    let mut max_id_seen: u64 = 0;
+    let mut opened: BTreeMap<u64, Arc<SsTable>> = BTreeMap::new();
+
+    for entry in std::fs::read_dir(sstables_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".sst.tmp") {
+            std::fs::remove_file(&path)?;
+            continue;
+        }
+        let Some(id) = sstable::parse_sstable_id(name) else {
+            continue;
+        };
+        max_id_seen = max_id_seen.max(id);
+        seen_ids.insert(id);
+
+        if state.live_sstables.contains_key(&id) {
+            let table = SsTable::open(&path, id).map_err(|e| wrap_sstable_path_error(e, &path))?;
+            opened.insert(id, Arc::new(table));
+        } else if state.ever_added.contains(&id) {
+            // Removed-but-undeleted orphan (LSM Engine Spec §7.2) —
+            // unreachable this phase (no Compaction issues
+            // REMOVE_SSTABLE yet), handled for forward compatibility.
+            std::fs::remove_file(&path)?;
+        } else {
+            let table = SsTable::open(&path, id).map_err(|e| wrap_sstable_path_error(e, &path))?;
+            let file_size = std::fs::metadata(&path)?.len();
+            let edit = ManifestEdit::AddSstable {
+                id,
+                min_seq: table.min_seq(),
+                max_seq: table.max_seq(),
+                file_size,
+            };
+            manifest.append_sync(edit)?;
+            state.apply(edit)?;
+            opened.insert(id, Arc::new(table));
+        }
+    }
+
+    for id in state.live_sstables.keys() {
+        if !seen_ids.contains(id) {
+            return Err(EngineError::Corruption {
+                detail: format!(
+                    "manifest: sstable id {id} is recorded live but {} is missing from disk",
+                    sstables_dir.join(sstable::sstable_filename(*id)).display()
+                ),
+            });
+        }
+    }
+
+    let next_id = max_id_seen
+        .max(state.ever_added.iter().copied().max().unwrap_or(0))
+        .max(state.live_sstables.keys().copied().max().unwrap_or(0))
+        + 1;
+
+    let tables: Vec<Arc<SsTable>> = opened.into_iter().rev().map(|(_, t)| t).collect();
+    Ok((tables, next_id))
+}
+
+/// The background flush thread body (`PHASE4B_ADR.md` ADR-P4B-5,
+/// extended by `PHASE5_MANIFEST_ARCHITECTURE.md` §5/§9): drains
+/// `immutables` oldest-first, running the full publish -> checkpoint ->
+/// purge sequence for each one:
+///
+/// 1. Build + atomically publish the SSTable (unchanged from Phase 4B,
+///    `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §3.4).
+/// 2. Durably append `ADD_SSTABLE` to the Manifest.
+/// 3. Make it visible in `sstables` (idempotent: only inserted if not
+///    already present, so a retry after step 4+ never double-inserts).
+/// 4. `pool.rotate()` (WAL Spec §2.2's own note, ahead of the marker).
+/// 5. Durably append `CHECKPOINT_MARKER` to the WAL, via the same
+///    `submit`/`wait` path any other write uses — no second sequence
+///    system.
+/// 6. Durably append `SET_CHECKPOINT` to the Manifest.
+/// 7. Update the shared `checkpoint_seq` observability value.
+/// 8. Drop the `ImmutableMemTable` — only now.
+/// 9. `pool.purge_before(...)` — only now, per the exact WAL Spec §10
+///    precondition chain (marker durably written AND SSTable durably
+///    Manifest-registered AND checkpoint durably recorded).
+///
+/// **Idempotent retry** (operating brief: "a failed or retried flush
+/// must not create two logically active copies of the same immutable
+/// state"): `published`/`checkpoint_marker`/`checkpoint_recorded` each
+/// independently track whether *their own* step already durably
+/// succeeded for this frozen memtable; a retry (triggered by any later
+/// step's failure) only ever repeats steps that have not yet succeeded.
+/// This closes a real bug found by this phase's own crash-cycle
+/// testing: an earlier version tracked only `published`, so a failure
+/// in step 6 (`SET_CHECKPOINT`) after step 5 (`CHECKPOINT_MARKER`) had
+/// already durably succeeded caused the retry to durably resubmit a
+/// *second* `CHECKPOINT_MARKER` for the same logical flush — safe
+/// (never wrong data, never a lost write) but a real, measurable
+/// deviation from "idempotent retry," caught by the crash harness's
+/// exact-accounting `RecoveryStats`-based invariant, not merely
+/// asserted correct (`PHASE5_ADR.md` has the full account). A flush
+/// failure can **never** advance `checkpoint_seq` or call
+/// `purge_before` — steps 4-9 are structurally unreachable unless steps
+/// 1-2 already durably succeeded, and the function returns `Err`
+/// (triggering a retry, not partial progress) the instant any step
+/// fails.
+///
+/// **Panic safety** (operating brief: audit the flush-thread-panic gap
+/// `PHASE4B_FAILURE_MODEL.md` named — "a flush-thread panic is not
+/// automatically recovered... may create an operational failure mode
+/// that was tolerable before checkpointing but is not necessarily
+/// acceptable now"): each attempt runs inside `catch_unwind`. A panic
+/// during one attempt is treated as exactly the same kind of failure as
+/// an I/O error — logged, retried with the same backoff policy, using
+/// the same per-step idempotence state above (a panic can never leave
+/// `published`/`checkpoint_marker`/`checkpoint_recorded` in a state
+/// that causes the *next* attempt to redo an already-durable step,
+/// since each is only ever set *after* its own step's durable success).
+/// This is deliberately **not** a supervised-restart *thread* design
+/// (spawning a fresh `JoinHandle` after a fatal error) — the operating
+/// brief explicitly warns against an automatic restart that "could
+/// duplicate an SSTable or replay an unsafe checkpoint transition," and
+/// this design sidesteps that risk entirely by never letting the thread
+/// die in the first place: the same one thread, the same one set of
+/// idempotence guards, handles both I/O failures and panics uniformly.
 #[allow(clippy::too_many_arguments)]
 fn spawn_flush_thread(
     receiver: mpsc::Receiver<FlushMsg>,
@@ -475,6 +768,9 @@ fn spawn_flush_thread(
     max_retries: u32,
     stop: Arc<std::sync::atomic::AtomicBool>,
     delay_ms: Arc<AtomicU64>,
+    pool: Arc<BatchCoordinatorPool>,
+    manifest: Arc<Mutex<Manifest>>,
+    checkpoint_seq: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(msg) = receiver.recv() {
@@ -483,6 +779,24 @@ fn spawn_flush_thread(
                 FlushMsg::Flush(frozen) => frozen,
             };
             let mut attempt: u32 = 0;
+            // Per-step idempotence tracking, not just "was the SSTable
+            // built": a retry (triggered by a *later* step's failure)
+            // must never redo an *earlier* step that already durably
+            // succeeded. The first crash test run against this code
+            // found exactly this bug: `pool.submit(CheckpointMarker)`
+            // and the `SET_CHECKPOINT` manifest append were being
+            // redone on every retry regardless of whether they had
+            // already succeeded, producing duplicate durable marker
+            // records for one logical flush (`PHASE5_ADR.md` has the
+            // full account). `pool.rotate()` and `pool.purge_before()`
+            // are deliberately *not* similarly guarded — both are
+            // already idempotent/safe to repeat (existing, tested WAL
+            // behavior; a redundant `rotate()` merely seals a
+            // near-empty segment early, a redundant `purge_before` with
+            // the same watermark is a no-op).
+            let mut published: Option<(u64, crate::sstable::SstableMeta)> = None;
+            let mut checkpoint_marker: Option<crate::wal::WalPosition> = None;
+            let mut checkpoint_recorded = false;
             loop {
                 if stop.load(Ordering::Acquire) {
                     return;
@@ -494,25 +808,91 @@ fn spawn_flush_thread(
                         return;
                     }
                 }
-                let id = next_sstable_id.fetch_add(1, Ordering::SeqCst);
-                let outcome =
-                    sstable::write_from_memtable(&frozen, id, &sstables_dir, &writer_config)
-                        .and_then(|meta| SsTable::open(&meta.path, meta.id));
-                match outcome {
-                    Ok(table) => {
-                        sstables
-                            .write()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(0, Arc::new(table));
+
+                let attempt_result: Result<()> =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                        let (id, meta) = match &published {
+                            Some((id, meta)) => (*id, meta.clone()),
+                            None => {
+                                let id = next_sstable_id.fetch_add(1, Ordering::SeqCst);
+                                let meta = sstable::write_from_memtable(
+                                    &frozen,
+                                    id,
+                                    &sstables_dir,
+                                    &writer_config,
+                                )?;
+                                let file_size = std::fs::metadata(&meta.path)?.len();
+                                manifest
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .append_sync(ManifestEdit::AddSstable {
+                                        id,
+                                        min_seq: meta.min_seq,
+                                        max_seq: meta.max_seq,
+                                        file_size,
+                                    })?;
+                                published = Some((id, meta.clone()));
+                                (id, meta)
+                            }
+                        };
+
+                        {
+                            let mut list = sstables.write().unwrap_or_else(|p| p.into_inner());
+                            if !list.iter().any(|t| t.id() == id) {
+                                let table = SsTable::open(&meta.path, id)?;
+                                list.insert(0, Arc::new(table));
+                            }
+                        }
+
+                        pool.rotate()?;
+                        let position = match checkpoint_marker {
+                            Some(position) => position,
+                            None => {
+                                let position = pool
+                                    .submit(WalOpOwned::CheckpointMarker {
+                                        flushed_through_seq: meta.max_seq,
+                                    })?
+                                    .wait()?;
+                                checkpoint_marker = Some(position);
+                                position
+                            }
+                        };
+                        if !checkpoint_recorded {
+                            manifest
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .append_sync(ManifestEdit::SetCheckpoint {
+                                    flushed_through_seq: meta.max_seq,
+                                    wal_segment_id: position.segment_id,
+                                    wal_offset: position.offset,
+                                })?;
+                            checkpoint_recorded = true;
+                        }
+                        checkpoint_seq.store(meta.max_seq, Ordering::Release);
                         immutables
                             .write()
                             .unwrap_or_else(|p| p.into_inner())
                             .retain(|m| !Arc::ptr_eq(m, &frozen));
-                        break;
-                    }
+                        pool.purge_before(meta.max_seq)?;
+                        Ok(())
+                    }))
+                    .unwrap_or_else(|panic_payload| {
+                        Err(EngineError::Aborted {
+                            detail: format!(
+                                "flush attempt panicked: {}",
+                                panic_payload_message(&panic_payload)
+                            ),
+                        })
+                    });
+
+                match attempt_result {
+                    Ok(()) => break,
                     Err(e) => {
                         attempt += 1;
-                        eprintln!("rubixdb: sstable flush attempt {attempt} (id {id}) failed: {e}");
+                        eprintln!(
+                            "rubixdb: flush attempt {attempt} failed \
+                             (published={published:?}): {e}"
+                        );
                         let backoff = if attempt <= max_retries {
                             Duration::from_millis(50u64.saturating_mul(attempt as u64))
                         } else {
@@ -527,6 +907,20 @@ fn spawn_flush_thread(
             }
         }
     })
+}
+
+/// Extracts a human-readable message from a caught panic payload —
+/// `std::panic::catch_unwind`'s own `Err` type is `Box<dyn Any + Send>`
+/// with no guaranteed structure; `panic!("...")`/`.unwrap()`-style
+/// panics are the two shapes actually seen in practice.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// Sleeps for `total`, checking `stop` in small increments so a stuck
@@ -545,11 +939,14 @@ fn sleep_checking_stop(total: Duration, stop: &std::sync::atomic::AtomicBool) {
     }
 }
 
-/// Applies one WAL-recovered record to a MemTable being reconstructed —
-/// `CheckpointMarker` is a no-op in Phase 4A (there is no flush-to-
-/// SSTable/checkpoint concept yet; every durable WAL record belongs in
-/// the recovered MemTable, full stop — `PHASE4A_MEMTABLE_ARCHITECTURE.md`
-/// §10's own closing note).
+/// Applies one WAL-recovered record to a MemTable being reconstructed.
+/// `CheckpointMarker` is still a no-op here as of Phase 5 — not because
+/// checkpoints don't matter (they now do, deeply), but because the
+/// checkpoint *value* used to decide what to replay at all comes from
+/// the Manifest (`LsmEngine::open`'s own `checkpoint_at_replay` filter,
+/// applied by the caller *before* this function is ever invoked for a
+/// given record) — the marker record's own presence during replay
+/// carries no additional information this function needs to act on.
 fn apply_wal_op(memtable: &mut MemTable, seq: u64, op: WalOp<'_>) {
     match op {
         WalOp::Put { key, value } => memtable.put(key, seq, value),

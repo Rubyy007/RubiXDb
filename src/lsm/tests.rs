@@ -234,6 +234,10 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
     // to) is harmless -- `shutdown`'s `flush_handle.take()` finds `None`
     // and skips the join.
     let (flush_sender, _unused_receiver) = mpsc::channel();
+    // `FileWal::open_for_recovery` above already holds this directory's
+    // exclusive lock in this same process, satisfying `Manifest::open_
+    // after_exclusive_lock`'s own contract.
+    let (manifest, _) = Manifest::open_after_exclusive_lock(&dir).unwrap();
     let engine = LsmEngine {
         pool: Arc::new(pool),
         active: RwLock::new(MemTable::new(LsmConfig::default().memtable_max_size_bytes)),
@@ -241,6 +245,9 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         sstables: Arc::new(RwLock::new(Vec::new())),
         next_sstable_id: Arc::new(AtomicU64::new(1)),
         sstables_dir: dir.join("sstables"),
+        manifest: Arc::new(Mutex::new(manifest)),
+        checkpoint_seq: Arc::new(AtomicU64::new(0)),
+        recovery_stats: RecoveryStats::default(),
         flush_sender,
         flush_handle: Mutex::new(None),
         flush_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -681,6 +688,238 @@ fn open_fails_closed_when_a_published_sstable_is_corrupt() {
     assert!(
         matches!(result, Err(EngineError::Corruption { .. })),
         "open() must fail closed on a corrupt published SSTable, not silently exclude it"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- Manifest / checkpoint / WAL purge integration (Phase 5) ---
+
+fn count_wal_segment_files(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.starts_with("wal-") && n.ends_with(".log"))
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A flush must durably advance the Manifest checkpoint and, only after
+/// that, allow the WAL to purge fully-covered segments
+/// (`PHASE5_MANIFEST_ARCHITECTURE.md` §5). With a small memtable and a
+/// small `max_segment_size`, sustained writes must keep the live WAL
+/// segment count bounded rather than growing without limit — direct
+/// evidence that `purge_before` is actually being called, not merely
+/// wired up unused.
+#[test]
+fn checkpoint_advances_and_wal_segments_stay_bounded() {
+    let dir = temp_dir("checkpoint_purge");
+    let wal_config = WalConfig {
+        max_segment_size: 4096,
+        ..test_wal_config()
+    };
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 4096,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = LsmEngine::open(&dir, wal_config, small_pool_config(), lsm_config).unwrap();
+
+    for i in 0..2000u32 {
+        engine
+            .put(
+                format!("k{i:05}").as_bytes(),
+                b"some-reasonably-sized-value",
+            )
+            .unwrap();
+    }
+
+    assert!(
+        wait_until(|| engine.checkpoint_seq() > 0, Duration::from_secs(10)),
+        "at least one checkpoint must have been durably recorded"
+    );
+    assert!(wait_until(
+        || engine.immutable_count() == 0,
+        Duration::from_secs(10)
+    ));
+
+    let segment_count = count_wal_segment_files(&dir);
+    assert!(
+        segment_count < 20,
+        "WAL segment count must stay bounded once checkpointing/purging is active, got {segment_count}"
+    );
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// After a checkpoint has been durably recorded and the WAL purged
+/// below it, a restart must replay only the records *after* the
+/// checkpoint into the fresh active MemTable (LSM Engine Spec §7.1 step
+/// 5) — not the full history a second time. Every key must still be
+/// correctly readable afterward regardless of which tier now holds it.
+#[test]
+fn restart_replays_only_post_checkpoint_records_and_all_data_remains_correct() {
+    let dir = temp_dir("bounded_replay");
+    let wal_config = WalConfig {
+        max_segment_size: 4096,
+        ..test_wal_config()
+    };
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 4096,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let total_keys = 2000u32;
+    {
+        let engine = LsmEngine::open(
+            &dir,
+            wal_config.clone(),
+            small_pool_config(),
+            lsm_config.clone(),
+        )
+        .unwrap();
+        for i in 0..total_keys {
+            engine
+                .put(
+                    format!("k{i:05}").as_bytes(),
+                    b"some-reasonably-sized-value",
+                )
+                .unwrap();
+        }
+        assert!(wait_until(
+            || engine.checkpoint_seq() > 0,
+            Duration::from_secs(10)
+        ));
+        assert!(wait_until(
+            || engine.immutable_count() == 0,
+            Duration::from_secs(10)
+        ));
+        engine.shutdown();
+    }
+
+    let engine2 = LsmEngine::open(&dir, wal_config, small_pool_config(), lsm_config).unwrap();
+    assert!(
+        engine2.active_entry_count() < total_keys as usize,
+        "replay must be bounded by the checkpoint, not replay the full history again \
+         (active_entry_count={}, total_keys={total_keys})",
+        engine2.active_entry_count()
+    );
+    for i in 0..total_keys {
+        assert_eq!(
+            engine2.get(format!("k{i:05}").as_bytes()).unwrap(),
+            Some(b"some-reasonably-sized-value".to_vec()),
+            "key k{i:05} must remain correctly readable after bounded-replay restart"
+        );
+    }
+    engine2.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `PHASE5_MANIFEST_ARCHITECTURE.md` §6: if the Manifest says an
+/// SSTable is live but its file is physically missing, `open()` must
+/// fail closed, never silently omit it from the live set.
+#[test]
+fn missing_live_sstable_fails_closed_on_open() {
+    let dir = temp_dir("missing_live_sstable");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 100,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    {
+        let engine = open(&dir, lsm_config.clone());
+        for i in 0..30u32 {
+            engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        assert!(wait_until(
+            || engine.sstable_count() >= 1,
+            Duration::from_secs(5)
+        ));
+        engine.shutdown();
+    }
+
+    let sstables_dir = dir.join("sstables");
+    let mut deleted_any = false;
+    for entry in fs::read_dir(&sstables_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sst") {
+            fs::remove_file(&path).unwrap();
+            deleted_any = true;
+            break; // just the first one -- enough to prove the point
+        }
+    }
+    assert!(deleted_any);
+
+    let result = LsmEngine::open(&dir, test_wal_config(), small_pool_config(), lsm_config);
+    assert!(
+        matches!(result, Err(EngineError::Corruption { .. })),
+        "open() must fail closed when the Manifest's live set references a missing file"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An invalid file sitting at a never-before-used SSTable id must never
+/// silently become live (it isn't valid) and must never be silently
+/// ignored either (operating brief: "extra orphan SSTables... must not
+/// become live merely because they are present on disk") -- `open()`
+/// fails closed either way it might otherwise be mishandled.
+#[test]
+fn garbage_orphan_sstable_file_fails_closed_not_silently_handled() {
+    let dir = temp_dir("garbage_orphan");
+    let sstables_dir = dir.join("sstables");
+    fs::create_dir_all(&sstables_dir).unwrap();
+    fs::write(
+        sstables_dir.join("00000000000000000099.sst"),
+        b"not a real sstable",
+    )
+    .unwrap();
+
+    let result = LsmEngine::open(
+        &dir,
+        test_wal_config(),
+        small_pool_config(),
+        LsmConfig::default(),
+    );
+    assert!(
+        matches!(result, Err(EngineError::Corruption { .. })),
+        "a garbage file at a never-acknowledged sstable id must fail closed, not be silently \
+         adopted or silently skipped"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A non-tail-corrupted `MANIFEST` file must fail `LsmEngine::open`
+/// closed (`RUBIC_MANIFEST_FORMAT_SPECIFICATION.md` §4.1), never guess
+/// at recovery.
+#[test]
+fn manifest_corruption_fails_closed_on_open() {
+    let dir = temp_dir("manifest_corruption");
+    {
+        let engine = open(&dir, LsmConfig::default());
+        engine.put(b"k1", b"v1").unwrap();
+        engine.shutdown();
+    }
+    // No flush happened (large default memtable), so MANIFEST may not
+    // exist yet -- create a minimally corrupt one directly to exercise
+    // the corruption path deterministically.
+    let manifest_path = dir.join("MANIFEST");
+    fs::write(&manifest_path, [0xFFu8; 40]).unwrap(); // garbage: bad length/crc, not a clean torn tail
+
+    let result = LsmEngine::open(
+        &dir,
+        test_wal_config(),
+        small_pool_config(),
+        LsmConfig::default(),
+    );
+    assert!(
+        matches!(result, Err(EngineError::Corruption { .. })),
+        "a corrupted (non-tail) MANIFEST must fail open() closed"
     );
     let _ = fs::remove_dir_all(&dir);
 }

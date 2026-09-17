@@ -78,7 +78,7 @@ pub fn sstable_tmp_filename(id: u64) -> String {
 /// the exact `{20 digits}.sst` shape (never matches `.sst.tmp`, never
 /// matches a non-numeric or wrong-width name) — used both by directory-
 /// scan ID recovery (§3.1) and by the discovery sweep below.
-fn parse_sstable_id(filename: &str) -> Option<u64> {
+pub(crate) fn parse_sstable_id(filename: &str) -> Option<u64> {
     let digits = filename.strip_suffix(".sst")?;
     if digits.len() != 20 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
