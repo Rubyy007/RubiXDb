@@ -1255,3 +1255,117 @@ landing clean; that item remains open and independent of this phase's
 own work.
 
 **Open Tier 3 question currently blocking further work:** none.
+
+---
+
+## 2026-09-17 (continued)
+
+**Implemented:** RUBIC Manifest (Phase 5) — the crash-safe record of
+the live SSTable set and the durable checkpoint boundary, and the safe
+WAL retention/purge mechanism it authorizes, per `RUBIC_MANIFEST_
+FORMAT_SPECIFICATION.md` and `PHASE5_MANIFEST_ARCHITECTURE.md`.
+
+Ran the release-gate audit first, as required: launched Phase 3C's
+still-outstanding long soak, then caught and corrected a real
+sequencing mistake within the same session (killing leg 1 early caused
+the wrapper script to advance straight into leg 2, which would have
+contaminated every one of this phase's own required clean benchmarks —
+`PHASE5_ADR.md` ADR-P5-0) — stopped it, ran every clean measurement
+this phase needed, and relaunched it uninterrupted as the very last
+action. Built a dedicated ablation (`examples/freeze_ablation_test.rs`)
+for the still-unexplained Phase 4B 100-writer anomaly: conclusively
+ruled out the bounded-`BTreeMap`-depth hypothesis (a freeze-and-
+discard-only variant never measured faster than the no-freeze
+baseline), left the real mechanism honestly unexplained rather than
+guessed at.
+
+The Manifest format was already fully specified (LSM Engine Spec §6.1
+— three edit types, WAL-frame-format reuse) — no format ambiguity to
+resolve. The genuinely hard design work was the *integration*:
+reconciled an apparent two-level description gap between the spec's
+§3.2 (atomic SSTable construction, including its own `ADD_SSTABLE`
+Manifest step) and §4.4 (the higher-level flush pseudocode, which
+doesn't re-show that step) as one indivisible unit, not a
+contradiction; derived a two-phase Manifest-recovery startup sequence
+(`manifest::replay_readonly` under a shared lock, before the exclusive
+lock; `Manifest::open_after_exclusive_lock` after it) that preserves
+Phase 4A's existing `replay_streaming`-before-`open_for_recovery`
+lock-ordering constraint without changing that WAL function's own
+signature at all.
+
+Implemented `src/manifest/` (`format.rs`, `state.rs`, `recovery.rs`,
+`mod.rs`): an independent (not shared-code, but byte-compatible) frame
+implementation reusing the WAL's own frame-header shape, sequential
+bounded-memory replay with the identical torn-vs-corrupt classification
+the WAL uses for its own segments, and idempotent recovery semantics
+exactly matching the spec's own tolerance rules. Wired the WAL's
+already-existing but previously-inert `CHECKPOINT_MARKER` op into real
+use for the first time since Phase 4A defined it. Extended `LsmEngine`'s
+flush pipeline to the full ten-step publish -> checkpoint -> purge
+sequence the WAL and LSM specs jointly require, reusing existing,
+already-tested primitives throughout (`pool.rotate()`, `pool.submit
+(CheckpointMarker)`, the existing `purge_before`) rather than inventing
+anything new.
+
+**A real idempotent-retry bug found by this phase's own crash-cycle
+testing, not by inspection**: the first working retry design tracked
+only whether the SSTable itself had been built, so a failure *after*
+the `CHECKPOINT_MARKER` had already been durably written (but before
+`SET_CHECKPOINT` landed) caused a retry to durably resubmit a *second*
+marker for the same logical flush. Found because the crash test was
+extended to assert an *exact* accounting invariant
+(`active_entry_count() + recovery_stats().checkpoint_markers_replayed
+== highest_seq - checkpoint_seq`) rather than a loose bound — that
+invariant failed on 94 of the first 100 real crash cycles against the
+initial design. Fixed by tracking each step's own durable-success state
+independently; re-verified clean, 180/180 cycles across two seeds,
+after the fix (`PHASE5_ADR.md` ADR-P5-4).
+
+Audited the flush-thread-panic gap `PHASE4B_FAILURE_MODEL.md` had
+already named as newly more consequential once WAL retention depends on
+flushing continuing. Decided against a supervised-restart thread design
+(the operating brief's own named risk: could duplicate an SSTable or
+replay an unsafe checkpoint transition) in favor of `catch_unwind`
+around each flush attempt, treating a caught panic identically to an
+I/O failure through the same already-proven idempotent-retry machinery
+— the thread itself never dies, so there is no restart state to
+reconcile (`PHASE5_ADR.md` ADR-P5-5).
+
+Added `LsmEngine::recovery_stats()`/`checkpoint_seq()`/
+`manifest_record_count()`/`manifest_size_bytes()`/`manifest_last_edit()`/
+`live_sstable_ids()` — real observability, not a checklist exercise
+(`recovery_stats()` specifically exists because the crash test's own
+exact-accounting invariant needed it to find the bug above).
+
+Ran a bounded (~3 minute, not multi-hour) soak with periodic real
+process kills interleaved (`examples/manifest_soak_test.rs`): 8/8
+cycles clean, and — the property this soak specifically exists to
+demonstrate — WAL byte count stayed at exactly `0` across every
+measurement (this tiny-memtable stress workload's checkpoint tracks
+within ~1% of `highest_seq` at all times, so `purge_before` reclaims
+essentially the whole WAL every cycle), while Manifest/SSTable-
+directory size grew as expected in the explicit absence of Compaction.
+
+Measured performance cleanly: at 1,000 writers under a realistic 4 MiB
+memtable, the full Manifest-integrated pipeline (96,368 ops/sec)
+measured within ~2% of a clean WAL-only baseline (98,225 ops/sec) —
+checkpoint/purge overhead is negligible at realistic configuration.
+
+**Tests passing: VERIFIED.** `cargo test --lib`: 253/253 (216
+pre-existing + 37 new: 32 in `src/manifest/`, 5 new `LsmEngine`
+Manifest-integration tests). `cargo test --lib --features test-util`:
+253/253. `cargo test --release --lib`: 253/253. `cargo clippy
+--all-targets --all-features -- -D warnings`: clean. `cargo fmt
+--check`: clean.
+
+**Final decision** (`PHASE5_TEST_RESULTS.md` §10): **MANIFEST NOT
+READY FOR COMPACTION — BLOCKERS REMAIN.** Two explicit blockers,
+neither a correctness defect: Phase 3C's own WAL certification has
+still never completed (carried forward, unresolved, across four
+phases now); the true multi-hour, realistic-configuration Phase 5 soak
+is not complete (only a bounded stress-configuration soak and the
+relaunched-but-still-running Phase 3C soak exist as evidence). Every
+correctness property actually tested this phase passed cleanly and
+does not need to be redone once those two items close.
+
+**Open Tier 3 question currently blocking further work:** none.

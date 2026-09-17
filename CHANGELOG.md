@@ -6,6 +6,60 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Phase 5: RUBIC Manifest (MANIFEST NOT READY FOR COMPACTION -- blockers remain)
+
+Extends the persistent architecture: `... -> RUBIC SSTable -> Manifest
+-> Safe WAL Checkpoint/Purge`. Ran the release-gate audit first
+(Phase 3C's still-outstanding long soak relaunched at the end of this
+phase's own work, after catching and correcting a sequencing mistake
+mid-session; the Phase 4B 100-writer anomaly investigated via a
+dedicated ablation and conclusively narrowed, not fully explained).
+
+- **`RUBIC_MANIFEST_FORMAT_SPECIFICATION.md`**/**`PHASE5_MANIFEST_
+  ARCHITECTURE.md`** (new): the Manifest format was already fully
+  specified by the LSM Engine Spec (three edit types, WAL-frame-format
+  reuse) -- the real design work was the Manifest-free-to-Manifest-
+  authoritative integration: a two-phase recovery split that preserves
+  the existing WAL lock-ordering constraint, and the full ten-step
+  publish -> checkpoint -> purge sequence.
+- **`src/manifest/`** (new): independent (byte-compatible, not shared-
+  code) frame implementation, sequential bounded-memory replay with the
+  WAL's own torn-vs-corrupt classification, idempotent recovery. Wires
+  up the WAL's own `CHECKPOINT_MARKER` op (defined since Phase 4A,
+  inert until now) for the first time.
+- **`src/lsm/mod.rs`** (extended): the flush pipeline now durably
+  publishes, checkpoints, and purges in the exact safe order the WAL
+  and LSM specs jointly require; the read path is now Manifest-
+  authoritative, never "every `.sst` file found in the directory."
+- **A real idempotent-retry bug found and fixed by this phase's own
+  crash-cycle testing**: a retried flush attempt could durably resubmit
+  a second `CHECKPOINT_MARKER` for one logical flush -- caught by an
+  exact-accounting invariant added to the crash harness, not by
+  inspection. Fixed via per-step (not just per-SSTable) idempotence
+  tracking. Full account: `PHASE5_ADR.md` ADR-P5-4.
+- **Flush-thread panic handling** (new): each flush attempt now runs
+  inside `catch_unwind`, treated identically to an I/O failure by the
+  same proven idempotent-retry machinery -- not a supervised-restart
+  thread design, which the operating brief itself flagged as risky.
+- **`LsmEngine::recovery_stats()`/`checkpoint_seq()`/Manifest
+  inspection accessors** (new): real observability, added because the
+  crash test's own exact-accounting invariant needed it.
+- **`examples/manifest_soak_test.rs`** (new): a bounded (~3 minute)
+  soak with periodic real process kills -- 8/8 cycles clean, WAL byte
+  count stayed at exactly 0 across every measurement (checkpoint
+  tracked within ~1% of `highest_seq` throughout).
+
+253/253 lib tests pass (216 + 37 new: 32 in `src/manifest/`, 5 new
+`LsmEngine` Manifest-integration tests), clippy and fmt clean. Full
+design: `PHASE5_ARCHITECTURE.md`/`PHASE5_MANIFEST_ARCHITECTURE.md`;
+failure model: `PHASE5_FAILURE_MODEL.md`; decisions: `PHASE5_ADR.md`;
+performance: `PHASE5_PERFORMANCE.md`; results and final decision
+(authoritative): `PHASE5_TEST_RESULTS.md` -- **MANIFEST NOT READY FOR
+COMPACTION -- BLOCKERS REMAIN** (Phase 3C's own WAL certification still
+never completed; the true multi-hour Phase 5 soak not yet complete).
+No correctness defect found; nothing tested this phase needs to be
+redone once those two items close.
+
 ### Phase 4B: RUBIC SSTable (RUBIC SSTABLE READY FOR MANIFEST)
 
 Extends the write path: `... -> MemTable -> Immutable MemTable -> RUBIC

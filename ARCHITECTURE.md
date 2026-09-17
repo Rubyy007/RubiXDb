@@ -654,3 +654,85 @@ certification eventually landing clean; that item remains open and
 independent of this phase's own work (Phase 4B modifies no WAL/
 coordinator code). Next phase per operating brief §55: Manifest /
 SSTable lifecycle management, followed by Compaction.
+
+## Phase 5: RUBIC Manifest (implemented, MANIFEST NOT READY FOR COMPACTION)
+
+Per `PHASE5_ADR.md` ADR-P5-0: began by launching Phase 3C's still-
+outstanding long soak, then caught and corrected a real sequencing
+mistake within the same session (killing the soak's first leg early
+caused its own wrapper script to advance straight into the second,
+longer leg — which would have contaminated every one of this phase's
+own required clean benchmarks) before any of that phase's own work
+continued. Extends the persistent architecture:
+
+```text
+... -> RUBIC SSTable -> Manifest -> Safe WAL Checkpoint/Purge
+```
+
+**The Manifest format required no format-ambiguity resolution** — LSM
+Engine Spec §6.1 already fully specifies it (three edit types, WAL-
+frame-format reuse). The real design work was the integration: a
+genuine startup lock-ordering interaction between Manifest recovery
+(which needs write access for its directory-reconciliation sweep) and
+the existing `wal::replay_streaming`-before-`FileWal::open_for_
+recovery` constraint (`PHASE4A_ADR.md` ADR-P4A-3), resolved by
+splitting Manifest recovery into a shared-lock read-only pass (before
+the exclusive lock) and an exclusive-lock write-capable pass (after) —
+see `PHASE5_MANIFEST_ARCHITECTURE.md` §4 for the full derivation.
+
+- **`RUBIC_MANIFEST_FORMAT_SPECIFICATION.md`** (new): the exact byte
+  format (already-final LSM spec §6.1), plus the startup-ordering and
+  crash-state-machine derivations this phase needed on top of it.
+- **`src/manifest/`** (new): `format.rs`/`state.rs`/`recovery.rs`/
+  `mod.rs` — an independent (byte-compatible, not shared-code) frame
+  implementation (`wal::format::encode_frame`'s own doc comment claimed
+  reusability it didn't actually have — corrected in place, zero
+  behavior change), sequential bounded-memory replay with the WAL's own
+  torn-vs-corrupt classification, idempotent recovery.
+- **`src/lsm/mod.rs`** (extended): the flush pipeline now runs the full
+  ten-step publish -> `ADD_SSTABLE` -> `pool.rotate()` ->
+  `CHECKPOINT_MARKER` (the WAL's own previously-inert op, defined since
+  Phase 4A, wired to real use for the first time) -> `SET_CHECKPOINT`
+  -> drop immutable -> `purge_before` sequence, reusing existing,
+  already-tested primitives throughout. The read path is now Manifest-
+  authoritative — never "every `.sst` file found in the directory,"
+  Phase 4B's own now-retired approach.
+- **A real idempotent-retry bug found by this phase's own crash-cycle
+  testing**: the first working retry design tracked only whether the
+  SSTable itself had been built, so a failure between two later durable
+  steps caused a retry to durably resubmit a *second* `CHECKPOINT_
+  MARKER` for one logical flush. Found because the crash harness was
+  extended to assert an *exact* accounting invariant rather than a
+  loose bound — that invariant failed 94/100 times against the initial
+  design. Fixed via independent per-step idempotence tracking; re-
+  verified clean, 180/180 real crash cycles across two seeds
+  (`PHASE5_ADR.md` ADR-P5-4).
+- **Flush-thread panic handling** (new): `catch_unwind` around each
+  attempt, treated identically to an I/O failure by the same idempotent
+  machinery — not a supervised-restart thread, which the operating
+  brief itself flagged as risky if done carelessly (`PHASE5_ADR.md`
+  ADR-P5-5).
+- **`examples/manifest_soak_test.rs`** (new): a bounded (~3 minute, not
+  multi-hour) soak with periodic real process kills — WAL byte count
+  stayed at exactly `0` across all 8 cycles, directly demonstrating
+  bounded WAL growth under active checkpointing.
+
+**253/253 lib tests pass** (216 + 37 new), clippy and fmt clean
+throughout. Full design: `PHASE5_ARCHITECTURE.md`/`PHASE5_MANIFEST_
+ARCHITECTURE.md`; failure model: `PHASE5_FAILURE_MODEL.md`; decisions:
+`PHASE5_ADR.md`; performance: `PHASE5_PERFORMANCE.md`; results and
+current status (authoritative): `PHASE5_TEST_RESULTS.md`.
+
+**Final decision: MANIFEST NOT READY FOR COMPACTION — BLOCKERS
+REMAIN.** Two explicit blockers, neither a correctness defect: Phase
+3C's own WAL certification still has never completed (carried forward,
+unresolved, across four phases now — Phase 4A, 4B, and this one all
+proceeded provisionally on the same documented basis); the true
+multi-hour, realistic-configuration Phase 5 soak is not complete (only
+a bounded stress-configuration soak, and the relaunched-but-still-
+running Phase 3C soak, exist as evidence at the time this document set
+was finalized). Every correctness/durability/crash-recovery/
+idempotence property actually tested this phase passed cleanly and
+does not need to be redone once those two items close. Next phase per
+operating brief §55, once re-certified with that evidence in hand:
+Compaction.
