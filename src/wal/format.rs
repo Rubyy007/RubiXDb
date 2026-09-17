@@ -117,14 +117,25 @@ pub fn decode_segment_header(buf: &[u8], expected_segment_id: u64) -> Result<Seg
     })
 }
 
-/// Encodes one full frame (`length || crc32c || body`, WAL Spec §2.3) for
-/// a `seq` and a caller-supplied op encoder. `encode_op_body` writes the
-/// `op` tag byte and its `op_body` into `out` and returns the tag byte —
-/// kept generic (and fallible: `write_len_prefixed`'s own per-field bound
-/// check can fail and propagate here, rather than needing a separate
-/// after-the-fact total-length check to catch what a per-field check
-/// already caught) so the Manifest's own edit types (LSM Engine Spec §6.1)
-/// can reuse this same framing function without depending on `WalOp`.
+/// Encodes one full WAL frame (`length || crc32c || body`, WAL Spec §2.3),
+/// where `body := seq(8) || op_tag(1) || op_body`. `encode_op_body` writes
+/// the `op` tag byte and its `op_body` into `out` and returns the tag byte
+/// — fallible (`write_len_prefixed`'s own per-field bound check can fail
+/// and propagate here, rather than needing a separate after-the-fact
+/// total-length check to catch what a per-field check already caught).
+///
+/// **Not directly reusable by the Manifest** (correcting an earlier,
+/// inaccurate version of this comment): this function always prepends an
+/// 8-byte `seq` before the op tag, per the WAL's own record-body layout —
+/// but the Manifest's body layout (LSM Engine Spec §6.1) is `edit_type(1)
+/// || type_fields`, with no `seq` prefix at all. Phase 5's
+/// `src/manifest/format.rs` implements its own minimal `length || crc32c
+/// || body` wrapper (byte-compatible with this one at the frame-header
+/// level, cross-checked by a dedicated test) rather than this function
+/// being refactored to drop the baked-in `seq` field — refactoring this
+/// already-certified, 200+-test-covered WAL primitive for that purpose
+/// was judged higher-risk than a ~15-line independent implementation
+/// (`PHASE5_ADR.md`).
 ///
 /// Returns `CapacityExceeded` (before writing anything) if the encoded
 /// body would exceed `max_record_len` or `u32::MAX` (the `length` field's

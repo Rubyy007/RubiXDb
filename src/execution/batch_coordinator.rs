@@ -582,6 +582,16 @@ impl BatchCoordinatorPool {
         self.committer.purge_before(watermark_seq)
     }
 
+    /// Delegates to `GroupCommitter::rotate` — Phase 5's flush pipeline
+    /// calls this immediately before durably writing a
+    /// `CHECKPOINT_MARKER` (WAL Spec §2.2's own note: "so the marker and
+    /// the rotation boundary line up cleanly for the retention rule"),
+    /// safe to call concurrently with ongoing submissions for the same
+    /// reason `purge_before` already is.
+    pub fn rotate(&self) -> Result<()> {
+        self.committer.rotate()
+    }
+
     pub fn into_inner(self) -> Result<GroupCommitter> {
         self.shutdown();
         let committer = Arc::clone(&self.committer);
