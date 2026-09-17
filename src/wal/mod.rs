@@ -124,9 +124,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{EngineError, Result};
-use file_io::{
-    acquire_exclusive_lock, acquire_shared_lock_if_present, fsync_dir, SegmentIo, LOCK_FILE_NAME,
-};
+use file_io::{acquire_exclusive_lock, acquire_shared_lock_if_present, SegmentIo, LOCK_FILE_NAME};
+// Re-exported `pub(crate)` (not merely imported privately) so `crate::sstable`
+// can reuse this exact, already-tested Unix-real/Windows-no-op directory-fsync
+// primitive for RUBIC SSTable's own atomic-publication discipline, rather than
+// duplicating platform-specific logic a second time (PHASE4B_ADR.md ADR-P4B-4).
+// Visibility-only change — behavior, signature, and every existing call site
+// are unchanged.
+pub(crate) use file_io::fsync_dir;
 use format::{encode_segment_header, SEGMENT_HEADER_LEN};
 use recovery::walk_full_segment;
 
