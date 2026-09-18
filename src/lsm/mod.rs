@@ -130,6 +130,56 @@ enum FlushMsg {
     Shutdown,
 }
 
+/// Deterministic flush-thread fault-injection points
+/// (`PHASE_WRITE_ENGINE_TEST_PLAN.md`, closing the gap
+/// `PHASE4B_FAILURE_MODEL.md`/`PHASE5_ADR.md` ADR-P5-5 named: the
+/// existing SSTable/Manifest crash tests kill the whole process
+/// externally, which never exercises `catch_unwind` at all — a killed
+/// process doesn't unwind, it's simply gone. These points let a test
+/// inject a real Rust panic *inside a live flush attempt* and verify the
+/// in-process recovery path (`spawn_flush_thread`'s doc comment) instead.
+/// Mirrors `execution::batch_coordinator::CoordinatorFaultPoint` and
+/// `wal::group_commit::GroupCommitter::fsync_fault_hook`'s existing,
+/// established pattern: an always-compiled enum plus an always-present
+/// (not `#[cfg]`-gated, matching `fsync_fault_hook`'s own precedent)
+/// `Mutex<Option<Hook>>`, so production builds pay one uncontended mutex
+/// lock per flush-thread step and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FlushFaultPoint {
+    /// Before `sstable::write_from_memtable` — nothing for this flush is
+    /// durable yet; a panic here must be indistinguishable from the
+    /// flush thread never having started this attempt.
+    BeforeSstableWrite,
+    /// Immediately after the SSTable file and its `AddSstable` Manifest
+    /// edit are both durable (`published` just set), before the table is
+    /// installed into the live `sstables` list.
+    AfterSstablePublish,
+    /// Immediately after `pool.rotate()` returns.
+    AfterRotate,
+    /// Immediately after the WAL `CHECKPOINT_MARKER` is durable
+    /// (`checkpoint_marker` just set), before `SET_CHECKPOINT` is
+    /// appended to the Manifest — the exact step ordering
+    /// `PHASE5_ADR.md`'s own real idempotent-retry bug was found at,
+    /// under an external kill rather than a panic.
+    AfterCheckpointMarker,
+    /// Immediately after `SET_CHECKPOINT` is durable in the Manifest
+    /// (`checkpoint_recorded` just set), before `checkpoint_seq` is
+    /// published and `purge_before` is called.
+    AfterSetCheckpoint,
+}
+
+type FlushFaultHook = Box<dyn Fn(FlushFaultPoint) + Send + Sync>;
+
+/// Calls the installed flush fault hook, if any — a cheap no-op
+/// (`Mutex` lock + `None` check) when nothing is installed, safe to call
+/// unconditionally from every build including production.
+fn fire_flush_fault_hook(hook: &Mutex<Option<FlushFaultHook>>, point: FlushFaultPoint) {
+    let hook = hook.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(f) = hook.as_ref() {
+        f(point);
+    }
+}
+
 pub struct LsmEngine {
     pool: Arc<BatchCoordinatorPool>,
     active: RwLock<MemTable>,
@@ -175,6 +225,18 @@ pub struct LsmEngine {
     /// suppression below rather than a genuine unused field.
     #[allow(dead_code)]
     flush_delay_ms: Arc<AtomicU64>,
+    /// Number of times `freeze_locked` skipped a freeze because
+    /// `immutables` was already at `max_immutable_memtables` — the
+    /// soft-success capacity-pressure signal (see `freeze_locked`'s doc
+    /// comment). Every write that triggered this still returned `Ok`;
+    /// this counter is purely observational, never consulted by any
+    /// correctness decision.
+    capacity_pressure_events: AtomicU64,
+    /// See `FlushFaultPoint`/`fire_flush_fault_hook`. Shared with the
+    /// background flush thread via the `Arc` `open()` clones into
+    /// `spawn_flush_thread`; this copy is what `install_flush_fault_hook`/
+    /// `clear_flush_fault_hook` write through.
+    flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>>,
     config: LsmConfig,
 }
 
@@ -252,6 +314,7 @@ impl LsmEngine {
         let (flush_sender, flush_receiver) = mpsc::channel::<FlushMsg>();
         let flush_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flush_delay_ms = Arc::new(AtomicU64::new(0));
+        let flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>> = Arc::new(Mutex::new(None));
         let flush_handle = spawn_flush_thread(
             flush_receiver,
             Arc::clone(&sstables),
@@ -268,6 +331,7 @@ impl LsmEngine {
             Arc::clone(&pool),
             Arc::clone(&manifest),
             Arc::clone(&checkpoint_seq),
+            Arc::clone(&flush_fault_hook),
         );
 
         let recovery_stats = RecoveryStats {
@@ -293,8 +357,33 @@ impl LsmEngine {
             flush_handle: Mutex::new(Some(flush_handle)),
             flush_stop,
             flush_delay_ms,
+            capacity_pressure_events: AtomicU64::new(0),
+            flush_fault_hook,
             config: lsm_config,
         })
+    }
+
+    /// Installs a flush-thread fault hook, called at every
+    /// `FlushFaultPoint` the background flush thread's current attempt
+    /// reaches, until `clear_flush_fault_hook` is called. Mirrors
+    /// `GroupCommitter::install_fsync_fault_hook`'s existing, established
+    /// shape and rationale (scoped to this instance, not a process-wide
+    /// global — `cargo test` runs tests concurrently by default).
+    /// Ordinary production code never calls this.
+    pub fn install_flush_fault_hook(&self, hook: impl Fn(FlushFaultPoint) + Send + Sync + 'static) {
+        *self
+            .flush_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// Removes any hook installed by `install_flush_fault_hook`,
+    /// restoring the default no-op behavior.
+    pub fn clear_flush_fault_hook(&self) {
+        *self
+            .flush_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// Test-only: makes every subsequent flush attempt sleep `delay`
@@ -360,10 +449,21 @@ impl LsmEngine {
     /// limit gets a clean, documented error and its own already-applied
     /// insert is **not** rolled back (the entry is durable and now live
     /// in what remains the active MemTable; only the *freeze* is
-    /// refused, not the write that triggered it).
+    /// refused, not the write that triggered it). This is the accepted,
+    /// twice-ratified contract (`PHASE4A_FAILURE_MODEL.md` §2,
+    /// `PHASE4A_ADR.md` ADR-P4A-5, reaffirmed as "transient rather than
+    /// permanent" by `PHASE4B_ADR.md`) — `CapacityExceeded` is still
+    /// returned to the caller; only its *meaning* (backpressure signal,
+    /// not data loss) and its *duration* (cleared once the background
+    /// flush thread catches up) changed across phases. Do not change
+    /// this to a silent `Ok` — that would contradict both ratified ADRs.
+    /// `capacity_pressure_events` below is purely additive observability
+    /// alongside the existing `Err`, not a replacement for it.
     fn freeze_locked(&self, active_guard: &mut MemTable) -> Result<()> {
         let mut immutables = self.lock_immutables_write();
         if immutables.len() >= self.config.max_immutable_memtables {
+            self.capacity_pressure_events
+                .fetch_add(1, Ordering::Relaxed);
             return Err(EngineError::CapacityExceeded {
                 requested: (immutables.len() as u64) + 1,
                 max: self.config.max_immutable_memtables as u64,
@@ -452,6 +552,18 @@ impl LsmEngine {
 
     pub fn immutable_count(&self) -> usize {
         self.lock_immutables_read().len()
+    }
+
+    /// Number of `put`/`delete` calls so far that returned
+    /// `Err(CapacityExceeded)` because their triggering freeze found
+    /// `immutables` at `max_immutable_memtables` (`freeze_locked`).
+    /// Purely additive observability: the underlying write was still
+    /// durable in the WAL and applied to the active MemTable before this
+    /// counted (`PHASE4A_FAILURE_MODEL.md` §2). A sustained non-zero
+    /// rate indicates the background flush thread is not keeping up with
+    /// the write rate.
+    pub fn capacity_pressure_events(&self) -> u64 {
+        self.capacity_pressure_events.load(Ordering::Relaxed)
     }
 
     /// Total bytes retained across every immutable MemTable — memory
@@ -771,6 +883,7 @@ fn spawn_flush_thread(
     pool: Arc<BatchCoordinatorPool>,
     manifest: Arc<Mutex<Manifest>>,
     checkpoint_seq: Arc<AtomicU64>,
+    flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(msg) = receiver.recv() {
@@ -814,6 +927,10 @@ fn spawn_flush_thread(
                         let (id, meta) = match &published {
                             Some((id, meta)) => (*id, meta.clone()),
                             None => {
+                                fire_flush_fault_hook(
+                                    &flush_fault_hook,
+                                    FlushFaultPoint::BeforeSstableWrite,
+                                );
                                 let id = next_sstable_id.fetch_add(1, Ordering::SeqCst);
                                 let meta = sstable::write_from_memtable(
                                     &frozen,
@@ -832,6 +949,10 @@ fn spawn_flush_thread(
                                         file_size,
                                     })?;
                                 published = Some((id, meta.clone()));
+                                fire_flush_fault_hook(
+                                    &flush_fault_hook,
+                                    FlushFaultPoint::AfterSstablePublish,
+                                );
                                 (id, meta)
                             }
                         };
@@ -845,6 +966,7 @@ fn spawn_flush_thread(
                         }
 
                         pool.rotate()?;
+                        fire_flush_fault_hook(&flush_fault_hook, FlushFaultPoint::AfterRotate);
                         let position = match checkpoint_marker {
                             Some(position) => position,
                             None => {
@@ -854,6 +976,10 @@ fn spawn_flush_thread(
                                     })?
                                     .wait()?;
                                 checkpoint_marker = Some(position);
+                                fire_flush_fault_hook(
+                                    &flush_fault_hook,
+                                    FlushFaultPoint::AfterCheckpointMarker,
+                                );
                                 position
                             }
                         };
@@ -867,6 +993,10 @@ fn spawn_flush_thread(
                                     wal_offset: position.offset,
                                 })?;
                             checkpoint_recorded = true;
+                            fire_flush_fault_hook(
+                                &flush_fault_hook,
+                                FlushFaultPoint::AfterSetCheckpoint,
+                            );
                         }
                         checkpoint_seq.store(meta.max_seq, Ordering::Release);
                         immutables

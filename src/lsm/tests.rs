@@ -164,6 +164,13 @@ fn immutable_backpressure_rejects_further_freezes_past_the_limit() {
     // this test exists to cover reproducible instead of timing-dependent.
     engine.set_flush_delay_for_test(Duration::from_millis(200));
 
+    // Accepted contract (`PHASE4A_FAILURE_MODEL.md` §2, `PHASE4A_ADR.md`
+    // ADR-P4A-5): the triggering write is already durable+applied before
+    // this check runs, but `put`/`delete` still surfaces
+    // `Err(CapacityExceeded)` to the caller as the backpressure signal —
+    // it is not silently swallowed. `capacity_pressure_events()` is an
+    // additional observability counter alongside that `Err`, not a
+    // replacement for it.
     let mut saw_capacity_error = false;
     for i in 0..40u32 {
         match engine.put(format!("k{i:03}").as_bytes(), b"v") {
@@ -179,6 +186,10 @@ fn immutable_backpressure_rejects_further_freezes_past_the_limit() {
         saw_capacity_error,
         "sustained writes past max_immutable_memtables must eventually hit backpressure, \
          not silently accumulate unbounded immutable memtables"
+    );
+    assert!(
+        engine.capacity_pressure_events() > 0,
+        "the capacity_pressure_events observability counter must track the same event"
     );
     assert!(engine.immutable_count() <= 2);
     engine.shutdown();
@@ -252,6 +263,8 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         flush_handle: Mutex::new(None),
         flush_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         flush_delay_ms: Arc::new(AtomicU64::new(0)),
+        capacity_pressure_events: AtomicU64::new(0),
+        flush_fault_hook: Arc::new(Mutex::new(None)),
         config: LsmConfig::default(),
     };
 
@@ -590,6 +603,115 @@ fn flush_moves_data_into_a_published_sstable_that_remains_readable() {
     }
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Closes the flush-thread-panic gap `PHASE4B_FAILURE_MODEL.md`/
+/// `PHASE5_ADR.md` ADR-P5-5 named but never deterministically tested:
+/// the existing SSTable/Manifest crash tests kill the whole process
+/// externally, which never exercises `catch_unwind` (a killed process
+/// doesn't unwind). This injects a real panic, exactly once, at each
+/// `FlushFaultPoint` in turn — the historically buggiest one
+/// (`AfterCheckpointMarker`, the exact step `PHASE5_ADR.md`'s own
+/// idempotent-retry bug was found at, there under an external kill) plus
+/// the earliest and latest points as boundary cases — and verifies: the
+/// panic is caught (the flush thread survives and keeps processing later
+/// messages), the immutable MemTable is retained until a later retry
+/// truly succeeds, checkpoint/SSTable state is never partially advanced
+/// by the panicking attempt, the retry succeeds shortly after, no caller
+/// ever hangs (every `put` in this test returns promptly), and every
+/// written value remains correctly readable throughout and after.
+#[test]
+fn flush_thread_panic_is_caught_and_retried_without_data_loss_or_duplication() {
+    for point in [
+        FlushFaultPoint::BeforeSstableWrite,
+        FlushFaultPoint::AfterSstablePublish,
+        FlushFaultPoint::AfterRotate,
+        FlushFaultPoint::AfterCheckpointMarker,
+        FlushFaultPoint::AfterSetCheckpoint,
+    ] {
+        let dir = temp_dir(&format!("flush_panic_{point:?}"));
+        // Every key/value below is "kNNN"/"vNNN" (4 bytes each), so each
+        // entry costs exactly 4+4+32=40 bytes (`memtable::entry_size`).
+        // 1180 sits strictly between 29*40=1160 and 30*40=1200, so all 30
+        // puts land in one MemTable and exactly one freeze (hence exactly
+        // one flush, exactly one SSTable) happens, on the very last put —
+        // required so this test's "exactly one SSTable, never duplicated"
+        // assertion below is meaningful.
+        let lsm_config = LsmConfig {
+            memtable_max_size_bytes: 1180,
+            max_immutable_memtables: 8,
+            ..LsmConfig::default()
+        };
+        let engine = open(&dir, lsm_config);
+
+        let already_panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let already_panicked = Arc::clone(&already_panicked);
+            engine.install_flush_fault_hook(move |p| {
+                if p == point
+                    && already_panicked
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    panic!("injected flush panic at {point:?} (deterministic fault test)");
+                }
+            });
+        }
+
+        // Every put must return promptly regardless of what the flush
+        // thread is doing — the write path never waits on flush.
+        for i in 0..30u32 {
+            let put_started = std::time::Instant::now();
+            engine
+                .put(format!("k{i:03}").as_bytes(), format!("v{i:03}").as_bytes())
+                .unwrap();
+            assert!(
+                put_started.elapsed() < Duration::from_secs(2),
+                "put must never hang waiting on the flush thread ({point:?})"
+            );
+        }
+
+        // The freeze that queues this flush happens synchronously inside
+        // the 30th `put` above, but the background flush thread reaching
+        // this fault point is asynchronous — poll with a bound instead of
+        // checking immediately.
+        assert!(
+            wait_until(
+                || already_panicked.load(Ordering::SeqCst),
+                Duration::from_secs(5)
+            ),
+            "the fault point {point:?} must actually have been reached and fired"
+        );
+
+        // The panicking attempt must never leave partial progress:
+        // eventually exactly one flush succeeds (retried by the same
+        // still-alive thread), publishing exactly one SSTable and
+        // advancing the checkpoint exactly once.
+        assert!(
+            wait_until(
+                || engine.checkpoint_seq() > 0 && engine.immutable_count() == 0,
+                Duration::from_secs(10)
+            ),
+            "the flush must eventually succeed after the injected panic ({point:?})"
+        );
+        assert_eq!(
+            engine.sstable_count(),
+            1,
+            "the panic must not cause a duplicate SSTable publication ({point:?})"
+        );
+
+        for i in 0..30u32 {
+            assert_eq!(
+                engine.get(format!("k{i:03}").as_bytes()).unwrap(),
+                Some(format!("v{i:03}").into_bytes()),
+                "no acknowledged durable write may be lost across the panic ({point:?})"
+            );
+        }
+
+        engine.clear_flush_fault_hook();
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 /// Per `PHASE4B_ADR.md` ADR-P4B-1 (no Manifest, no WAL purge this
