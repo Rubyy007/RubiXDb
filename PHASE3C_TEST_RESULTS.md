@@ -7,12 +7,13 @@ stand as the historical record of their own increment. Regression-bound
 rule (established before the final acceptance run): `PHASE3C_TEST_
 PLAN.md` §1.
 
-**Document status: IN PROGRESS.** The true long-duration soak (§3, a
-4-hour-per-writer-level run, launched in the background early in this
-session) is still running at the time of this document's first
-commit — everything else below is complete. §3, §9, and §12 (final
-decision) will be updated in place, not left as placeholders, once the
-soak completes.
+**Document status: FINAL (updated 2026-09-19).** The true long-duration
+soak (§3) has now run to completion — both writer levels, full
+14,400s each, for the first time in this project's history across
+Phase 3C through Phase 5. §3, §9, and §12 (final decision) are updated
+in place below with the completed evidence. See
+`PHASE_WRITE_ENGINE_TEST_RESULTS.md` for the full cross-phase
+certification this soak's completion unblocks.
 
 ## 1. Repository state
 
@@ -64,10 +65,14 @@ duration this document was written except where explicitly noted
 t=480-742s of the 100-writer run, during which this session ran
 unrelated builds/tests — see the note in that section below).
 
-**Status at last update**: in progress — see the log excerpt and
-running characterization below; this section is updated in place (not
-left as a stale placeholder) once the full 4h+4h run and its final
-recovery check complete.
+**Status: COMPLETE.** Both legs ran to completion sequentially
+(2026-09-18 21:44:12 → 2026-09-19 05:46:47, ~8 hours total), auto-
+sequenced by the harness itself once leg 1's process tree was
+confirmed clean. `harness_result_20260918_214412.txt`'s final line:
+`BOTH LEGS COMPLETED SUCCESSFULLY. HARNESS RESULT: PASS` (this
+reflects the harness's own clean-exit criteria; the 1000-writer
+throughput target itself was not met — see below and
+`PHASE_WRITE_ENGINE_PERFORMANCE.md` for the full analysis).
 
 ### 100 writers — running characterization (as of t≈1585s of 14400s)
 
@@ -117,11 +122,43 @@ evidence not growing unbounded (not separately tabulated here; the
 final recovery check at the end of each writer-level's run is the
 authoritative confirmation, §3's completion will record it).
 
+**100-writer final result**: throughput 19,352 → 21,614 ops/sec
+(start→end), net +11.7% (no decline — the mid-run plateau tracked
+live during this session fully recovered by the end). RSS growth
++16 KB over 4h (+0.2%). `completed_err=0` throughout;
+`sync_failures=1` (the single early event, never recurred);
+`rejected_backpressure=0`. Post-run recovery: 0 corrupted segments,
+8,823,451 records recovered, gap-free from the first surviving
+record. **Target (≥15,000 ops/sec): met throughout the entire run.**
+
 ### 1,000 writers
 
-Not yet started as of this document's current state — runs
-sequentially after the 100-writer phase completes. Will be added here
-in the same format once available.
+**Command**: same harness, `1000 14400`, launched automatically by the
+wrapper harness immediately after leg 1's process tree was confirmed
+clean (2026-09-19 01:45:11 → 05:46:42, exit code 0).
+
+Mean throughput across the full run (121 samples): **75,822 ops/sec**.
+This held as a stable plateau (75,364-75,822 across repeated checks
+throughout the run) — not a decline, not noise, a consistent
+steady-state result. RSS growth +560 KB over 4h (+2.1%).
+`completed_err=0` throughout; `sync_failures=0` (final);
+`rejected_backpressure=0` despite `max_queue_depth_observed=1,000`
+(capacity 4,000) — backpressure engaged under load and always
+self-corrected. Post-run recovery: 0 corrupted segments, 14,397,035
+records recovered, gap-free.
+
+**Target (≥80,000 ops/sec): NOT met.** This is corroborated by the
+dedicated performance-regression suite (§9 below and
+`PHASE_WRITE_ENGINE_PERFORMANCE.md`) — every configuration tested at
+1,000 writers, not just this soak, lands 15-25% below both the target
+and this project's own historical band (89,157-98,666 ops/sec across
+Phase 2B/3C/4B). The WAL-only layer (architecturally unchanged since
+Phase 2B) shows the identical shortfall, which argues against a
+newer-code (SSTable/Manifest) regression specifically. A
+clean-reboot re-run (not performed — no reboot was available
+mid-session) is recommended to separate a genuine code regression
+from an artifact of measuring immediately after two consecutive
+4-hour soaks (8h of continuous disk I/O).
 
 ## 4. Soak stability criteria (§4) — evaluated against the 100-writer data available so far
 
@@ -137,8 +174,23 @@ in the same format once available.
 | No worker/coordinator death | Holding — `pool_state` not yet `Failed` at any sample |
 | No silent request loss | Holding — `submitted == completed_ok + completed_err` at every sample so far (not separately tabulated; `completed_err=0` and `submitted` tracking `completed_ok` exactly in the raw log confirms this) |
 
-**Full evaluation deferred to this section's own update once both
-4-hour runs and their final recovery checks complete.**
+**Full evaluation (both legs complete):**
+
+| Criterion | 100w (leg 1, complete) | 1000w (leg 2, complete) |
+|---|---|---|
+| No unbounded RSS growth | PASS — +0.2% over 4h | PASS — +2.1% over 4h |
+| No unbounded queue growth | PASS — max 63/400, self-corrected | PASS — max 1,000/4,000, always self-corrected |
+| No persistent throughput decline | PASS — net +11.7% start→end | PASS — stable plateau, no decline (but see performance finding below) |
+| No persistent latency drift | PASS | PASS — p95 stayed flat even where p99/max showed transient noise |
+| No sequence corruption | PASS — 0 corrupted segments, gap-free | PASS — 0 corrupted segments, gap-free |
+| No durability violation | PASS — `completed_err=0` | PASS — `completed_err=0` |
+| No deadlock | PASS — ran to natural completion | PASS — ran to natural completion |
+| No worker/coordinator death | PASS — `pool_state=Stopped fully_drained=true` at clean exit | PASS — same |
+| No silent request loss | PASS | PASS |
+| No purge failure accumulation | PASS — segments purged continuously throughout (46+ cycles leg 1, 590+ cycles leg 2), no failures logged | PASS |
+
+**Leg 1 verdict: full PASS, including the 15,000 ops/sec throughput target.**
+**Leg 2 verdict: PASS on every stability/correctness criterion; the 80,000 ops/sec throughput target itself was not met** — see `PHASE_WRITE_ENGINE_PERFORMANCE.md` for the full cross-configuration analysis. This is the certification's one open performance finding, not a stability or correctness defect.
 
 ## 5. Periodic forced-crash-during-soak (§5-§6)
 
@@ -259,12 +311,37 @@ regression would already surface there via the regression-bound rule.
 
 ## 9. Final performance re-verification (§20)
 
-**Deferred until the long-duration soak (§3) completes**, per this
-phase's own learned methodology (§2's note, `PHASE3C_TEST_PLAN.md` §1
-rule 5) — running it now would contaminate both the soak's own
-remaining evidence and the benchmark's own validity. Will be added
-here, compared against §2's baseline per the pre-established rule, once
-the machine is genuinely idle.
+**Complete.** Run immediately after both soak legs finished (methodology
+caveat: not after a clean reboot — see below). Full detail and
+per-configuration breakdown: `PHASE_WRITE_ENGINE_PERFORMANCE.md`.
+
+| Level | This session (median, full-pipeline) | §2 baseline (commit `4221e2f`) | Historical band |
+|---|---|---|---|
+| 100 writers | 14,020-15,248 (short bench) / 19,352-21,614 (soak) | 17,872 | 13,700-18,700 |
+| 1,000 writers | 76,427 (short bench) / 75,822 mean (soak) | 91,517 | 89,157-98,666 |
+
+100-writer: inside the historical band via short benchmark, above it
+via the (more authoritative) soak — **target met**.
+
+1,000-writer: **15-25% below both the target and the historical band,
+reproduced across every layer tested (WAL-only through full pipeline)
+and both short-benchmark and 4-hour-soak methodologies** — this is a
+reproduced shortfall by this project's own regression-bound rule
+(`PHASE3C_TEST_PLAN.md` §1: consistent reproduction across repetitions,
+not a single noisy sample). The WAL-only layer, unchanged since
+Phase 2B/3C, shows the identical shortfall, arguing against a
+newer-code cause specifically.
+
+**Methodology caveat**: this benchmark ran immediately after 8
+continuous hours of soak I/O, not on a freshly-idle machine as this
+document's own §2 rule (added specifically to avoid CPU-contention
+artifacts) intends. Unlike §2's discarded contaminated run (which was
+concurrent with an *active* soak and produced obviously-wrong ~9-10k
+numbers), this run had no concurrent process — but thermal/disk-cache
+state may still differ from a true cold baseline. **Recommended
+follow-up** (not performed — no reboot available mid-session): re-run
+this comparison after a clean reboot to isolate a genuine code
+regression from an environmental artifact.
 
 ## 10. Rotation/backpressure/coordinator/leader recertification (§16-§19)
 
@@ -295,11 +372,26 @@ paths under real sustained multi-hour load and real external process
 kills — coverage Phase 3B's shorter, synthetic fault-injection tests
 structurally cannot provide.
 
-**`cargo test --release --test group_commit --features test-util` /
-`cargo test --release --test crash_consistency --features test-util`**:
-deferred alongside §9 to avoid contaminating/being contaminated by the
-active soak (the former in particular is CPU- and time-intensive); will
-be re-run and recorded once the soak completes.
+**`cargo test --release --test group_commit --features test-util`**:
+6 passed, 2 failed. The 2 failures are the pre-existing, historical
+Phase 1 direct-thread throughput tests (`hundred_writers_throughput`,
+`thousand_writers_throughput`) — these exercise a bare `GroupCommitter`
+with no `execution::batch_coordinator` in front, explicitly out of
+scope per this project's own rule that historical direct-thread
+failures remain historical once the Dedicated Batch Coordinator is the
+certified architecture. All other tests in this binary (leader-failure
+propagation, rotation-mid-batch, watermark monotonicity, single-writer
+latency, crash consistency) pass.
+
+**`cargo test --release --test crash_consistency --features test-util`**:
+2/2 passed.
+
+**`cargo test --test pathological_recovery_matrix`** (release too): 9/9
+passed, matching §6 above exactly.
+
+Full unit suite, both profiles, both with/without `test-util`: 254/254
+(up from the 130/130 recorded earlier in this phase — 124 additional
+tests accumulated across Phases 4A/4B/5, all passing).
 
 ## 11. Security and dependency review (§14-§15)
 
@@ -318,10 +410,28 @@ already-audited dependency surface).
 
 ## 12. Final certification decision (§26)
 
-**Deferred** until §3 (long soak), §9 (final benchmark), and the
-remaining §10 commands complete — per operating brief §24 ("never
-convert a short soak into a multi-hour PASS... never silently remove
-an incomplete item"), no decision is recorded here until the evidence
-for it actually exists. This section will state exactly one of **WAL
-FOUNDATION CERTIFIED FOR LSM INTEGRATION** or **WAL FOUNDATION NOT YET
-CERTIFIED**, with full reasoning, once complete.
+**Complete.** §3 (long soak, both legs), §9 (final benchmark), and
+§10's remaining commands are all now recorded above.
+
+This document's original decision scope ("WAL foundation certified for
+LSM integration") has been **overtaken by events**: LSM integration
+(MemTable, RUBIC SSTable, RUBIC Manifest) was implemented and
+committed across Phases 4A/4B/5 while this soak was outstanding, each
+phase proceeding provisionally on the explicit condition that this
+soak would eventually complete cleanly. It now has.
+
+**WAL foundation: CERTIFIED.** Every invariant this phase set out to
+prove — durability, sequence monotonicity, crash safety, bounded
+recovery memory, bounded resource growth, group-commit correctness,
+observability — is proven by evidence above, holding across a genuine
+4-hour-per-writer-level soak for the first time in this project's
+history.
+
+**One open item carried forward, not resolved by this document**: the
+1,000-writer throughput target (§3, §9) is not met, reproduced
+consistently enough to be a real finding rather than noise. This does
+not invalidate the WAL foundation's *correctness* certification above
+— zero durability, correctness, or stability defects were found at
+any writer level — but it is a blocking item for the broader
+write-engine production-readiness decision. See
+`PHASE_WRITE_ENGINE_CERTIFICATION.md` for that decision.
