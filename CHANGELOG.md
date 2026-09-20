@@ -6,6 +6,54 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Read Engine: memory + range-performance investigation, Implementation Increment 5 (2026-09-20)
+
+Investigated three items Increment 4's completed 4-hour soak flagged
+rather than silently resolved: constant `snapshots_live=50`, ~2GB
+final RSS, and visibly high late-run `range_large` latency. **Range
+scan latency root cause found, traced in source, and independently
+reproduced**: `range_large` p50 grew from 1.15ms to 43.1 seconds over
+the soak (super-linear, unlike point lookups' known-linear scaling),
+traced to `RangeScanIter`'s per-key `refill` re-peeking every source
+holding a version of each winning key -- on this project's own
+realistic (small-cardinality, heavily-overwritten) endurance workload,
+this is O(distinct keys yielded × live SSTable count). Reproduced
+exactly in a new, deterministic ~3-minute benchmark
+(`examples/read_engine_bench.rs`'s `overlap_repro` section):
+`sstables_consulted/sstable` pinned at a constant integer across five
+SSTable-count checkpoints. `PHASE_READ_ENGINE_RANGE_PERFORMANCE_ADR.md`
+(new, ADR-RE-002) evaluates four fix options and proposes persistent
+source cursors (an owned-`Arc` iterator refactor, no `unsafe`, no new
+dependency) for a *future* increment's decision -- **no optimization
+implemented this increment**. **No memory leak found**: RSS's
+monotonic growth is fully explained by per-SSTable index/bloom-filter
+metadata (expected pre-Compaction); non-monotonic swings are most
+plausibly (not profiler-confirmed) Windows working-set volatility; the
+constant `snapshots_live=50` was verified to be the test harness's own
+deliberate pool cap, not an engine-side leak -- no snapshot semantics
+changed. Full detail: `PHASE_READ_ENGINE_RESOURCE_INVESTIGATION.md`,
+`PROGRESS.md`'s 2026-09-20 "Increment 5" entry. Certification status
+kept distinct rather than collapsed: correctness PASS, performance
+OPEN, memory OPEN-but-no-leak-found. **Status unchanged: READ ENGINE
+NOT READY.**
+
+### Read Engine: long-duration read soak + integrated write/read endurance, Implementation Increment 4 (2026-09-20)
+
+A real 4-hour soak (`examples/read_write_soak_test.rs`, new) under 8
+concurrent writers + 16 concurrent readers against the full real stack
+(WAL, MemTable, SSTables, Manifest, checkpoint, WAL purge),
+continuously validated against an independent reference model.
+`RESULT=PASS`: 13,483,811 writes, 3,375,298 deletes, 4,582,352 reads,
+261,455 range scans, zero in-run or post-recovery mismatches, clean
+recovery. Also: a mid-session (no restart) corruption-injection test
+(`src/lsm/tests.rs`) and `lsm_crash_cycle_test.rs` extended from
+"open() returned Ok" to real post-recovery read verification against
+exact expected values. Full detail: `PROGRESS.md`'s 2026-09-20
+"Increment 4" entry. **Status: READ ENGINE NOT READY** -- three
+observations from the soak (RSS growth, constant snapshot count, late-
+run range latency) were flagged, not silently resolved, and carried
+forward into Increment 5 above rather than assumed benign.
+
 ### Read Engine: contains() + performance baseline, Implementation Increment 3 (2026-09-20)
 
 `LsmEngine::contains(key, as_of_seq) -> Result<bool>` (`ADR-RE-001`

@@ -395,3 +395,112 @@ evidence the brief requires *before* any future optimization — and per
 the brief's explicit instruction, acting on them (e.g., a future
 Compaction phase to bound SSTable count) requires a new ADR, not a
 unilateral change here.
+
+## Run: 2026-09-20 (Increment 4: memory-scaling check, 100-5,000 SSTables)
+
+Read Engine Increment 4 §21's dedicated, observational-only memory-
+scaling check (`examples/read_engine_bench.rs`'s `memory_scaling`
+section — not part of its default `ALL` run, invoked explicitly via
+`read_engine_bench memory_scaling`). One continuously-growing real
+fixture (never five separate rebuilds), measured the instant each
+SSTable-count checkpoint was crossed. Keys are sequential
+(`scale-k{i:08}`), so — unlike the concurrent soak run below — each
+SSTable's key range is contiguous and largely disjoint from its
+neighbors, the same favorable layout Increment 3's own baseline used.
+This section explicitly does not optimize anything; it only measures
+whether RSS/latency remain operationally bounded as SSTable count
+grows.
+
+| checkpoint (target = actual) | RSS (KB) | point-read p99 | range-scan p99 (50-key span) | blocks_read (this checkpoint's measurement burst) | sstables_consulted (same burst) |
+|---:|---:|---:|---:|---:|---:|
+| 100   | 4,180 | 150.4us    | 1,406.3us  | 751    | 24,524    |
+| 500   | 4,744 | 735.1us    | 5,932.5us  | 2,775  | 144,524   |
+| 1,000 | 5,364 | 1,441.2us  | 16,069.7us | 5,330  | 294,524   |
+| 2,000 | 6,444 | 4,683.9us  | 29,370.5us | 10,684 | 594,524   |
+| 5,000 | 9,856 | 11,586.0us | 56,075.7us | 26,289 | 1,494,524 |
+
+**Verified, not assumed**: RSS growth here is small and clearly
+bounded (4,180 KB → 9,856 KB, +5,676 KB across 4,900 additional
+SSTables ≈ 1.16 KB/table) — far below the Write Engine's own
+established ~176 KB/table finding (`PHASE_WRITE_ENGINE_MEMORY_
+INVESTIGATION.md`), consistent with this fixture's much smaller
+per-table footprint (8 tiny keys/table, 1-byte values, vs. that
+investigation's ~102,721-record real-world tables). The *shape* of the
+relationship (bounded, monotonic, no runaway growth) matches, which is
+the property this check exists to confirm; the absolute per-table
+constant is expected to differ with table content size and is not
+itself a finding.
+
+**Point-read and range-scan p99 both grow consistently with live
+SSTable count** (point-read: 150us → 11.6ms, ~77x, across a 50x
+SSTable-count increase; range-scan: 1.4ms → 56.1ms, ~40x) — confirming
+Increment 3's read-amplification finding (§4 above) continues to hold,
+observationally, out to 5,000 SSTables, without becoming unbounded or
+pathological *for this favorable, contiguous-key layout*. Contrast
+with the concurrent long-duration soak's own findings below, which
+use a realistic *overlapping/scattered* key layout and show a far
+more severe range-scan degradation at a much lower SSTable count —
+the comparison between the two is itself the most important finding
+of this check (see `PHASE_READ_ENGINE_SOAK_RESULTS.md`).
+
+No optimization was performed or attempted based on this data, per the
+brief's explicit instruction — this is observational evidence for a
+future ADR-gated decision, not a trigger to act now.
+
+## Run: 2026-09-20 (Increment 5: memory + range-performance investigation)
+
+Full detail, methodology, and every raw number: `PHASE_READ_ENGINE_
+RESOURCE_INVESTIGATION.md` (new, this increment) — this section is a
+short pointer/summary, not a duplicate.
+
+Investigated Increment 4's completed, `RESULT=PASS` 4-hour integrated
+write/read endurance soak (`temp/read_write_soak_output.log`, preserved
+unmodified as historical evidence). Two headline findings, both traced
+to root cause and independently reproduced in a new, deterministic,
+~3-minute benchmark (`examples/read_engine_bench.rs`'s new
+`overlap_repro` section, standalone via `read_engine_bench
+overlap_repro`, not part of the default `ALL` run):
+
+1. **Range-scan latency grows super-linearly** (not the linear scaling
+   point lookups show) on this project's own established "realistic"
+   overlapping-key endurance workload: `range_large` p50 went from
+   1.15ms at 5 live SSTables to 43.1 **seconds** at 597 — traced to
+   `RangeScanIter`'s per-key `refill` re-peeking every source that
+   holds a version of each winning key (`src/lsm/mod.rs:706-733`),
+   which on a small-cardinality, heavily-overwritten keyspace (this
+   soak's own `KEY_CARDINALITY=4000` against ~27,424 writes/flush
+   cycle ⇒ ~99.9% per-key/per-table overlap probability) reduces to
+   O(distinct keys yielded × live SSTable count). Reproduced exactly:
+   the new `overlap_repro` benchmark shows `sstables_consulted/sstable`
+   pinned at a constant integer (21.000) across five SSTable-count
+   checkpoints once the workload's overlap ratio is tuned to match the
+   soak's own regime. `PHASE_READ_ENGINE_RANGE_PERFORMANCE_ADR.md`
+   (new, ADR-RE-002) evaluates fix options — **no optimization
+   implemented this increment**, per the brief's explicit instruction.
+2. **No memory leak found.** RSS growth's monotonic component is fully
+   explained (source-verified: no static cache, no engine-side scan
+   registry, per-`SsTable` index+bloom-filter memory that is expected
+   to persist until a future Compaction phase exists) by per-SSTable
+   metadata accumulation, consistent in shape with Increment 4's own
+   `memory_scaling` finding, scaled up for this soak's realistic
+   (~27,424-entry) table sizes vs. that section's tiny (8-entry)
+   fixture. Non-monotonic multi-hundred-MB RSS swings (e.g. −704MB
+   across two samples) are not explained by any code-level data
+   structure (nothing in this engine shrinks pre-Compaction) and are
+   most plausibly, though not independently profiler-confirmed here,
+   attributed to Windows working-set volatility. Snapshot registry
+   (`snapshots_live=50` constant throughout) verified, by source
+   review, to be the test harness's own deliberate pool cap
+   (`SnapshotPool::prune(50)`), not an engine-side leak — the engine's
+   own `SnapshotRegistry` (`src/lsm/mod.rs:266-342`) is a correctly
+   refcounted multiset. File handles track SSTable count 1:1
+   (unchanged from Increment 3 §8's own finding, now confirmed at
+   production scale under real concurrent load); thread count stays
+   flat during the run and shuts down cleanly.
+
+**Certification status, stated without collapsing into PASS/FAIL** (per
+the brief's own explicit instruction): correctness **PASS** (unchanged
+from Increment 4), performance **OPEN** (range-scan finding above, not
+yet addressed), memory **OPEN but no leak found** (residual uncertainty
+about the OS-level RSS swings specifically, not a suspected
+application-level leak). **READ ENGINE remains NOT READY.**

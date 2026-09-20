@@ -2105,3 +2105,116 @@ integrated write+read endurance testing, any justified optimization
 (only if backed by a new ADR), and the final certification matrix --
 not started here, per the instruction to stop and report after this
 increment.
+
+## 2026-09-20 (continued: Read Engine Increment 4 -- long-duration read soak + integrated write/read endurance)
+
+A real, 4-hour (`duration_secs=14400`), production-profile soak
+(`examples/read_write_soak_test.rs`, new -- mirrors this project's own
+established `realistic_full_pipeline_soak.rs` endurance methodology
+rather than a bounded smoke test) exercising the full real stack (WAL,
+MemTable, immutable MemTables, SSTables, Manifest, checkpoint, WAL
+purge) under 8 concurrent writers + 16 concurrent readers, continuously
+validated against an independent reference model (never the production
+merge algorithm itself as the oracle -- brief's own explicit
+instruction). `RESULT=PASS`: `writes_issued=13,483,811
+deletes_issued=3,375,298 reads_issued=4,582,352
+range_scans_issued=261,455 in_run_mismatches=0 recovery_ok=true
+post_recovery_mismatches=0 capacity_backpressure_events=0
+final_sstables=614 final_db_bytes=2,368,131,525
+final_rss_kb=2,011,784`. `storage_state` stayed `Healthy` throughout.
+Also extended in this increment: `corruption_injected_mid_session_
+between_reads_is_caught_on_the_very_next_read` (`src/lsm/tests.rs`,
+new -- corruption injected while the engine stays open and has already
+served a successful read from the exact table, no restart, closing a
+gap the restart-based corruption tests didn't cover) and
+`examples/lsm_crash_cycle_test.rs`'s own verification extended from
+"open() returned Ok" to real `get`/`contains`/`range` reads against an
+exact expected value after each crash+recovery cycle.
+
+**Status: READ ENGINE NOT READY.** The soak's own `RESULT=PASS` is a
+real, meaningful correctness/endurance result -- not itself a
+certification. Flagged, not silently resolved: `snapshots_live=50`
+stayed constant throughout the run and `rss_kb` grew to ~2GB by the
+end, and `range_large` latency was visibly high late in the run --
+none of these were treated as automatic failures (none violate any
+stated acceptance criterion) but all three were carried forward as the
+explicit trigger for a dedicated Increment 5 investigation rather than
+assumed benign or silently optimized.
+
+## 2026-09-20 (continued: Read Engine Increment 5 -- memory + range-performance investigation)
+
+Investigated the three items flagged above, against Increment 4's
+completed soak log (`temp/read_write_soak_output.log`, preserved
+unmodified as historical evidence, not rerun). Full detail: `PHASE_
+READ_ENGINE_RESOURCE_INVESTIGATION.md` (new).
+
+**Range-scan latency: root cause found, traced in source, and
+independently reproduced.** `range_large` p50 grew from 1.15ms (5
+SSTables) to 43.1 **seconds** (597 SSTables) -- super-linear (~n^2.2
+apparent exponent), unlike point lookups' already-known linear
+scaling. Traced to `RangeScanIter::refill` (`src/lsm/mod.rs:706-733`)
+re-peeking every source holding a version of each winning key, which
+on this soak's own small-cardinality (`KEY_CARDINALITY=4000`), heavily
+-overwritten (~27,424 writes/flush-cycle) keyspace means ~99.9% of
+keys land in nearly every live table -- reducing the cost to
+O(distinct keys yielded × live SSTable count). **Reproduced exactly**
+in a new, deterministic ~3-minute benchmark (`examples/read_engine_
+bench.rs`'s new `overlap_repro` section): `sstables_consulted/sstable`
+pinned at a constant integer (21.000) across five SSTable-count
+checkpoints once the workload's overlap ratio matched the soak's own
+regime -- a first, lower-overlap attempt (reported, not hidden) showed
+only 1.6-2.5x, itself evidence that overlap ratio, not raw SSTable
+count, is the driving variable. `PHASE_READ_ENGINE_RANGE_PERFORMANCE_
+ADR.md` (new, ADR-RE-002) evaluates four fix options (persistent
+source cursors via an owned-`Arc` iterator refactor, block-position
+reuse, range-aware seeking, reduced bloom/index work) and proposes a
+direction (persistent source cursors) for a *future* increment's
+decision -- **no optimization implemented this increment**, per the
+brief's explicit instruction; no cache/mmap/prefetch/parallel-read
+evaluated at all (explicitly out of scope without their own dedicated
+ADR).
+
+**Memory: no leak found.** RSS's monotonic growth component is fully
+explained, with source evidence (no static cache anywhere in the read
+path, no engine-side registry of live range scans -- both confirmed by
+`grep`, not assumed), by per-SSTable `BloomFilter`/`Vec<IndexEntry>`
+metadata that is expected to persist until a future Compaction phase
+exists (none does yet) -- consistent in shape with, and now explaining
+the absolute-magnitude gap against, Increment 4's own `memory_scaling`
+section's much smaller tiny-fixture numbers. Non-monotonic
+multi-hundred-MB RSS swings (worst: -704MB across two samples) are not
+explained by any code-level structure (nothing in this engine shrinks
+pre-Compaction) and are most plausibly, though not independently
+profiler-confirmed here (no such tool available in this environment),
+attributed to Windows working-set volatility. `snapshots_live=50`
+staying constant for all 115 samples was verified, by source review of
+`SnapshotRegistry` (`src/lsm/mod.rs:266-342`, a correctly refcounted
+`Mutex<BTreeMap<seq, count>>`), to be the *test harness's own*
+deliberate 50-snapshot pool cap (`SnapshotPool::prune(50)` in
+`read_write_soak_test.rs`), not an engine-side leak -- no snapshot
+semantics were changed. File handles track SSTable count 1:1 (~1.00
+handle/table across the run), confirming Increment 3 §8's finding
+still holds at production scale under real concurrent load across
+261,455 range scans; thread count stays flat during the run and shuts
+down cleanly after.
+
+**Certification status, not collapsed into PASS/FAIL** (per the
+brief's own explicit instruction): correctness **PASS** (unchanged),
+performance **OPEN** (range-scan finding, not yet addressed), memory
+**OPEN but no leak found** (residual uncertainty about the OS-level
+RSS swings specifically). **Status: READ ENGINE NOT READY.**
+
+**Diff scope this increment**: `examples/read_engine_bench.rs`
+(+`section_overlap_repro`, new benchmark section), `PHASE_READ_ENGINE_
+RESOURCE_INVESTIGATION.md` (new), `PHASE_READ_ENGINE_RANGE_
+PERFORMANCE_ADR.md` (new), `PHASE_READ_ENGINE_PERFORMANCE.md` (+one
+summary section), this file. No production source file
+(`src/lsm/mod.rs`, `src/sstable/`, `src/wal/`, `src/manifest/`)
+changed -- per the brief's explicit instruction, this increment
+investigates and reports; it does not optimize.
+
+**Next increment's scope (not started here)**: a maintainer decision
+on `ADR-RE-002`'s proposed direction, followed by (if approved) an
+implementation increment for Option A (persistent source cursors),
+re-running the full corruption matrix and a before/after
+`overlap_repro`-style benchmark before claiming any improvement.
