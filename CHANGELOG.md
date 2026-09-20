@@ -6,6 +6,25 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Read Engine: production-grade range_scan, Implementation Increment 2 (2026-09-20)
+
+`LsmEngine::range_scan(start, end, as_of_seq)`/`range(start, end)`: a
+real binary-heap k-way merge across active + immutable MemTables + live
+SSTables, built on Increment 1's `ReadView`/`Snapshot`/`ReadStats`
+foundation, per `ADR-RE-001`. Lazy, ordered, bounded-memory, exactly one
+resolved value per logical key, tombstones suppressed, fail-closed on
+corruption. Fixed one real, pre-existing bug along the way (test-first,
+per the ADR's own explicit authorization): `MemTable::range`'s
+`Excluded` bound never actually excluded the boundary key's own
+entries. Two more real bugs were caught and fixed before this shipped
+by actually running the new tests: a mid-group corruption `Err` was
+being silently swallowed instead of propagated, and `BTreeMap::range`
+panics (rather than returning empty) on `start > end` or degenerate
+`Excluded==Excluded` bounds. 20 new tests (293/293 total), including a
+64-case property test against an independent reference model. Full
+detail: `PROGRESS.md`'s 2026-09-20 "Increment 2" entry. **Not** Read
+Engine production-ready -- that certification has not started.
+
 ### Read Engine: architecture report, ADR-RE-001, Implementation Increment 1 (2026-09-20)
 
 New, separately-scoped phase (Write Engine is certified and protected,

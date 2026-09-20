@@ -29,7 +29,8 @@
 //! and mutate them without borrowing `LsmEngine` itself across a thread
 //! boundary.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
 use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -389,12 +390,11 @@ struct ReadStatCounters {
 
 /// `ADR-RE-001` §1/§5: the `range_scan` consistency mechanism --
 /// captures a stable set of source references once, at construction
-/// time, so a (not-yet-implemented -- this is foundation only, wired
-/// into `range_scan` in the next increment) k-way merge can run
-/// lock-free against an unchanging view for the scan's whole duration.
-/// Point lookups (`get`/`get_as_of`) do **not** use this -- they keep
-/// the existing, separately-safe sequential-lock pattern (`ADR-RE-001`
-/// §1's "Alternatives considered").
+/// time, so the k-way merge (`RangeScanIter`) can run lock-free against
+/// an unchanging view for the scan's whole duration. Point lookups
+/// (`get`/`get_as_of`) do **not** use this -- they keep the existing,
+/// separately-safe sequential-lock pattern (`ADR-RE-001` §1's
+/// "Alternatives considered").
 ///
 /// Deliberately does not clone MemTable/SSTable *contents*:
 /// `immutables`/`sstables` below are `Arc` clones (a refcount bump each,
@@ -403,7 +403,6 @@ struct ReadStatCounters {
 /// or index structure is constructed anywhere in `capture_read_view`).
 /// `active_range` materializes only the entries already inside the
 /// requested `[start, end)`, never the whole active MemTable.
-#[allow(dead_code)] // consumed by `range_scan`, landing in the next increment
 pub(crate) struct ReadView {
     /// Entries from the active MemTable already inside the requested
     /// range, *not yet version-resolved* -- mirrors `MemTable::range`'s
@@ -415,6 +414,403 @@ pub(crate) struct ReadView {
     immutables: Vec<Arc<MemTable>>,
     /// Newest-first -- same ordering convention as `LsmEngine.sstables`.
     sstables: Vec<Arc<SsTable>>,
+}
+
+/// `ADR-RE-001` §6/§15: `std::collections::BTreeMap::range` **panics**
+/// (rather than returning an empty iterator) when `start > end`, or
+/// when `start == end` and both bounds are `Excluded` -- both are
+/// mathematically empty intervals, not errors, so every entry point
+/// that could reach a `BTreeMap::range` call (`capture_read_view`'s own
+/// `active.range(..)`, transitively `MemTable::range` for immutables)
+/// must detect and short-circuit to an empty result *before* ever
+/// constructing such a range, rather than let the panic happen. Caught
+/// by actually running the `start > end` and `Excluded(x)..Excluded(x)`
+/// cases in `range_scan_empty_cases` before trusting this code -- the
+/// first version of this increment panicked on exactly this input.
+fn range_is_definitely_empty(start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
+    match (start, end) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(s), Bound::Included(e)) => s > e,
+        (Bound::Included(s), Bound::Excluded(e))
+        | (Bound::Excluded(s), Bound::Included(e))
+        | (Bound::Excluded(s), Bound::Excluded(e)) => s >= e,
+    }
+}
+
+fn to_owned_bound(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
+    match b {
+        Bound::Included(k) => Bound::Included(k.to_vec()),
+        Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn bound_as_ref(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match b {
+        Bound::Included(k) => Bound::Included(k.as_slice()),
+        Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn record_value_to_memtable_value(v: RecordValue) -> MemtableValue {
+    match v {
+        RecordValue::Put(bytes) => MemtableValue::Put(bytes),
+        RecordValue::Tombstone => MemtableValue::Tombstone,
+    }
+}
+
+/// `ADR-RE-001` §4: which `ReadView` source a `HeapEntry` came from --
+/// carries enough information for `RangeScanIter` to know which cursor
+/// to advance once that entry's key has been resolved (won or lost).
+/// The `usize` payloads are indices into `ReadView.immutables`/
+/// `ReadView.sstables`, not recency ranks (recency is tracked
+/// separately on `HeapEntry` itself, since it depends on where in the
+/// newest-first list the index falls, not the index value itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeSource {
+    Active,
+    Immutable(usize),
+    SsTable(usize),
+}
+
+/// One source's contribution to the k-way merge at its current
+/// position: the next distinct key it holds (at or after that source's
+/// own resume point) and *every* version of that key from this source
+/// (`ADR-RE-001` §3: source iterators expose unresolved, all-version
+/// streams -- version resolution is this merge layer's job, never
+/// assumed already done).
+struct HeapEntry {
+    key: Vec<u8>,
+    /// `ADR-RE-001` §4: `0` = active, `1..=immutables.len()` = immutable
+    /// MemTables newest-first, then live SSTables newest-first. Lower
+    /// number = more recent = resolved first when multiple sources tie
+    /// on `key`.
+    recency: usize,
+    source: RangeSource,
+    versions: Vec<(u64, MemtableValue)>,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.recency == other.recency
+    }
+}
+impl Eq for HeapEntry {}
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapEntry {
+    /// Primary: key ascending. Secondary: recency ascending (`ADR-RE-001`
+    /// §4's exact heap order). Used inside a `BinaryHeap<Reverse<
+    /// HeapEntry>>` so the heap's own max-heap behavior pops the
+    /// smallest `(key, recency)` pair first.
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        (&self.key, self.recency).cmp(&(&other.key, other.recency))
+    }
+}
+
+/// `ADR-RE-001` §3/§4/§6/§7: the `range_scan`/`range` return type -- a
+/// lazy, ordered, bounded-memory, single-logical-value-per-key iterator
+/// over a [`ReadView`] captured exactly once, at construction. After
+/// construction, iteration touches only the captured `ReadView` and
+/// each live `SsTable`'s own already-open `File` -- never the live
+/// engine's `immutables`/`sstables` lists, never the filesystem sweep,
+/// never `ManifestState`.
+///
+/// **Why source iterators are re-queried per key rather than held live**
+/// (`ADR-RE-001` §3 says "use the existing `MemTable::range()`/
+/// `SsTable::range_scan_raw()`, do not rewrite their fundamental
+/// iteration behavior" -- honored exactly: every record this type ever
+/// sees comes from an unmodified call to one of those two functions):
+/// both return an iterator borrowing from the `MemTable`/`SsTable` they
+/// were called on (`range_scan_raw<'a>(&'a self, ..)`). Storing such a
+/// borrowing iterator in the *same* struct as the `Arc<MemTable>`/
+/// `Arc<SsTable>` it borrows from is a self-referential struct Rust's
+/// borrow checker cannot express without `unsafe` or an external crate
+/// (e.g. `ouroboros`/`self_cell`) -- neither is warranted here. Instead,
+/// each source tracks only its own resume point (an owned `Bound<Vec<
+/// u8>>`); every peek makes one fresh, short-lived call to `range`/
+/// `range_scan_raw` (dropped at the end of that one call, so its borrow
+/// never outlives it), pulls every version of exactly the next distinct
+/// key, and advances the resume point past that key.
+///
+/// **Known, deliberately deferred performance characteristic** (per
+/// `ADR-RE-001` §19/§23/§24 and the phase brief's own "do not optimize
+/// prematurely... benchmark suite comes in the next phase"): this means
+/// an `SsTable` source may re-run `range_scan_raw`'s own block-locating
+/// binary search, and re-read+re-decode a data block, once per distinct
+/// key that block holds, rather than once per block. Every block read
+/// still goes through the one shared, already-instrumented `read_block`
+/// (`blocks_read` stays accurate either way), and no block is cached
+/// or retained beyond that single peek. Not addressed in this
+/// increment -- flagged here for the future benchmark/optimization
+/// phase to measure and decide whether it matters in practice.
+pub struct RangeScanIter {
+    read_view: ReadView,
+    as_of_seq: u64,
+    end: Bound<Vec<u8>>,
+    /// Position into `read_view.active_range` -- already fully
+    /// materialized and range-filtered at capture time, so no bound
+    /// re-query is ever needed for this source.
+    active_position: usize,
+    /// `None` once that immutable is known exhausted (no re-query is
+    /// attempted again for it).
+    immutable_next_start: Vec<Option<Bound<Vec<u8>>>>,
+    sstable_next_start: Vec<Option<Bound<Vec<u8>>>>,
+    heap: BinaryHeap<std::cmp::Reverse<HeapEntry>>,
+    heap_initialized: bool,
+    read_stats: Arc<ReadStatCounters>,
+    /// Sticky once a source yields an `Err` -- `ADR-RE-001` §7: stop on
+    /// first corruption/I/O error, never continue, never yield anything
+    /// after the error.
+    errored: bool,
+}
+
+impl RangeScanIter {
+    fn new(
+        read_view: ReadView,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        as_of_seq: u64,
+        read_stats: Arc<ReadStatCounters>,
+    ) -> Self {
+        let immutable_next_start = vec![Some(start.clone()); read_view.immutables.len()];
+        let sstable_next_start = vec![Some(start); read_view.sstables.len()];
+        RangeScanIter {
+            read_view,
+            as_of_seq,
+            end,
+            active_position: 0,
+            immutable_next_start,
+            sstable_next_start,
+            heap: BinaryHeap::new(),
+            heap_initialized: false,
+            read_stats,
+            errored: false,
+        }
+    }
+
+    /// Peeks the next distinct key from the pre-materialized
+    /// `active_range` (already sorted `(key, seq)` ascending, already
+    /// filtered to the requested range at `capture_read_view` time) --
+    /// no I/O, no re-query, just a linear scan forward from the last
+    /// position.
+    fn peek_active(&mut self) -> Option<HeapEntry> {
+        let range = &self.read_view.active_range;
+        if self.active_position >= range.len() {
+            return None;
+        }
+        let key = range[self.active_position].0 .0.clone();
+        let mut versions = Vec::new();
+        while self.active_position < range.len() && range[self.active_position].0 .0 == key {
+            let ((_, seq), value) = &range[self.active_position];
+            versions.push((*seq, value.clone()));
+            self.active_position += 1;
+        }
+        Some(HeapEntry {
+            key,
+            recency: 0,
+            source: RangeSource::Active,
+            versions,
+        })
+    }
+
+    fn peek_immutable(&mut self, idx: usize, recency: usize) -> Option<HeapEntry> {
+        let next_start = self.immutable_next_start[idx].clone()?;
+        let table = &self.read_view.immutables[idx];
+        let mut iter = table
+            .range(bound_as_ref(&next_start), bound_as_ref(&self.end))
+            .peekable();
+        let (first_tuple, first_value) = iter.next()?;
+        let key = first_tuple.0.clone();
+        let mut versions = vec![(first_tuple.1, first_value.clone())];
+        while iter.peek().is_some_and(|(t, _)| t.0 == key) {
+            let (tuple, value) = iter.next().expect("just confirmed present by peek");
+            versions.push((tuple.1, value.clone()));
+        }
+        drop(iter);
+        self.immutable_next_start[idx] = Some(Bound::Excluded(key.clone()));
+        Some(HeapEntry {
+            key,
+            recency,
+            source: RangeSource::Immutable(idx),
+            versions,
+        })
+    }
+
+    fn peek_sstable(&mut self, idx: usize, recency: usize) -> Result<Option<HeapEntry>> {
+        let Some(next_start) = self.sstable_next_start[idx].clone() else {
+            return Ok(None);
+        };
+        let table = Arc::clone(&self.read_view.sstables[idx]);
+        self.read_stats
+            .sstables_consulted
+            .fetch_add(1, Ordering::Relaxed);
+        let mut iter = table
+            .range_scan_raw(bound_as_ref(&next_start), bound_as_ref(&self.end))
+            .peekable();
+        let (key, first_seq, first_value) = match iter.next() {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => return Err(e),
+            None => {
+                self.sstable_next_start[idx] = None;
+                return Ok(None);
+            }
+        };
+        let mut versions = vec![(first_seq, record_value_to_memtable_value(first_value))];
+        loop {
+            match iter.peek() {
+                Some(Ok((k, _, _))) if *k == key => {}
+                // Propagate immediately -- must NOT `break` past this
+                // and return the already-collected (incomplete)
+                // `versions` as if they were a complete, successful
+                // result: that would silently advance `sstable_next_
+                // start` past the corrupted record on the next call,
+                // exactly the "silent continuation past corruption"
+                // `ADR-RE-001` §7 forbids. The corrupted record is
+                // still logically part of *this* key's version group,
+                // so this exact call must fail, not a later one.
+                Some(Err(_)) => match iter.next() {
+                    Some(Err(e)) => return Err(e),
+                    _ => unreachable!("peek() just confirmed Err present"),
+                },
+                _ => break,
+            }
+            match iter.next() {
+                Some(Ok((_, seq, value))) => {
+                    versions.push((seq, record_value_to_memtable_value(value)))
+                }
+                _ => unreachable!("just confirmed matching key present by peek"),
+            }
+        }
+        drop(iter);
+        self.sstable_next_start[idx] = Some(Bound::Excluded(key.clone()));
+        Ok(Some(HeapEntry {
+            key,
+            recency,
+            source: RangeSource::SsTable(idx),
+            versions,
+        }))
+    }
+
+    /// Peeks and pushes the current position of every source named in
+    /// `only` (or every non-exhausted source, if `only` is `None` --
+    /// used once, to seed the heap on the very first `next()` call).
+    /// Subsequent calls pass `Some(&sources_just_advanced)`, matching
+    /// the standard k-way merge pattern: a source's heap entry stays
+    /// valid and untouched until that specific source is the one that
+    /// gets consumed and must be re-peeked.
+    fn refill(&mut self, only: Option<&[RangeSource]>) -> Result<()> {
+        let want = |s: RangeSource| only.is_none_or(|list| list.contains(&s));
+
+        if want(RangeSource::Active) {
+            if let Some(entry) = self.peek_active() {
+                self.heap.push(std::cmp::Reverse(entry));
+            }
+        }
+        for idx in 0..self.read_view.immutables.len() {
+            if want(RangeSource::Immutable(idx)) {
+                // Recency `1..=immutables.len()`, newest immutable = 1,
+                // matching `ADR-RE-001` §4 and `LsmEngine.immutables`'
+                // own newest-first ordering convention exactly.
+                if let Some(entry) = self.peek_immutable(idx, 1 + idx) {
+                    self.heap.push(std::cmp::Reverse(entry));
+                }
+            }
+        }
+        let sstable_recency_base = 1 + self.read_view.immutables.len();
+        for idx in 0..self.read_view.sstables.len() {
+            if want(RangeSource::SsTable(idx)) {
+                if let Some(entry) = self.peek_sstable(idx, sstable_recency_base + idx)? {
+                    self.heap.push(std::cmp::Reverse(entry));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for RangeScanIter {
+    /// One resolved, visible `Put` per logical key -- never a
+    /// tombstone, never a duplicate key, never a version with `seq >
+    /// as_of_seq` (`ADR-RE-001` §4/§6/§7).
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.errored {
+            return None;
+        }
+        if !self.heap_initialized {
+            self.heap_initialized = true;
+            if let Err(e) = self.refill(None) {
+                self.errored = true;
+                return Some(Err(e));
+            }
+        }
+        loop {
+            let std::cmp::Reverse(first) = self.heap.pop()?;
+            let winning_key = first.key.clone();
+            let mut group = vec![first];
+            while let Some(std::cmp::Reverse(top)) = self.heap.peek() {
+                if top.key != winning_key {
+                    break;
+                }
+                let std::cmp::Reverse(next_entry) =
+                    self.heap.pop().expect("just confirmed present by peek");
+                group.push(next_entry);
+            }
+            // `group` is already sorted by recency ascending: every
+            // member shares `winning_key`, and the heap's own `Ord`
+            // sorts secondarily by recency, so pop order among ties
+            // *is* recency order.
+
+            // `ADR-RE-001` §4/§5: within each source, take the highest
+            // `seq <= as_of_seq`; among sources holding this key, the
+            // first (most recent) one with *any* visible version wins
+            // -- structurally equivalent to "highest seq across all
+            // sources" (never resurrects an older value hidden by a
+            // newer tombstone) because this project's recency ordering
+            // already guarantees a newer source's versions are always
+            // newer than an older source's, so nothing an older source
+            // holds could ever outrank a newer source's own visible
+            // answer.
+            let mut winner: Option<MemtableValue> = None;
+            for entry in &group {
+                let best = entry
+                    .versions
+                    .iter()
+                    .filter(|(seq, _)| *seq <= self.as_of_seq)
+                    .max_by_key(|(seq, _)| *seq);
+                if let Some((_, value)) = best {
+                    winner = Some(value.clone());
+                    break;
+                }
+            }
+
+            let sources: Vec<RangeSource> = group.iter().map(|e| e.source).collect();
+            if let Err(e) = self.refill(Some(&sources)) {
+                self.errored = true;
+                return Some(Err(e));
+            }
+
+            match winner {
+                Some(MemtableValue::Put(v)) => {
+                    self.read_stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(Ok((winning_key, v)));
+                }
+                // Tombstone: suppress, per `ADR-RE-001` §6 -- never
+                // yielded, never a sentinel, never resurrects an older
+                // source's value for this same key (the loop above
+                // already stopped at the first, newest, visible answer).
+                // None: no source had any version of this key visible
+                // at `as_of_seq` -- also nothing to yield.
+                Some(MemtableValue::Tombstone) | None => continue,
+            }
+        }
+    }
 }
 
 pub struct LsmEngine {
@@ -496,8 +892,12 @@ pub struct LsmEngine {
     /// for its `Drop` impl to reach back into.
     snapshot_registry: Arc<SnapshotRegistry>,
     /// `ADR-RE-001` §12. See `ReadStatCounters`'s own doc comment for
-    /// exactly which counters live here vs. on `SsTable`.
-    read_stats: ReadStatCounters,
+    /// exactly which counters live here vs. on `SsTable`. `Arc`-wrapped
+    /// (Increment 2) so a detached `RangeScanIter` -- which outlives the
+    /// `&self` borrow that created it, per `ADR-RE-001` §1's `ReadView`
+    /// design -- can still update `sstables_consulted`/`hits` as it's
+    /// driven, without holding a reference back to the engine itself.
+    read_stats: Arc<ReadStatCounters>,
     config: LsmConfig,
 }
 
@@ -631,7 +1031,7 @@ impl LsmEngine {
             storage_pressure_events,
             flush_io_fault_hook,
             snapshot_registry: Arc::new(SnapshotRegistry::default()),
-            read_stats: ReadStatCounters::default(),
+            read_stats: Arc::new(ReadStatCounters::default()),
             config: lsm_config,
         })
     }
@@ -955,14 +1355,20 @@ impl LsmEngine {
     }
 
     /// `ADR-RE-001` §1/§5: captures a [`ReadView`] over `[start, end)` --
-    /// foundation for the `range_scan` implementation landing in the
-    /// next increment (`pub(crate)`, not yet part of the public read
-    /// API). Three short lock-acquire/clone-or-extract/release scopes,
-    /// never more than one lock held at a time, matching this codebase's
-    /// existing lock-scoping discipline (`lock_active_read`/
-    /// `lock_immutables_read`/`lock_sstables_read`).
-    #[allow(dead_code)] // consumed by `range_scan`, landing in the next increment
+    /// the consistency foundation `range_scan` builds on (`pub(crate)`,
+    /// not itself part of the public read API). Three short
+    /// lock-acquire/clone-or-extract/release scopes, never more than one
+    /// lock held at a time, matching this codebase's existing
+    /// lock-scoping discipline (`lock_active_read`/`lock_immutables_
+    /// read`/`lock_sstables_read`).
     pub(crate) fn capture_read_view(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> ReadView {
+        if range_is_definitely_empty(start, end) {
+            return ReadView {
+                active_range: Vec::new(),
+                immutables: Vec::new(),
+                sstables: Vec::new(),
+            };
+        }
         let active_range: Vec<((Vec<u8>, u64), MemtableValue)> = {
             let active = self.lock_active_read();
             active
@@ -983,6 +1389,41 @@ impl LsmEngine {
             immutables,
             sstables,
         }
+    }
+
+    /// `ADR-RE-001` §3/§13: the k-way-merged, version-resolved,
+    /// tombstone-collapsed range read -- the `LsmEngine`-level
+    /// counterpart to `get_as_of`, covering a key range instead of one
+    /// key. Captures a [`ReadView`] once, here, before returning (every
+    /// engine lock is released before the first item is ever produced);
+    /// iteration afterward touches only that captured view. `read_
+    /// requests` counts this call once, regardless of how many rows the
+    /// returned iterator ultimately yields (`ADR-RE-001` §13's explicit
+    /// instruction: one invocation = one request, never one per row).
+    pub fn range_scan(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        as_of_seq: u64,
+    ) -> RangeScanIter {
+        self.read_stats.requests.fetch_add(1, Ordering::Relaxed);
+        let owned_start = to_owned_bound(start);
+        let owned_end = to_owned_bound(end);
+        let read_view = self.capture_read_view(start, end);
+        RangeScanIter::new(
+            read_view,
+            owned_start,
+            owned_end,
+            as_of_seq,
+            Arc::clone(&self.read_stats),
+        )
+    }
+
+    /// `range_scan` at `as_of_seq = u64::MAX` -- "as of right now,"
+    /// mirroring `get`'s own relationship to `get_as_of` exactly
+    /// (`get(key) = get_as_of(key, u64::MAX)`, `src/lsm/mod.rs`).
+    pub fn range(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> RangeScanIter {
+        self.range_scan(start, end, u64::MAX)
     }
 
     /// Current active MemTable's byte size — observability only

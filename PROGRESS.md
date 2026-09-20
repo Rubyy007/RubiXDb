@@ -1808,3 +1808,166 @@ vs. `Ok(None)` already resolved by the ADR; the `MemTable::range`
 Increment 2's own scope (`range_scan`, the k-way merge, version
 resolution, tombstone handling, range correctness tests) — not started
 here, per the instruction to stop and report after this increment.
+
+## 2026-09-20 (continued: Read Engine Increment 2 — production-grade range_scan)
+
+Implemented `LsmEngine::range_scan(start, end, as_of_seq) -> RangeScanIter`
+and `range(start, end)` (= `range_scan(.., u64::MAX)`), per `ADR-RE-001`.
+Lazy, ordered, bounded-memory, single-logical-value-per-key, built on
+Increment 1's `ReadView`/`Snapshot`/`ReadStats` foundation.
+
+**A real, pre-existing bug fixed first, per §6's explicit conditional
+authorization** ("if production source is wrong, add the regression
+test first, then the smallest correct fix"): `MemTable::range`'s
+`bound_to_tuple` used the same sentinel seq for both `Included` and
+`Excluded` bounds, so an `Excluded(k)` bound never actually excluded
+`k`'s own entries -- a genuine violation of `std::ops::Bound`'s own
+unambiguous contract, not intentional behavior, confirmed by two new
+regression tests (`range_excluded_start_bound_.../range_excluded_end_
+bound_...`) written and shown failing *before* the fix. Fixed by
+splitting into `bound_to_tuple_start`/`bound_to_tuple_end`, each
+choosing the sentinel that actually enforces exclusion in its own
+direction. All 17 memtable tests (including the property tests)
+re-verified clean afterward. This is the one deliberate, pre-authorized
+exception to "do not touch protected Write Engine files" this
+increment made -- flagged explicitly, not silently done.
+
+**Algorithm** (`RangeScanIter`, `src/lsm/mod.rs`): a real binary-heap
+k-way merge (`BinaryHeap<Reverse<HeapEntry>>`, ordered by `(key asc,
+source recency asc)`, matching the LSM Engine Spec §4.2's own
+description almost verbatim once re-read directly). Because both
+`MemTable::range` and `SsTable::range_scan_raw` return iterators that
+*borrow* from the `MemTable`/`SsTable` they're called on, and
+`RangeScanIter` needs to *own* the `Arc<MemTable>`/`Arc<SsTable>` it
+reads from (a self-referential-struct shape Rust can't express without
+`unsafe` or an external crate), each source instead tracks only its own
+resume point (an owned `Bound<Vec<u8>>`) and makes one fresh, short-lived
+call per distinct key -- reusing `range`/`range_scan_raw` exactly as
+they exist today (`ADR-RE-001` §3's explicit instruction), never
+rewriting their iteration behavior. **Known, deliberately deferred
+performance characteristic, documented in code and here rather than
+hidden**: this can re-run an SSTable's block-locating search and
+re-read+re-decode a block once per distinct key it holds, rather than
+once per block -- correctness is unaffected (every block read still
+goes through the one shared, already-instrumented `read_block`), and
+this is explicitly left for the future benchmark/optimization phase to
+measure and address, per the ADR's own "do not optimize prematurely."
+
+**Version resolution / tombstones**: within each source, the highest
+`seq <= as_of_seq` wins; among sources sharing a key, the first
+(newest, by recency) source with *any* visible version wins outright --
+proven structurally equivalent to "highest seq across all sources" (the
+spec's own phrasing) under this project's existing recency-ordering
+invariant, not a new, separate rule. A winning tombstone suppresses the
+key entirely -- never yielded, never a sentinel, never falls through to
+an older source's value.
+
+**Corruption**: fail-closed, matching `range_scan_raw`'s own existing
+contract exactly -- first `Err` ends the whole iterator immediately, no
+skipped table, no partial success. **Caught and fixed a real bug in my
+own first draft before it shipped**: the initial version of `peek_
+sstable`'s multi-version-collection loop silently `break`-ed out on a
+mid-group `Err`, returning the already-collected (incomplete) versions
+as if they were a complete success and advancing the resume point past
+the corrupted record -- exactly the silent-corruption-skip the ADR
+forbids. Fixed to propagate the `Err` immediately instead.
+
+**Bounds**: a second real bug caught by running the new empty/edge-case
+test before trusting it: `std::collections::BTreeMap::range` *panics*
+(not "returns empty") on `start > end` or `Excluded(x)..Excluded(x)` --
+both mathematically empty intervals. Added `range_is_definitely_empty`,
+checked before ever constructing a `BTreeMap`-backed range, so these
+cases return a genuinely empty `RangeScanIter` instead of panicking.
+
+**Snapshot**: `range_scan(.., snapshot.seq())` observes exactly the
+historical state as of that snapshot, unaffected by later writes;
+dropping it correctly releases the registration (`oldest_live_
+snapshot_seq()` reflects it at every step) -- reusing Increment 1's
+`Snapshot`/`SnapshotRegistry` exactly, no changes needed there.
+
+**Concurrent flush**: a new deterministic test (`FlushFaultPoint`, no
+sleeps -- same established mechanism as Increment 1's point-lookup
+concurrency test) captures a `range_scan`'s `ReadView` while a flush is
+deliberately stuck between publishing an SSTable and removing the
+corresponding immutable, then verifies the scan's output has no
+duplicate keys, no missing pre-existing keys, and no impossible key --
+coherent regardless of which side of the transition the capture landed
+on.
+
+**`ReadStats`**: `read_requests` increments once per `range_scan`/
+`range` *call* (never once per row, per §13's explicit instruction);
+`read_hits` increments once per yielded row (a documented, explicit
+choice, since a range scan has no single hit/miss outcome the way a
+point lookup does); `sstables_consulted` increments once per real
+physical query against a table; `blocks_read` was already free
+(Increment 1's shared `SsTable` counter, inside `read_block`, hit by
+both `get_versioned` and `range_scan_raw` identically).
+
+**Tests, all newly added and all passing** (matching the phase brief's
+own 17-item matrix): basic scan; included/excluded/unbounded bounds;
+the full empty/edge-case matrix (empty DB, no-match range, start>end,
+degenerate Excluded==Excluded, single-key range, every Included/
+Excluded/Unbounded combination); a range spanning 5+ live SSTables;
+active+multiple-immutables+SSTable merged together; multiple versions;
+tombstone suppression; delete/recreate; the ADR's own three worked
+version-resolution examples reproduced against real, separately-flushed
+SSTables; snapshot range + registry correctness; `get`/`range_scan`
+equivalence (every key, every seq actually produced); concurrent-flush
+coherence; corrupted-data-block fail-closed-and-ends; a deterministic
+differential test against an independent (non-production-algorithm)
+reference model spanning active+immutable+SSTable; a 64-case
+`proptest`-based property test (matching this project's own established
+I/O-heavy-test case-count convention) generating random PUT/DELETE
+sequences and checking ordering, no-duplicate-keys, and full
+reference-model equivalence; `ReadStats` correctness for the range
+path.
+
+**Full regression gate, run and verified clean on the actual code
+about to be committed**: `cargo fmt --check`, `cargo clippy
+--all-targets --all-features -- -D warnings`, `cargo test --lib`
+(293/293 -- 273 at the end of Increment 1, plus 20 new tests this
+increment: 2 `MemTable` `Excluded`-bound regression tests plus 18 new
+`LsmEngine`-level tests covering `range_scan`, one of which drives 64
+randomized property-test cases internally), `cargo test --release
+--lib` (293/293, confirmed clean across 7 consecutive full-suite runs
+after investigating one single intermittent failure -- traced to the
+same pre-existing, already-documented `coordinator_panic_before_batch_
+formation_fails_safely` flake noted in earlier entries, in a file none
+of this increment's work touches; the two new concurrency-sensitive
+tests this increment added were separately stress-run 6/6 clean each),
+`cargo check --all-targets --all-features`, plus `wal_tests` (12/12),
+`crash_consistency --features test-util` (2/2),
+`pathological_recovery_matrix` debug+release (9/9 each), and the
+storage-pressure test re-verified fresh (5/5). No existing Write Engine
+test's behavior changed. A small sanity comparison (100-writer full-
+pipeline write throughput, 3 reps: 17,157 / 11,706 / 16,098 ops/sec)
+stayed within this project's own already-documented historical
+variance band -- not a rigorous benchmark (that's explicitly deferred
+to the next phase per the ADR's own §19/§24), just confirmation nothing
+is obviously, grossly disturbed.
+
+**Diff scope**: `src/lsm/mod.rs`, `src/lsm/tests.rs` (primary), and
+`src/memtable/mod.rs` (the one pre-authorized bug fix above). No
+changes to `src/wal/`, `src/manifest/`, `src/execution/`, or
+`src/error.rs`.
+
+**Not implemented this increment, deliberately**: the performance
+benchmark suite, any cache/prefetch/mmap/parallel execution, `batch_get`,
+the full corruption matrix (one corruption case was added; a complete
+matrix mirroring the Write Engine's own is future work), long-duration
+read soak, and — explicitly — **Read Engine production-readiness
+certification**. `PHASE_READ_ENGINE_CERTIFICATION.md` does not exist
+yet and should not be inferred from this increment's passing tests
+alone.
+
+**Status: READ ENGINE NOT READY** (not a regression -- it was never
+claimed ready; `range_scan` now exists and is well-tested, which is
+real, meaningful progress, not a certification).
+
+**Open Tier 3 question currently blocking further work:** none. The
+next increment's own scope (per the phase brief's §21 remaining items
+and `ADR-RE-001`'s §24 certification gates) is the performance
+benchmark suite, the full corruption matrix, `contains()`, the
+long-duration read soak, and integrated write+read testing -- not
+started here, per the instruction to stop and report after this
+increment.

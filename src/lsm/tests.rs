@@ -269,7 +269,7 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         storage_pressure_events: Arc::new(AtomicU64::new(0)),
         flush_io_fault_hook: Arc::new(Mutex::new(None)),
         snapshot_registry: Arc::new(SnapshotRegistry::default()),
-        read_stats: ReadStatCounters::default(),
+        read_stats: Arc::new(ReadStatCounters::default()),
         config: LsmConfig::default(),
     };
 
@@ -1674,34 +1674,28 @@ fn read_view_active_range_is_bounded_to_the_requested_range_not_the_whole_memtab
         engine.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
     }
 
-    // Discrepancy recorded explicitly, not silently worked around
-    // (caught by actually running this test before trusting it):
-    // `MemTable::range`'s own `bound_to_tuple(end, u64::MAX)` maps an
-    // `Excluded(k)` *end* bound to the tuple bound `Excluded((k,
-    // u64::MAX))` -- since every real entry's `seq` is far below
-    // `u64::MAX`, `(k, real_seq) < (k, u64::MAX)` always holds, so an
-    // `Excluded` end bound does not actually exclude the boundary key's
-    // own entries in this codebase's existing, already-shipped
-    // implementation. `capture_read_view` inherits this exactly (it
-    // does not reimplement bound logic, just calls `MemTable::range`),
-    // so `Excluded(b"k0020")` here still includes "k0020" itself -- 11
-    // keys (k0010..=k0020), not 10. This is a real, pre-existing
-    // `MemTable::range` behavior, out of scope for this Read Engine
-    // increment to change (a write-path-shared file); flagged here for
-    // `range_scan`'s own implementation (the next increment) to
-    // explicitly decide whether the merge layer must apply an
-    // additional exclusion filter to honor `Excluded` end bounds
-    // correctly, per `ADR-RE-001` §3's bound-handling contract.
+    // Increment 1 recorded a real discrepancy here: `MemTable::range`'s
+    // `Excluded` end bound did not actually exclude the boundary key's
+    // own entries (`bound_to_tuple` used the same sentinel for
+    // `Included`/`Excluded`). Investigated against `std::ops::Bound`'s
+    // own unambiguous contract and confirmed a genuine bug, not
+    // intentional behavior (`memtable::tests::range_excluded_end_
+    // bound_excludes_every_version_of_the_boundary_key`, added before
+    // the fix, per this project's "test first, then the smallest
+    // correct fix" convention); fixed in `src/memtable/mod.rs`
+    // (`bound_to_tuple` split into `bound_to_tuple_start`/`_end`, each
+    // choosing the sentinel that actually enforces exclusion). This
+    // test's own expectation is updated to match the now-correct
+    // behavior.
     let view = engine.capture_read_view(
         Bound::Included(b"k0010".as_slice()),
         Bound::Excluded(b"k0020".as_slice()),
     );
     assert_eq!(
         view.active_range.len(),
-        11,
-        "capture_read_view must materialize only the requested range, not the whole \
-         200-entry active memtable (11, not 10, per the recorded Excluded-end-bound \
-         discrepancy documented above)"
+        10,
+        "capture_read_view must materialize only the 10 keys inside [k0010, k0020), not the \
+         whole 200-entry active memtable"
     );
 
     engine.shutdown();
@@ -1922,4 +1916,1048 @@ fn point_lookup_during_the_sstable_published_immutable_not_yet_removed_window_ne
     engine.clear_flush_fault_hook();
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// range_scan (`ADR-RE-001`, Implementation Increment 2).
+// ============================================================================
+
+/// Drains a `RangeScanIter` into a plain `Vec`, propagating the first
+/// `Err` (if any) as this helper's own `Err` -- matches the iterator's
+/// own documented "stop on first error" contract.
+fn collect_range(iter: RangeScanIter) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    iter.collect()
+}
+
+#[test]
+fn basic_range_scan_returns_every_key_in_order() {
+    let dir = temp_dir("range_basic");
+    let engine = open(&dir, LsmConfig::default());
+    for i in 0..10u32 {
+        engine
+            .put(format!("k{i:03}").as_bytes(), format!("v{i:03}").as_bytes())
+            .unwrap();
+    }
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..10u32)
+        .map(|i| {
+            (
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            )
+        })
+        .collect();
+    assert_eq!(rows, expected);
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_included_bounds() {
+    let dir = temp_dir("range_included");
+    let engine = open(&dir, LsmConfig::default());
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    let rows = collect_range(engine.range(
+        Bound::Included(b"k003".as_slice()),
+        Bound::Included(b"k006".as_slice()),
+    ))
+    .unwrap();
+    let keys: Vec<Vec<u8>> = rows.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(
+        keys,
+        vec![
+            b"k003".to_vec(),
+            b"k004".to_vec(),
+            b"k005".to_vec(),
+            b"k006".to_vec()
+        ]
+    );
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_excluded_bounds() {
+    let dir = temp_dir("range_excluded");
+    let engine = open(&dir, LsmConfig::default());
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    let rows = collect_range(engine.range(
+        Bound::Excluded(b"k003".as_slice()),
+        Bound::Excluded(b"k006".as_slice()),
+    ))
+    .unwrap();
+    let keys: Vec<Vec<u8>> = rows.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, vec![b"k004".to_vec(), b"k005".to_vec()]);
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_unbounded_start_or_end() {
+    let dir = temp_dir("range_unbounded");
+    let engine = open(&dir, LsmConfig::default());
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    let head =
+        collect_range(engine.range(Bound::Unbounded, Bound::Included(b"k002".as_slice()))).unwrap();
+    assert_eq!(
+        head.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        vec![b"k000".to_vec(), b"k001".to_vec(), b"k002".to_vec()]
+    );
+    let tail =
+        collect_range(engine.range(Bound::Included(b"k008".as_slice()), Bound::Unbounded)).unwrap();
+    assert_eq!(
+        tail.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        vec![b"k008".to_vec(), b"k009".to_vec()]
+    );
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_empty_cases() {
+    let dir = temp_dir("range_empty_cases");
+    let engine = open(&dir, LsmConfig::default());
+
+    // Empty database entirely.
+    assert_eq!(
+        collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap(),
+        vec![]
+    );
+
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+
+    // A range that matches no keys.
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Included(b"z000".as_slice()),
+            Bound::Included(b"z999".as_slice())
+        ))
+        .unwrap(),
+        vec![]
+    );
+
+    // start > end: mathematically empty, must not panic or hang.
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Included(b"k008".as_slice()),
+            Bound::Included(b"k002".as_slice())
+        ))
+        .unwrap(),
+        vec![]
+    );
+
+    // start == end, both Excluded: empty (nothing strictly between a
+    // point and itself).
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Excluded(b"k005".as_slice()),
+            Bound::Excluded(b"k005".as_slice())
+        ))
+        .unwrap(),
+        vec![]
+    );
+
+    // start == end, both Included: exactly that one key.
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Included(b"k005".as_slice()),
+            Bound::Included(b"k005".as_slice())
+        ))
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect::<Vec<_>>(),
+        vec![b"k005".to_vec()]
+    );
+
+    // Included(x), Excluded(x): empty (a single point range that
+    // excludes its own only possible member).
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Included(b"k005".as_slice()),
+            Bound::Excluded(b"k005".as_slice())
+        ))
+        .unwrap(),
+        vec![]
+    );
+
+    // Excluded(x), Included(x): empty, same reasoning.
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Excluded(b"k005".as_slice()),
+            Bound::Included(b"k005".as_slice())
+        ))
+        .unwrap(),
+        vec![]
+    );
+
+    // Single-key range via Included/Included on adjacent-but-distinct
+    // bytes still returns just the one real key inside it.
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Included(b"k005".as_slice()),
+            Bound::Excluded(b"k006".as_slice())
+        ))
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect::<Vec<_>>(),
+        vec![b"k005".to_vec()]
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_spans_multiple_sstables_correctly_merged() {
+    let dir = temp_dir("range_multi_sstable");
+    // Small memtable so many SSTables accumulate quickly.
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350, // exactly 10 entries/table, see the
+        // 37-bytes-per-entry calibration used elsewhere in this file.
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..80u32 {
+        engine
+            .put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+            .unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() >= 5 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "several flushes must complete so this test genuinely spans multiple SSTables"
+    );
+
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..80u32)
+        .map(|i| {
+            (
+                format!("k{i:04}").into_bytes(),
+                format!("v{i:04}").into_bytes(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        expected,
+        "a range spanning {} live SSTables must still return every key, correctly ordered, \
+         with no duplicates and no gaps",
+        engine.sstable_count()
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_merges_active_immutable_and_sstable_sources_correctly() {
+    let dir = temp_dir("range_active_immutable_sstable");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    engine.set_flush_delay_for_test(Duration::from_millis(300));
+
+    // First 10 -> freeze #1 (will become an immutable, then flush).
+    for i in 0..10u32 {
+        engine
+            .put(
+                format!("k{i:03}").as_bytes(),
+                format!("v{i:03}-gen1").as_bytes(),
+            )
+            .unwrap();
+    }
+    // Next 10 -> freeze #2 (a second immutable, since flush is delayed).
+    for i in 10..20u32 {
+        engine
+            .put(
+                format!("k{i:03}").as_bytes(),
+                format!("v{i:03}-gen1").as_bytes(),
+            )
+            .unwrap();
+    }
+    // A few more stay in the active MemTable (not enough to freeze again).
+    for i in 20..24u32 {
+        engine
+            .put(
+                format!("k{i:03}").as_bytes(),
+                format!("v{i:03}-gen1").as_bytes(),
+            )
+            .unwrap();
+    }
+    assert!(
+        engine.immutable_count() >= 1,
+        "at least one freeze must have happened while flush is delayed"
+    );
+
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..24u32)
+        .map(|i| {
+            (
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}-gen1").into_bytes(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        expected,
+        "a scan spanning active ({} entries) + {} immutable(s) + {} flushed SSTable(s) must \
+         return one correctly merged, correctly ordered logical view",
+        engine.active_entry_count(),
+        engine.immutable_count(),
+        engine.sstable_count()
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_multiple_versions_of_a_key_resolve_to_the_newest_visible() {
+    let dir = temp_dir("range_multiple_versions");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+    engine.put(b"k1", b"v2").unwrap();
+    engine.put(b"k1", b"v3").unwrap();
+    engine.put(b"k2", b"only").unwrap();
+
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (b"k1".to_vec(), b"v3".to_vec()),
+            (b"k2".to_vec(), b"only".to_vec()),
+        ],
+        "exactly one row per key, the newest version, never a duplicate"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_suppresses_tombstoned_keys_entirely() {
+    let dir = temp_dir("range_tombstone_suppression");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+    engine.put(b"k2", b"v2").unwrap();
+    engine.delete(b"k2").unwrap();
+    engine.put(b"k3", b"v3").unwrap();
+
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k3".to_vec(), b"v3".to_vec())
+        ],
+        "a tombstoned key must not appear at all -- no (key, None), no sentinel"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_delete_then_recreate_shows_only_the_recreated_value() {
+    let dir = temp_dir("range_delete_recreate");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+    engine.delete(b"k1").unwrap();
+    engine.put(b"k1", b"v2").unwrap();
+
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    assert_eq!(rows, vec![(b"k1".to_vec(), b"v2".to_vec())]);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Directly exercises `ADR-RE-001` §5's three worked examples (adapted
+/// to this engine's real sequence semantics, via `flush` to force
+/// cross-SSTable placement -- each example's "SSTable A"/"SSTable B"
+/// below really are two distinct, separately-flushed SSTables, not a
+/// toy stand-in).
+#[test]
+fn range_scan_version_resolution_matches_adr_worked_examples() {
+    let dir = temp_dir("range_adr_examples");
+    let lsm_config = LsmConfig {
+        // Smaller than even one entry's own cost (key+value+32-byte
+        // overhead is always > 10 for any non-empty key/value used
+        // below), so `is_full()` is already true immediately after the
+        // very first put -- each put below freezes+flushes entirely on
+        // its own, landing in its own distinct SSTable, exactly as this
+        // test's own commentary describes (caught by actually running
+        // this test before trusting it: 80 bytes was NOT small enough
+        // to force a freeze after a single ~39-byte entry).
+        memtable_max_size_bytes: 10,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+
+    // Example (a): SSTable A: key=x seq=10-ish PUT; SSTable B (newer):
+    // key=x seq=20-ish PUT. Expect the newer (B's) value.
+    let seq_a = engine.put(b"x", b"from-A").unwrap();
+    assert!(
+        wait_until(|| engine.sstable_count() >= 1, Duration::from_secs(5)),
+        "the first tiny put must flush on its own"
+    );
+    let seq_b = engine.put(b"x", b"from-B").unwrap();
+    assert!(seq_b > seq_a);
+    assert!(
+        wait_until(|| engine.sstable_count() >= 2, Duration::from_secs(5)),
+        "the second tiny put must flush into its own, newer SSTable"
+    );
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Included(b"x".as_slice()),
+            Bound::Included(b"x".as_slice())
+        ))
+        .unwrap(),
+        vec![(b"x".to_vec(), b"from-B".to_vec())],
+        "example (a): the newer SSTable's PUT must win"
+    );
+
+    // Example (b): a newer SSTable's DELETE must shadow an older PUT,
+    // even for range_scan (the key must not appear at all).
+    engine.delete(b"x").unwrap();
+    assert!(
+        wait_until(|| engine.sstable_count() >= 3, Duration::from_secs(5)),
+        "the delete must also flush into its own, newest SSTable"
+    );
+    assert_eq!(
+        collect_range(engine.range(
+            Bound::Included(b"x".as_slice()),
+            Bound::Included(b"x".as_slice())
+        ))
+        .unwrap(),
+        vec![],
+        "example (b): a newer DELETE must suppress the key entirely, not resurrect the older PUT"
+    );
+
+    // Example (c): at a snapshot seq *before* the delete, the older PUT
+    // must still be visible (the delete is invisible at that seq).
+    let before_delete_seq = seq_b; // durable right after "from-B" was written
+    let rows = collect_range(engine.range_scan(
+        Bound::Included(b"x".as_slice()),
+        Bound::Included(b"x".as_slice()),
+        before_delete_seq,
+    ))
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(b"x".to_vec(), b"from-B".to_vec())],
+        "example (c): at a snapshot before the delete's own seq, the older visible PUT must \
+         still be returned"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_snapshot_observes_historical_state_and_registry_stays_correct() {
+    let dir = temp_dir("range_snapshot");
+    let engine = open(&dir, LsmConfig::default());
+
+    engine.put(b"k1", b"v1").unwrap();
+    let snap = engine.snapshot();
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(snap.seq()));
+
+    // Later writes, including a delete of a key the snapshot never saw.
+    engine.put(b"k1", b"v2").unwrap();
+    engine.put(b"k2", b"v2").unwrap();
+    engine.delete(b"k2").unwrap();
+
+    let historical =
+        collect_range(engine.range_scan(Bound::Unbounded, Bound::Unbounded, snap.seq())).unwrap();
+    assert_eq!(
+        historical,
+        vec![(b"k1".to_vec(), b"v1".to_vec())],
+        "range_scan at the snapshot's seq must observe only what existed at that point"
+    );
+
+    let current = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    assert_eq!(
+        current,
+        vec![(b"k1".to_vec(), b"v2".to_vec())],
+        "an unbounded (current) range must see the latest state, unaffected by the snapshot"
+    );
+
+    drop(snap);
+    assert_eq!(
+        engine.oldest_live_snapshot_seq(),
+        None,
+        "dropping the snapshot must release its registration"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ADR-RE-001` §8's hard invariant: for every key inside a range and
+/// every sequence, `get_as_of(k, s)` must agree with the corresponding
+/// row `range_scan(start, end, s)` produces. Drives a moderately rich
+/// dataset (multiple keys, multiple versions, a delete/recreate, spread
+/// across active + immutable + SSTable via a small memtable) and checks
+/// every key at every seq actually assigned, cross-checking two
+/// independent call paths against each other rather than the range
+/// merge against itself.
+#[test]
+fn get_and_range_scan_agree_for_every_key_and_sequence() {
+    let dir = temp_dir("get_range_equivalence");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 200,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+
+    let mut seqs = Vec::new();
+    for i in 0..15u32 {
+        seqs.push(engine.put(format!("k{i:03}").as_bytes(), b"v1").unwrap());
+    }
+    // Overwrite a few keys, delete one, recreate one.
+    seqs.push(engine.put(b"k003", b"v2").unwrap());
+    seqs.push(engine.delete(b"k005").unwrap());
+    seqs.push(engine.put(b"k007", b"v2").unwrap());
+    seqs.push(engine.delete(b"k007").unwrap());
+    seqs.push(engine.put(b"k007", b"v3").unwrap());
+
+    assert!(
+        wait_until(|| engine.immutable_count() == 0, Duration::from_secs(5)),
+        "let any triggered flushes settle so both call paths see a stable state"
+    );
+
+    let all_keys: Vec<Vec<u8>> = (0..15u32)
+        .map(|i| format!("k{i:03}").into_bytes())
+        .collect();
+
+    for &s in &seqs {
+        let range_rows: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            collect_range(engine.range_scan(Bound::Unbounded, Bound::Unbounded, s))
+                .unwrap()
+                .into_iter()
+                .collect();
+        for key in &all_keys {
+            let point = engine.get_as_of(key, s).unwrap();
+            let ranged = range_rows.get(key).cloned();
+            assert_eq!(
+                point, ranged,
+                "get_as_of({key:?}, {s}) = {point:?} but range_scan(.., {s}) has {ranged:?} \
+                 for the same key/seq -- these two call paths must always agree"
+            );
+        }
+    }
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ADR-RE-001` §1/§8 of the phase brief: the range-scan analogue of
+/// `point_lookup_during_the_sstable_published_immutable_not_yet_removed_
+/// window_never_misses` -- same deterministic `FlushFaultPoint`
+/// machinery (no sleeps), but this time the `ReadView` is captured
+/// (`range_scan` called) *before* the flush thread is released, so the
+/// scan's own snapshot is provably fixed before the publish/removal
+/// transition happens at all. The result must be internally coherent
+/// (every key appears exactly once, with a value consistent with *some*
+/// real point in time), never a torn mix, regardless of what the flush
+/// thread does concurrently.
+#[test]
+fn range_scan_during_concurrent_flush_sees_a_coherent_snapshot() {
+    let dir = temp_dir("range_concurrent_flush");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = Arc::new(open(&dir, lsm_config));
+
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(|| engine.immutable_count() == 0, Duration::from_secs(5)),
+        "let the first batch settle before capturing the ReadView under test"
+    );
+
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+    let proceed_rx = Mutex::new(proceed_rx);
+    engine.install_flush_fault_hook(move |p| {
+        if p == FlushFaultPoint::AfterSetCheckpoint {
+            let _ = reached_tx.send(());
+            let _ = proceed_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+        }
+    });
+
+    // A second batch that will freeze+flush concurrently with the scan
+    // below (10 more puts against the same 350-byte/10-entry-per-table
+    // calibration used elsewhere in this file -- exactly one more
+    // freeze+flush cycle).
+    let write_engine = Arc::clone(&engine);
+    let writer = thread::spawn(move || {
+        for i in 10..20u32 {
+            write_engine
+                .put(format!("k{i:03}").as_bytes(), b"v")
+                .unwrap();
+        }
+    });
+
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the flush thread must reach AfterSetCheckpoint within 5s");
+
+    // The ReadView is captured *now*, while the second batch's flush is
+    // still stuck at the fault point -- before or during the exact
+    // publish/immutable-removal transition.
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+
+    proceed_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert!(
+        wait_until(|| engine.immutable_count() == 0, Duration::from_secs(5)),
+        "the flush must complete once released"
+    );
+    engine.clear_flush_fault_hook();
+
+    // Coherence checks -- must hold regardless of exactly which side of
+    // the transition the captured ReadView landed on.
+    let mut seen = std::collections::HashSet::new();
+    for (k, _v) in &rows {
+        assert!(
+            seen.insert(k.clone()),
+            "no key may appear twice in one range_scan's output: {k:?} appeared more than once"
+        );
+    }
+    // The first 10 keys were durable and stable well before the scan
+    // was even constructed -- they must always be present.
+    for i in 0..10u32 {
+        let key = format!("k{i:03}").into_bytes();
+        assert!(
+            seen.contains(&key),
+            "key {key:?} was durable before this scan started and must always be present"
+        );
+    }
+    // Every key present must be one this test actually wrote -- no
+    // phantom/impossible key.
+    for (k, _) in &rows {
+        let n: u32 = std::str::from_utf8(&k[1..]).unwrap().parse().unwrap();
+        assert!(n < 20, "range_scan produced an impossible key: {k:?}");
+    }
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Closes the range-scan analogue of `data_block_corruption_is_
+/// detected_lazily_at_read_time_not_at_open`: a live SSTable data block
+/// corrupted after a successful `open()` must fail a `range_scan`
+/// touching it closed, with `Err(Corruption)`, and the iterator must
+/// then end -- never skip the corrupted table, never return a partial
+/// success silently.
+#[test]
+fn range_scan_across_a_corrupted_data_block_fails_closed_and_ends() {
+    let dir = temp_dir("range_corruption");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    {
+        let engine = open(&dir, lsm_config.clone());
+        for i in 0..10u32 {
+            engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        assert!(
+            wait_until(
+                || engine.sstable_count() == 1 && engine.immutable_count() == 0,
+                Duration::from_secs(5)
+            ),
+            "the flush must complete before this test corrupts the resulting file"
+        );
+        engine.shutdown();
+    }
+
+    // Same technique as the point-lookup lazy-corruption test: flip a
+    // byte at file offset 0, always inside the first data block (data
+    // blocks are written before bloom/index/footer).
+    let sst_path = fs::read_dir(dir.join("sstables"))
+        .unwrap()
+        .find_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            name.ends_with(".sst").then(|| e.path())
+        })
+        .expect("exactly one .sst file must exist after the flush above");
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst_path)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+    }
+
+    let engine = open(&dir, lsm_config);
+    let mut iter = engine.range(Bound::Unbounded, Bound::Unbounded);
+    let first = iter.next();
+    assert!(
+        matches!(first, Some(Err(EngineError::Corruption { .. }))),
+        "a range scan touching a corrupted data block must yield Err(Corruption), got {first:?}"
+    );
+    assert!(
+        iter.next().is_none(),
+        "the iterator must end after yielding the error -- no silent continuation, no partial \
+         success, and the corrupted SSTable must not be skipped"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ADR-RE-001` §13: `read_requests` counts one per `range_scan`/`range`
+/// *call*, never once per returned row; `sstables_consulted` reflects
+/// real physical queries; `blocks_read` is already free via `SsTable`'s
+/// own shared counter (Increment 1).
+#[test]
+fn read_stats_counts_range_scan_calls_and_sstable_consultation_correctly() {
+    let dir = temp_dir("read_stats_range_scan");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..30u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() >= 2 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "at least two SSTables must exist so sstables_consulted has something real to count"
+    );
+
+    let before = engine.read_stats();
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    assert_eq!(rows.len(), 30);
+    let after = engine.read_stats();
+
+    assert_eq!(
+        after.read_requests,
+        before.read_requests + 1,
+        "exactly one range_scan *call* must be counted, regardless of the 30 rows it returned"
+    );
+    assert!(
+        after.sstables_consulted > before.sstables_consulted,
+        "scanning across multiple live SSTables must count real consultation activity"
+    );
+    assert!(
+        after.blocks_read > before.blocks_read,
+        "reading real data out of SSTables must count real block reads (already free via \
+         SsTable's own shared counter since Increment 1)"
+    );
+    assert_eq!(
+        after.read_hits,
+        before.read_hits + 30,
+        "read_hits counts one per yielded row for a range scan (ADR-RE-001 §13's own \
+         'define counting semantics clearly' -- documented and locked in here)"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ADR-RE-001`/phase brief §17: an independent reference model (*not*
+/// the production merge algorithm) driving `get`/`get_as_of`/
+/// `range_scan` through a deterministic PUT/DELETE/overwrite/snapshot
+/// sequence, with a small memtable so the same data actually spans
+/// active + immutable + multiple SSTables (a purely in-memory scenario
+/// would never exercise the merge across all three source kinds).
+#[test]
+fn differential_reference_model_matches_across_active_immutable_and_sstable() {
+    let dir = temp_dir("differential_reference_model");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 200,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+
+    // key index -> every (seq, MemtableValue) ever applied, in order --
+    // deliberately the simplest possible representation, queried by a
+    // naive linear scan + max below, so this can never share a bug with
+    // the production k-way merge it's checking.
+    let mut model: std::collections::HashMap<u8, Vec<(u64, MemtableValue)>> =
+        std::collections::HashMap::new();
+    let key_for = |idx: u8| format!("k{idx:03}").into_bytes();
+    let mut all_seqs = Vec::new();
+
+    let script: &[(u8, Option<&[u8]>)] = &[
+        (0, Some(b"v0")),
+        (1, Some(b"v1")),
+        (2, Some(b"v2")),
+        (1, Some(b"v1-b")), // overwrite
+        (3, Some(b"v3")),
+        (2, None), // delete
+        (4, Some(b"v4")),
+        (5, Some(b"v5")),
+        (2, Some(b"v2-recreated")), // recreate a deleted key
+        (6, Some(b"v6")),
+        (7, Some(b"v7")),
+        (0, None), // delete the very first key, much later
+        (8, Some(b"v8")),
+        (9, Some(b"v9")),
+    ];
+    for &(idx, value) in script {
+        let key = key_for(idx);
+        let (seq, mv) = match value {
+            Some(v) => (engine.put(&key, v).unwrap(), MemtableValue::Put(v.to_vec())),
+            None => (engine.delete(&key).unwrap(), MemtableValue::Tombstone),
+        };
+        model.entry(idx).or_default().push((seq, mv));
+        all_seqs.push(seq);
+    }
+    assert!(
+        wait_until(|| engine.immutable_count() == 0, Duration::from_secs(5)),
+        "let any triggered flushes settle so the SSTable layer is genuinely exercised"
+    );
+    assert!(
+        engine.sstable_count() >= 1,
+        "this test's own point is to exercise the SSTable layer -- if nothing ever flushed, \
+         it isn't testing what it claims to"
+    );
+
+    let model_value_at = |idx: u8, as_of_seq: u64| -> Option<Vec<u8>> {
+        model
+            .get(&idx)?
+            .iter()
+            .filter(|(s, _)| *s <= as_of_seq)
+            .max_by_key(|(s, _)| *s)
+            .and_then(|(_, v)| match v {
+                MemtableValue::Put(v) => Some(v.clone()),
+                MemtableValue::Tombstone => None,
+            })
+    };
+
+    // get()/get_as_of() at every seq boundary actually produced, for
+    // every key.
+    for &s in &all_seqs {
+        for idx in 0u8..10 {
+            let expected = model_value_at(idx, s);
+            let actual = engine.get_as_of(&key_for(idx), s).unwrap();
+            assert_eq!(
+                actual, expected,
+                "get_as_of(k{idx:03}, {s}) mismatch: engine={actual:?} model={expected:?}"
+            );
+        }
+    }
+    for idx in 0u8..10 {
+        let expected = model_value_at(idx, u64::MAX);
+        let actual = engine.get(&key_for(idx)).unwrap();
+        assert_eq!(
+            actual, expected,
+            "get(k{idx:03}) mismatch: engine={actual:?} model={expected:?}"
+        );
+    }
+
+    // range_scan() at the final state must match the model's own
+    // sorted, tombstone-filtered view exactly.
+    let mut expected_range: Vec<(Vec<u8>, Vec<u8>)> = (0u8..10)
+        .filter_map(|idx| model_value_at(idx, u64::MAX).map(|v| (key_for(idx), v)))
+        .collect();
+    expected_range.sort_by(|a, b| a.0.cmp(&b.0));
+    let actual_range = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    assert_eq!(actual_range, expected_range);
+
+    // And at a historical snapshot, midway through the script.
+    let mid_seq = all_seqs[all_seqs.len() / 2];
+    let mut expected_mid: Vec<(Vec<u8>, Vec<u8>)> = (0u8..10)
+        .filter_map(|idx| model_value_at(idx, mid_seq).map(|v| (key_for(idx), v)))
+        .collect();
+    expected_mid.sort_by(|a, b| a.0.cmp(&b.0));
+    let actual_mid =
+        collect_range(engine.range_scan(Bound::Unbounded, Bound::Unbounded, mid_seq)).unwrap();
+    assert_eq!(
+        actual_mid, expected_mid,
+        "historical range_scan at seq {mid_seq} mismatch"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ADR-RE-001`/phase brief §18: property-based, using this project's
+/// existing `proptest` convention (`memtable::property_tests`,
+/// `manifest::tests::property`, `sstable::tests`'s own proptest blocks)
+/// — case count matched to the *I/O-involving* precedent (`manifest`/
+/// `sstable`'s own `with_cases(64)`, not `memtable`/`wal`'s
+/// pure-in-memory `with_cases(1000)`), since each case here opens a
+/// real `LsmEngine` against a real directory. Reproducibility: `proptest`
+/// persists a failing seed to `proptest-regressions/lsm/tests.txt`
+/// automatically, this project's existing, already-relied-upon
+/// mechanism (see `memtable::property_tests`'s own doc comment).
+mod range_scan_property_tests {
+    use proptest::collection::vec as pvec;
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    enum FuzzOp {
+        Put { key_idx: u8, value: Vec<u8> },
+        Delete { key_idx: u8 },
+    }
+
+    fn fuzz_op_strategy() -> impl Strategy<Value = FuzzOp> {
+        prop_oneof![
+            (0u8..10, pvec(any::<u8>(), 0..12))
+                .prop_map(|(key_idx, value)| FuzzOp::Put { key_idx, value }),
+            (0u8..10).prop_map(|key_idx| FuzzOp::Delete { key_idx }),
+        ]
+    }
+
+    fn key_for(idx: u8) -> Vec<u8> {
+        format!("k{idx:03}").into_bytes()
+    }
+
+    /// Deliberately naive (linear scan + max), never the production
+    /// engine's own merge/resolution algorithm -- so this can never
+    /// share a bug with what it's checking.
+    #[derive(Debug, Default)]
+    struct ReferenceModel {
+        history: std::collections::HashMap<Vec<u8>, Vec<(u64, MemtableValue)>>,
+    }
+    impl ReferenceModel {
+        fn apply(&mut self, key: &[u8], seq: u64, value: MemtableValue) {
+            self.history
+                .entry(key.to_vec())
+                .or_default()
+                .push((seq, value));
+        }
+        fn value_at(&self, key: &[u8], as_of_seq: u64) -> Option<Vec<u8>> {
+            self.history
+                .get(key)?
+                .iter()
+                .filter(|(s, _)| *s <= as_of_seq)
+                .max_by_key(|(s, _)| *s)
+                .and_then(|(_, v)| match v {
+                    MemtableValue::Put(v) => Some(v.clone()),
+                    MemtableValue::Tombstone => None,
+                })
+        }
+        fn range_at(&self, as_of_seq: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut keys: Vec<Vec<u8>> = self.history.keys().cloned().collect();
+            keys.sort();
+            keys.into_iter()
+                .filter_map(|k| {
+                    let v = self.value_at(&k, as_of_seq)?;
+                    Some((k, v))
+                })
+                .collect()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Ordering, no duplicate logical keys, correct versions, correct
+        /// tombstones, `get`/`range_scan` equivalence, and reference-model
+        /// equivalence -- folded into one property, matching `memtable::
+        /// property_tests`'s own "all instances of the same underlying
+        /// check" rationale.
+        #[test]
+        fn lsm_engine_range_scan_matches_independent_reference_model(
+            ops in pvec(fuzz_op_strategy(), 1..30)
+        ) {
+            let lsm_config = LsmConfig {
+                memtable_max_size_bytes: 200,
+                max_immutable_memtables: 16,
+                ..LsmConfig::default()
+            };
+            let dir = temp_dir("range_scan_property");
+            let engine = open(&dir, lsm_config);
+            let mut model = ReferenceModel::default();
+            let mut all_seqs = Vec::new();
+
+            for op in &ops {
+                match op {
+                    FuzzOp::Put { key_idx, value } => {
+                        let key = key_for(*key_idx);
+                        let seq = engine.put(&key, value).unwrap();
+                        model.apply(&key, seq, MemtableValue::Put(value.clone()));
+                        all_seqs.push(seq);
+                    }
+                    FuzzOp::Delete { key_idx } => {
+                        let key = key_for(*key_idx);
+                        let seq = engine.delete(&key).unwrap();
+                        model.apply(&key, seq, MemtableValue::Tombstone);
+                        all_seqs.push(seq);
+                    }
+                }
+            }
+
+            for &s in &all_seqs {
+                for key_idx in 0u8..10 {
+                    let key = key_for(key_idx);
+                    let expected = model.value_at(&key, s);
+                    let actual = engine.get_as_of(&key, s).unwrap();
+                    prop_assert_eq!(
+                        actual.clone(), expected.clone(),
+                        "get_as_of mismatch for key {:?} at seq {}: engine={:?} model={:?}",
+                        key, s, actual, expected
+                    );
+                }
+            }
+
+            let expected_range = model.range_at(u64::MAX);
+            let actual_range = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+            prop_assert_eq!(actual_range.clone(), expected_range.clone());
+
+            // Ordering + no-duplicate-keys, checked directly (not just
+            // implied by equality with the model, which is itself
+            // already sorted/deduplicated by construction).
+            for w in actual_range.windows(2) {
+                prop_assert!(w[0].0 < w[1].0, "range_scan output must be strictly ascending by key, no duplicates");
+            }
+
+            // get()/range_scan() equivalence at the final state.
+            for key_idx in 0u8..10 {
+                let key = key_for(key_idx);
+                let point = engine.get(&key).unwrap();
+                let ranged = actual_range
+                    .iter()
+                    .find(|(k, _)| k == &key)
+                    .map(|(_, v)| v.clone());
+                prop_assert_eq!(point, ranged, "get()/range_scan() disagree for key {:?}", key);
+            }
+
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 }

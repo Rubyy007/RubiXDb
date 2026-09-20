@@ -176,8 +176,8 @@ impl MemTable {
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
     ) -> impl Iterator<Item = (&(Vec<u8>, u64), &MemtableValue)> {
-        let start = bound_to_tuple(start, 0);
-        let end = bound_to_tuple(end, u64::MAX);
+        let start = bound_to_tuple_start(start);
+        let end = bound_to_tuple_end(end);
         self.map.range((start, end))
     }
 
@@ -222,10 +222,41 @@ impl MemTable {
     }
 }
 
-fn bound_to_tuple(bound: Bound<&[u8]>, seq_at_unbounded: u64) -> Bound<(Vec<u8>, u64)> {
+/// Maps a key-level *start* (lower) bound to a `(key, seq)` tuple bound.
+/// `Included(k)` must admit every version of `k` (seq >= 0, the
+/// minimum), so it maps to `Included((k, 0))`. `Excluded(k)` must
+/// exclude every version of `k` -- not just the one at some arbitrary
+/// sentinel seq -- so the tuple bound must sit *above* every real
+/// version of `k`, i.e. `Excluded((k, u64::MAX))`.
+///
+/// Fixed 2026-09-20 (`ADR-RE-001`/`PHASE_READ_ENGINE_ARCHITECTURE_
+/// REPORT.md` §14.2): the previous single-function `bound_to_tuple`
+/// used the *same* sentinel (`seq_at_unbounded`) for both `Included`
+/// and `Excluded`, which is only correct for `Included` -- `Excluded(k)`
+/// was silently mapping to `Excluded((k, 0))`, and since every real
+/// entry has `seq >= 1`, `(k, real_seq) > (k, 0)` always holds, so an
+/// "excluded" boundary key's own entries were never actually excluded.
+/// Caught by a regression test (`range_excluded_start_bound_excludes_
+/// every_version_of_the_boundary_key`) added *before* this fix, per
+/// this project's own "test first, then the smallest correct fix"
+/// convention for a confirmed production bug.
+fn bound_to_tuple_start(bound: Bound<&[u8]>) -> Bound<(Vec<u8>, u64)> {
     match bound {
-        Bound::Included(k) => Bound::Included((k.to_vec(), seq_at_unbounded)),
-        Bound::Excluded(k) => Bound::Excluded((k.to_vec(), seq_at_unbounded)),
+        Bound::Included(k) => Bound::Included((k.to_vec(), 0)),
+        Bound::Excluded(k) => Bound::Excluded((k.to_vec(), u64::MAX)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+/// The *end* (upper) bound's mirror image of `bound_to_tuple_start`:
+/// `Included(k)` must admit every version of `k`, so it maps to
+/// `Included((k, u64::MAX))` (above every real version). `Excluded(k)`
+/// must exclude every version of `k`, so it maps to `Excluded((k, 0))`
+/// (at or below every real version, since real `seq` is always >= 1).
+fn bound_to_tuple_end(bound: Bound<&[u8]>) -> Bound<(Vec<u8>, u64)> {
+    match bound {
+        Bound::Included(k) => Bound::Included((k.to_vec(), u64::MAX)),
+        Bound::Excluded(k) => Bound::Excluded((k.to_vec(), 0)),
         Bound::Unbounded => Bound::Unbounded,
     }
 }
@@ -359,6 +390,57 @@ mod tests {
                 (b"b".to_vec(), 1),
                 (b"c".to_vec(), 1),
             ]
+        );
+    }
+
+    /// `ADR-RE-001`/`PHASE_READ_ENGINE_ARCHITECTURE_REPORT.md` §14.2's
+    /// recorded discrepancy, investigated and confirmed a real bug (not
+    /// intentional behavior) before fixing: `std::ops::Bound::Excluded(x)`
+    /// has one, universal, unambiguous meaning -- "up to but not
+    /// including `x`." `range()` takes exactly this standard type, so it
+    /// must honor that contract for both the start and end bound,
+    /// regardless of how many distinct `seq` versions the boundary key
+    /// has.
+    #[test]
+    fn range_excluded_end_bound_excludes_every_version_of_the_boundary_key() {
+        let mut m = MemTable::new(DEFAULT_MAX_SIZE_BYTES);
+        m.put(b"k0010", 1, b"v");
+        m.put(b"k0020", 2, b"v"); // the boundary key -- multiple things could
+        m.put(b"k0020", 3, b"v"); // go wrong if only one of its two versions
+                                  // were (correctly or incorrectly) excluded.
+        m.put(b"k0030", 4, b"v");
+
+        let keys: Vec<Vec<u8>> = m
+            .range(Bound::Included(b"k0010"), Bound::Excluded(b"k0020"))
+            .map(|((k, _), _)| k.clone())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![b"k0010".to_vec()],
+            "Excluded(k0020) as an end bound must exclude ALL versions of k0020, not just \
+             the version whose seq happens to be below some internal sentinel"
+        );
+    }
+
+    /// Same investigation, the START-bound direction (also affected by
+    /// the same underlying `bound_to_tuple` sentinel mismatch, though
+    /// not the specific case the architecture report's own bounded-range
+    /// test happened to surface first).
+    #[test]
+    fn range_excluded_start_bound_excludes_every_version_of_the_boundary_key() {
+        let mut m = MemTable::new(DEFAULT_MAX_SIZE_BYTES);
+        m.put(b"k0010", 1, b"v");
+        m.put(b"k0010", 2, b"v");
+        m.put(b"k0020", 3, b"v");
+
+        let keys: Vec<Vec<u8>> = m
+            .range(Bound::Excluded(b"k0010"), Bound::Unbounded)
+            .map(|((k, _), _)| k.clone())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![b"k0020".to_vec()],
+            "Excluded(k0010) as a start bound must exclude ALL versions of k0010"
         );
     }
 
