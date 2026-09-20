@@ -1698,3 +1698,113 @@ Replication, or multi-node work — that starts as its own separately-
 scoped phase, only when explicitly instructed.
 
 **Open Tier 3 question currently blocking further work:** none.
+
+## 2026-09-20 (Read Engine: architecture report, ADR-RE-001, Implementation Increment 1)
+
+With the Write Engine certified, started the Read Engine as its own
+separately-scoped phase, per this project's own stop condition. Phase
+1 was a read-only audit (`PHASE_READ_ENGINE_ARCHITECTURE_REPORT.md`,
+spec review + full source mapping of the read-relevant code in
+`src/lsm/`, `src/sstable/`, `src/memtable/`, `src/manifest/`, no source
+touched) — key finding: `LsmEngine::get`/`get_as_of` already implement
+the recency-ordered, tombstone-collapsing merge the spec describes;
+the real gap is `range_scan`, which doesn't exist yet, and a precise,
+traced (not assumed) divergence from the spec's `ReadView` concurrency
+model for that specific operation shape.
+
+Phase 2 was `PHASE_READ_ENGINE_ADR.md` (ADR-RE-001), resolving all 13
+required decisions (ReadView model, snapshot model/lifetime, `NotFound`
+vs. `Ok(None)`, `range_scan` contract, merge ordering, tombstone/
+corruption semantics, concurrent-flush visibility, SSTable authority,
+`contains()`/`batch_get()` scope, memory ownership, benchmark
+instrumentation, final API scope) — again no source touched, verified
+via `git status`.
+
+**Implementation Increment 1** (approved scope only: snapshot
+infrastructure, `ReadStats` infrastructure, the `ReadView` foundation
+type, point-read regression protection, a concurrent-flush point-read
+test — explicitly not `range_scan`, not a cache, not `batch_get`, no
+change to `get`/`get_as_of` semantics or to `EngineError`):
+
+- `Snapshot`/`SnapshotRegistry` (`src/lsm/mod.rs`): a real, `Drop`-
+  released, multiset-correct read-snapshot handle plus
+  `oldest_live_snapshot_seq()` — the registration mechanism a future
+  Compaction phase will need, built now (not just sketched) since it's
+  cheap and independently testable without Compaction existing to
+  consume it.
+- `ReadStats`/`ReadStatCounters` (`src/lsm/mod.rs`) + two new counters
+  on `SsTable` (`src/sstable/reader.rs`: `blocks_read`, incremented
+  once inside the shared `read_block` so it will also cover
+  `range_scan_raw` for free once `range_scan` lands; `bloom_negative_
+  count`, incremented at `get_versioned`'s existing bloom check) —
+  `get_as_of` gained exactly these counter increments alongside its
+  existing branches/returns, no control-flow or return-value change.
+- `ReadView` (`pub(crate)`, foundation only — not yet wired into any
+  public method): `Arc`-clones `immutables`/`sstables` and materializes
+  only the requested key range from `active`, never full MemTable/
+  SSTable contents, never a second Bloom filter or index.
+- 17 new tests, all passing, all re-run for stability where timing-
+  sensitive: 8 `Snapshot`/`SnapshotRegistry` cases (one/two-different-
+  seq/two-same-seq/drop-newest-first/drop-oldest-first/all-dropped/
+  seq-stable-after-later-writes), 4 `ReadStats` cases (MemTable hit,
+  miss, SSTable hit+consultation+block-reads, bloom-negative miss with
+  zero block reads), 2 `ReadView` foundation cases, 2 point-read
+  regression cases closing real gaps the architecture report flagged
+  (plain overwrite without a delete; data-block corruption detected
+  *lazily at read time*, not at `open()` — this one required flipping
+  one byte at file offset 0, verified against the writer's actual
+  block-then-bloom-then-index-then-footer layout, not guessed), and 1
+  concurrent-flush point-read test using the existing `FlushFaultPoint`/
+  `install_flush_fault_hook` machinery (no sleeps) to deterministically
+  land a lookup inside the exact "SSTable published, immutable not yet
+  removed" transition window `ADR-RE-001` §1 traced safe.
+
+**Three real bugs caught and fixed by actually running these tests
+before trusting them**, matching this project's own established
+discipline: (1) the concurrent-flush test's closure captured an
+`mpsc::Receiver` by move, which isn't `Sync` — `install_flush_fault_
+hook`'s bound requires it; fixed by wrapping in a `Mutex`. (2) Two
+tests used a 150-byte memtable with 10 puts, intended to trigger
+exactly one freeze — it actually triggered multiple, so `sstable_
+count() == 1`/`immutable_count() == 1` assertions failed; fixed by
+calibrating to 350 bytes (37 bytes/entry × 10, same tuning convention
+already used elsewhere in this file). (3) The `ReadView` bounded-range
+test assumed `Bound::Excluded` on the end key excludes that key's own
+entries; it does not, in `MemTable::range`'s existing, already-shipped
+`bound_to_tuple` mapping (`Excluded(k)` end bound maps to `Excluded((k,
+u64::MAX))`, which every real, sub-`u64::MAX` seq falls under) — a
+real, pre-existing discrepancy, explicitly recorded (not silently
+worked around) in the test's own comment and flagged for `range_scan`'s
+own implementation (the next increment) to explicitly decide how to
+handle.
+
+**Full regression gate, re-run and verified clean on the actual
+committed state**: `cargo fmt --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo test --lib` (273/273 = 256
+pre-existing + 17 new), `cargo test --release --lib` (273/273),
+`cargo check --all-targets --all-features` (examples/benches still
+build). No existing Write Engine test's behavior changed.
+
+**Not implemented this increment, deliberately**: `range_scan`, the
+k-way merge, `contains()`, `batch_get()` (deferred per the ADR), any
+cache, mmap, or benchmark suite. **Not claimed**: Read Engine
+production readiness — that requires the full certification matrix
+per `ADR-RE-001`'s own §24/§12, none of which has started yet.
+
+**Commit discipline note**: this session's Write Engine certification
+work (ADR-WE-SP-001 through the final 16-gate certification) had not
+yet been committed when this Read Engine work began, in the same files
+this increment also touches. Reconstructed a precise Write-Engine-only
+snapshot of `src/lsm/mod.rs`/`src/lsm/tests.rs` (verified it still
+builds and passes its own 256/256 tests standalone) to commit that
+backlog as its own commit first, then committed this Read Engine
+increment separately and focused, per the instruction to keep this
+increment's commit scoped to exactly what it implements.
+
+**Open Tier 3 question currently blocking further work:** none for
+this increment. Two real, explicitly-recorded discrepancies (`NotFound`
+vs. `Ok(None)` already resolved by the ADR; the `MemTable::range`
+`Excluded`-end-bound behavior not yet resolved) carry forward into
+Increment 2's own scope (`range_scan`, the k-way merge, version
+resolution, tombstone handling, range correctness tests) — not started
+here, per the instruction to stop and report after this increment.

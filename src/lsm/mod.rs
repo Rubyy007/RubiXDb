@@ -31,6 +31,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -251,6 +252,171 @@ fn fire_flush_io_fault_hook(hook: &Mutex<Option<FlushIoFaultHook>>) -> Option<io
     hook.as_ref().and_then(|f| f())
 }
 
+// ============================================================================
+// Read Engine foundation (`ADR-RE-001`, Implementation Increment 1).
+//
+// Everything in this section is additive: no existing method's signature
+// or behavior changes because of it. `get`/`get_as_of` gain exactly two
+// kinds of new side effect -- `ReadStats` counter increments -- and
+// nothing else; their control flow and return values are unchanged (see
+// the comments at each insertion point below).
+// ============================================================================
+
+/// `ADR-RE-001` §2: tracks outstanding [`Snapshot`]s by sequence number,
+/// as a multiset (`seq -> outstanding_count`) since two callers can
+/// independently snapshot the same sequence. Grows only with the number
+/// of *live* `Snapshot` handles, never with data volume -- dropping a
+/// `Snapshot` always shrinks or removes its entry, never leaves it
+/// behind. This is the mechanism a future Compaction phase will need
+/// ("never remove a version still needed by the oldest live snapshot")
+/// without this phase building Compaction itself.
+#[derive(Default)]
+struct SnapshotRegistry {
+    counts: Mutex<BTreeMap<u64, u64>>,
+}
+
+impl SnapshotRegistry {
+    fn acquire(&self, seq: u64) {
+        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        *counts.entry(seq).or_insert(0) += 1;
+    }
+
+    /// Decrements `seq`'s outstanding count, removing the entry entirely
+    /// once it reaches zero -- so `oldest()` never reports a sequence
+    /// with zero live holders.
+    fn release(&self, seq: u64) {
+        let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = counts.get_mut(&seq) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&seq);
+            }
+        }
+    }
+
+    /// The lowest sequence with at least one live `Snapshot` still
+    /// holding it, or `None` if no snapshot is currently outstanding.
+    fn oldest(&self) -> Option<u64> {
+        let counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        counts.keys().next().copied()
+    }
+}
+
+/// `ADR-RE-001` §2: a caller-held point-in-time read watermark. Obtaining
+/// one (`LsmEngine::snapshot()`) and passing its [`seq()`](Snapshot::seq)
+/// to `get_as_of` (or, once implemented, `range_scan`) guarantees a
+/// stable view "as of when I asked," independent of later writes --
+/// exactly the semantics `get_as_of`'s existing bare `as_of_seq: u64`
+/// parameter already provides, just with an explicit, registered
+/// lifetime attached instead of a caller-supplied raw number. Registered
+/// in the owning `LsmEngine`'s `snapshot_registry` for its entire
+/// lifetime; deregistered automatically on `Drop`.
+///
+/// Deliberately does **not** implement `Clone` -- two independent
+/// snapshots of the same `seq` are two independent registry entries
+/// (`SnapshotRegistry::acquire` is called once per `LsmEngine::
+/// snapshot()` call), not one shared handle; a caller wanting two must
+/// call `snapshot()` twice (or explicitly reason about sharing one
+/// `Arc<Snapshot>`, which remains possible without `Clone` on the
+/// underlying type).
+pub struct Snapshot {
+    seq: u64,
+    registry: Arc<SnapshotRegistry>,
+}
+
+impl Snapshot {
+    /// The durable watermark this snapshot pins -- pass to `get_as_of`
+    /// (and, once implemented, `range_scan`) for a stable, point-in-time
+    /// read unaffected by writes that happen after this snapshot was
+    /// taken.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        self.registry.release(self.seq);
+    }
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot").field("seq", &self.seq).finish()
+    }
+}
+
+/// `ADR-RE-001` §12: read-path observability, mirroring the existing
+/// `capacity_pressure_events`/`storage_pressure_events` convention
+/// (cheap `Relaxed` atomics on `LsmEngine`, exposed via a snapshot-copy
+/// accessor) rather than introducing a new observability pattern.
+/// Definitions, precise (see `get_as_of`'s instrumentation below for
+/// exactly where each is incremented):
+/// - `read_hits`/`read_misses`: whether *some* source held a matching
+///   `(key, seq)` entry at all (a found tombstone counts as a hit here,
+///   even though the public `get`/`get_as_of` API still returns `Ok
+///   (None)` for it -- this counter is about how much of the source
+///   chain had to be searched, a different question from what the
+///   caller ultimately sees).
+/// - `bloom_negatives`/`blocks_read`: summed across every currently-live
+///   `SsTable` at `read_stats()` call time (`SsTable::bloom_negative_
+///   count`/`blocks_read` are each individually cumulative and, since no
+///   SSTable is ever removed without Compaction, summing the live set
+///   is exactly the lifetime total -- see `read_stats()`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadStats {
+    pub read_requests: u64,
+    pub read_hits: u64,
+    pub read_misses: u64,
+    pub bloom_negatives: u64,
+    pub blocks_read: u64,
+    pub sstables_consulted: u64,
+}
+
+/// The mutable (interior, via atomics) counters `ReadStats` is a
+/// snapshot-copy of. `sstables_consulted` lives here (an `LsmEngine`-
+/// level fact: how many tables *this engine's* reads have visited) --
+/// `bloom_negatives`/`blocks_read` do not, deliberately: those are
+/// per-`SsTable` facts (`ADR-RE-001` §12), summed from the live
+/// `sstables` list at `read_stats()` time instead of duplicated here.
+#[derive(Default)]
+struct ReadStatCounters {
+    requests: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    sstables_consulted: AtomicU64,
+}
+
+/// `ADR-RE-001` §1/§5: the `range_scan` consistency mechanism --
+/// captures a stable set of source references once, at construction
+/// time, so a (not-yet-implemented -- this is foundation only, wired
+/// into `range_scan` in the next increment) k-way merge can run
+/// lock-free against an unchanging view for the scan's whole duration.
+/// Point lookups (`get`/`get_as_of`) do **not** use this -- they keep
+/// the existing, separately-safe sequential-lock pattern (`ADR-RE-001`
+/// §1's "Alternatives considered").
+///
+/// Deliberately does not clone MemTable/SSTable *contents*:
+/// `immutables`/`sstables` below are `Arc` clones (a refcount bump each,
+/// never a data copy -- per `ADR-RE-001` §12, this must never duplicate
+/// a `BloomFilter`/`Vec<IndexEntry>`, and it does not: no new `BloomFilter`
+/// or index structure is constructed anywhere in `capture_read_view`).
+/// `active_range` materializes only the entries already inside the
+/// requested `[start, end)`, never the whole active MemTable.
+#[allow(dead_code)] // consumed by `range_scan`, landing in the next increment
+pub(crate) struct ReadView {
+    /// Entries from the active MemTable already inside the requested
+    /// range, *not yet version-resolved* -- mirrors `MemTable::range`'s
+    /// own "all versions in range, caller resolves" contract exactly
+    /// (`ADR-RE-001` §5's explicit discrepancy note: `range`/
+    /// `range_scan_raw` are lower-level than `get`/`get_as_of`).
+    active_range: Vec<((Vec<u8>, u64), MemtableValue)>,
+    /// Newest-first -- same ordering convention as `LsmEngine.immutables`.
+    immutables: Vec<Arc<MemTable>>,
+    /// Newest-first -- same ordering convention as `LsmEngine.sstables`.
+    sstables: Vec<Arc<SsTable>>,
+}
+
 pub struct LsmEngine {
     pool: Arc<BatchCoordinatorPool>,
     active: RwLock<MemTable>,
@@ -325,6 +491,13 @@ pub struct LsmEngine {
     /// uncontended-mutex-lock-and-`None`-check convention as
     /// `flush_fault_hook`.
     flush_io_fault_hook: Arc<Mutex<Option<FlushIoFaultHook>>>,
+    /// `ADR-RE-001` §2. `Arc`-wrapped even though nothing else currently
+    /// shares it, matching `Snapshot`'s own need to hold a clone of it
+    /// for its `Drop` impl to reach back into.
+    snapshot_registry: Arc<SnapshotRegistry>,
+    /// `ADR-RE-001` §12. See `ReadStatCounters`'s own doc comment for
+    /// exactly which counters live here vs. on `SsTable`.
+    read_stats: ReadStatCounters,
     config: LsmConfig,
 }
 
@@ -457,6 +630,8 @@ impl LsmEngine {
             storage_state,
             storage_pressure_events,
             flush_io_fault_hook,
+            snapshot_registry: Arc::new(SnapshotRegistry::default()),
+            read_stats: ReadStatCounters::default(),
             config: lsm_config,
         })
     }
@@ -683,9 +858,18 @@ impl LsmEngine {
     /// MemTable-only Phase 4A read path never had, so this can no longer
     /// be an infallible lookup.
     pub fn get_as_of(&self, key: &[u8], as_of_seq: u64) -> Result<GetResult> {
+        // `ADR-RE-001` §12/Implementation Increment 1: `ReadStats`
+        // instrumentation only -- every increment below sits alongside an
+        // existing branch/return, never changes which branch is taken or
+        // what is returned. `read_hits` counts "some source held a
+        // matching (key, seq) entry" (a found tombstone counts as a hit
+        // here, even though it still resolves to `Ok(None)` below, same
+        // as it always has) -- see `ReadStats`'s own doc comment.
+        self.read_stats.requests.fetch_add(1, Ordering::Relaxed);
         {
             let active = self.lock_active_read();
             if let Some((_, value)) = active.get_as_of(key, as_of_seq) {
+                self.read_stats.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(resolve(value));
             }
         }
@@ -693,6 +877,7 @@ impl LsmEngine {
             let immutables = self.lock_immutables_read();
             for imm in immutables.iter() {
                 if let Some((_, value)) = imm.get_as_of(key, as_of_seq) {
+                    self.read_stats.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(resolve(value));
                 }
             }
@@ -700,11 +885,16 @@ impl LsmEngine {
         {
             let sstables = self.lock_sstables_read();
             for table in sstables.iter() {
+                self.read_stats
+                    .sstables_consulted
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Some((_, value)) = table.get_versioned(key, as_of_seq)? {
+                    self.read_stats.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(resolve_sstable(value));
                 }
             }
         }
+        self.read_stats.misses.fetch_add(1, Ordering::Relaxed);
         Ok(None)
     }
 
@@ -715,6 +905,84 @@ impl LsmEngine {
     /// `put`/`delete` call, not a value captured beforehand.
     pub fn snapshot_seq(&self) -> u64 {
         self.pool.stats().committer_stats.durable_through
+    }
+
+    /// `ADR-RE-001` §2: takes a registered, `Drop`-released read
+    /// snapshot pinned at the current durable watermark (the same value
+    /// `snapshot_seq()` returns) -- pass `Snapshot::seq()` to
+    /// `get_as_of` (and, once implemented, `range_scan`) for a stable,
+    /// point-in-time read. Unlike a bare `snapshot_seq()` value, holding
+    /// a `Snapshot` is visible to `oldest_live_snapshot_seq()` -- the
+    /// piece of information a future Compaction phase will need and
+    /// that this phase deliberately does not yet act on (no Compaction
+    /// exists to consult it).
+    pub fn snapshot(&self) -> Snapshot {
+        let seq = self.snapshot_seq();
+        self.snapshot_registry.acquire(seq);
+        Snapshot {
+            seq,
+            registry: Arc::clone(&self.snapshot_registry),
+        }
+    }
+
+    /// `ADR-RE-001` §2: the lowest sequence any currently-live
+    /// [`Snapshot`] still holds, or `None` if none are outstanding.
+    pub fn oldest_live_snapshot_seq(&self) -> Option<u64> {
+        self.snapshot_registry.oldest()
+    }
+
+    /// `ADR-RE-001` §12: a point-in-time copy of the read-path counters.
+    /// `bloom_negatives`/`blocks_read` are summed across every
+    /// currently-live `SsTable` at call time (each is individually
+    /// cumulative per table; since no table is ever removed without
+    /// Compaction, summing the live set is exactly the lifetime total --
+    /// see `ReadStats`'s own doc comment).
+    pub fn read_stats(&self) -> ReadStats {
+        let (bloom_negatives, blocks_read) = {
+            let sstables = self.lock_sstables_read();
+            sstables.iter().fold((0u64, 0u64), |(bn, br), table| {
+                (bn + table.bloom_negative_count(), br + table.blocks_read())
+            })
+        };
+        ReadStats {
+            read_requests: self.read_stats.requests.load(Ordering::Relaxed),
+            read_hits: self.read_stats.hits.load(Ordering::Relaxed),
+            read_misses: self.read_stats.misses.load(Ordering::Relaxed),
+            bloom_negatives,
+            blocks_read,
+            sstables_consulted: self.read_stats.sstables_consulted.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `ADR-RE-001` §1/§5: captures a [`ReadView`] over `[start, end)` --
+    /// foundation for the `range_scan` implementation landing in the
+    /// next increment (`pub(crate)`, not yet part of the public read
+    /// API). Three short lock-acquire/clone-or-extract/release scopes,
+    /// never more than one lock held at a time, matching this codebase's
+    /// existing lock-scoping discipline (`lock_active_read`/
+    /// `lock_immutables_read`/`lock_sstables_read`).
+    #[allow(dead_code)] // consumed by `range_scan`, landing in the next increment
+    pub(crate) fn capture_read_view(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> ReadView {
+        let active_range: Vec<((Vec<u8>, u64), MemtableValue)> = {
+            let active = self.lock_active_read();
+            active
+                .range(start, end)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        let immutables: Vec<Arc<MemTable>> = {
+            let guard = self.lock_immutables_read();
+            guard.iter().cloned().collect()
+        };
+        let sstables: Vec<Arc<SsTable>> = {
+            let guard = self.lock_sstables_read();
+            guard.iter().cloned().collect()
+        };
+        ReadView {
+            active_range,
+            immutables,
+            sstables,
+        }
     }
 
     /// Current active MemTable's byte size — observability only

@@ -6,6 +6,29 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Read Engine: architecture report, ADR-RE-001, Implementation Increment 1 (2026-09-20)
+
+New, separately-scoped phase (Write Engine is certified and protected,
+unchanged). `PHASE_READ_ENGINE_ARCHITECTURE_REPORT.md` and
+`PHASE_READ_ENGINE_ADR.md` (13 resolved decisions) precede any code.
+Increment 1 (foundation only, no `range_scan` yet): `Snapshot`/
+`SnapshotRegistry` (a real, `Drop`-released, multiset-correct read
+watermark, forward-compatible with a future Compaction's `snapshot_
+refs` needs), `ReadStats` observability (`read_requests`/`read_hits`/
+`read_misses`/`bloom_negatives`/`blocks_read`/`sstables_consulted`,
+plus two new counters on `SsTable`), and a `ReadView` foundation type
+(`Arc`-clones existing sources, never duplicates a Bloom filter or
+index, never copies a whole MemTable). `get`/`get_as_of` gained only
+non-functional counter increments -- no behavior change. 17 new tests
+(273/273 total), including a deterministic concurrent-flush point-read
+test (existing `FlushFaultPoint` machinery, no sleeps) and a
+previously-missing lazy-data-block-corruption regression test. Three
+real bugs caught and fixed by running these tests before trusting them
+(a `Sync`-bound compile error, two freeze-count miscalibrations, and a
+real pre-existing `MemTable::range` `Excluded`-bound discrepancy,
+explicitly recorded for the next increment). Full detail:
+`PROGRESS.md`'s 2026-09-20 Read Engine entry.
+
 ### Write-Engine Certification: RSS growth investigated and explained; final decision reaffirmed (2026-09-20)
 
 The soak certified below showed RSS growing +2,334% over its 4 hours.

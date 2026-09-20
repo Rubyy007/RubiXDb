@@ -268,6 +268,8 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         storage_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         storage_pressure_events: Arc::new(AtomicU64::new(0)),
         flush_io_fault_hook: Arc::new(Mutex::new(None)),
+        snapshot_registry: Arc::new(SnapshotRegistry::default()),
+        read_stats: ReadStatCounters::default(),
         config: LsmConfig::default(),
     };
 
@@ -1292,6 +1294,632 @@ fn sstable_count_and_immutable_memory_track_flushes_exactly_no_extra_retention()
          or any other factor"
     );
 
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// Read Engine foundation (`ADR-RE-001`, Implementation Increment 1).
+// ============================================================================
+
+// --- Snapshot / SnapshotRegistry ---
+
+#[test]
+fn one_snapshot_registers_and_releases() {
+    let dir = temp_dir("snapshot_one");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+
+    assert_eq!(engine.oldest_live_snapshot_seq(), None);
+    let snap = engine.snapshot();
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(snap.seq()));
+    drop(snap);
+    assert_eq!(engine.oldest_live_snapshot_seq(), None);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_snapshots_at_different_sequence_numbers_report_the_older_as_oldest() {
+    let dir = temp_dir("snapshot_two_diff_seq");
+    let engine = open(&dir, LsmConfig::default());
+
+    engine.put(b"k1", b"v1").unwrap();
+    let older = engine.snapshot();
+    engine.put(b"k2", b"v2").unwrap();
+    let newer = engine.snapshot();
+    assert!(
+        newer.seq() > older.seq(),
+        "a snapshot taken after a later write must pin a strictly later sequence"
+    );
+
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(older.seq()));
+    drop(newer);
+    assert_eq!(
+        engine.oldest_live_snapshot_seq(),
+        Some(older.seq()),
+        "dropping the newer snapshot must not change the oldest-reported sequence"
+    );
+    drop(older);
+    assert_eq!(engine.oldest_live_snapshot_seq(), None);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_snapshots_at_the_same_sequence_are_counted_independently() {
+    let dir = temp_dir("snapshot_same_seq");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+
+    // No write happens between these two calls, so both pin the same
+    // durable watermark -- the multiset case `SnapshotRegistry` exists
+    // to handle correctly (a plain `HashSet<u64>`/`BTreeSet<u64>` would
+    // conflate these two independent holders into one entry).
+    let a = engine.snapshot();
+    let b = engine.snapshot();
+    assert_eq!(
+        a.seq(),
+        b.seq(),
+        "no intervening write, so both snapshots pin the same seq"
+    );
+
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(a.seq()));
+    drop(a);
+    assert_eq!(
+        engine.oldest_live_snapshot_seq(),
+        Some(b.seq()),
+        "dropping one of two same-sequence snapshots must not remove the sequence while \
+         the other is still alive"
+    );
+    drop(b);
+    assert_eq!(
+        engine.oldest_live_snapshot_seq(),
+        None,
+        "dropping the final same-sequence snapshot must remove the entry"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dropping_snapshots_newest_first_reports_correctly_at_every_step() {
+    let dir = temp_dir("snapshot_drop_newest_first");
+    let engine = open(&dir, LsmConfig::default());
+
+    engine.put(b"k1", b"v1").unwrap();
+    let first = engine.snapshot();
+    engine.put(b"k2", b"v2").unwrap();
+    let second = engine.snapshot();
+    engine.put(b"k3", b"v3").unwrap();
+    let third = engine.snapshot();
+
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(first.seq()));
+    drop(third);
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(first.seq()));
+    drop(second);
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(first.seq()));
+    drop(first);
+    assert_eq!(engine.oldest_live_snapshot_seq(), None);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dropping_snapshots_oldest_first_reports_correctly_at_every_step() {
+    let dir = temp_dir("snapshot_drop_oldest_first");
+    let engine = open(&dir, LsmConfig::default());
+
+    engine.put(b"k1", b"v1").unwrap();
+    let first = engine.snapshot();
+    engine.put(b"k2", b"v2").unwrap();
+    let second = engine.snapshot();
+    engine.put(b"k3", b"v3").unwrap();
+    let third = engine.snapshot();
+
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(first.seq()));
+    drop(first);
+    assert_eq!(
+        engine.oldest_live_snapshot_seq(),
+        Some(second.seq()),
+        "the oldest reported sequence must advance once the true oldest is dropped"
+    );
+    drop(second);
+    assert_eq!(engine.oldest_live_snapshot_seq(), Some(third.seq()));
+    drop(third);
+    assert_eq!(engine.oldest_live_snapshot_seq(), None);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn all_snapshots_dropped_leaves_no_live_snapshot() {
+    let dir = temp_dir("snapshot_all_dropped");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+
+    let snaps: Vec<Snapshot> = (0..5).map(|_| engine.snapshot()).collect();
+    assert!(engine.oldest_live_snapshot_seq().is_some());
+    drop(snaps);
+    assert_eq!(engine.oldest_live_snapshot_seq(), None);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn snapshot_seq_remains_stable_after_later_writes_and_is_usable_with_get_as_of() {
+    let dir = temp_dir("snapshot_stable_seq");
+    let engine = open(&dir, LsmConfig::default());
+
+    engine.put(b"k1", b"v1").unwrap();
+    let snap = engine.snapshot();
+    let seq_at_snapshot = snap.seq();
+
+    // Later writes, including an overwrite of the same key.
+    engine.put(b"k1", b"v2").unwrap();
+    engine.put(b"k2", b"v-after-snapshot").unwrap();
+
+    assert_eq!(
+        snap.seq(),
+        seq_at_snapshot,
+        "Snapshot::seq() must never change after construction, regardless of later writes"
+    );
+
+    // Existing point-lookup behavior, completely unchanged: passing a
+    // `Snapshot`'s `seq()` to `get_as_of` must behave identically to
+    // passing the equivalent raw `u64` (`snapshot_reads_remain_stable_
+    // across_later_writes` already covers the raw-`u64` case; this
+    // confirms `Snapshot` is just a safer way to hold that same value,
+    // not a new read mechanism).
+    assert_eq!(
+        engine.get_as_of(b"k1", snap.seq()).unwrap(),
+        Some(b"v1".to_vec())
+    );
+    assert_eq!(engine.get_as_of(b"k2", snap.seq()).unwrap(), None);
+    assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- ReadStats ---
+
+#[test]
+fn read_stats_counts_a_memtable_hit_without_touching_sstables() {
+    let dir = temp_dir("read_stats_memtable_hit");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+
+    let before = engine.read_stats();
+    assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+    let after = engine.read_stats();
+
+    assert_eq!(after.read_requests, before.read_requests + 1);
+    assert_eq!(after.read_hits, before.read_hits + 1);
+    assert_eq!(after.read_misses, before.read_misses);
+    assert_eq!(
+        after.sstables_consulted, before.sstables_consulted,
+        "a MemTable hit must short-circuit before ever consulting an SSTable"
+    );
+    assert_eq!(after.blocks_read, before.blocks_read);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_stats_counts_a_miss() {
+    let dir = temp_dir("read_stats_miss");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+
+    let before = engine.read_stats();
+    assert_eq!(engine.get(b"does-not-exist").unwrap(), None);
+    let after = engine.read_stats();
+
+    assert_eq!(after.read_requests, before.read_requests + 1);
+    assert_eq!(after.read_hits, before.read_hits);
+    assert_eq!(after.read_misses, before.read_misses + 1);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_stats_counts_sstable_consultation_and_block_reads_on_an_sstable_hit() {
+    let dir = temp_dir("read_stats_sstable_hit");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 150,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() >= 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "the flush must complete before this test can measure an SSTable hit"
+    );
+
+    let before = engine.read_stats();
+    // k000 is guaranteed to have been part of the frozen-and-flushed
+    // memtable (the freeze happens partway through this loop, and only
+    // the active memtable -- never yet-flushed keys -- would still be
+    // reachable without going through the SSTable).
+    let result = engine.get(b"k000").unwrap();
+    assert!(
+        result.is_some(),
+        "k000 must still be readable after its memtable was flushed"
+    );
+    let after = engine.read_stats();
+
+    assert_eq!(after.read_hits, before.read_hits + 1);
+    assert!(
+        after.sstables_consulted > before.sstables_consulted,
+        "a hit that required checking the SSTable layer must count at least one consultation"
+    );
+    assert!(
+        after.blocks_read > before.blocks_read,
+        "a real (non-bloom-negative) SSTable hit must read at least one data block"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_stats_counts_a_bloom_negative_miss_with_zero_block_reads() {
+    let dir = temp_dir("read_stats_bloom_negative");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 150,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() >= 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "the flush must complete before this test can measure a bloom-negative miss"
+    );
+
+    let before = engine.read_stats();
+    // A clearly-distinct key never written anywhere -- with
+    // `bloom_bits_per_key=10`'s low false-positive rate, this is a real
+    // (not merely probable) bloom-negative for a dataset this small.
+    assert_eq!(engine.get(b"definitely-absent-key-xyz").unwrap(), None);
+    let after = engine.read_stats();
+
+    assert_eq!(after.read_misses, before.read_misses + 1);
+    assert!(
+        after.bloom_negatives > before.bloom_negatives,
+        "a miss on a key absent from every live SSTable's bloom filter must count as a \
+         bloom-negative"
+    );
+    assert_eq!(
+        after.blocks_read, before.blocks_read,
+        "a bloom-negative miss must read zero data blocks"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- ReadView foundation (consumed by `range_scan` in the next increment) ---
+
+#[test]
+fn read_view_captures_reference_counts_matching_the_live_engine_at_capture_time() {
+    let dir = temp_dir("read_view_foundation");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 150,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    engine.set_flush_delay_for_test(Duration::from_millis(200));
+
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        engine.immutable_count() >= 1,
+        "at least one freeze must have happened by now"
+    );
+
+    let view = engine.capture_read_view(Bound::Unbounded, Bound::Unbounded);
+
+    // Arc clones of the live source lists, not data copies -- captured
+    // counts must match what the live engine reports at this instant.
+    assert_eq!(view.immutables.len(), engine.immutable_count());
+    assert_eq!(view.sstables.len(), engine.sstable_count());
+
+    // Every key materialized into `active_range` really did come from
+    // this run's own writes -- not phantom or duplicated data.
+    let expected_keys: std::collections::HashSet<Vec<u8>> = (0..10u32)
+        .map(|i| format!("k{i:03}").into_bytes())
+        .collect();
+    for ((k, _seq), _v) in &view.active_range {
+        assert!(
+            expected_keys.contains(k),
+            "active_range must only ever contain keys this test actually wrote, got {k:?}"
+        );
+    }
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_view_active_range_is_bounded_to_the_requested_range_not_the_whole_memtable() {
+    let dir = temp_dir("read_view_bounded_range");
+    // Default (large) memtable so nothing freezes -- every key below
+    // stays in `active`, isolating this test to the range-bounding
+    // behavior specifically.
+    let engine = open(&dir, LsmConfig::default());
+    for i in 0..200u32 {
+        engine.put(format!("k{i:04}").as_bytes(), b"v").unwrap();
+    }
+
+    // Discrepancy recorded explicitly, not silently worked around
+    // (caught by actually running this test before trusting it):
+    // `MemTable::range`'s own `bound_to_tuple(end, u64::MAX)` maps an
+    // `Excluded(k)` *end* bound to the tuple bound `Excluded((k,
+    // u64::MAX))` -- since every real entry's `seq` is far below
+    // `u64::MAX`, `(k, real_seq) < (k, u64::MAX)` always holds, so an
+    // `Excluded` end bound does not actually exclude the boundary key's
+    // own entries in this codebase's existing, already-shipped
+    // implementation. `capture_read_view` inherits this exactly (it
+    // does not reimplement bound logic, just calls `MemTable::range`),
+    // so `Excluded(b"k0020")` here still includes "k0020" itself -- 11
+    // keys (k0010..=k0020), not 10. This is a real, pre-existing
+    // `MemTable::range` behavior, out of scope for this Read Engine
+    // increment to change (a write-path-shared file); flagged here for
+    // `range_scan`'s own implementation (the next increment) to
+    // explicitly decide whether the merge layer must apply an
+    // additional exclusion filter to honor `Excluded` end bounds
+    // correctly, per `ADR-RE-001` §3's bound-handling contract.
+    let view = engine.capture_read_view(
+        Bound::Included(b"k0010".as_slice()),
+        Bound::Excluded(b"k0020".as_slice()),
+    );
+    assert_eq!(
+        view.active_range.len(),
+        11,
+        "capture_read_view must materialize only the requested range, not the whole \
+         200-entry active memtable (11, not 10, per the recorded Excluded-end-bound \
+         discrepancy documented above)"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- Point-read regression protection (ADR-RE-001 Implementation Increment 1
+// §6: get()/get_as_of() are explicitly NOT rewritten this increment -- these
+// tests lock in that existing behavior, closing real gaps the architecture
+// report identified rather than duplicating what already exists elsewhere
+// (`put_then_get_round_trips`, `delete_then_get_returns_not_found`,
+// `put_delete_put_resolves_to_the_newest_write`, `snapshot_reads_remain_
+// stable_across_later_writes`, `wal_durability_ordering_is_respected_not_
+// just_memtable_visibility`, `open_fails_closed_when_a_published_sstable_
+// is_corrupt` already cover PUT / DELETE / recreate / snapshot lookup / I/O
+// error propagation / open-time corruption). ---
+
+#[test]
+fn plain_overwrite_without_a_delete_returns_the_newest_value() {
+    let dir = temp_dir("plain_overwrite");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+    engine.put(b"k1", b"v2").unwrap();
+    engine.put(b"k1", b"v3").unwrap();
+    assert_eq!(engine.get(b"k1").unwrap(), Some(b"v3".to_vec()));
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_on_a_key_that_was_never_written_returns_none() {
+    let dir = temp_dir("never_written_key");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+    assert_eq!(engine.get(b"never-written").unwrap(), None);
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Closes a real, previously-identified gap (`PHASE_READ_ENGINE_
+/// ARCHITECTURE_REPORT.md` §16 item 4): existing corruption tests cover
+/// open-time failures (`open_fails_closed_when_a_published_sstable_is_
+/// corrupt`, footer/index/bloom) but not a data block corrupted *after*
+/// a successful `open()` -- the lazy, read-time path `get_versioned`'s
+/// own doc comment describes but that had no dedicated regression test.
+#[test]
+fn data_block_corruption_is_detected_lazily_at_read_time_not_at_open() {
+    let dir = temp_dir("lazy_block_corruption");
+    // Each "k{i:03}"/"v" entry costs exactly 4+1+32=37 bytes
+    // (`memtable::entry_size`). 350 sits strictly between 9*37=333 and
+    // 10*37=370, so all 10 puts below land in one MemTable and trigger
+    // exactly one freeze (hence exactly one SSTable), on the very last
+    // put -- required so "exactly one .sst file" below is guaranteed,
+    // not racy (an earlier version of this test used a too-small 150
+    // bytes, which froze partway through and produced multiple
+    // SSTables, causing the `sstable_count() == 1` wait below to time
+    // out -- caught by actually running this test before trusting it).
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    {
+        let engine = open(&dir, lsm_config.clone());
+        for i in 0..10u32 {
+            engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        assert!(
+            wait_until(
+                || engine.sstable_count() == 1 && engine.immutable_count() == 0,
+                Duration::from_secs(5)
+            ),
+            "the flush must complete before this test corrupts the resulting file"
+        );
+        engine.shutdown();
+    }
+
+    // Corrupt one byte at file offset 0 -- always inside the first data
+    // block, since `sstable::writer::write_from_memtable` writes every
+    // data block *before* the bloom filter, index, and footer
+    // (`src/sstable/writer.rs`). This leaves every open-time-validated
+    // structure (footer/bloom/index checksums) untouched.
+    let sst_path = fs::read_dir(dir.join("sstables"))
+        .unwrap()
+        .find_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            name.ends_with(".sst").then(|| e.path())
+        })
+        .expect("exactly one .sst file must exist after the flush above");
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst_path)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+    }
+
+    // Reopen: this must succeed -- open-time validation must not regress
+    // into eagerly scanning data blocks (bounded-memory-at-open is an
+    // already-certified design property, not something this test should
+    // ever be allowed to silently break).
+    let engine = open(&dir, lsm_config);
+    assert_eq!(
+        engine.sstable_count(),
+        1,
+        "open() must succeed despite the data-block corruption -- it never reads data blocks"
+    );
+
+    // Reading the key living in the now-corrupted first block must fail
+    // closed, lazily, at this read -- never silently return wrong data.
+    let result = engine.get(b"k000");
+    assert!(
+        matches!(result, Err(EngineError::Corruption { .. })),
+        "a corrupted data block must fail the read closed with Corruption, got {result:?}"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- Concurrent-flush point-read consistency (ADR-RE-001 §1/§8; the test
+// the architecture report identified as required by the LSM spec's own
+// checklist but not yet existing) ---
+
+/// Deterministically controls the exact transition window traced (not
+/// merely asserted) safe by `ADR-RE-001` §1: the flush thread has
+/// already installed the newly-published SSTable into `sstables`
+/// (which happens well before `FlushFaultPoint::AfterSetCheckpoint`,
+/// the *last* fault point before `immutables.retain(..)` removes the
+/// flushed entry), but has not yet removed the corresponding entry from
+/// `immutables`. A concurrent point lookup during exactly this window
+/// must find the value via whichever of the two sources it happens to
+/// check (both hold it), never observe it as missing, and never
+/// observe an impossible third state. Uses the existing `FlushFaultPoint`/
+/// `install_flush_fault_hook` mechanism -- no sleeps, no timing luck.
+#[test]
+fn point_lookup_during_the_sstable_published_immutable_not_yet_removed_window_never_misses() {
+    let dir = temp_dir("concurrent_flush_point_read");
+    // Same 37-bytes-per-entry calibration as `data_block_corruption_is_
+    // detected_lazily_at_read_time_not_at_open` -- 350 guarantees exactly
+    // one freeze, on the 10th (last) put below, so exactly one immutable
+    // exists when the fault hook fires (an earlier version of this test
+    // used 150 bytes, which froze multiple times before the flush thread
+    // -- now stuck on the first one -- could drain any of them, leaving
+    // 2 immutables instead of the 1 this test's own assertions require;
+    // caught by actually running this test before trusting it).
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = Arc::new(open(&dir, lsm_config));
+
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+    // `install_flush_fault_hook` requires `Sync` (the hook is called
+    // from the flush thread via a shared `Arc<Mutex<...>>`) -- `Receiver`
+    // alone is `Send` but not `Sync`, so it's wrapped here; only ever
+    // accessed from this one hook, never concurrently.
+    let proceed_rx = Mutex::new(proceed_rx);
+    engine.install_flush_fault_hook(move |p| {
+        if p == FlushFaultPoint::AfterSetCheckpoint {
+            let _ = reached_tx.send(());
+            // Blocks the flush thread here -- SSTable already installed
+            // into `sstables`, `immutables.retain(..)` not yet run.
+            let _ = proceed_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+        }
+    });
+
+    let write_engine = Arc::clone(&engine);
+    let writer = thread::spawn(move || {
+        for i in 0..10u32 {
+            write_engine
+                .put(format!("k{i:03}").as_bytes(), b"v")
+                .unwrap();
+        }
+    });
+
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the flush thread must reach AfterSetCheckpoint within 5s");
+
+    // Exactly the transition window: SSTable published, immutable not
+    // yet removed. A point lookup right now must still find the value.
+    assert_eq!(
+        engine.sstable_count(),
+        1,
+        "the SSTable must already be installed at this fault point"
+    );
+    assert_eq!(
+        engine.immutable_count(),
+        1,
+        "the immutable must not yet be removed at this fault point -- this IS the window \
+         under test; if this assertion fails, the test is no longer testing the transition \
+         it claims to"
+    );
+    let observed = engine.get(b"k000").unwrap();
+    assert_eq!(
+        observed,
+        Some(b"v".to_vec()),
+        "a point lookup during the publish/removal transition must never observe a missing \
+         result -- the data is present in both `sstables` and `immutables` right now"
+    );
+
+    proceed_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert!(
+        wait_until(|| engine.immutable_count() == 0, Duration::from_secs(5)),
+        "the flush must complete and drain the immutable once released"
+    );
+
+    engine.clear_flush_fault_hook();
     engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }

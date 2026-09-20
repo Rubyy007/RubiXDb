@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{EngineError, Result};
 use crate::sstable::bloom::BloomFilter;
@@ -53,7 +54,14 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 
 /// An open, fully-validated RUBIC SSTable. Immutable for its entire
 /// lifetime (`RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §3.4) — every field
-/// here is set once, at `open()`, and never mutated again.
+/// describing the table's own on-disk-derived data (`footer`/`bloom`/
+/// `index`) is set once, at `open()`, and never mutated again. The two
+/// `AtomicU64` counters below are the one deliberate exception:
+/// `ADR-RE-001` §12 read-path observability, incremented from `&self`
+/// methods via interior mutability, never affecting what a lookup
+/// returns — see `read_block`/`get_versioned` for the exact, single
+/// counting points (one well-defined point per counter, not
+/// instrumentation scattered through every call site).
 #[derive(Debug)]
 pub struct SsTable {
     id: u64,
@@ -62,6 +70,14 @@ pub struct SsTable {
     footer: Footer,
     bloom: BloomFilter,
     index: Vec<IndexEntry>,
+    /// Cumulative count of `read_block` calls that returned `Ok` for
+    /// this table — shared by `get_versioned` and `range_scan_raw`
+    /// (both call the same `read_block`), so this one counter already
+    /// covers both without separate instrumentation at each call site.
+    blocks_read: AtomicU64,
+    /// Cumulative count of `get_versioned` calls that returned early on
+    /// `!bloom.might_contain(key)` — the fast, zero-I/O miss path.
+    bloom_negative_count: AtomicU64,
 }
 
 impl SsTable {
@@ -136,6 +152,8 @@ impl SsTable {
             footer,
             bloom,
             index,
+            blocks_read: AtomicU64::new(0),
+            bloom_negative_count: AtomicU64::new(0),
         })
     }
 
@@ -158,6 +176,21 @@ impl SsTable {
         self.index.len()
     }
 
+    /// `ADR-RE-001` §12 read-path observability — cumulative count of
+    /// successful `read_block` calls against this table (shared by
+    /// `get_versioned` and `range_scan_raw`). Purely observational,
+    /// never consulted by any correctness decision.
+    pub fn blocks_read(&self) -> u64 {
+        self.blocks_read.load(Ordering::Relaxed)
+    }
+
+    /// `ADR-RE-001` §12 read-path observability — cumulative count of
+    /// `get_versioned` calls that short-circuited on a bloom-filter
+    /// negative (zero block reads). Purely observational.
+    pub fn bloom_negative_count(&self) -> u64 {
+        self.bloom_negative_count.load(Ordering::Relaxed)
+    }
+
     fn read_block(&self, entry: &IndexEntry) -> Result<Vec<DecodedRecord>> {
         let len: usize = entry
             .block_length
@@ -165,7 +198,9 @@ impl SsTable {
             .map_err(|_| corrupt("index: block_length implausibly large"))?;
         let mut buf = vec![0u8; len];
         read_exact_at(&self.file, &mut buf, entry.block_offset)?;
-        format::decode_block(&buf)
+        let decoded = format::decode_block(&buf)?;
+        self.blocks_read.fetch_add(1, Ordering::Relaxed);
+        Ok(decoded)
     }
 
     /// LSM Engine Spec §2.8's `get_versioned` algorithm, extended to
@@ -180,6 +215,7 @@ impl SsTable {
     /// same last key.
     pub fn get_versioned(&self, key: &[u8], as_of_seq: u64) -> Result<Option<(u64, RecordValue)>> {
         if !self.bloom.might_contain(key) {
+            self.bloom_negative_count.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
         if self.index.is_empty() {
