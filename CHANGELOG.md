@@ -6,6 +6,34 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Read Engine: contains() + performance baseline, Implementation Increment 3 (2026-09-20)
+
+`LsmEngine::contains(key, as_of_seq) -> Result<bool>` (`ADR-RE-001`
+§2/§10), backed by a new `SsTable::contains_versioned` that reuses
+`get_versioned`'s bloom+index+block walk without constructing an owned
+value. 11 new tests (304/304), including two genuine (not simulated)
+I/O-failure regression tests across `contains`/`get_as_of`/
+`range_scan`, and the differential/property tests extended in place to
+a three-way `reference model == get_as_of == contains` invariant.
+`examples/read_engine_bench.rs`: a new, real (unmocked) performance
+harness; full results in the new `PHASE_READ_ENGINE_PERFORMANCE.md`.
+Headline, honestly-reported findings: **`contains()` shows no
+measurable performance difference from `get_as_of(..).is_some()`** at
+any value size or SSTable count tested (traced to why: the block
+decode this method hoped to skip already happens unconditionally);
+**point-lookup read amplification scales roughly linearly with live
+SSTable count** (no Compaction yet to bound it), dominated by cheap
+bloom-negative checks rather than disk I/O; `range_scan`'s
+bounded-memory design confirmed with a real number (168KB peak RSS
+growth over a 25MiB scan); and a rare, fully-traced, pre-existing
+cross-thread `snapshot_seq()` characteristic (not a `contains()` bug,
+not a protected-code change made or needed) flagged for future
+investigation rather than silently resolved. No cache/mmap/prefetch/
+parallel-read/secondary-index optimization added -- per the phase
+brief, this increment measures only. Full detail: `PROGRESS.md`'s
+2026-09-20 "Increment 3" entry, `PHASE_READ_ENGINE_PERFORMANCE.md`.
+**Not** Read Engine production-ready.
+
 ### Read Engine: production-grade range_scan, Implementation Increment 2 (2026-09-20)
 
 `LsmEngine::range_scan(start, end, as_of_seq)`/`range(start, end)`: a

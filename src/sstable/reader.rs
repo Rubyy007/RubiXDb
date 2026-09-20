@@ -261,6 +261,58 @@ impl SsTable {
         Ok(best)
     }
 
+    /// `ADR-RE-001` §10/§2's `contains` primitive: identical bloom +
+    /// sparse-index + candidate-block walk as `get_versioned` above, but
+    /// the per-record scan never constructs an owned `RecordValue` for
+    /// the caller — it inspects `r.op` and discards `r.value` in place,
+    /// so no value bytes are moved past this function's stack frame.
+    /// Returns `Ok(None)` when this table has no visible record for
+    /// `key` at `as_of_seq` at all (bloom-negative, index-absent, or no
+    /// candidate block held a matching record); `Ok(Some(is_put))`
+    /// otherwise, distinguishing a live value from a tombstone so the
+    /// caller (`LsmEngine::contains`) can apply the merge-layer
+    /// recency rule the exact same way `get_as_of` does.
+    ///
+    /// Note (measured, not assumed — see `PHASE_READ_ENGINE_PERFORMANCE.md`
+    /// §"contains vs get_as_of"): `read_block`/`format::decode_block`
+    /// eagerly decodes every record's key *and* value bytes for a whole
+    /// block regardless of which method is called, so this cannot avoid
+    /// that allocation — only the final per-record `RecordValue::Put`
+    /// construction on the winning record, which in `get_versioned` is
+    /// itself already just a move, not a clone. The benchmark reports
+    /// whatever difference this actually produces rather than assuming
+    /// one.
+    pub fn contains_versioned(&self, key: &[u8], as_of_seq: u64) -> Result<Option<bool>> {
+        if !self.bloom.might_contain(key) {
+            self.bloom_negative_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        if self.index.is_empty() {
+            return Ok(None);
+        }
+        let mut idx = self.index.partition_point(|e| e.last_key.as_slice() < key);
+        if idx >= self.index.len() {
+            return Ok(None);
+        }
+
+        let mut candidates = vec![idx];
+        while self.index[idx].last_key.as_slice() == key && idx + 1 < self.index.len() {
+            idx += 1;
+            candidates.push(idx);
+        }
+
+        let mut best: Option<(u64, bool)> = None;
+        for &ci in &candidates {
+            let records = self.read_block(&self.index[ci])?;
+            for r in &records {
+                if r.key == key && r.seq <= as_of_seq && best.is_none_or(|(bs, _)| r.seq > bs) {
+                    best = Some((r.seq, r.op == OP_PUT));
+                }
+            }
+        }
+        Ok(best.map(|(_, is_put)| is_put))
+    }
+
     /// Ordered iteration over `[start, end)`, bounded memory (one block
     /// materialized at a time, never the whole table — operating brief
     /// §20/§23). Stops safely and yields exactly one `Err` on the first

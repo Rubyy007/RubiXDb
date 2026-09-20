@@ -2774,6 +2774,12 @@ fn differential_reference_model_matches_across_active_immutable_and_sstable() {
                 actual, expected,
                 "get_as_of(k{idx:03}, {s}) mismatch: engine={actual:?} model={expected:?}"
             );
+            let contained = engine.contains(&key_for(idx), s).unwrap();
+            assert_eq!(
+                contained,
+                expected.is_some(),
+                "contains(k{idx:03}, {s}) mismatch: contains={contained} get_as_of={actual:?}"
+            );
         }
     }
     for idx in 0u8..10 {
@@ -2805,6 +2811,449 @@ fn differential_reference_model_matches_across_active_immutable_and_sstable() {
     assert_eq!(
         actual_mid, expected_mid,
         "historical range_scan at seq {mid_seq} mismatch"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- `contains` (Read Engine Increment 3, `ADR-RE-001` §2/§10) ---
+
+#[test]
+fn contains_matches_get_as_of_is_some_for_a_hit_and_a_miss() {
+    let dir = temp_dir("contains_hit_and_miss");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+
+    assert!(engine.contains(b"k1", u64::MAX).unwrap());
+    assert_eq!(
+        engine.contains(b"k1", u64::MAX).unwrap(),
+        engine.get_as_of(b"k1", u64::MAX).unwrap().is_some()
+    );
+
+    assert!(!engine.contains(b"never-written", u64::MAX).unwrap());
+    assert_eq!(
+        engine.contains(b"never-written", u64::MAX).unwrap(),
+        engine
+            .get_as_of(b"never-written", u64::MAX)
+            .unwrap()
+            .is_some()
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contains_returns_false_for_a_visible_tombstone() {
+    let dir = temp_dir("contains_tombstone");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+    let del_seq = engine.delete(b"k1").unwrap();
+
+    assert!(!engine.contains(b"k1", del_seq).unwrap());
+    assert_eq!(engine.get_as_of(b"k1", del_seq).unwrap(), None);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contains_true_after_delete_then_recreate() {
+    let dir = temp_dir("contains_delete_recreate");
+    let engine = open(&dir, LsmConfig::default());
+    engine.put(b"k1", b"v1").unwrap();
+    let del_seq = engine.delete(b"k1").unwrap();
+    let recreate_seq = engine.put(b"k1", b"v2").unwrap();
+
+    assert!(!engine.contains(b"k1", del_seq).unwrap());
+    assert!(engine.contains(b"k1", recreate_seq).unwrap());
+    assert_eq!(
+        engine.contains(b"k1", recreate_seq).unwrap(),
+        engine.get_as_of(b"k1", recreate_seq).unwrap().is_some()
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contains_respects_as_of_seq_across_multiple_versions() {
+    let dir = temp_dir("contains_as_of_versions");
+    let engine = open(&dir, LsmConfig::default());
+    let s1 = engine.put(b"k1", b"v1").unwrap();
+    let s2 = engine.put(b"k1", b"v2").unwrap();
+    let s3 = engine.delete(b"k1").unwrap();
+    let s4 = engine.put(b"k1", b"v3").unwrap();
+
+    for &s in &[s1, s2, s3, s4, s1 - 1] {
+        assert_eq!(
+            engine.contains(b"k1", s).unwrap(),
+            engine.get_as_of(b"k1", s).unwrap().is_some(),
+            "contains/get_as_of disagree at seq {s}"
+        );
+    }
+    assert!(!engine.contains(b"k1", s1 - 1).unwrap());
+    assert!(engine.contains(b"k1", s1).unwrap());
+    assert!(!engine.contains(b"k1", s3).unwrap());
+    assert!(engine.contains(b"k1", s4).unwrap());
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contains_agrees_with_get_as_of_across_active_immutable_and_sstable_overlap() {
+    let dir = temp_dir("contains_active_immutable_sstable");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    engine.set_flush_delay_for_test(Duration::from_millis(300));
+
+    for i in 0..10u32 {
+        engine
+            .put(
+                format!("k{i:03}").as_bytes(),
+                format!("v{i:03}-gen1").as_bytes(),
+            )
+            .unwrap();
+    }
+    for i in 10..20u32 {
+        engine
+            .put(
+                format!("k{i:03}").as_bytes(),
+                format!("v{i:03}-gen1").as_bytes(),
+            )
+            .unwrap();
+    }
+    for i in 20..24u32 {
+        engine
+            .put(
+                format!("k{i:03}").as_bytes(),
+                format!("v{i:03}-gen1").as_bytes(),
+            )
+            .unwrap();
+    }
+    assert!(
+        engine.immutable_count() >= 1,
+        "at least one freeze must have happened while flush is delayed"
+    );
+
+    for i in 0..24u32 {
+        let key = format!("k{i:03}").into_bytes();
+        assert!(
+            engine.contains(&key, u64::MAX).unwrap(),
+            "k{i:03} must be found regardless of which source (active/immutable/sstable) holds it"
+        );
+        assert_eq!(
+            engine.contains(&key, u64::MAX).unwrap(),
+            engine.get_as_of(&key, u64::MAX).unwrap().is_some()
+        );
+    }
+    assert!(!engine.contains(b"never-written", u64::MAX).unwrap());
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contains_consults_multiple_sstables_and_agrees_with_get_as_of() {
+    let dir = temp_dir("contains_multi_sstable");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 16,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..80u32 {
+        engine
+            .put(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+            .unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() >= 5 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "several flushes must complete so this test genuinely spans multiple SSTables"
+    );
+
+    let before = engine.read_stats();
+    for i in 0..80u32 {
+        let key = format!("k{i:04}").into_bytes();
+        assert!(engine.contains(&key, u64::MAX).unwrap());
+    }
+    let after = engine.read_stats();
+    assert!(
+        after.sstables_consulted > before.sstables_consulted,
+        "contains() must wire up the same sstables_consulted counter get_as_of() uses"
+    );
+    assert!(!engine
+        .contains(b"definitely-absent-key-xyz", u64::MAX)
+        .unwrap());
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_stats_counts_contains_the_same_way_as_get_as_of_on_an_sstable_hit() {
+    let dir = temp_dir("contains_read_stats_hit");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 150,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() >= 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "the flush must complete before this test can measure an SSTable hit"
+    );
+
+    let before = engine.read_stats();
+    assert!(engine.contains(b"k000", u64::MAX).unwrap());
+    let after = engine.read_stats();
+
+    assert_eq!(after.read_hits, before.read_hits + 1);
+    assert!(
+        after.sstables_consulted > before.sstables_consulted,
+        "a contains() hit that required checking the SSTable layer must count at least one \
+         consultation"
+    );
+    assert!(
+        after.blocks_read > before.blocks_read,
+        "a real (non-bloom-negative) contains() SSTable hit must read at least one data block \
+         -- contains_versioned() shares read_block/blocks_read with get_versioned()"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_stats_counts_a_contains_bloom_negative_miss_with_zero_block_reads() {
+    let dir = temp_dir("contains_read_stats_bloom_negative");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 150,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() >= 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "the flush must complete before this test can measure a bloom-negative miss"
+    );
+
+    let before = engine.read_stats();
+    assert!(!engine
+        .contains(b"definitely-absent-key-xyz", u64::MAX)
+        .unwrap());
+    let after = engine.read_stats();
+
+    assert_eq!(after.read_misses, before.read_misses + 1);
+    assert!(
+        after.bloom_negatives > before.bloom_negatives,
+        "a contains() miss on a key absent from every live SSTable's bloom filter must count \
+         as a bloom-negative"
+    );
+    assert_eq!(
+        after.blocks_read, before.blocks_read,
+        "a bloom-negative contains() miss must read zero data blocks"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contains_across_a_corrupted_data_block_fails_closed_with_corruption() {
+    let dir = temp_dir("contains_corrupt_block");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    {
+        let engine = open(&dir, lsm_config.clone());
+        for i in 0..10u32 {
+            engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        assert!(
+            wait_until(
+                || engine.sstable_count() == 1 && engine.immutable_count() == 0,
+                Duration::from_secs(5)
+            ),
+            "the flush must complete before this test corrupts the resulting file"
+        );
+        engine.shutdown();
+    }
+
+    // Same single-byte corruption at offset 0 as the `get`-path
+    // equivalent (`data_block_corruption_is_detected_lazily_at_read_
+    // time_not_at_open`) -- always inside the first data block.
+    let sst_path = fs::read_dir(dir.join("sstables"))
+        .unwrap()
+        .find_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            name.ends_with(".sst").then(|| e.path())
+        })
+        .expect("exactly one .sst file must exist after the flush above");
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst_path)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+    }
+
+    let engine = open(&dir, lsm_config);
+    let result = engine.contains(b"k000", u64::MAX);
+    assert!(
+        matches!(result, Err(EngineError::Corruption { .. })),
+        "contains() must fail closed with Corruption on a corrupted data block, got {result:?}"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contains_when_the_underlying_file_shrinks_mid_lifetime_fails_closed_with_io_error() {
+    let dir = temp_dir("contains_truncated_file");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() == 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "the flush must complete before this test can truncate the resulting file"
+    );
+
+    // A restart-then-corrupt (as `contains_across_a_corrupted_data_
+    // block_fails_closed_with_corruption` above does) always fails at
+    // `SsTable::open`'s own footer/index bounds checks with
+    // `Corruption`, never reaching a real `io::Error` -- open()
+    // re-validates the file against its *current* length. To exercise
+    // a genuine OS I/O failure at *read* time instead, this shrinks the
+    // file out from under the already-open, already-validated live
+    // `SsTable` (its footer/index stay cached in memory, describing
+    // offsets that are no longer within the file), so the positional
+    // read inside `read_block` genuinely hits end-of-file.
+    let sst_path = fs::read_dir(dir.join("sstables"))
+        .unwrap()
+        .find_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            name.ends_with(".sst").then(|| e.path())
+        })
+        .expect("exactly one .sst file must exist after the flush above");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&sst_path)
+        .unwrap()
+        .set_len(1)
+        .unwrap();
+
+    let result = engine.contains(b"k000", u64::MAX);
+    assert!(
+        matches!(result, Err(EngineError::Io(_))),
+        "a data block genuinely beyond the file's current end must fail closed with a real \
+         Io error, not Corruption or a silent wrong answer, got {result:?}"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// §17's corruption matrix, `get_as_of`/`range_scan` legs: the same
+/// live-file-shrink technique as `contains_when_the_underlying_file_
+/// shrinks_mid_lifetime_fails_closed_with_io_error` above, run against
+/// `get_as_of` and `range_scan` too -- both share `SsTable::read_block`
+/// with `contains_versioned`/`get_versioned`, so this closes out the
+/// matrix's remaining cells with exact-variant assertions rather than
+/// leaving them to be inferred from `contains()`'s own coverage alone.
+#[test]
+fn get_as_of_and_range_scan_when_the_underlying_file_shrinks_mid_lifetime_fail_closed_with_io_error(
+) {
+    let dir = temp_dir("get_range_truncated_file");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() == 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "the flush must complete before this test can truncate the resulting file"
+    );
+
+    let sst_path = fs::read_dir(dir.join("sstables"))
+        .unwrap()
+        .find_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            name.ends_with(".sst").then(|| e.path())
+        })
+        .expect("exactly one .sst file must exist after the flush above");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&sst_path)
+        .unwrap()
+        .set_len(1)
+        .unwrap();
+
+    let get_result = engine.get_as_of(b"k000", u64::MAX);
+    assert!(
+        matches!(get_result, Err(EngineError::Io(_))),
+        "get_as_of() on a data block genuinely beyond the file's current end must fail closed \
+         with a real Io error, got {get_result:?}"
+    );
+
+    let mut iter = engine.range(Bound::Unbounded, Bound::Unbounded);
+    let first = iter.next();
+    assert!(
+        matches!(first, Some(Err(EngineError::Io(_)))),
+        "range_scan() on a data block genuinely beyond the file's current end must yield \
+         Err(Io), got {first:?}"
+    );
+    assert!(
+        iter.next().is_none(),
+        "the iterator must end after yielding the Io error, same as the Corruption case"
     );
 
     engine.shutdown();
@@ -2930,6 +3379,15 @@ mod range_scan_property_tests {
                         actual.clone(), expected.clone(),
                         "get_as_of mismatch for key {:?} at seq {}: engine={:?} model={:?}",
                         key, s, actual, expected
+                    );
+                    // `ADR-RE-001`/Increment 3 §19: three-way invariant --
+                    // reference model, `get_as_of`, and `contains` must
+                    // all agree at every seq boundary, for every key.
+                    let contained = engine.contains(&key, s).unwrap();
+                    prop_assert_eq!(
+                        contained, expected.is_some(),
+                        "contains/get_as_of disagree for key {:?} at seq {}: contains={} get_as_of={:?}",
+                        key, s, contained, expected
                     );
                 }
             }

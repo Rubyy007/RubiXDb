@@ -1298,6 +1298,54 @@ impl LsmEngine {
         Ok(None)
     }
 
+    /// `ADR-RE-001` §2/§10: `Contains(key, snapshot_sequence)` — visible
+    /// existence only, `true` iff some source's first (recency-ordered)
+    /// match for `key` at `as_of_seq` is a live `Put`, `false` for a
+    /// missing key *or* a visible tombstone. Deliberately mirrors
+    /// `get_as_of`'s exact source order and first-hit-wins rule line for
+    /// line (active → immutables newest-first → SSTables newest-first)
+    /// rather than sharing a helper with it, so the equivalence
+    /// `contains(k, s) == get_as_of(k, s)?.is_some()` holds by
+    /// construction and is exercised directly as a test, not merely
+    /// implemented as a wrapper — the SSTable step calls
+    /// `contains_versioned`, never `get_versioned`, so no value bytes
+    /// are copied on this path (see that method's own doc comment for
+    /// what that saving actually amounts to, measured in
+    /// `PHASE_READ_ENGINE_PERFORMANCE.md`).
+    pub fn contains(&self, key: &[u8], as_of_seq: u64) -> Result<bool> {
+        self.read_stats.requests.fetch_add(1, Ordering::Relaxed);
+        {
+            let active = self.lock_active_read();
+            if let Some((_, value)) = active.get_as_of(key, as_of_seq) {
+                self.read_stats.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(matches!(value, MemtableValue::Put(_)));
+            }
+        }
+        {
+            let immutables = self.lock_immutables_read();
+            for imm in immutables.iter() {
+                if let Some((_, value)) = imm.get_as_of(key, as_of_seq) {
+                    self.read_stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(matches!(value, MemtableValue::Put(_)));
+                }
+            }
+        }
+        {
+            let sstables = self.lock_sstables_read();
+            for table in sstables.iter() {
+                self.read_stats
+                    .sstables_consulted
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(is_put) = table.contains_versioned(key, as_of_seq)? {
+                    self.read_stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(is_put);
+                }
+            }
+        }
+        self.read_stats.misses.fetch_add(1, Ordering::Relaxed);
+        Ok(false)
+    }
+
     /// A snapshot boundary consistent with `PHASE4A_ARCHITECTURE.md` §5's
     /// ordering rule: only durable data is ever snapshot-visible. Callers
     /// wanting "as of right now, including whatever I just wrote" should

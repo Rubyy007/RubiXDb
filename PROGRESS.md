@@ -1971,3 +1971,137 @@ benchmark suite, the full corruption matrix, `contains()`, the
 long-duration read soak, and integrated write+read testing -- not
 started here, per the instruction to stop and report after this
 increment.
+
+## 2026-09-20 (continued: Read Engine Increment 3 -- performance + observability + contains())
+
+`LsmEngine::contains(key, as_of_seq) -> Result<bool>` (`ADR-RE-001`
+§2/§10): mirrors `get_as_of`'s exact active → immutables → SSTables
+recency-ordered traversal line for line (not implemented as a wrapper
+around it, so the invariant `contains(k,s) == get_as_of(k,s)?.is_some()`
+is exercised as a real test, not assumed from shared code), backed by
+a new `SsTable::contains_versioned` that reuses the identical bloom +
+sparse-index + candidate-block walk as `get_versioned` without ever
+constructing an owned `RecordValue`. 11 new tests (304/304 total):
+hit/miss, visible tombstone, delete-then-recreate, `as_of_seq`
+filtering across multiple versions, active+immutable+SSTable overlap,
+multi-SSTable consultation, two `ReadStats` wiring tests, and -- the
+matrix's real gap-closer -- two genuine (not simulated) I/O-failure
+tests for `contains`/`get_as_of`/`range_scan`, built by shrinking a
+live SSTable's file out from under its already-open, already-validated
+`SsTable` so `read_block` hits a real `io::ErrorKind::UnexpectedEof`,
+asserted as `Err(EngineError::Io(_))` specifically (not `is_err()`).
+The differential reference-model test and the 64-case property test
+were both extended in place to check the same three-way invariant
+(reference model == `get_as_of` == `contains`) at every seq boundary,
+not just added as separate tests.
+
+**`examples/read_engine_bench.rs`** (new, ~800 lines): a real,
+unmocked measurement harness -- every fixture is a real `LsmEngine`
+populated through the real write path (real WAL group-commit, real
+background flush thread, real `.sst` files), never a mock. Ten
+sections (`point_lookup`, `tombstone`, `contains_vs_get`, `read_amp`,
+`range`, `memory`, `fd`, `concurrency`, `sanity`,
+`readstats_overhead`), each independently runnable. Full run, every
+number transcribed (not summarized from a best/median-only view) into
+the new `PHASE_READ_ENGINE_PERFORMANCE.md`. Headline findings:
+
+- **`contains()` vs `get_as_of(..).is_some()`: no measurable
+  performance difference**, at any value size tested (32B/1KB/16KB) or
+  SSTable count (10/1000) -- the honest verdict the brief explicitly
+  demanded ("do not keep `contains()` just because the ADR predicted a
+  benefit"), traced to why: `read_block`/`decode_block` already
+  eagerly decodes every record's value bytes for a whole block
+  regardless of which method reads it, so the value-copy `contains()`
+  was meant to avoid was already free (a `Vec` move, not a clone) in
+  `get_versioned`'s own existing code.
+- **Read amplification scales roughly linearly with live SSTable
+  count** for point lookups (a hit at ~1333 live SSTables consults
+  ~1167 of them on average before finding a match, since there is no
+  Compaction yet to bound the table count) -- but almost entirely via
+  cheap bloom-negatives, not disk I/O (`avg_blocks_read` stays at
+  ~27 even when ~1167 tables were consulted). The clear, measured
+  bottleneck at scale is CPU-bound bloom-filter checking, not I/O --
+  exactly what a future Compaction phase would fix. Not optimized
+  here, per the brief's explicit instruction; only identified.
+- **`range_scan`'s bounded-memory design verified with a real number,
+  not just an architectural claim**: a full scan over a 25.0 MiB,
+  200-SSTable, 16KB-value dataset grew peak RSS by only 168KB.
+- **A real, rare, and fully explained cross-thread finding**: a reader
+  thread sampling `snapshot_seq()` from *another* thread's writes and
+  then reading at that pinned seq can, extremely rarely (~1 per 1.4M
+  checks), transiently disagree with a repeat read at the same seq.
+  Reproduced with plain `get_as_of` alone (no `contains()` involved),
+  and traced directly in the source -- `freeze_locked` and the flush
+  thread's SSTable-publish-before-immutable-removal ordering are both
+  race-free by inspection -- leaving `snapshot_seq()`'s own documented
+  same-thread-safe caveat (`durable_through` reflects WAL durability,
+  not "every other thread's `apply_after_durable` has completed") as
+  the explanation. Verified as same-thread-safe (writer thread checking
+  its own just-completed write: zero disagreements across 664 writes
+  in the same run). Not a `contains()`/Increment-3 bug, not a protected
+  Write Engine change made or needed here -- flagged for visibility,
+  not silently resolved.
+- File-descriptor/thread counts confirmed stable across 2000 point
+  lookups + 20 full range scans at ~1333 live SSTables (handle delta:
+  0) -- no per-read handle leak.
+- `ReadStats` instrumentation overhead bounded at ~4.5ns/counter
+  increment (a best-effort proxy measurement; no A/B toggle exists or
+  was added, since one would touch the production read path beyond
+  this increment's approved scope) -- negligible against the
+  microsecond-scale latencies measured everywhere else in this run.
+
+**No optimization was added this increment** -- no cache, mmap,
+prefetch, parallel reads, secondary index, or read worker pool. Both
+headline findings above (read-amp scaling, no `contains()` win) are
+exactly the "measure first" evidence the brief required before any of
+those could even be considered, and per its explicit instruction,
+acting on them needs a new ADR, not a unilateral change here.
+
+**Corruption matrix** (`PHASE_READ_ENGINE_PERFORMANCE.md`'s own table):
+every read path (`get`/`get_as_of`, `range`/`range_scan`, `contains`)
+now has both a checksum/structural-corruption test and a genuine
+(not simulated) I/O-failure test, each asserting the exact
+`EngineError` variant. Plus the pre-existing open-time/manifest/
+missing-file/orphan-file corruption tests, unchanged.
+
+**Full regression gate, run and verified clean on the actual code
+committed**: `cargo fmt --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo test --lib` (304/304 -- 293 at
+the end of Increment 2, plus 11 new tests this increment), `cargo test
+--release --lib` (304/304), `cargo check --all-targets --all-features`,
+`wal_tests` (12/12), `crash_consistency --features test-util` (2/2),
+`pathological_recovery_matrix` debug+release (9/9 each), and the
+storage-pressure state-machine test re-verified as part of the full
+304-test `--lib` run. No existing Write Engine or Read Engine test's
+behavior changed.
+
+**Diff scope**: `src/lsm/mod.rs` (+48, `contains()`),
+`src/sstable/reader.rs` (+52, `contains_versioned`), `src/lsm/tests.rs`
+(+458, new/extended tests), `examples/read_engine_bench.rs` (new),
+`PHASE_READ_ENGINE_PERFORMANCE.md` (new). Every change to existing
+files is a pure addition (no deletions, no edits to existing lines
+outside the two files' own already-reviewed diffs). No changes to
+`src/wal/`, `src/manifest/`, `src/execution/`, or `src/error.rs`.
+
+**Not implemented this increment, deliberately**: any caching/mmap/
+prefetch/parallel-read/secondary-index optimization, `batch_get`, the
+long-duration read soak, integrated write+read endurance testing
+(the 5-second bounded sanity workload is not a soak), and --
+explicitly -- **Read Engine production-readiness certification**.
+`PHASE_READ_ENGINE_CERTIFICATION.md` does not exist yet.
+
+**Status: READ ENGINE NOT READY** (not a regression -- `contains()`
+and a real performance baseline now exist and are well-tested, which
+is real, meaningful progress, not a certification).
+
+**Open Tier 3 question currently blocking further work:** none, except
+the cross-thread `snapshot_seq()` finding above, which is flagged for a
+future, narrowly-scoped Write Engine investigation if cross-thread
+linearizable snapshot reads become a requirement -- not blocking this
+increment's own completion, and not something this increment is
+authorized to change. The next increment's own scope (per `ADR-RE-001`
+§24's remaining certification gates) is the long-duration read soak,
+integrated write+read endurance testing, any justified optimization
+(only if backed by a new ADR), and the final certification matrix --
+not started here, per the instruction to stop and report after this
+increment.
