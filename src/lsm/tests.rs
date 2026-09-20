@@ -265,6 +265,9 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         flush_delay_ms: Arc::new(AtomicU64::new(0)),
         capacity_pressure_events: AtomicU64::new(0),
         flush_fault_hook: Arc::new(Mutex::new(None)),
+        storage_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        storage_pressure_events: Arc::new(AtomicU64::new(0)),
+        flush_io_fault_hook: Arc::new(Mutex::new(None)),
         config: LsmConfig::default(),
     };
 
@@ -1043,5 +1046,252 @@ fn manifest_corruption_fails_closed_on_open() {
         matches!(result, Err(EngineError::Corruption { .. })),
         "a corrupted (non-tail) MANIFEST must fail open() closed"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ADR-WE-SP-001` §16: deterministic ENOSPC / storage-pressure
+/// capacity-exhaustion test. Injects a real, correctly-classified
+/// ENOSPC-shaped `io::Error` at the exact point the 2026-09-19 realistic
+/// soak actually failed (the flush thread's SSTable-write step) via
+/// `install_flush_io_fault_hook` — deterministic and safe, never fills a
+/// real disk (`PHASE5_ENOSPC_FAILURE_ANALYSIS.md` is the incident this
+/// test exists to close the gap on).
+///
+/// Walks the full state sequence the ADR specifies: healthy -> flush
+/// fails -> bounded fast retries -> `STORAGE_PRESSURE` -> immutable
+/// backlog reaches its bound -> `STORAGE_FULL` -> new writes rejected
+/// deterministically (fail-fast, before any WAL append) -> storage
+/// "restored" (fault cleared) -> flush resumes -> checkpoint progresses
+/// -> back to `Healthy` -> normal writes accepted again.
+#[test]
+fn storage_pressure_state_machine_recovers_after_injected_enospc() {
+    let dir = temp_dir("storage_pressure_enospc");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 120,
+        max_immutable_memtables: 2,
+        max_flush_retries: 1,
+        storage_pressure_retry_interval: Duration::from_millis(50),
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+
+    assert_eq!(
+        engine.storage_state(),
+        StorageState::Healthy,
+        "a freshly opened engine must start Healthy"
+    );
+
+    // Unconditional synthetic ENOSPC for every flush attempt, until
+    // cleared below -- same fault-injection pattern already established
+    // by `install_flush_fault_hook`/`FlushFaultPoint` tests in this file,
+    // extended (`FlushIoFaultHook`) to actually replace the I/O outcome
+    // rather than just observe it.
+    engine.install_flush_io_fault_hook(|| {
+        Some(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "injected ENOSPC (test)",
+        ))
+    });
+
+    // Freeze #1: triggers the flush thread, which immediately starts
+    // failing on the injected fault. `max_flush_retries: 1` means the
+    // fast-retry budget (one 50ms attempt) is exhausted almost
+    // instantly, so STORAGE_PRESSURE should appear quickly. Each entry
+    // costs `key.len() + value.len() + ENTRY_OVERHEAD` bytes
+    // (`memtable::entry_size`) -- a handful of small puts is enough to
+    // exceed the tiny 120-byte memtable and trigger exactly one freeze.
+    for i in 0..4u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.storage_state() == StorageState::StoragePressure,
+            Duration::from_secs(5)
+        ),
+        "storage state must reach StoragePressure after the fast-retry budget is exhausted on a \
+         confirmed ENOSPC failure"
+    );
+    assert!(
+        engine.storage_pressure_events() > 0,
+        "storage_pressure_events must count the ENOSPC-classified failures"
+    );
+    // Data already accepted is retained, not discarded, while stuck in
+    // StoragePressure (ADR-WE-SP-001 §9/§11).
+    assert_eq!(engine.immutable_count(), 1);
+    assert_eq!(
+        engine.checkpoint_seq(),
+        0,
+        "checkpoint must never advance while every flush attempt is failing"
+    );
+    assert_eq!(
+        engine.sstable_count(),
+        0,
+        "no SSTable can have been published while every flush attempt is failing"
+    );
+
+    // Freeze #2: fills the immutable backlog to its configured bound
+    // (max_immutable_memtables=2) while still stuck in StoragePressure --
+    // exactly the ADR §6.3 "safe resource boundary reached" trigger for
+    // StorageFull.
+    let mut i = 100u32;
+    let freeze2 = wait_until(
+        || {
+            if engine.storage_state() == StorageState::StorageFull {
+                return true;
+            }
+            let key = format!("k{i:03}");
+            i += 1;
+            // A `CapacityExceeded` here is the pre-existing, accepted
+            // freeze-backpressure contract firing once the backlog is
+            // already full at the moment of this particular call --
+            // still forward progress toward StorageFull, not a failure
+            // of this test.
+            let _ = engine.put(key.as_bytes(), b"v");
+            engine.storage_state() == StorageState::StorageFull
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        freeze2,
+        "storage state must reach StorageFull once the immutable backlog fills while stuck in \
+         StoragePressure"
+    );
+
+    // StorageFull: new writes must fail fast with StorageExhausted,
+    // *before* any WAL append (ADR-WE-SP-001 §9) -- verified by checking
+    // the pool's own `submitted` counter does not move for this call.
+    let submitted_before = engine.pool_stats().submitted;
+    let rejected = engine.put(b"should-be-rejected", b"v");
+    assert!(
+        matches!(rejected, Err(EngineError::StorageExhausted { .. })),
+        "a write while StorageFull must fail fast with StorageExhausted, got {rejected:?}"
+    );
+    assert_eq!(
+        engine.pool_stats().submitted,
+        submitted_before,
+        "a StorageFull rejection must never reach pool.submit() / the WAL at all"
+    );
+
+    // "Storage restored": clear the fault. The already-stuck flush
+    // thread's own retry loop (still running at storage_pressure_retry_
+    // interval) must pick this up on its own -- no restart needed.
+    engine.clear_flush_io_fault_hook();
+    assert!(
+        wait_until(
+            || engine.storage_state() == StorageState::Healthy,
+            Duration::from_secs(5)
+        ),
+        "storage state must return to Healthy once a flush actually succeeds after the fault is \
+         cleared"
+    );
+    assert!(
+        wait_until(
+            || engine.checkpoint_seq() > 0 && engine.sstable_count() > 0,
+            Duration::from_secs(5)
+        ),
+        "checkpoint must progress and a real SSTable must be published once flush resumes"
+    );
+
+    // Normal operation resumes.
+    engine
+        .put(b"k-after-recovery", b"v-after-recovery")
+        .unwrap();
+    assert_eq!(
+        engine.get(b"k-after-recovery").unwrap(),
+        Some(b"v-after-recovery".to_vec())
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Memory-investigation regression test (2026-09-20): the 2026-09-19
+/// 23:47 realistic full-pipeline soak showed RSS growing from 25 MB to
+/// 609 MB over 4 hours as 3,294 SSTables accumulated. Traced to source
+/// and confirmed by two independent empirical scaling measurements
+/// (linear fit R²=0.9999 against SSTable count, matching each open
+/// `SsTable`'s retained `bloom: BloomFilter` + `index: Vec<IndexEntry>`
+/// almost exactly) that this is expected, deterministic, bounded-per-
+/// table growth (Compaction, which would reclaim it, does not exist
+/// yet — an explicit, already-documented Non-Goal, `PHASE4B_ADR.md`
+/// ADR-P4B-1) — not a leak. See `PHASE_WRITE_ENGINE_MEMORY_
+/// INVESTIGATION.md` for the full analysis this test locks in.
+///
+/// This test does not measure real OS-level RSS (that lives in the
+/// reproducible `realistic_full_pipeline_soak` scaling runs referenced
+/// above — an OS process-metrics sample inside `cargo test --lib`
+/// would be noisy and platform-specific). Instead it locks in the two
+/// **object-ownership invariants** that are the actual code-level
+/// guarantee against a real leak: (1) a flushed immutable MemTable's
+/// bytes are fully released, not retained anywhere, once its flush
+/// succeeds; (2) `sstable_count()` grows by exactly one per successful
+/// flush, never more (no duplicate/phantom publication) and never less
+/// (no silently-dropped SSTable). A regression that broke either
+/// invariant would itself constitute new, real, additional growth
+/// beyond the already-accounted-for bloom/index model above.
+#[test]
+fn sstable_count_and_immutable_memory_track_flushes_exactly_no_extra_retention() {
+    let dir = temp_dir("memory_regression");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 150,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+
+    const FREEZE_CYCLES: usize = 12;
+    let mut i: u32 = 0;
+    for cycle in 0..FREEZE_CYCLES {
+        let before_sstables = engine.sstable_count();
+        let before_immutable_bytes = engine.immutable_total_bytes();
+        assert_eq!(
+            before_immutable_bytes, 0,
+            "cycle {cycle}: no bytes should remain retained in `immutables` before this \
+             cycle's own freeze -- the previous cycle's flush must have already released them"
+        );
+
+        // Enough puts to exceed the 150-byte memtable and force exactly
+        // one freeze.
+        loop {
+            let key = format!("k{i:05}");
+            i += 1;
+            engine.put(key.as_bytes(), b"v").unwrap();
+            if engine.immutable_count() > 0 || engine.sstable_count() > before_sstables {
+                break;
+            }
+        }
+
+        assert!(
+            wait_until(
+                || engine.sstable_count() == before_sstables + 1 && engine.immutable_count() == 0,
+                Duration::from_secs(5)
+            ),
+            "cycle {cycle}: exactly one new SSTable must be published and the immutable backlog \
+             must fully drain (flush succeeded and released the flushed memtable)"
+        );
+        assert_eq!(
+            engine.sstable_count(),
+            before_sstables + 1,
+            "cycle {cycle}: sstable_count must grow by exactly 1 per successful flush -- more \
+             would mean duplicate publication, less would mean a silently lost SSTable"
+        );
+        assert_eq!(
+            engine.immutable_total_bytes(),
+            0,
+            "cycle {cycle}: immutable_total_bytes must return to exactly 0 after this cycle's \
+             flush -- any nonzero residual would be exactly the kind of additional, unaccounted \
+             retention this test exists to catch"
+        );
+    }
+
+    assert_eq!(
+        engine.sstable_count(),
+        FREEZE_CYCLES,
+        "total SSTable count must equal the number of freeze cycles performed, exactly -- \
+         confirms sstable_count growth correlates 1:1 with successful flushes, not with time \
+         or any other factor"
+    );
+
+    engine.shutdown();
     let _ = fs::remove_dir_all(&dir);
 }

@@ -216,3 +216,9 @@ next step is closing them (let both soaks run to completion on an
 idle machine), not redoing correctness work. Compaction, the next
 phase per operating brief §55, should not begin until this
 certification is re-evaluated with that evidence in hand.
+
+---
+
+**POINTER (2026-09-20):** both items named above as outstanding have since closed. Phase 3C's long soak completed (`PHASE_WRITE_ENGINE_TEST_RESULTS.md` §7). The true multi-hour realistic-configuration full-pipeline soak was run under `PHASE_WRITE_ENGINE_*` naming (this cert effort spans Phase 5 and beyond) — it failed once on ENOSPC (`PHASE5_ENOSPC_FAILURE_ANALYSIS.md`), the root cause was fixed (`PHASE_WRITE_ENGINE_STORAGE_PRESSURE_ADR.md`), and the re-run passed (`PHASE_WRITE_ENGINE_TEST_RESULTS.md` §7a, `PHASE_WRITE_ENGINE_CERTIFICATION.md`). Final decision: **WRITE ENGINE PRODUCTION READY.** Not duplicating full detail here per this project's own pointer convention — see the docs named above.
+
+**FURTHER POINTER (2026-09-20, same day as the pointer above):** the full-pipeline soak's own RSS growth was investigated and found to be expected, bounded-per-SSTable metadata growth, not a leak (`PHASE_WRITE_ENGINE_MEMORY_INVESTIGATION.md`). Final certification, with the complete gate-by-gate matrix: `PHASE_WRITE_ENGINE_CERTIFICATION.md`.

@@ -45,6 +45,17 @@ pub enum EngineError {
     /// necessarily failed — the wait itself simply ran out of time, and a
     /// caller may reasonably retry the wait.
     Timeout { detail: String },
+    /// Persistent storage-capacity exhaustion (ENOSPC / disk full),
+    /// confirmed at the `StorageState::StorageFull` level
+    /// (`ADR-WE-SP-001` §6.3/§9) — distinct from a generic `Io` failure
+    /// (which may be transient and retried) and from `CapacityExceeded`
+    /// (MemTable-freeze backpressure, a different failure mode entirely:
+    /// see `PHASE4A_FAILURE_MODEL.md` §2). Returned to a caller *before*
+    /// any WAL append is attempted, once the engine has already confirmed
+    /// persistence cannot proceed — a caller may reasonably retry once
+    /// storage availability returns and the engine's storage state moves
+    /// back toward `Healthy`.
+    StorageExhausted { detail: String },
 }
 
 impl fmt::Display for EngineError {
@@ -63,7 +74,33 @@ impl fmt::Display for EngineError {
                 write!(f, "invalid path {}: {detail}", path.display())
             }
             EngineError::Timeout { detail } => write!(f, "timeout: {detail}"),
+            EngineError::StorageExhausted { detail } => {
+                write!(f, "storage exhausted: {detail}")
+            }
         }
+    }
+}
+
+/// `ADR-WE-SP-001` §7: classifies an I/O error as storage-capacity
+/// exhaustion using the platform's structured error identity —
+/// `io::ErrorKind::StorageFull` first (stable, portable), falling back to
+/// the well-known raw OS codes directly (Windows `ERROR_DISK_FULL`=112,
+/// POSIX `ENOSPC`=28) for toolchains/platforms where the `ErrorKind`
+/// isn't populated. Deliberately never parses the error's `Display`
+/// text — that string is documented as user-facing/locale-dependent, not
+/// a stable classification surface.
+pub fn is_enospc(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(112) | Some(28))
+}
+
+impl EngineError {
+    /// True for an `Io` error this project's flush/write path should
+    /// treat as storage-capacity exhaustion rather than a generic,
+    /// possibly-transient I/O failure (`ADR-WE-SP-001` §7-§8). Always
+    /// `false` for every other variant, including the pre-existing
+    /// `CapacityExceeded` (a different, MemTable-level failure mode).
+    pub fn is_storage_exhausted(&self) -> bool {
+        matches!(self, EngineError::Io(e) if is_enospc(e))
     }
 }
 

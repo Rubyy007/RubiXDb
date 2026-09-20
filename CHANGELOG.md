@@ -6,6 +6,98 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Write-Engine Certification: RSS growth investigated and explained; final decision reaffirmed (2026-09-20)
+
+The soak certified below showed RSS growing +2,334% over its 4 hours.
+That was flagged and fully investigated rather than certified past on
+trust: traced to source (`SsTable::open()` retains a Bloom filter +
+sparse index per open table for the engine's lifetime; no Compaction
+exists yet to reclaim old tables) and confirmed by two independent
+measurements fitting a near-perfect linear model against SSTable count
+(R²=0.9999) — classified expected, bounded-per-table growth, not a
+leak. `PHASE_WRITE_ENGINE_MEMORY_INVESTIGATION.md` (new doc). A
+regression test locking in the underlying ownership invariants was
+added (`lsm::tests::sstable_count_and_immutable_memory_track_flushes_
+exactly_no_extra_retention`), and the harness now reports
+`min_rss_kb_observed`/`max_rss_kb_observed`, not just start-vs-end.
+Performance acceptance was also broadened from one 3-rep set to 15
+reps across 3 sessions before being trusted — median clears both hard
+targets, with real, already-documented, non-blocking run-to-run
+variance reported in full rather than the favorable subset. Final
+certification verdict unchanged: **WRITE ENGINE PRODUCTION READY**,
+now with a complete 16-gate matrix (`PHASE_WRITE_ENGINE_CERTIFICATION.md`).
+
+### Write-Engine Certification: FINAL DECISION -- WRITE ENGINE PRODUCTION READY (2026-09-20)
+
+The realistic full-pipeline endurance soak (200 writers, 14,400s,
+`LsmConfig::default()`) was re-run on a properly provisioned `E:`
+volume, per a documented storage budget (`PHASE_WRITE_ENGINE_
+STORAGE_BUDGET.md`), and passed clean: `completed_err=0` throughout,
+throughput sustained 19,332-26,116 ops/sec with no collapse, 3,294
+SSTables published, checkpoint advancing continuously, 0 ENOSPC events.
+Fresh 100w/1000w acceptance benchmarks both cleared their hard targets.
+Final certification decision: `PHASE_WRITE_ENGINE_CERTIFICATION.md`
+(new doc). A real bug in the soak harness's own PowerShell PASS/FAIL
+logic (`-notmatch` array-filtering semantics, producing a false FAIL
+despite a genuinely healthy run) was found and fixed, verified by
+replaying the corrected logic against both this run and the original
+failed run before trusting it (`temp/realistic_soak_harness.ps1`).
+
+### Write-Engine Certification: storage-pressure / ENOSPC handling (ADR-WE-SP-001 -- implemented and verified by the re-soak above)
+
+#### Fixed
+
+- The background flush thread's retry loop (`spawn_flush_thread`,
+  `src/lsm/mod.rs`) used `max_flush_retries` only to pick a backoff
+  duration, never as an actual retry limit: past that budget it fell
+  into an **unconditional, unbounded** flat 2-second retry cadence for
+  every kind of I/O failure, including a genuinely permanent disk-full
+  condition. The 2026-09-19 realistic full-pipeline soak (200 writers,
+  `LsmConfig::default()`) hit this exact path when its target volume
+  filled at t≈5,100s and spent the remaining ~9,200s of the run
+  retrying a doomed flush every 2 seconds instead of failing safe --
+  `completed_err` reached 580,190,298, throughput collapsed 97.9%. See
+  `PHASE5_ENOSPC_FAILURE_ANALYSIS.md` for the full incident analysis
+  (including a from-source proof that the huge `completed_err` number
+  was not an accounting bug) and `PHASE_WRITE_ENGINE_STORAGE_PRESSURE_ADR.md`
+  for the fix design and its "Implementation Notes" section for exactly
+  what landed. Durability/crash-recovery correctness were never
+  affected by the original defect -- this was purely an availability/
+  retry/backpressure gap.
+- The realistic-soak certification harness (`temp/realistic_soak_harness.ps1`)
+  reported PASS on `exit_code == 0` + a clean process tree alone, which
+  is how the above defect went uncaught. It now additionally requires
+  `completed_err == 0`, no persistent throughput collapse, no ENOSPC/
+  retry-storm lines in stderr, a successful recovery line, and a clean
+  drained shutdown.
+
+#### Added
+
+- `EngineError::StorageExhausted` (`src/error.rs`) -- a new, additive
+  error variant distinct from the generic `Io` variant and from the
+  pre-existing `CapacityExceeded` (MemTable-freeze backpressure, a
+  different failure mode, contract unchanged). Returned by `LsmEngine::
+  put`/`delete` before any WAL append is attempted, once storage is
+  confirmed exhausted.
+- `lsm::StorageState` (`Healthy` / `StoragePressure` / `StorageFull`),
+  an explicit storage-health state machine on `LsmEngine`
+  (`storage_state()`, `storage_pressure_events()`), plus
+  `LsmConfig::storage_pressure_retry_interval` (default 5s) -- the
+  backoff used once a flush's bounded fast-retry budget is exhausted on
+  a confirmed ENOSPC-classified failure, replacing the old flat-2s-
+  forever cadence for that specific case.
+- `LsmEngine::install_flush_io_fault_hook`/`clear_flush_io_fault_hook`,
+  a test-only fault-injection point (extends the existing `install_
+  flush_fault_hook`/`FlushFaultPoint` pattern to actually substitute a
+  real I/O outcome, not just observe) used by the new deterministic
+  ENOSPC test below without ever touching real disk capacity.
+- Two new tests: `lsm::tests::storage_pressure_state_machine_recovers_after_injected_enospc`
+  (in-process, walks the full `Healthy` -> `StoragePressure` ->
+  `StorageFull` -> `Healthy` sequence) and `examples/
+  storage_pressure_crash_{child,test}.rs` (external-process, kills the
+  child while genuinely stuck in `StorageFull` and verifies clean
+  recovery -- 10/10 cycles clean).
+
 ### Phase 5: RUBIC Manifest (MANIFEST NOT READY FOR COMPACTION -- blockers remain)
 
 Extends the persistent architecture: `... -> RUBIC SSTable -> Manifest

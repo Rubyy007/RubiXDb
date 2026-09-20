@@ -195,3 +195,7 @@ established for this same, still-open item.
   to make flush/checkpoint/purge activity observable in a short run —
   it demonstrates the *mechanism* works and WAL stays bounded, not a
   realistic-duration, realistic-configuration production profile.
+
+---
+
+**POINTER (2026-09-20):** the Phase 3C long soak referenced above has since completed, and the write engine's full certification (spanning beyond Phase 5) reached a final decision: **WRITE ENGINE PRODUCTION READY** — see `PHASE_WRITE_ENGINE_CERTIFICATION.md`.

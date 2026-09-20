@@ -30,8 +30,9 @@
 //! boundary.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -69,6 +70,15 @@ pub struct LsmConfig {
     /// flush is never abandoned, only its short-backoff phase is
     /// bounded).
     pub max_flush_retries: u32,
+    /// `ADR-WE-SP-001` §8: once a flush's bounded fast-retry budget
+    /// (`max_flush_retries`) is exhausted on an ENOSPC-classified
+    /// failure specifically, this is the backoff used for every
+    /// subsequent `STORAGE_PRESSURE` retry — replacing the flat,
+    /// unconditional 2-second-forever cadence the pre-ADR code used for
+    /// every kind of persistent flush failure
+    /// (`PHASE5_ENOSPC_FAILURE_ANALYSIS.md` §5 traces the resulting
+    /// 9,200-second retry storm to exactly that code path).
+    pub storage_pressure_retry_interval: Duration,
 }
 
 impl Default for LsmConfig {
@@ -79,6 +89,51 @@ impl Default for LsmConfig {
             sstable_target_block_size: crate::sstable::format::DEFAULT_TARGET_BLOCK_SIZE,
             bloom_bits_per_key: crate::sstable::format::DEFAULT_BLOOM_BITS_PER_KEY,
             max_flush_retries: 3,
+            storage_pressure_retry_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+/// `ADR-WE-SP-001` §6: explicit storage-health state, orthogonal to the
+/// pre-existing `CapacityExceeded` MemTable-freeze backpressure signal
+/// (that contract — `[[project_rubixdb_capacity_contract]]` —  is
+/// unchanged by this enum). `Healthy` is the only state in which a flush
+/// failure gets purely the bounded fast-retry treatment; the other two
+/// states exist so a *persistent* ENOSPC-classified failure (confirmed
+/// by exhausting the fast-retry budget) cannot degrade into an unbounded
+/// fixed-interval retry loop with no operator-visible signal — exactly
+/// what the 2026-09-19 realistic soak found
+/// (`PHASE5_ENOSPC_FAILURE_ANALYSIS.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StorageState {
+    /// Normal operation. The last flush attempt (if any) succeeded, or
+    /// no ENOSPC-classified failure has ever exhausted the fast-retry
+    /// budget.
+    Healthy = 0,
+    /// A flush is retrying an ENOSPC-classified failure at the slower,
+    /// configured `storage_pressure_retry_interval` cadence. Writes are
+    /// still accepted normally (through the existing WAL/MemTable path,
+    /// including the existing `CapacityExceeded` backpressure signal) —
+    /// this state alone does not reject anything; it only replaces the
+    /// old unbounded fast retry with a bounded, quieter one.
+    StoragePressure = 1,
+    /// The immutable-MemTable backlog reached `max_immutable_memtables`
+    /// while a flush was already stuck in `StoragePressure` — the
+    /// engine's configured safe-resource boundary. New writes now fail
+    /// fast with `EngineError::StorageExhausted`, before any WAL append
+    /// is attempted, rather than continuing to accumulate applied-but-
+    /// unflushed state. Cleared back to `Healthy` the moment any flush
+    /// attempt actually succeeds.
+    StorageFull = 2,
+}
+
+impl StorageState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => StorageState::Healthy,
+            1 => StorageState::StoragePressure,
+            _ => StorageState::StorageFull,
         }
     }
 }
@@ -180,6 +235,22 @@ fn fire_flush_fault_hook(hook: &Mutex<Option<FlushFaultHook>>, point: FlushFault
     }
 }
 
+/// `ADR-WE-SP-001` §16: unlike `FlushFaultHook` (an observer with no
+/// return value), this hook can *inject* a real `io::Error` at the exact
+/// point the 2026-09-19 soak's flush attempts actually failed (just
+/// before `sstable::write_from_memtable`) — so a test can drive the
+/// storage-pressure state machine deterministically through a real
+/// ENOSPC-shaped error, exercised by the same classification code
+/// (`EngineError::is_storage_exhausted`) a real disk-full condition
+/// would hit, without ever filling a real disk.
+type FlushIoFaultHook = Box<dyn Fn() -> Option<io::Error> + Send + Sync>;
+
+/// Same cheap-no-op-when-unset shape as `fire_flush_fault_hook`.
+fn fire_flush_io_fault_hook(hook: &Mutex<Option<FlushIoFaultHook>>) -> Option<io::Error> {
+    let hook = hook.lock().unwrap_or_else(|p| p.into_inner());
+    hook.as_ref().and_then(|f| f())
+}
+
 pub struct LsmEngine {
     pool: Arc<BatchCoordinatorPool>,
     active: RwLock<MemTable>,
@@ -237,6 +308,23 @@ pub struct LsmEngine {
     /// `spawn_flush_thread`; this copy is what `install_flush_fault_hook`/
     /// `clear_flush_fault_hook` write through.
     flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>>,
+    /// `ADR-WE-SP-001` §6. Shared with the background flush thread (the
+    /// sole writer on a successful/failed flush) and read by `put`/
+    /// `delete` (`reject_if_storage_full`) and `freeze_locked` (the
+    /// `StoragePressure` -> `StorageFull` promotion). `AtomicU8` rather
+    /// than a `Mutex<StorageState>` so the hot `put`/`delete` path pays
+    /// one relaxed-ish atomic load, not a lock.
+    storage_state: Arc<AtomicU8>,
+    /// Count of ENOSPC-classified flush failures observed (`ADR-WE-SP-001`
+    /// §14) — distinct from `capacity_pressure_events`, which counts a
+    /// different failure mode (MemTable-freeze backpressure).
+    storage_pressure_events: Arc<AtomicU64>,
+    /// See `FlushIoFaultHook`/`fire_flush_io_fault_hook`. Test-only in
+    /// practice (nothing in production ever calls
+    /// `install_flush_io_fault_hook`), always compiled — same
+    /// uncontended-mutex-lock-and-`None`-check convention as
+    /// `flush_fault_hook`.
+    flush_io_fault_hook: Arc<Mutex<Option<FlushIoFaultHook>>>,
     config: LsmConfig,
 }
 
@@ -315,6 +403,9 @@ impl LsmEngine {
         let flush_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flush_delay_ms = Arc::new(AtomicU64::new(0));
         let flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>> = Arc::new(Mutex::new(None));
+        let flush_io_fault_hook: Arc<Mutex<Option<FlushIoFaultHook>>> = Arc::new(Mutex::new(None));
+        let storage_state = Arc::new(AtomicU8::new(StorageState::Healthy as u8));
+        let storage_pressure_events = Arc::new(AtomicU64::new(0));
         let flush_handle = spawn_flush_thread(
             flush_receiver,
             Arc::clone(&sstables),
@@ -332,6 +423,10 @@ impl LsmEngine {
             Arc::clone(&manifest),
             Arc::clone(&checkpoint_seq),
             Arc::clone(&flush_fault_hook),
+            Arc::clone(&flush_io_fault_hook),
+            Arc::clone(&storage_state),
+            Arc::clone(&storage_pressure_events),
+            lsm_config.storage_pressure_retry_interval,
         );
 
         let recovery_stats = RecoveryStats {
@@ -359,6 +454,9 @@ impl LsmEngine {
             flush_delay_ms,
             capacity_pressure_events: AtomicU64::new(0),
             flush_fault_hook,
+            storage_state,
+            storage_pressure_events,
+            flush_io_fault_hook,
             config: lsm_config,
         })
     }
@@ -386,6 +484,56 @@ impl LsmEngine {
             .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
+    /// `ADR-WE-SP-001` §16: installs a hook that, while set, replaces the
+    /// SSTable-write step of every flush attempt with a synthetic
+    /// `io::Error` whenever it returns `Some`. Mirrors `install_flush_
+    /// fault_hook`'s shape; ordinary production code never calls this.
+    pub fn install_flush_io_fault_hook(
+        &self,
+        hook: impl Fn() -> Option<io::Error> + Send + Sync + 'static,
+    ) {
+        *self
+            .flush_io_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// Removes any hook installed by `install_flush_io_fault_hook`.
+    pub fn clear_flush_io_fault_hook(&self) {
+        *self
+            .flush_io_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// `ADR-WE-SP-001` §14: current storage-health state.
+    pub fn storage_state(&self) -> StorageState {
+        StorageState::from_u8(self.storage_state.load(Ordering::Acquire))
+    }
+
+    /// Count of ENOSPC-classified flush failures observed so far
+    /// (`ADR-WE-SP-001` §14) — distinct from `capacity_pressure_events`.
+    pub fn storage_pressure_events(&self) -> u64 {
+        self.storage_pressure_events.load(Ordering::Relaxed)
+    }
+
+    /// `ADR-WE-SP-001` §9: once `StorageState::StorageFull` is confirmed,
+    /// a new write fails fast with `StorageExhausted` *before* any WAL
+    /// append is attempted — the engine already has strong evidence
+    /// (an immutable backlog stuck at its configured bound behind a
+    /// flush that is itself stuck on a confirmed storage-capacity
+    /// error) that the append would only repeat the same failure.
+    fn reject_if_storage_full(&self) -> Result<()> {
+        if self.storage_state() == StorageState::StorageFull {
+            return Err(EngineError::StorageExhausted {
+                detail: "persistent storage is exhausted (STORAGE_FULL); write rejected before \
+                         WAL append -- retry once storage_state() shows recovery toward Healthy"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Test-only: makes every subsequent flush attempt sleep `delay`
     /// before running, so a test can reliably widen the window in which
     /// `immutables`/memory-accounting state can be observed before the
@@ -405,6 +553,7 @@ impl LsmEngine {
     /// once this call returns, both are guaranteed — `PHASE4A_
     /// ARCHITECTURE.md` §5's "logical completion" point).
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<u64> {
+        self.reject_if_storage_full()?;
         let completion = self.pool.submit(WalOpOwned::Put {
             key: key.to_vec(),
             value: value.to_vec(),
@@ -420,6 +569,7 @@ impl LsmEngine {
     /// semantics, LSM Engine Spec §1.4) — this call only ever adds a new,
     /// newer entry.
     pub fn delete(&self, key: &[u8]) -> Result<u64> {
+        self.reject_if_storage_full()?;
         let completion = self.pool.submit(WalOpOwned::Delete { key: key.to_vec() })?;
         let position = completion.wait()?;
         self.apply_after_durable(key, position.seq, MemtableValue::Tombstone)?;
@@ -464,6 +614,35 @@ impl LsmEngine {
         if immutables.len() >= self.config.max_immutable_memtables {
             self.capacity_pressure_events
                 .fetch_add(1, Ordering::Relaxed);
+            // `ADR-WE-SP-001` §6.3: the immutable backlog reaching its
+            // configured bound while the flush thread is already stuck
+            // in `StoragePressure` is exactly the "safe resource
+            // boundary" the ADR names as the `StorageFull` trigger --
+            // from here, `reject_if_storage_full` fails new writes fast
+            // instead of letting applied-but-unflushed state keep
+            // growing. Never demotes: only the flush thread's own
+            // success path ever clears `StorageFull` (see
+            // `spawn_flush_thread`). The existing `CapacityExceeded`
+            // return below is unchanged either way -- this promotion is
+            // purely additive, per the ADR's explicit instruction not to
+            // repurpose that established contract.
+            if self
+                .storage_state
+                .compare_exchange(
+                    StorageState::StoragePressure as u8,
+                    StorageState::StorageFull as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                eprintln!(
+                    "rubixdb: storage state STORAGE_PRESSURE -> STORAGE_FULL (immutable backlog \
+                     reached max_immutable_memtables={}); new writes will fail fast with \
+                     StorageExhausted until a flush succeeds",
+                    self.config.max_immutable_memtables
+                );
+            }
             return Err(EngineError::CapacityExceeded {
                 requested: (immutables.len() as u64) + 1,
                 max: self.config.max_immutable_memtables as u64,
@@ -884,6 +1063,10 @@ fn spawn_flush_thread(
     manifest: Arc<Mutex<Manifest>>,
     checkpoint_seq: Arc<AtomicU64>,
     flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>>,
+    flush_io_fault_hook: Arc<Mutex<Option<FlushIoFaultHook>>>,
+    storage_state: Arc<AtomicU8>,
+    storage_pressure_events: Arc<AtomicU64>,
+    storage_pressure_retry_interval: Duration,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(msg) = receiver.recv() {
@@ -931,6 +1114,11 @@ fn spawn_flush_thread(
                                     &flush_fault_hook,
                                     FlushFaultPoint::BeforeSstableWrite,
                                 );
+                                if let Some(injected) =
+                                    fire_flush_io_fault_hook(&flush_io_fault_hook)
+                                {
+                                    return Err(EngineError::Io(injected));
+                                }
                                 let id = next_sstable_id.fetch_add(1, Ordering::SeqCst);
                                 let meta = sstable::write_from_memtable(
                                     &frozen,
@@ -1016,19 +1204,107 @@ fn spawn_flush_thread(
                     });
 
                 match attempt_result {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        // `ADR-WE-SP-001` §6.1/§13: any successful
+                        // end-to-end flush is the one thing that clears
+                        // storage-pressure state, regardless of which
+                        // state it was in beforehand -- a real
+                        // persistence success is stronger evidence of
+                        // recovery than a free-space check could be.
+                        // This deliberately collapses the ADR's
+                        // StorageFull -> StoragePressure -> Healthy
+                        // two-step description into one direct
+                        // transition on genuine success (see
+                        // `PHASE_WRITE_ENGINE_STORAGE_PRESSURE_ADR.md`
+                        // implementation notes) -- the safety property
+                        // that step exists for (never claim recovery
+                        // without a real successful persistence attempt)
+                        // is preserved exactly, since this branch only
+                        // runs on that attempt's actual success.
+                        let previous =
+                            storage_state.swap(StorageState::Healthy as u8, Ordering::AcqRel);
+                        if previous != StorageState::Healthy as u8 {
+                            eprintln!(
+                                "rubixdb: storage state {:?} -> HEALTHY (flush succeeded after \
+                                 {attempt} failed attempt(s))",
+                                StorageState::from_u8(previous)
+                            );
+                        }
+                        break;
+                    }
                     Err(e) => {
                         attempt += 1;
-                        eprintln!(
-                            "rubixdb: flush attempt {attempt} failed \
-                             (published={published:?}): {e}"
-                        );
-                        let backoff = if attempt <= max_retries {
-                            Duration::from_millis(50u64.saturating_mul(attempt as u64))
+                        let is_enospc = e.is_storage_exhausted();
+                        if is_enospc {
+                            storage_pressure_events.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if attempt <= max_retries {
+                            // Bounded fast retry -- unchanged from the
+                            // pre-ADR behavior for every error kind; by
+                            // construction this phase is brief and
+                            // bounded, so logging every attempt here
+                            // does not reproduce the log-flood the ADR
+                            // is about (`PHASE5_ENOSPC_FAILURE_ANALYSIS.md`
+                            // §5/§8's 4,407-line stderr came entirely
+                            // from attempts *past* this budget).
+                            eprintln!(
+                                "rubixdb: flush attempt {attempt} failed \
+                                 (published={published:?}): {e}"
+                            );
+                            sleep_checking_stop(
+                                Duration::from_millis(50u64.saturating_mul(attempt as u64)),
+                                &stop,
+                            );
+                        } else if is_enospc {
+                            // `ADR-WE-SP-001` §8: fast-retry budget
+                            // exhausted on a *confirmed* ENOSPC failure
+                            // -- exactly the condition the pre-ADR code
+                            // treated identically to every other I/O
+                            // error (flat 2s retry, forever, one log
+                            // line per attempt). Enter STORAGE_PRESSURE,
+                            // log the transition once rather than per
+                            // attempt, and back off at the slower,
+                            // configured cadence instead.
+                            let transitioned = storage_state.compare_exchange(
+                                StorageState::Healthy as u8,
+                                StorageState::StoragePressure as u8,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                            if transitioned.is_ok() {
+                                eprintln!(
+                                    "rubixdb: storage state HEALTHY -> STORAGE_PRESSURE (flush \
+                                     attempt {attempt} failed with a storage-capacity error: {e})"
+                                );
+                            } else if attempt.is_multiple_of(10) {
+                                // Aggregate heartbeat, not one line per
+                                // attempt (`ADR-WE-SP-001` §14: "repeated
+                                // identical errors must not flood logs").
+                                eprintln!(
+                                    "rubixdb: still in {:?} after {attempt} total flush \
+                                     attempt(s) (most recent: {e})",
+                                    StorageState::from_u8(storage_state.load(Ordering::Acquire))
+                                );
+                            }
+                            sleep_checking_stop(storage_pressure_retry_interval, &stop);
                         } else {
-                            Duration::from_secs(2)
-                        };
-                        sleep_checking_stop(backoff, &stop);
+                            // Non-ENOSPC I/O error past the fast-retry
+                            // budget: out of `ADR-WE-SP-001`'s scope
+                            // (targeted at storage-capacity exhaustion
+                            // specifically -- see
+                            // `PHASE5_ENOSPC_FAILURE_ANALYSIS.md` §6),
+                            // so the retry cadence is unchanged from the
+                            // pre-ADR flat 2s-forever behavior. Logging
+                            // is still throttled, matching the same
+                            // observability goal.
+                            if attempt.is_multiple_of(10) {
+                                eprintln!(
+                                    "rubixdb: flush attempt {attempt} still failing (non-storage-\
+                                     capacity error): {e}"
+                                );
+                            }
+                            sleep_checking_stop(Duration::from_secs(2), &stop);
+                        }
                         if stop.load(Ordering::Acquire) {
                             return;
                         }

@@ -113,12 +113,29 @@ fn sample_process_metrics(pid: u32) -> Option<(u64, f64)> {
     Some((rss_bytes / 1024, cpu_secs))
 }
 
+/// Base directory the soak's own database directory is created under.
+/// Defaults to `std::env::temp_dir()` (unchanged default behavior for
+/// every other caller of this example), but honors `RUBIXDB_SOAK_BASE_DIR`
+/// when set -- the smallest safe harness-only fix for the defect
+/// `PHASE5_ENOSPC_FAILURE_ANALYSIS.md` traces to this exact call: the
+/// 2026-09-19 08:51 run resolved to this machine's chronically
+/// ~97%-full `C:` `%TEMP%` with no way to point it anywhere else. This
+/// changes only where the *test fixture* puts its directory -- the
+/// engine's own storage semantics (`LsmEngine::open` takes whatever
+/// `&Path` its caller gives it, always) are completely unchanged.
+fn soak_base_dir() -> PathBuf {
+    match std::env::var_os("RUBIXDB_SOAK_BASE_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    }
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("rubixdb_realistic_soak_{tag}_{nanos}"));
+    let path = soak_base_dir().join(format!("rubixdb_realistic_soak_{tag}_{nanos}"));
     fs::create_dir_all(&path).unwrap();
     path
 }
@@ -186,7 +203,21 @@ fn main() {
         .unwrap_or(120);
 
     let dir = temp_dir("run");
-    println!("realistic_full_pipeline_soak: dir={}", dir.display());
+    // Canonicalized, not just the joined path string -- proves this run's
+    // actual database directory resolves onto the volume the operator
+    // intended (RUBIXDB_SOAK_BASE_DIR or the OS default temp dir),
+    // printed before any engine I/O happens.
+    let canonical_dir = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    println!(
+        "realistic_full_pipeline_soak: dir={} canonical={} base_dir_source={}",
+        dir.display(),
+        canonical_dir.display(),
+        if std::env::var_os("RUBIXDB_SOAK_BASE_DIR").is_some() {
+            "RUBIXDB_SOAK_BASE_DIR"
+        } else {
+            "std::env::temp_dir()"
+        }
+    );
 
     let wal_config = WalConfig {
         sync_mode: SyncMode::GroupCommit {
@@ -424,6 +455,20 @@ fn main() {
             "realistic_soak_analysis: max_queue_depth_observed={max_queue_depth} \
              max_wal_bytes_observed={max_wal_bytes} max_immutable_count_observed={max_immutable}"
         );
+        // `rss_growth_kb`/`rss_growth_pct` above compare only the first and
+        // last sample -- if a mid-run spike is followed by a mid-run drop
+        // (observed for real once already: PHASE5_ENOSPC_FAILURE_ANALYSIS.md
+        // §4, peak RSS 4.5x the reported start-vs-end figure during the
+        // 2026-09-19 ENOSPC incident), that start/end comparison can hide
+        // it. Report the true observed range across every sample instead.
+        let rss_samples: Vec<u64> = samples.iter().filter_map(|s| s.rss_kb).collect();
+        if let (Some(&min_rss), Some(&max_rss)) =
+            (rss_samples.iter().min(), rss_samples.iter().max())
+        {
+            println!(
+                "realistic_soak_analysis: min_rss_kb_observed={min_rss} max_rss_kb_observed={max_rss}"
+            );
+        }
         let throughput_drop_pct =
             100.0 * (start_s.ops_per_sec - end_s.ops_per_sec) / start_s.ops_per_sec.max(1.0);
         println!(
@@ -455,7 +500,8 @@ fn main() {
     // reopening below -- `shutdown()` takes `&self` and does not itself
     // consume/drop the engine, matching `long_soak_test.rs`'s identical
     // `Arc::try_unwrap` + drop pattern for the same reason.
-    let engine = Arc::try_unwrap(engine).unwrap_or_else(|_| panic!("outstanding Arc<LsmEngine> reference"));
+    let engine =
+        Arc::try_unwrap(engine).unwrap_or_else(|_| panic!("outstanding Arc<LsmEngine> reference"));
     drop(engine);
 
     // Recovery check: reopen fresh against the same directory. This
@@ -505,7 +551,10 @@ fn main() {
                 "realistic_full_pipeline_soak: recovery FAILED recovery_ms={recovery_ms:.1} \
                  error={e}"
             );
-            eprintln!("realistic_full_pipeline_soak: NOT deleting {} for inspection", dir.display());
+            eprintln!(
+                "realistic_full_pipeline_soak: NOT deleting {} for inspection",
+                dir.display()
+            );
             std::process::exit(1);
         }
     }
