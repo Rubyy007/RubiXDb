@@ -68,6 +68,101 @@ fn child_binary_path() -> PathBuf {
     path
 }
 
+/// Increment 4 (`PHASE_READ_ENGINE_ADR.md`, brief §15/§16) extension:
+/// the fixed value every `lsm_crash_cycle_child` write uses, so a
+/// present key's value can be checked for *exact* equality, not just
+/// existence -- closing the brief's explicit "do not merely verify
+/// that startup returned Ok" gap on this already-existing crash-cycle
+/// harness, reused rather than duplicated.
+const EXPECTED_VALUE: &[u8] = b"lsm-crash-cycle-value";
+
+/// Real `get`/`contains`/`range` verification after a crash+recovery
+/// cycle, against the exact fixed value every write in this harness
+/// uses. A key that was never durably written is legitimately absent
+/// (the crash could have landed before or after any given key's
+/// write) -- that is not itself a failure; only a *present* key with
+/// the wrong value, or a disagreement between `get` and `contains`,
+/// counts as one. Returns the number of real mismatches found.
+fn verify_reads_after_recovery(
+    engine: &LsmEngine,
+    writer_count: usize,
+    sample_per_writer: u64,
+) -> u64 {
+    let mut mismatches = 0u64;
+    for w in 0..writer_count {
+        for i in 0..sample_per_writer {
+            let key = format!("t{w}-{i}");
+            match engine.get(key.as_bytes()) {
+                Ok(Some(v)) => {
+                    if v != EXPECTED_VALUE {
+                        mismatches += 1;
+                        println!(
+                            "lsm_crash_cycle_test: READ MISMATCH get({key}) = {v:?}, expected \
+                             {EXPECTED_VALUE:?}"
+                        );
+                    }
+                }
+                Ok(None) => {} // legitimately never written before the kill -- not a failure.
+                Err(e) => {
+                    mismatches += 1;
+                    println!("lsm_crash_cycle_test: READ ERROR get({key}): {e}");
+                }
+            }
+            match engine.contains(key.as_bytes(), u64::MAX) {
+                Ok(found) => {
+                    let expected_found = engine
+                        .get(key.as_bytes())
+                        .map(|v| v.is_some())
+                        .unwrap_or(false);
+                    if found != expected_found {
+                        mismatches += 1;
+                        println!(
+                            "lsm_crash_cycle_test: READ MISMATCH contains({key})={found} \
+                             disagrees with get().is_some()={expected_found}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    mismatches += 1;
+                    println!("lsm_crash_cycle_test: READ ERROR contains({key}): {e}");
+                }
+            }
+        }
+    }
+
+    // A bounded range scan across the first writer's keyspace slice --
+    // every row returned must carry exactly the fixed value, and the
+    // scan itself must not error or panic against whatever partial
+    // state the kill left behind.
+    let start = b"t0-".to_vec();
+    let end = b"t0-~".to_vec(); // '~' sorts after ASCII digits, bounding the scan.
+    match engine
+        .range(
+            std::ops::Bound::Included(start.as_slice()),
+            std::ops::Bound::Excluded(end.as_slice()),
+        )
+        .collect::<rubixdb::error::Result<Vec<_>>>()
+    {
+        Ok(rows) => {
+            for (k, v) in &rows {
+                if v != EXPECTED_VALUE {
+                    mismatches += 1;
+                    println!(
+                        "lsm_crash_cycle_test: READ MISMATCH range() row {k:?} = {v:?}, \
+                         expected {EXPECTED_VALUE:?}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            mismatches += 1;
+            println!("lsm_crash_cycle_test: READ ERROR range() over t0- slice: {e}");
+        }
+    }
+
+    mismatches
+}
+
 fn open_for_verification(dir: &Path) -> rubixdb::error::Result<LsmEngine> {
     let wal_config = WalConfig {
         sync_mode: SyncMode::GroupCommit {
@@ -123,6 +218,7 @@ fn main() {
     let mut failures = 0u32;
     let mut last_highest_seq = 0u64;
     let mut last_durable_through = 0u64;
+    let mut total_read_mismatches = 0u64;
 
     for cycle in 1..=num_cycles {
         let kill_delay_ms = rng.range(min_delay_ms, max_delay_ms);
@@ -154,11 +250,25 @@ fn main() {
                          highest_seq {highest_seq} < {last_highest_seq} or durable_through \
                          {durable_through} < {last_durable_through}"
                     );
-                } else {
+                }
+                // Brief §15/§16: actual reads with exact expected
+                // values, not just "open() returned Ok" -- sample up to
+                // 5,000 keys per writer (comfortably above what a
+                // sub-2-second kill delay could produce per thread).
+                let mismatches = verify_reads_after_recovery(&engine, writer_count, 5000);
+                total_read_mismatches += mismatches;
+                if mismatches > 0 {
+                    failures += 1;
+                    println!(
+                        "lsm_crash_cycle_test: cycle {cycle} FAIL {mismatches} read \
+                         mismatch(es) after recovery"
+                    );
+                } else if ok {
                     println!(
                         "lsm_crash_cycle_test: cycle {cycle} OK kill_delay_ms={kill_delay_ms} \
                          highest_seq={highest_seq} durable_through={durable_through} \
-                         active_entries={} immutable_count={} recovery_ms={recovery_ms:.1}",
+                         active_entries={} immutable_count={} recovery_ms={recovery_ms:.1} \
+                         reads_verified_ok=true",
                         engine.active_entry_count(),
                         engine.immutable_count(),
                     );
@@ -176,7 +286,8 @@ fn main() {
 
     println!(
         "lsm_crash_cycle_test: SUMMARY cycles={num_cycles} successful={} failed={failures} \
-         final_highest_seq={last_highest_seq} final_durable_through={last_durable_through}",
+         final_highest_seq={last_highest_seq} final_durable_through={last_durable_through} \
+         total_read_mismatches={total_read_mismatches}",
         num_cycles - failures
     );
 
