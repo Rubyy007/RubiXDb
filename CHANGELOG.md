@@ -6,6 +6,38 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Read Engine: persistent range source cursors, `ADR-RE-002` Option A, Implementation Increment 6 (2026-09-20)
+
+Implemented the optimization Increment 5's investigation identified and
+`ADR-RE-002` proposed: `RangeScanIter`'s SSTable sources now use a
+persistent, owned-`Arc` cursor (`SsTableRangeCursor`, new,
+`src/sstable/reader.rs`) instead of a resume-point `Bound` plus a
+fresh `range_scan_raw` call per key -- eliminating the repeated binary
+search and repeated block re-read/re-decode Increment 5 traced and
+reproduced. **Zero `unsafe`, zero new dependency** (owning `Arc
+<SsTable>` inside the cursor sidesteps the self-referential-struct
+problem structurally). Before/after benchmark on the identical,
+unmodified `overlap_repro` workload (`n=7` reps/checkpoint, 5
+checkpoints 20-300 SSTables): `blocks_read` (unchanged counting point)
+dropped by an exact, constant **4.714x** at every checkpoint; wall-clock
+p50 improved **3.20x-3.69x**. `sstables_consulted`'s semantics were
+intentionally revised (once per live SSTable per scan, matching point
+lookups' own convention, not once per key drawn) and documented, with a
+new regression test (`lsm::tests::range_scan_source_cursor_persists_
+across_keys_instead_of_reconstructing_per_key`) asserting the exact
+count rather than timing. Resource-lifetime check: 400 repeated
+create/consume/drop scan cycles show zero handle delta, zero thread
+delta, ~0.55 KB/scan RSS noise (not a leak). Point-lookup code paths
+(`get`/`get_as_of`/`contains`) untouched -- confirmed by diff, no
+regression. Full regression suite (306/306 `cargo test --lib` debug and
+release, `wal_tests`, `crash_consistency`, `pathological_recovery_
+matrix`, `fmt`/`clippy`) clean. Full detail: `PHASE_READ_ENGINE_
+PERFORMANCE.md`'s Increment 6 section, `PROGRESS.md`'s Increment 6
+entry, `PHASE_READ_ENGINE_RANGE_PERFORMANCE_ADR.md` §9. **`ADR-RE-002`:
+IMPLEMENTED.** **Status unchanged: READ ENGINE PRODUCTION READY = NO**
+-- final corruption/recovery, integrated endurance, performance
+validation, and certification matrix remain outstanding.
+
 ### Read Engine: memory + range-performance investigation, Implementation Increment 5 (2026-09-20)
 
 Investigated three items Increment 4's completed 4-hour soak flagged

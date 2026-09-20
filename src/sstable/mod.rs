@@ -31,7 +31,7 @@ mod test_support;
 mod writer;
 
 pub use bloom::BloomFilter;
-pub use reader::SsTable;
+pub use reader::{SsTable, SsTableRangeCursor};
 pub use writer::{write_from_memtable, SsTableWriterConfig};
 
 use std::fs;

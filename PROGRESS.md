@@ -2218,3 +2218,146 @@ on `ADR-RE-002`'s proposed direction, followed by (if approved) an
 implementation increment for Option A (persistent source cursors),
 re-running the full corruption matrix and a before/after
 `overlap_repro`-style benchmark before claiming any improvement.
+
+## 2026-09-20 (continued: Read Engine Increment 6 -- `ADR-RE-002` Option A implemented: persistent source cursors)
+
+Implemented exactly the direction `ADR-RE-002` proposed and nothing
+else -- no cache, no mmap, no prefetch, no parallel-read workers, no
+secondary index, no Compaction/Router/Replication, no Write Engine/
+WAL/Manifest change.
+
+**Implementation.** New `SsTableRangeCursor` (`src/sstable/reader.rs`,
+126 lines added, zero removed -- `RangeScanRaw`/`range_scan_raw` left
+completely unmodified, still exactly what they were before this
+increment): functionally identical to `RangeScanRaw` (same start-block
+binary search, same lazy one-block-at-a-time reads via the shared
+`read_block`, same bounds/corruption-propagation contract) but owns
+its own `Arc<SsTable>` clone and owned `Bound<Vec<u8>>` bounds instead
+of borrowing `&'a SsTable`/`Bound<&'a [u8]>` -- which is what makes it
+safe to store *inside* `RangeScanIter` for a scan's whole lifetime
+without a self-referential struct: it borrows nothing from the struct
+holding it, only from its own owned `Arc` clone (a refcount bump, the
+same pattern `ReadView` already used). `RangeScanIter`
+(`src/lsm/mod.rs`) now holds `sstable_cursors: Vec<Option<Peekable
+<SsTableRangeCursor>>>` -- one persistent cursor per live SSTable
+source, constructed once in `new` and driven forward with ordinary
+`Peekable::peek`/`next` for the scan's entire remaining lifetime,
+replacing the old `sstable_next_start: Vec<Option<Bound<Vec<u8>>>>`
+resume-point-plus-fresh-call design that forced a binary search and a
+discarded/re-read block on every single key drawn from a source. The
+k-way merge algorithm itself (`refill`/`Iterator::next`) is unchanged
+-- only `peek_sstable`'s body changed (now pulls from the persistent
+cursor instead of constructing a fresh one). `MemTable`/immutable
+sources deliberately left untouched (`src/memtable/mod.rs` not
+touched at all) -- the measured bottleneck was entirely SSTable-side
+(`PHASE_READ_ENGINE_RESOURCE_INVESTIGATION.md` §4), and `MemTable::
+range` is a cheap in-memory `BTreeMap::range` call, never the
+re-read-a-block-from-disk cost the SSTable side had. **Zero `unsafe`,
+zero new dependency** (`Cargo.toml`/`Cargo.lock` unchanged, confirmed
+by `git status`) -- proving the approved design (owned-`Arc` refactor,
+no `ouroboros`/`self_cell`) was sufficient, exactly as `ADR-RE-002` §3
+Option A predicted.
+
+**`ReadStats` semantics, intentionally revised and documented, not
+silently changed (brief §16)**: `sstables_consulted` for range scans
+now increments once per live SSTable actually captured by a scan's
+`ReadView` (matching point lookups' own "once per table checked...
+whether or not that check was a bloom-negative" convention) instead of
+once per distinct key drawn from a source (the old design's necessary
+side effect of every key draw being a fresh `range_scan_raw` call).
+`blocks_read`'s counting point (`SsTable::read_block`) is completely
+unchanged. New regression test, brief §23's explicit ask ("prefer an
+observable test hook/counter over timing"): `lsm::tests::range_scan_
+source_cursor_persists_across_keys_instead_of_reconstructing_per_key`
+(`src/lsm/tests.rs`) builds a small, deliberately overlapping keyspace
+(5+ SSTables each holding a version of nearly every one of 15 keys)
+and asserts `sstables_consulted` increases by *exactly* the live
+SSTable count for one range scan -- not merely more than before, which
+the old design would also have satisfied; a regression reintroducing
+per-key reconstruction fails this assertion immediately, independent
+of timing.
+
+**Benchmark evidence -- before/after, same unmodified `overlap_repro`
+workload, `n=7` reps/checkpoint (full table: `PHASE_READ_ENGINE_
+PERFORMANCE.md`'s dated Increment 6 section)**. Old numbers captured
+by `git stash`-ing just the implementation files (`src/lsm/mod.rs`,
+`src/sstable/reader.rs`, `src/sstable/mod.rs`) back to their
+pre-Increment-6 committed state, rebuilding, rerunning the identical
+benchmark invocation, then restoring and rerunning unchanged -- same
+machine, same `--release` build, same dataset generation, same PRNG
+seed, same checkpoints (20/50/100/200/300 SSTables), same range bound.
+
+| SSTables | OLD p50 (us) | NEW p50 (us) | speedup | OLD blocks_read | NEW blocks_read |
+|---:|---:|---:|---:|---:|---:|
+| 20  | 5,169.9  | 1,617.5  | 3.20x | 660   | 140   |
+| 50  | 14,251.1 | 3,862.5  | 3.69x | 1,650 | 350   |
+| 100 | 27,451.3 | 8,006.1  | 3.43x | 3,300 | 700   |
+| 200 | 56,331.6 | 16,947.4 | 3.32x | 6,600 | 1,400 |
+| 300 | 90,469.2 | 24,723.0 | 3.66x | 9,900 | 2,100 |
+
+`blocks_read` (unchanged counting point) dropped by an exact, constant
+**4.714x** at every checkpoint -- direct, apples-to-apples proof of the
+mechanism fix, not just "faster." Wall-clock p50 improved
+**3.20x-3.69x** across all five checkpoints. `sstables_consulted`
+dropped by an exact 21x at every checkpoint (reflects both the
+mechanism fix and the documented counter-definition change together,
+not a clean isolated number -- `blocks_read` is the number to cite for
+the mechanism alone).
+
+**Resource-lifetime check** (`read_engine_bench cursor_resource_check`,
+new section): 200 create/partial-consume/drop + 200 create/full-
+consume/drop cycles (400 scans) against a 5-SSTable overlapping
+fixture -- handle delta = 0, thread delta = 0, RSS delta = 220 KB
+total across all 400 scans (~0.55 KB/scan, ordinary allocator noise,
+not a leak). Point-lookup regression check: `point_p50_us` at every
+checkpoint stayed within this benchmark's own single-digit-microsecond
+noise floor old vs. new (expected -- `get`/`get_as_of`/`contains` and
+`SsTable::get_versioned`/`contains_versioned` were not touched;
+confirmed by diff, `src/sstable/reader.rs`'s entire diff is additive).
+
+**Full regression suite, run and verified clean**: `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test
+--lib` (306/306 -- 305 at the end of Increment 4, plus this
+increment's one new regression test), `cargo test --release --lib`
+(306/306), `cargo check --all-targets --all-features`, `wal_tests`
+(12/12), `crash_consistency --features test-util` (2/2),
+`pathological_recovery_matrix` debug+release (9/9 each). The full
+`--lib` run already covers every named corruption/range-bounds/
+version-tombstone/snapshot/concurrent-flush/property test (`lsm::
+tests::range_scan_during_concurrent_flush_sees_a_coherent_snapshot`,
+`range_scan_across_a_corrupted_data_block_fails_closed_and_ends`,
+`range_scan_included_bounds`/`excluded_bounds`/`unbounded_start_or_
+end`, `range_scan_property_tests::lsm_engine_range_scan_matches_
+independent_reference_model`, and every other `range_scan_*`/
+`*snapshot*` test individually confirmed still passing by name). No
+existing test's assertions were altered.
+
+**Diff scope**: `src/sstable/reader.rs` (+126/-0, `SsTableRangeCursor`
++ `SsTable::range_scan_cursor`), `src/sstable/mod.rs` (+1/-1, export),
+`src/lsm/mod.rs` (+126/-53, `RangeScanIter` refactor + doc comments +
+revised `sstables_consulted` counting point), `src/lsm/tests.rs` (new
+regression test -- this file's diff also still carries Increment 4's
+own not-yet-committed `corruption_injected_mid_session_between_reads_
+is_caught_on_the_very_next_read` test, bundled into this commit as a
+side effect of sharing the file, not itself Increment 6 work),
+`examples/read_engine_bench.rs` (new `cursor_resource_check` section,
+`overlap_repro` enhanced to `n=7` reps/checkpoint with p50/p95/p99/max
+-- this file's diff also still carries Increment 4's `memory_scaling`
+section and Increment 5's `overlap_repro` section, neither committed
+until now, both swept in as the same side effect), `PHASE_READ_ENGINE_
+PERFORMANCE.md`/`PHASE_READ_ENGINE_RANGE_PERFORMANCE_ADR.md` (dated
+Increment 6 sections, `ADR-RE-002` status flipped to Implemented),
+this file. **Not** included, deliberately out of this increment's
+scope: `examples/lsm_crash_cycle_test.rs`, `examples/read_write_soak_
+test.rs` (both pure Increment 4 work, unrelated to range-scan cursors).
+No `src/wal/`, `src/manifest/`, `src/error.rs`, `Cargo.toml`, or
+`Cargo.lock` change.
+
+**`ADR-RE-002`: IMPLEMENTED.** Correctness unregressed, no protected
+behavior changed, no new resource leak, measured and reproducible
+improvement on the exact workload that demonstrated the original
+problem. **Status: READ ENGINE PRODUCTION READY = NO** -- final
+corruption/recovery validation, final integrated endurance validation,
+final performance validation, and the final certification matrix
+remain outstanding, unstarted gates. No Compaction, Router, or
+Replication work started. No new soak run.

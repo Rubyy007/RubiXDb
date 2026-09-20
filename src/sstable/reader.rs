@@ -10,6 +10,7 @@ use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::error::{EngineError, Result};
 use crate::sstable::bloom::BloomFilter;
@@ -406,6 +407,131 @@ impl<'a> Iterator for RangeScanRaw<'a> {
                     return Some(Err(e));
                 }
             }
+        }
+    }
+}
+
+/// `ADR-RE-002` Option A: an owned-`Arc` counterpart to [`RangeScanRaw`]
+/// -- functionally identical (same start-block binary search via
+/// `partition_point`, same lazy one-block-at-a-time reads through the
+/// one shared, already-instrumented `read_block`, same in/end bound
+/// checks, same "stop on first `Err`, never continue past it" contract)
+/// but holding its own `Arc<SsTable>` clone and owned `Bound<Vec<u8>>`
+/// range bounds instead of borrowing `&'a SsTable`/`Bound<&'a [u8]>`.
+///
+/// This is what makes it safe to store *inside* `RangeScanIter`
+/// (`src/lsm/mod.rs`) for a scan's entire lifetime without creating a
+/// self-referential struct: it borrows nothing from whatever struct
+/// holds it, only from its own owned `Arc` clone -- the same non-data-
+/// duplicating pattern `ReadView` already uses for `Arc<SsTable>`/
+/// `Arc<MemTable>` (a refcount bump, never a data copy). `RangeScanRaw`
+/// itself is intentionally left unmodified above (still used by
+/// `SsTable::range_scan_raw`'s existing callers/tests) -- this is an
+/// addition, not a replacement.
+pub struct SsTableRangeCursor {
+    table: Arc<SsTable>,
+    next_block_idx: usize,
+    current: std::vec::IntoIter<DecodedRecord>,
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+    done: bool,
+}
+
+impl SsTableRangeCursor {
+    fn in_start_bound(&self, key: &[u8]) -> bool {
+        match &self.start {
+            Bound::Unbounded => true,
+            Bound::Included(k) => key >= k.as_slice(),
+            Bound::Excluded(k) => key > k.as_slice(),
+        }
+    }
+    fn in_end_bound(&self, key: &[u8]) -> bool {
+        match &self.end {
+            Bound::Unbounded => true,
+            Bound::Included(k) => key <= k.as_slice(),
+            Bound::Excluded(k) => key < k.as_slice(),
+        }
+    }
+}
+
+impl Iterator for SsTableRangeCursor {
+    type Item = Result<(Vec<u8>, u64, RecordValue)>;
+
+    /// Identical control flow to `RangeScanRaw::next` (`in_start_bound`/
+    /// `in_end_bound` checks, one-block-at-a-time lazy reads via
+    /// `read_block`, fail-closed on the first corrupted/unreadable
+    /// block) -- duplicated rather than shared via a generic/trait
+    /// abstraction because the only difference between the two types is
+    /// whether `table`/`start`/`end` are borrowed or owned, and this
+    /// project's own convention (per its coding guidelines) is to prefer
+    /// plain, obviously-correct duplication over an abstraction whose
+    /// only job is to paper over a borrowed-vs-owned split.
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if let Some(r) = self.current.next() {
+                if !self.in_start_bound(&r.key) {
+                    continue;
+                }
+                if !self.in_end_bound(&r.key) {
+                    self.done = true;
+                    return None;
+                }
+                let value = if r.op == OP_PUT {
+                    RecordValue::Put(r.value)
+                } else {
+                    RecordValue::Tombstone
+                };
+                return Some(Ok((r.key, r.seq, value)));
+            }
+            if self.next_block_idx >= self.table.index.len() {
+                self.done = true;
+                return None;
+            }
+            let entry = &self.table.index[self.next_block_idx];
+            self.next_block_idx += 1;
+            match self.table.read_block(entry) {
+                Ok(records) => self.current = records.into_iter(),
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+impl SsTable {
+    /// Constructs an owned-`Arc` range cursor over `[start, end)` --
+    /// same start-block binary search as `range_scan_raw` (leftmost
+    /// index whose `last_key >= start`, so a key spanning several
+    /// consecutive blocks with a tied `last_key` is never skipped), but
+    /// returning [`SsTableRangeCursor`] (owns `table`) instead of
+    /// [`RangeScanRaw`] (borrows it) -- suitable for long-lived storage
+    /// across a whole range scan (`ADR-RE-002` Option A), unlike
+    /// `range_scan_raw`, which is still exactly what it was before this
+    /// increment.
+    pub fn range_scan_cursor(
+        table: Arc<SsTable>,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> SsTableRangeCursor {
+        let start_block = match &start {
+            Bound::Unbounded => 0,
+            Bound::Included(k) | Bound::Excluded(k) => table
+                .index
+                .partition_point(|e| e.last_key.as_slice() < k.as_slice()),
+        };
+        let done = start_block >= table.index.len();
+        SsTableRangeCursor {
+            table,
+            next_block_idx: start_block,
+            current: Vec::new().into_iter(),
+            start,
+            end,
+            done,
         }
     }
 }

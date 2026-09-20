@@ -2,9 +2,15 @@
 
 **ADR ID:** ADR-RE-002
 
-**Status:** Proposed for Review — **no implementation in this document or this step**
+**Status:** **Implemented** (Increment 6, 2026-09-20 — see §9 below).
+Originally proposed 2026-09-20 as "Proposed for Review — no
+implementation in this document or this step"; §0-§8 below are that
+original proposal, preserved unedited as the historical record of what
+was proposed and why. §9 is new, appended after implementation, per
+this project's own append-only documentation convention (never rewrite
+a past section's own conclusions — add a new one).
 
-**Date:** 2026-09-20
+**Date:** 2026-09-20 (proposed); 2026-09-20 (implemented, Increment 6)
 
 **Scope:** `RangeScanIter`'s per-source cursor strategy only (`src/lsm/
 mod.rs:551-` ff.). Does not touch point lookups (`get`/`get_as_of`/
@@ -233,3 +239,82 @@ B), informed by this ADR and `PHASE_READ_ENGINE_RESOURCE_
 INVESTIGATION.md` — not an automatic continuation from this
 investigation, per the phase brief's own explicit instruction to stop
 and report rather than optimize automatically.
+
+## 9. Implementation record (Increment 6, 2026-09-20)
+
+Option A was implemented as proposed in §5, with no deviation from the
+design sketched there: `SsTableRangeCursor` (`src/sstable/reader.rs`,
+new type, 126 lines added, zero lines removed from that file) owns its
+own `Arc<SsTable>` clone plus owned `Bound<Vec<u8>>` range bounds — no
+`unsafe`, no `ouroboros`/`self_cell`, no new `Cargo.toml`/`Cargo.lock`
+entry (confirmed by `git status`, zero changes to either file).
+`RangeScanIter` (`src/lsm/mod.rs`) now stores one persistent
+`Option<Peekable<SsTableRangeCursor>>` per live SSTable source
+(`sstable_cursors`), constructed once in `RangeScanIter::new` and
+driven forward via ordinary `Peekable::peek`/`next` for the scan's
+entire remaining lifetime — replacing the old `sstable_next_start:
+Vec<Option<Bound<Vec<u8>>>>` resume-point-plus-fresh-`range_scan_raw`-
+call design entirely. `RangeScanRaw`/`range_scan_raw` (the pre-existing
+borrowed-iterator type/method) were left completely unmodified — kept,
+not replaced, exactly as §5's proposed direction anticipated (their
+existing callers/tests are untouched).
+
+**§7's required tests, all run and passing**: full existing
+`RangeScanIter`/corruption-matrix/range-bounds/version-tombstone/
+concurrent-flush/property-test suite (306/306 `cargo test --lib`,
+debug and release; the +1 over the pre-Increment-6 305 is this
+increment's own new regression test, `range_scan_source_cursor_
+persists_across_keys_instead_of_reconstructing_per_key`,
+`src/lsm/tests.rs`, asserting `sstables_consulted` increases by
+*exactly* the live SSTable count for one scan over a small,
+fully-overlapping keyspace — an observable-counter regression guard
+per brief §23, not a timing-dependent one); `wal_tests` (12/12),
+`crash_consistency --features test-util` (2/2), `pathological_
+recovery_matrix` debug+release (9/9 each); `cargo fmt --check`/`cargo
+clippy --all-targets --all-features -- -D warnings` both clean.
+
+**§6's safety impact, verified rather than merely asserted**: no
+`unsafe`; the k-way merge algorithm (`refill`/`Iterator::next`) is
+byte-for-byte the same as before this increment (only `peek_sstable`'s
+body and the `sstable_cursors` field changed); `errored`-flag
+fail-closed-on-corruption behavior preserved and re-verified by the
+full corruption-matrix test run; `src/wal/`, `src/manifest/`, `src/
+error.rs` untouched (confirmed by `git status`); point-lookup code
+paths (`get`/`get_as_of`/`contains`, `SsTable::get_versioned`/
+`contains_versioned`) untouched (confirmed by diff — `src/sstable/
+reader.rs`'s entire diff is additive).
+
+**Benchmark evidence (full detail: `PHASE_READ_ENGINE_PERFORMANCE.md`'s
+own dated Increment 6 section, `PROGRESS.md`'s Increment 6 entry)**:
+before/after comparison using the identical, unmodified `overlap_repro`
+workload at the same five checkpoints (20/50/100/200/300 SSTables),
+`n=7` repetitions each. `blocks_read` — whose counting point was not
+touched by this increment — dropped by an exact, constant **4.714x**
+at every single checkpoint, direct proof the redundant re-read/re-decode
+mechanism this ADR targeted is gone. Wall-clock p50 improved
+**3.20x-3.69x** across all five checkpoints. `sstables_consulted`
+dropped by an exact, constant 21x at every checkpoint, reflecting both
+the mechanism fix and this increment's documented, regression-tested
+redefinition of that counter (§16 of the phase brief; not a silent
+change). A resource-lifetime check (`read_engine_bench cursor_
+resource_check`) ran 400 repeated create/consume/drop scan cycles and
+found zero handle delta, zero thread delta, and RSS growth (220 KB
+total) consistent with ordinary allocator noise, not a per-scan leak.
+
+**Conclusion**: the measured dominant re-peek cost (§1-§2 above,
+originally traced and reproduced in `PHASE_READ_ENGINE_RESOURCE_
+INVESTIGATION.md` §4) is substantially reduced, with no correctness
+regression, no protected-behavior change, and no new resource leak.
+**`ADR-RE-002` status: IMPLEMENTED.**
+
+**What remains open, not resolved by this increment**: the real
+4-hour soak's own steeper apparent ~n^2.2 latency exponent was never
+fully reproduced by `overlap_repro` at benchmark scale (before *or*
+after this fix — both show a closer-to-linear shape at this small
+scale); this increment was not re-validated against another real,
+multi-hour soak (deliberately not run, per the phase brief's explicit
+instruction). READ ENGINE PRODUCTION READY remains **NO** — final
+corruption/recovery validation, final integrated endurance validation,
+final performance validation, and the final certification matrix are
+still outstanding, unstarted gates, not something this increment
+declares complete.

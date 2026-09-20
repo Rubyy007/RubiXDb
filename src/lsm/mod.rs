@@ -44,7 +44,7 @@ use crate::error::{EngineError, Result};
 use crate::execution::batch_coordinator::{BatchCoordinatorConfig, BatchCoordinatorPool};
 use crate::manifest::{self, Manifest, ManifestEdit, ManifestState};
 use crate::memtable::{MemTable, MemtableValue, DEFAULT_MAX_SIZE_BYTES};
-use crate::sstable::{self, RecordValue, SsTable, SsTableWriterConfig};
+use crate::sstable::{self, RecordValue, SsTable, SsTableRangeCursor, SsTableWriterConfig};
 use crate::wal::{self, FileWal, GroupCommitter, Wal, WalConfig, WalOp, WalOpOwned};
 
 /// `RubixDB-LSM-Engine-Specification-v1.0.md` §4.1's `LsmConfig`, plus
@@ -520,34 +520,50 @@ impl Ord for HeapEntry {
 /// engine's `immutables`/`sstables` lists, never the filesystem sweep,
 /// never `ManifestState`.
 ///
-/// **Why source iterators are re-queried per key rather than held live**
-/// (`ADR-RE-001` §3 says "use the existing `MemTable::range()`/
-/// `SsTable::range_scan_raw()`, do not rewrite their fundamental
-/// iteration behavior" -- honored exactly: every record this type ever
-/// sees comes from an unmodified call to one of those two functions):
-/// both return an iterator borrowing from the `MemTable`/`SsTable` they
-/// were called on (`range_scan_raw<'a>(&'a self, ..)`). Storing such a
-/// borrowing iterator in the *same* struct as the `Arc<MemTable>`/
-/// `Arc<SsTable>` it borrows from is a self-referential struct Rust's
-/// borrow checker cannot express without `unsafe` or an external crate
-/// (e.g. `ouroboros`/`self_cell`) -- neither is warranted here. Instead,
-/// each source tracks only its own resume point (an owned `Bound<Vec<
-/// u8>>`); every peek makes one fresh, short-lived call to `range`/
-/// `range_scan_raw` (dropped at the end of that one call, so its borrow
-/// never outlives it), pulls every version of exactly the next distinct
-/// key, and advances the resume point past that key.
+/// **Why immutable-MemTable source iterators are re-queried per key**:
+/// `MemTable::range()` returns an iterator borrowing from the `MemTable`
+/// it was called on. Storing such a borrowing iterator in the *same*
+/// struct as the `Arc<MemTable>` it borrows from is a self-referential
+/// struct Rust's borrow checker cannot express without `unsafe` or an
+/// external crate (e.g. `ouroboros`/`self_cell`) -- neither is warranted
+/// here, and `MemTable::range` is a cheap, in-memory `BTreeMap::range`
+/// call (O(log n) tree descent, no I/O, no block decode), so re-issuing
+/// it once per distinct key was never the measured cost (`PHASE_READ_
+/// ENGINE_RESOURCE_INVESTIGATION.md` traced the entire soak-observed
+/// range-latency blowup to the SSTable side, never the MemTable side)
+/// -- left exactly as it was, per `ADR-RE-002`'s own explicit "do not
+/// rewrite MemTable logic unnecessarily" instruction. Each immutable
+/// source still tracks only its own resume point (an owned `Bound<Vec<
+/// u8>>`); every peek makes one fresh, short-lived call to `range`
+/// (dropped at the end of that one call), pulls every version of
+/// exactly the next distinct key, and advances the resume point.
 ///
-/// **Known, deliberately deferred performance characteristic** (per
-/// `ADR-RE-001` §19/§23/§24 and the phase brief's own "do not optimize
-/// prematurely... benchmark suite comes in the next phase"): this means
-/// an `SsTable` source may re-run `range_scan_raw`'s own block-locating
-/// binary search, and re-read+re-decode a data block, once per distinct
-/// key that block holds, rather than once per block. Every block read
-/// still goes through the one shared, already-instrumented `read_block`
-/// (`blocks_read` stays accurate either way), and no block is cached
-/// or retained beyond that single peek. Not addressed in this
-/// increment -- flagged here for the future benchmark/optimization
-/// phase to measure and decide whether it matters in practice.
+/// **SSTable sources: `ADR-RE-002` Option A, implemented this
+/// increment.** Until Increment 6, each `SsTable` source used the same
+/// resume-point-plus-fresh-call pattern as immutables above, via
+/// `SsTable::range_scan_raw<'a>(&'a self, ..)` -- which meant re-running
+/// that call's own block-locating binary search, and (far more costly,
+/// per `PHASE_READ_ENGINE_RESOURCE_INVESTIGATION.md` §4's traced root
+/// cause) re-reading and re-decoding a data block from scratch every
+/// time a key drawn from that source's remaining decoded records had
+/// already been consumed by the previous call -- once per distinct key
+/// a source contributed, not once per block. On this project's own
+/// realistic (small-cardinality, heavily-overwritten) endurance
+/// workload, that meant re-peeking essentially every live SSTable once
+/// per yielded key: O(distinct keys yielded x live SSTable count),
+/// measured growing `range_large` p50 from 1.15ms to 43.1 seconds over
+/// a 4-hour soak (614 SSTables). Each `sstable_cursors` entry below now
+/// holds a persistent [`SsTableRangeCursor`] (`src/sstable/reader.rs`)
+/// -- constructed once per source at scan start and driven forward
+/// with ordinary `Iterator::next()`/`Peekable::peek()` calls for the
+/// scan's entire remaining lifetime, never reconstructed. Because
+/// `SsTableRangeCursor` owns its own `Arc<SsTable>` clone (a refcount
+/// bump, not a data copy -- the same pattern `ReadView` already uses)
+/// rather than borrowing `&'a SsTable`, storing it here is not
+/// self-referential: no `unsafe`, no `ouroboros`/`self_cell`, no new
+/// dependency. The k-way merge algorithm itself (`refill`/`next` below)
+/// is unchanged -- only how an SSTable source produces its next record
+/// changed.
 pub struct RangeScanIter {
     read_view: ReadView,
     as_of_seq: u64,
@@ -557,9 +573,19 @@ pub struct RangeScanIter {
     /// re-query is ever needed for this source.
     active_position: usize,
     /// `None` once that immutable is known exhausted (no re-query is
-    /// attempted again for it).
+    /// attempted again for it). Unchanged by `ADR-RE-002` -- see this
+    /// struct's own doc comment for why immutables keep this design.
     immutable_next_start: Vec<Option<Bound<Vec<u8>>>>,
-    sstable_next_start: Vec<Option<Bound<Vec<u8>>>>,
+    /// `ADR-RE-002` Option A: one persistent, owned-`Arc` cursor per
+    /// live SSTable source, constructed once (`new`, at scan start) and
+    /// driven forward via `Peekable::peek`/`next` for the rest of the
+    /// scan -- never reconstructed per key. `None` once that source is
+    /// known exhausted (its cursor is dropped at that point, releasing
+    /// its `Arc<SsTable>` clone and decoded-block buffer immediately,
+    /// rather than waiting for the whole scan to finish -- see §6/§17
+    /// of `PROGRESS.md`'s Increment 6 entry for the resource-lifetime
+    /// verification this enables).
+    sstable_cursors: Vec<Option<std::iter::Peekable<SsTableRangeCursor>>>,
     heap: BinaryHeap<std::cmp::Reverse<HeapEntry>>,
     heap_initialized: bool,
     read_stats: Arc<ReadStatCounters>,
@@ -578,14 +604,31 @@ impl RangeScanIter {
         read_stats: Arc<ReadStatCounters>,
     ) -> Self {
         let immutable_next_start = vec![Some(start.clone()); read_view.immutables.len()];
-        let sstable_next_start = vec![Some(start); read_view.sstables.len()];
+        // `ADR-RE-002` Option A: construct every live SSTable source's
+        // persistent cursor up front -- cheap (one in-memory
+        // `partition_point` binary search per source, zero I/O; the
+        // first real block read happens lazily, on the first `next()`
+        // pulled from a given cursor, exactly as before) and it removes
+        // the need to track a separate resume-point `Bound` per source,
+        // since the cursor's own internal block index/decoded-record
+        // position already *is* the resume point.
+        let sstable_cursors: Vec<Option<std::iter::Peekable<SsTableRangeCursor>>> = read_view
+            .sstables
+            .iter()
+            .map(|table| {
+                Some(
+                    SsTable::range_scan_cursor(Arc::clone(table), start.clone(), end.clone())
+                        .peekable(),
+                )
+            })
+            .collect();
         RangeScanIter {
             read_view,
             as_of_seq,
             end,
             active_position: 0,
             immutable_next_start,
-            sstable_next_start,
+            sstable_cursors,
             heap: BinaryHeap::new(),
             heap_initialized: false,
             read_stats,
@@ -641,53 +684,61 @@ impl RangeScanIter {
         })
     }
 
+    /// `ADR-RE-002` Option A: pulls the next distinct key's full version
+    /// group from this source's *persistent* cursor -- `Peekable::peek`/
+    /// `next` on the same [`SsTableRangeCursor`] constructed once in
+    /// `new`, never a freshly reconstructed one. No binary search, no
+    /// discarded/re-read block: the cursor's own `next_block_idx`/
+    /// `current` (decoded-block) state already carries forward from
+    /// wherever the previous call left off. Logically identical to the
+    /// pre-Increment-6 behavior otherwise -- same grouping loop, same
+    /// fail-closed-on-`Err` contract (still must not `break` past a
+    /// corrupted record and return an incomplete `versions` as if
+    /// complete: the corrupted record is still logically part of this
+    /// key's version group).
     fn peek_sstable(&mut self, idx: usize, recency: usize) -> Result<Option<HeapEntry>> {
-        let Some(next_start) = self.sstable_next_start[idx].clone() else {
+        let Some(cursor) = self.sstable_cursors[idx].as_mut() else {
             return Ok(None);
         };
-        let table = Arc::clone(&self.read_view.sstables[idx]);
-        self.read_stats
-            .sstables_consulted
-            .fetch_add(1, Ordering::Relaxed);
-        let mut iter = table
-            .range_scan_raw(bound_as_ref(&next_start), bound_as_ref(&self.end))
-            .peekable();
-        let (key, first_seq, first_value) = match iter.next() {
+        let (key, first_seq, first_value) = match cursor.next() {
             Some(Ok(v)) => v,
             Some(Err(e)) => return Err(e),
             None => {
-                self.sstable_next_start[idx] = None;
+                // Exhausted -- drop the cursor now rather than at scan
+                // end, releasing its `Arc<SsTable>` clone and decoded-
+                // block buffer immediately (§6/§17 resource-lifetime
+                // requirement: a completed source must not stay
+                // reachable/retained for the rest of the scan).
+                self.sstable_cursors[idx] = None;
                 return Ok(None);
             }
         };
         let mut versions = vec![(first_seq, record_value_to_memtable_value(first_value))];
         loop {
-            match iter.peek() {
+            let cursor = self.sstable_cursors[idx]
+                .as_mut()
+                .expect("cursor just yielded Some(..) above, not yet cleared");
+            match cursor.peek() {
                 Some(Ok((k, _, _))) if *k == key => {}
                 // Propagate immediately -- must NOT `break` past this
                 // and return the already-collected (incomplete)
                 // `versions` as if they were a complete, successful
-                // result: that would silently advance `sstable_next_
-                // start` past the corrupted record on the next call,
-                // exactly the "silent continuation past corruption"
-                // `ADR-RE-001` §7 forbids. The corrupted record is
-                // still logically part of *this* key's version group,
-                // so this exact call must fail, not a later one.
-                Some(Err(_)) => match iter.next() {
+                // result: the corrupted record is still logically part
+                // of *this* key's version group, so this exact call
+                // must fail, not a later one (`ADR-RE-001` §7).
+                Some(Err(_)) => match cursor.next() {
                     Some(Err(e)) => return Err(e),
                     _ => unreachable!("peek() just confirmed Err present"),
                 },
                 _ => break,
             }
-            match iter.next() {
+            match cursor.next() {
                 Some(Ok((_, seq, value))) => {
                     versions.push((seq, record_value_to_memtable_value(value)))
                 }
                 _ => unreachable!("just confirmed matching key present by peek"),
             }
         }
-        drop(iter);
-        self.sstable_next_start[idx] = Some(Bound::Excluded(key.clone()));
         Ok(Some(HeapEntry {
             key,
             recency,
@@ -745,6 +796,28 @@ impl Iterator for RangeScanIter {
         }
         if !self.heap_initialized {
             self.heap_initialized = true;
+            // `ADR-RE-002`/`PHASE_READ_ENGINE_PERFORMANCE.md`'s revised
+            // `sstables_consulted` semantics (Increment 6): counted once
+            // per live SSTable this scan's `ReadView` captured -- i.e.
+            // once per table actually consulted for this one logical
+            // range-scan operation -- not once per distinct key drawn
+            // from a source, which is what the pre-Increment-6
+            // implementation (necessarily, since every key draw was a
+            // fresh `range_scan_raw` call) counted instead. This matches
+            // point lookups' own already-established convention exactly
+            // ("once per table checked... whether or not that check was
+            // a bloom-negative", `PHASE_READ_ENGINE_PERFORMANCE.md`) --
+            // an attempted-consultation count, not a result count -- and
+            // is counted here, at the single point where every source's
+            // persistent cursor is known to exist, rather than
+            // scattered across `peek_sstable` calls that may now number
+            // fewer than one per source (a source can be asked for its
+            // next key zero times if the merge never needs it) or more
+            // than one (repeated draws from the *same*, already-open
+            // cursor no longer represent a new consultation).
+            self.read_stats
+                .sstables_consulted
+                .fetch_add(self.read_view.sstables.len() as u64, Ordering::Relaxed);
             if let Err(e) = self.refill(None) {
                 self.errored = true;
                 return Some(Err(e));

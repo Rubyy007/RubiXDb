@@ -900,6 +900,328 @@ fn section_sanity() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// --- Increment 4 §21: memory-scaling check, observational only, no
+// optimization. One continuously-growing fixture (not five separate
+// rebuilds), measured at each SSTable-count checkpoint as it's
+// crossed. ---
+
+fn section_memory_scaling() {
+    println!(
+        "\n=== memory_scaling: RSS / point-read p99 / range-scan p99 vs live SSTable count ==="
+    );
+    let checkpoints: [usize; 5] = [100, 500, 1000, 2000, 5000];
+    let dir = temp_dir("memscale");
+    let engine = open_engine(&dir, 350, 64); // same per-entry calibration as build_fixture.
+    let pid = current_pid();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut next_checkpoint = 0usize;
+    let mut i: u64 = 0;
+
+    while next_checkpoint < checkpoints.len() {
+        let key = format!("scale-k{i:08}").into_bytes();
+        engine.put(&key, b"v").unwrap();
+        keys.push(key);
+        i += 1;
+
+        let count = engine.sstable_count();
+        if count >= checkpoints[next_checkpoint] {
+            let target = checkpoints[next_checkpoint];
+            assert!(
+                wait_until(|| engine.immutable_count() == 0, Duration::from_secs(30)),
+                "flush must settle before measuring checkpoint {target}"
+            );
+            let rss = sample_rss_kb(pid);
+
+            let before = engine.read_stats();
+            let (_, mut point_lat) =
+                time_over_keys(&keys, 300.min(keys.len()), |k| engine.get(k).unwrap());
+            let after = engine.read_stats();
+            point_lat.sort_unstable();
+            let point_p99 = us(percentile_ns(&point_lat, 0.99));
+
+            let mut range_lat = Vec::new();
+            for r in 0..20u64 {
+                let start_idx = ((r as usize) * keys.len() / 20).min(keys.len().saturating_sub(1));
+                let end_idx = (start_idx + 50).min(keys.len() - 1);
+                let t1 = Instant::now();
+                let _: Vec<_> = engine
+                    .range(
+                        Bound::Included(keys[start_idx].as_slice()),
+                        Bound::Included(keys[end_idx].as_slice()),
+                    )
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                range_lat.push(t1.elapsed().as_nanos());
+            }
+            range_lat.sort_unstable();
+            let range_p99 = us(percentile_ns(&range_lat, 0.99));
+
+            println!(
+                "checkpoint target={target} actual_sstables={count} rss_kb={rss:?} \
+                 point_read_p99_us={point_p99:.1} range_scan_p99_us={range_p99:.1} \
+                 blocks_read_delta={} sstables_consulted_delta={} keys_so_far={}",
+                after.blocks_read - before.blocks_read,
+                after.sstables_consulted - before.sstables_consulted,
+                keys.len(),
+            );
+            next_checkpoint += 1;
+        }
+    }
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- Increment 5: independent, deterministic reproduction of the
+// long-duration soak's range-scan degradation -- a small, deliberately
+// *overlapping* keyspace (every write picks a key uniformly from a
+// small cardinality, exactly like `read_write_soak_test.rs`'s
+// `KEY_CARDINALITY=4000` pattern, unlike this file's own
+// `memory_scaling` section above, which uses disjoint sequential
+// keys). The soak observed `range_large` p50 grow from 1.15ms at 5
+// SSTables to 43.1s at 597 SSTables (~37,000x for a ~120x SSTable-
+// count increase) and `sstables_consulted` per range op reach roughly
+// the live SSTable count itself. This section exists to reproduce that
+// *shape* in minutes, not 4 hours, and to isolate whether keyspace
+// overlap (not SSTable count alone) is the driver -- `memory_scaling`
+// above already shows SSTable count alone, on a disjoint keyspace,
+// produces only ordinary linear-ish growth (§ Increment 4's own
+// finding). No optimization is attempted here.
+fn section_overlap_repro() {
+    println!(
+        "\n=== overlap_repro: RSS / range-scan cost / sstables_consulted vs SSTable count, an \
+         OVERLAPPING (small-cardinality, soak-like) keyspace ==="
+    );
+    // The soak's own overlap ratio -- entries flushed per memtable-fill
+    // cycle vs. distinct key cardinality -- was ~27,424 : 4,000 (~6.9
+    // writes per key per flush, ~99.9% chance a given key lands in any
+    // given table). The first version of this repro used ~2.8
+    // writes/key/flush (500-key cardinality, 350-byte memtable) and
+    // reproduced only a ~1.6-2.5 sstables_consulted/sstable ratio --
+    // nowhere near the soak's observed ~500-1000+ -- precisely because
+    // overlap probability per table was low (~0.6%). `KEY_CARDINALITY`
+    // and `memtable_max_size_bytes` below are chosen so entries-per-
+    // flush is ~10x the cardinality (~99.995% per-key overlap
+    // probability per table), matching the soak's real regime instead
+    // of guessing at it.
+    const KEY_CARDINALITY: u64 = 20;
+    const CHECKPOINTS: [usize; 5] = [20, 50, 100, 200, 300];
+    let dir = temp_dir("overlap_repro");
+    // ~150 bytes/entry (16-256B value + key/overhead) x ~200 entries
+    // (10x KEY_CARDINALITY) ~ 30,000 bytes.
+    let engine = open_engine(&dir, 30_000, 64);
+    let pid = current_pid();
+    let mut rng_state: u64 = 20260920;
+    let mut next_rand = move || {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+    let key_for = |i: u64| format!("ov-k{i:06}").into_bytes();
+    let mut next_checkpoint = 0usize;
+    let mut writes = 0u64;
+
+    while next_checkpoint < CHECKPOINTS.len() {
+        let idx = next_rand() % KEY_CARDINALITY;
+        let key = key_for(idx);
+        let len = 16 + (next_rand() % 240) as usize;
+        let mut value = vec![0u8; len];
+        for b in value.iter_mut() {
+            *b = (next_rand() & 0xFF) as u8;
+        }
+        engine.put(&key, &value).unwrap();
+        writes += 1;
+
+        let count = engine.sstable_count();
+        if count >= CHECKPOINTS[next_checkpoint] {
+            let target = CHECKPOINTS[next_checkpoint];
+            assert!(
+                wait_until(|| engine.immutable_count() == 0, Duration::from_secs(30)),
+                "flush must settle before measuring checkpoint {target}"
+            );
+            let rss = sample_rss_kb(pid);
+
+            // `ADR-RE-002`/Increment 6 brief §12/§14: report a real
+            // distribution (p50/p95/p99/max), not a single best/only
+            // run -- `REPS` identical, independent range scans over the
+            // exact same live SSTable set at this checkpoint (the
+            // fixture is not mutated between reps). `sstables_consulted`
+            // /`blocks_read` are recorded from the *last* rep only (both
+            // are deterministic functions of the live SSTable set and
+            // this fixed range, identical across reps by construction --
+            // recording them once avoids implying they are a
+            // distribution when they are not).
+            const REPS: usize = 7;
+            let mut range_lat_ns: Vec<u128> = Vec::with_capacity(REPS);
+            let (mut consulted_delta, mut blocks_delta, mut rows_len) = (0u64, 0u64, 0usize);
+            for _ in 0..REPS {
+                let before = engine.read_stats();
+                let t0 = Instant::now();
+                let rows: Vec<_> = engine
+                    .range(
+                        Bound::Included(key_for(0).as_slice()),
+                        Bound::Included(key_for(99.min(KEY_CARDINALITY - 1)).as_slice()),
+                    )
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                range_lat_ns.push(t0.elapsed().as_nanos());
+                let after = engine.read_stats();
+                consulted_delta = after.sstables_consulted - before.sstables_consulted;
+                blocks_delta = after.blocks_read - before.blocks_read;
+                rows_len = rows.len();
+            }
+            range_lat_ns.sort_unstable();
+
+            let mut point_lat = Vec::new();
+            for i in 0..50u64 {
+                let k = key_for(i % KEY_CARDINALITY);
+                let t1 = Instant::now();
+                let _ = engine.get(&k).unwrap();
+                point_lat.push(t1.elapsed().as_nanos());
+            }
+            point_lat.sort_unstable();
+            let point_p50 = us(percentile_ns(&point_lat, 0.50));
+
+            println!(
+                "checkpoint target={target} actual_sstables={count} writes_so_far={writes} \
+                 rss_kb={rss:?} range100of500_rows={rows_len} n={REPS} \
+                 range100of500_p50_us={:.1} range100of500_p95_us={:.1} \
+                 range100of500_p99_us={:.1} range100of500_max_us={:.1} \
+                 range_sstables_consulted={consulted_delta} range_blocks_read={blocks_delta} \
+                 sstables_consulted/sstable={:.3} point_p50_us={point_p50:.1}",
+                us(percentile_ns(&range_lat_ns, 0.50)),
+                us(percentile_ns(&range_lat_ns, 0.95)),
+                us(percentile_ns(&range_lat_ns, 0.99)),
+                us(*range_lat_ns.last().unwrap()),
+                consulted_delta as f64 / count as f64,
+            );
+            next_checkpoint += 1;
+        }
+    }
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- Increment 6 (`ADR-RE-002` Option A) §6/§17: resource-lifetime
+// verification for persistent per-scan SSTable cursors -- handles,
+// threads, RSS must return to baseline after repeated
+// create-partial-consume-drop cycles; no completed scan may remain
+// reachable/retained. ---
+
+fn section_cursor_resource_check() {
+    println!(
+        "\n=== cursor_resource_check: handles/threads/RSS across repeated create-partial-\
+         consume-drop range scan cycles ==="
+    );
+    let dir = temp_dir("cursor_resource");
+    // Same small-cardinality, high-overlap shape as `overlap_repro`
+    // above -- every live SSTable holds a version of nearly every key,
+    // so each scan below actually exercises persistent cursors on
+    // every one of the live sources, not just a couple.
+    let engine = open_engine(&dir, 6_000, 32);
+    let pid = current_pid();
+    const KEY_CARDINALITY: u64 = 15;
+    let key_for = |i: u64| format!("res-k{i:03}").into_bytes();
+    let mut i: u64 = 0;
+    while engine.sstable_count() < 5 {
+        engine.put(&key_for(i % KEY_CARDINALITY), b"v").unwrap();
+        i += 1;
+    }
+    assert!(
+        wait_until(|| engine.immutable_count() == 0, Duration::from_secs(30)),
+        "flush must settle before measuring baseline"
+    );
+    let live_sstables = engine.sstable_count();
+
+    // Let one full GC/quiescence tick pass before sampling the
+    // baseline, since the very first process-wide handle/RSS sample
+    // right after a burst of flushes can still reflect transient setup
+    // cost unrelated to what this section measures.
+    thread::sleep(Duration::from_millis(200));
+    let baseline_handles = sample_handle_count(pid);
+    let baseline_threads = sample_thread_count(pid);
+    let baseline_rss = sample_rss_kb(pid);
+    println!(
+        "baseline: live_sstables={live_sstables} handles={baseline_handles:?} \
+         threads={baseline_threads:?} rss_kb={baseline_rss:?}"
+    );
+
+    const CYCLES: usize = 200;
+    for cycle in 0..CYCLES {
+        // Partial consumption: create a scan, pull a few rows, then
+        // drop it while still mid-scan -- exercises early-drop cursor
+        // cleanup (some sources' persistent cursors are still open,
+        // holding an `Arc<SsTable>` clone and a decoded-block buffer,
+        // when the whole `RangeScanIter` -- and therefore every
+        // `Option<Peekable<SsTableRangeCursor>>` it owns -- drops).
+        {
+            let mut partial = engine.range(Bound::Unbounded, Bound::Unbounded);
+            for _ in 0..3 {
+                let _ = partial.next();
+            }
+            drop(partial);
+        }
+        // Full consumption: create another scan, drain it completely
+        // (every source cursor reaches natural exhaustion and is
+        // dropped inside `peek_sstable` itself, per Increment 6), then
+        // drop the (already-fully-exhausted) iterator too.
+        {
+            let full: Vec<_> = engine
+                .range(Bound::Unbounded, Bound::Unbounded)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                full.len(),
+                KEY_CARDINALITY as usize,
+                "cycle {cycle}: every key in this small, fully-overlapping keyspace must still \
+                 be yielded exactly once"
+            );
+        }
+    }
+
+    thread::sleep(Duration::from_millis(200));
+    let final_handles = sample_handle_count(pid);
+    let final_threads = sample_thread_count(pid);
+    let final_rss = sample_rss_kb(pid);
+    println!(
+        "after {CYCLES} create/partial-consume/drop + create/full-consume/drop cycles: \
+         handles={final_handles:?} threads={final_threads:?} rss_kb={final_rss:?}"
+    );
+    if let (Some(b), Some(f)) = (baseline_handles, final_handles) {
+        println!(
+            "handle delta = {} ({} baseline -> {} final) across {} scans ({} partial-drop + \
+             {} full-drain)",
+            f as i64 - b as i64,
+            b,
+            f,
+            CYCLES * 2,
+            CYCLES,
+            CYCLES,
+        );
+    }
+    if let (Some(b), Some(f)) = (baseline_threads, final_threads) {
+        println!(
+            "thread delta = {} ({} baseline -> {} final)",
+            f as i64 - b as i64,
+            b,
+            f
+        );
+    }
+    if let (Some(b), Some(f)) = (baseline_rss, final_rss) {
+        println!(
+            "rss delta = {} KB ({} baseline -> {} final)",
+            f as i64 - b as i64,
+            b,
+            f
+        );
+    }
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // --- §13: ReadStats instrumentation overhead (best-effort proxy) ---
 
 fn section_readstats_overhead() {
@@ -972,6 +1294,28 @@ fn main() {
     }
     if want("readstats_overhead") {
         section_readstats_overhead();
+    }
+    // Not part of the default `ALL` run -- Increment 4's dedicated
+    // 100/500/1000/2000/5000-SSTable-checkpoint sweep takes tens of
+    // minutes on its own and is meant to be run standalone
+    // (`read_engine_bench memory_scaling`), not bundled into every
+    // routine baseline run.
+    if args.iter().any(|a| a == "memory_scaling") {
+        section_memory_scaling();
+    }
+    // Increment 5: independent, deterministic reproduction of the
+    // soak's overlapping-keyspace range-scan degradation -- also not
+    // part of the default `ALL` run, standalone via `read_engine_bench
+    // overlap_repro`.
+    if args.iter().any(|a| a == "overlap_repro") {
+        section_overlap_repro();
+    }
+    // Increment 6 (`ADR-RE-002` Option A) §6/§17: repeated create/
+    // partial-consume/drop + create/full-consume/drop cycles, verifying
+    // handles/threads/RSS return to baseline -- standalone via
+    // `read_engine_bench cursor_resource_check`.
+    if args.iter().any(|a| a == "cursor_resource_check") {
+        section_cursor_resource_check();
     }
 
     println!("\ndone.");

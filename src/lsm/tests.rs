@@ -2692,6 +2692,85 @@ fn read_stats_counts_range_scan_calls_and_sstable_consultation_correctly() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `ADR-RE-002` Option A (Increment 6) regression test -- brief §23:
+/// "prove a single source cursor advances through multiple consecutive
+/// keys WITHOUT reconstructing the source iterator for every key...
+/// prefer an observable test hook/counter over timing."
+///
+/// Uses `sstables_consulted`'s own Increment-6-revised semantics (once
+/// per live SSTable actually captured by this scan's `ReadView`, not
+/// once per key drawn from it -- see `RangeScanIter::next`'s own doc
+/// comment) as that observable counter. Deliberately builds a small,
+/// heavily *overlapping* keyspace (mirrors `PHASE_READ_ENGINE_
+/// RESOURCE_INVESTIGATION.md` §4.3's `overlap_repro` reproduction, at
+/// unit-test scale): a handful of SSTables that each hold a version of
+/// nearly every key in the scanned range, so a single source cursor is
+/// asked to advance through *many* consecutive keys during this one
+/// scan. Under the pre-Increment-6 implementation (a fresh `range_scan_
+/// raw` call, and therefore one `sstables_consulted` increment, per key
+/// drawn from a source), this would have produced a count many times
+/// the live SSTable count -- exactly the re-peek signature
+/// `PHASE_READ_ENGINE_RESOURCE_INVESTIGATION.md` traced and reproduced.
+/// A regression that reintroduces per-key reconstruction would make
+/// this assertion fail immediately, with no dependence on timing.
+#[test]
+fn range_scan_source_cursor_persists_across_keys_instead_of_reconstructing_per_key() {
+    let dir = temp_dir("cursor_persists");
+    // Small memtable relative to the write volume below, small key
+    // cardinality: each flush cycle writes far more entries than there
+    // are distinct keys, so (mirroring the soak's own overlap ratio)
+    // essentially every flushed SSTable ends up holding a version of
+    // essentially every key.
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 6_000,
+        max_immutable_memtables: 32,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    const KEY_CARDINALITY: u32 = 15;
+    let mut i: u64 = 0;
+    while engine.sstable_count() < 5 {
+        let key = format!("ov{:03}", i % KEY_CARDINALITY as u64);
+        engine.put(key.as_bytes(), b"v").unwrap();
+        i += 1;
+    }
+    assert!(
+        wait_until(|| engine.immutable_count() == 0, Duration::from_secs(5)),
+        "flush must settle before measuring"
+    );
+    let live_sstables = engine.sstable_count() as u64;
+    assert!(
+        live_sstables >= 5,
+        "fixture must actually reach >=5 live, overlapping SSTables, got {live_sstables}"
+    );
+
+    let before = engine.read_stats();
+    let rows = collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+    let after = engine.read_stats();
+
+    assert_eq!(
+        rows.len(),
+        KEY_CARDINALITY as usize,
+        "sanity: every one of the small, fully-overlapping keyspace's keys must be yielded \
+         exactly once"
+    );
+    assert_eq!(
+        after.sstables_consulted - before.sstables_consulted,
+        live_sstables,
+        "sstables_consulted must increase by EXACTLY the live SSTable count for this one range \
+         scan -- not by a multiple of the {} keys yielded, which is what the pre-Increment-6 \
+         per-key-reconstruction design would have produced (each of the {live_sstables} sources \
+         held a version of nearly every one of the {} overlapping keys, so a regression back to \
+         reconstructing each source's iterator per key would inflate this count far past \
+         {live_sstables}, not merely exceed it slightly)",
+        rows.len(),
+        KEY_CARDINALITY,
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `ADR-RE-001`/phase brief §17: an independent reference model (*not*
 /// the production merge algorithm) driving `get`/`get_as_of`/
 /// `range_scan` through a deterministic PUT/DELETE/overwrite/snapshot
@@ -3254,6 +3333,96 @@ fn get_as_of_and_range_scan_when_the_underlying_file_shrinks_mid_lifetime_fail_c
     assert!(
         iter.next().is_none(),
         "the iterator must end after yielding the Io error, same as the Corruption case"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Read Engine Increment 4 (`PHASE_READ_ENGINE_ADR.md` brief §17):
+/// corruption injected *while the engine stays open and has already
+/// served a successful read from this exact table* -- no restart, no
+/// `SsTable::open` re-validation in between. Data blocks are never
+/// cached (bounded-memory-by-design, `src/sstable/reader.rs`'s own
+/// doc comment), so a live engine reading the same table again after
+/// an external corruption must observe it immediately, exactly like
+/// the already-covered restart case -- this test verifies that is
+/// actually true, not merely assumed from the restart-based tests.
+#[test]
+fn corruption_injected_mid_session_between_reads_is_caught_on_the_very_next_read() {
+    let dir = temp_dir("mid_session_corruption");
+    let lsm_config = LsmConfig {
+        memtable_max_size_bytes: 350,
+        max_immutable_memtables: 8,
+        ..LsmConfig::default()
+    };
+    let engine = open(&dir, lsm_config);
+    for i in 0..10u32 {
+        engine.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+    }
+    assert!(
+        wait_until(
+            || engine.sstable_count() == 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ),
+        "the flush must complete before this test can read successfully, then corrupt"
+    );
+
+    // First: a real, successful read through this exact live engine --
+    // proves the table is genuinely readable before corruption, not
+    // just "not yet opened."
+    assert_eq!(engine.get(b"k000").unwrap(), Some(b"v".to_vec()));
+    assert!(engine.contains(b"k000", u64::MAX).unwrap());
+
+    // Corrupt the first data block via a second handle, without
+    // restarting or reopening the engine -- the live `SsTable`'s
+    // already-validated footer/index/bloom stay exactly as they were.
+    let sst_path = fs::read_dir(dir.join("sstables"))
+        .unwrap()
+        .find_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            name.ends_with(".sst").then(|| e.path())
+        })
+        .expect("exactly one .sst file must exist after the flush above");
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst_path)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+    }
+
+    // Every read path must now fail closed on the very next call,
+    // through the same still-open engine -- no silent stale-cache
+    // return of the pre-corruption value, no partial/incomplete
+    // silent success.
+    let get_result = engine.get(b"k000");
+    assert!(
+        matches!(get_result, Err(EngineError::Corruption { .. })),
+        "get() must fail closed immediately after mid-session corruption, got {get_result:?}"
+    );
+    let contains_result = engine.contains(b"k000", u64::MAX);
+    assert!(
+        matches!(contains_result, Err(EngineError::Corruption { .. })),
+        "contains() must fail closed immediately after mid-session corruption, got \
+         {contains_result:?}"
+    );
+    let mut iter = engine.range(Bound::Unbounded, Bound::Unbounded);
+    let first = iter.next();
+    assert!(
+        matches!(first, Some(Err(EngineError::Corruption { .. }))),
+        "range() must fail closed immediately after mid-session corruption, got {first:?}"
+    );
+    assert!(
+        iter.next().is_none(),
+        "range() must end after the corruption error, never silently continue with an \
+         incomplete result"
     );
 
     engine.shutdown();
