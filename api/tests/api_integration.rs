@@ -84,6 +84,7 @@ fn test_config(data_dir: PathBuf) -> Config {
         rate_limit_burst: 10_000,
         compaction_auto_trigger: false,
         compaction_trigger_count: 4,
+        cors_allowed_origins: vec!["http://localhost:5173".to_string()],
     }
 }
 
@@ -141,6 +142,42 @@ async fn healthz_requires_no_auth() {
 }
 
 #[tokio::test]
+async fn cors_allows_only_the_configured_origin_and_never_wildcards() {
+    let dir = temp_dir("cors");
+    // `test_config` configures exactly one allowed origin
+    // (http://localhost:5173, the frontend dev server).
+    let (state, router) = build_app(&dir);
+
+    let allowed = Request::builder()
+        .method("GET")
+        .uri("/v1/status")
+        .header("Authorization", format!("Bearer {READER_KEY}"))
+        .header("Origin", "http://localhost:5173")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(allowed).await.unwrap();
+    let allow_origin = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(allow_origin.as_deref(), Some("http://localhost:5173"));
+    assert_ne!(allow_origin.as_deref(), Some("*"));
+
+    let disallowed = Request::builder()
+        .method("GET")
+        .uri("/v1/status")
+        .header("Authorization", format!("Bearer {READER_KEY}"))
+        .header("Origin", "https://not-allowed.example")
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = router.clone().oneshot(disallowed).await.unwrap();
+    assert!(resp2.headers().get("access-control-allow-origin").is_none());
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn readyz_requires_auth_and_reports_storage_state() {
     let dir = temp_dir("ready");
     let (state, router) = build_app(&dir);
@@ -160,6 +197,41 @@ async fn readyz_requires_auth_and_reports_storage_state() {
     let body = json_body(ok).await;
     assert_eq!(body["ready"], true);
     assert_eq!(body["storage_state"], "Healthy");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn whoami_reports_the_authenticated_principal_and_role() {
+    let dir = temp_dir("whoami");
+    let (state, router) = build_app(&dir);
+
+    let admin_resp = router
+        .clone()
+        .oneshot(req("GET", "/v1/whoami", Some(ADMIN_KEY), None))
+        .await
+        .unwrap();
+    assert_eq!(admin_resp.status(), StatusCode::OK);
+    let admin_body = json_body(admin_resp).await;
+    assert_eq!(admin_body["principal_name"], "admin");
+    assert_eq!(admin_body["role"], "admin");
+
+    let reader_resp = router
+        .clone()
+        .oneshot(req("GET", "/v1/whoami", Some(READER_KEY), None))
+        .await
+        .unwrap();
+    let reader_body = json_body(reader_resp).await;
+    assert_eq!(reader_body["principal_name"], "reader");
+    assert_eq!(reader_body["role"], "reader");
+
+    let unauth = router
+        .clone()
+        .oneshot(req("GET", "/v1/whoami", None, None))
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
     state.engine.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

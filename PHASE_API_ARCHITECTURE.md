@@ -178,6 +178,7 @@ the API must not silently assume UTF-8.
 |---|---|---|---|
 | GET | `/healthz` | liveness (process is up) | none — no engine call |
 | GET | `/readyz` | readiness (engine open, serving) | `storage_state()` (any state = ready; only "engine not yet open" is not-ready) |
+| GET | `/v1/whoami` | the caller's own authenticated principal name + role — added during frontend implementation (`PHASE_FRONTEND_ARCHITECTURE.md` §5): a role-aware UI needs this and no other endpoint provided it | none — reads the `Principal` `auth_middleware` already attaches |
 | GET | `/v1/status` | engine status snapshot | `storage_state`, `storage_pressure_events`, `sstable_count`, `checkpoint_seq`, `manifest_record_count`, `manifest_size_bytes`, `live_sstable_ids().len()`, `capacity_pressure_events` |
 | GET | `/v1/metadata` | database/keyspace metadata | static: single flat keyspace, engine config echoed back (the config the service itself opened with — the engine has no `config()` getter, so the service remembers what it passed to `open()`) |
 | PUT | `/v1/kv` | put a key/value | `put(key, value)` |

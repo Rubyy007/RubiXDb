@@ -9,10 +9,12 @@ pub mod status;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::{header, Method};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::Router;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::auth::auth_middleware;
 use crate::state::AppState;
@@ -52,9 +54,36 @@ fn body_size_limit(config: &crate::config::Config) -> usize {
     (config.max_value_bytes + config.max_key_bytes) * 4 / 3 + 4096
 }
 
+/// `None` (no layer applied -- same-origin only, the safe default)
+/// unless `RUBIXDB_CORS_ALLOWED_ORIGINS` names at least one origin.
+/// Never wildcards the origin: this API is authenticated and mutable,
+/// so an explicit allow-list is used even though the `Authorization`
+/// header alone (no cookies, `credentials: 'include'` never set by
+/// this project's own frontend) would not technically require one --
+/// restricting the allow-list still prevents an arbitrary third-party
+/// page's script from reading a response even if it somehow obtained
+/// a valid bearer token some other way.
+fn cors_layer(config: &crate::config::Config) -> Option<CorsLayer> {
+    if config.cors_allowed_origins.is_empty() {
+        return None;
+    }
+    let origins: Vec<_> = config
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::PUT, Method::POST, Method::DELETE])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+    )
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/readyz", get(health::readyz))
+        .route("/v1/whoami", get(health::whoami))
         .route("/v1/status", get(status::status))
         .route("/v1/metadata", get(status::metadata))
         .route("/v1/kv", put(kv::put))
@@ -82,9 +111,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         ));
 
     let limit = body_size_limit(&state.config);
-    Router::new()
+    let cors = cors_layer(&state.config);
+    let mut router = Router::new()
         .route("/healthz", get(health::healthz))
         .merge(protected)
-        .layer(DefaultBodyLimit::max(limit))
-        .with_state(state)
+        .layer(DefaultBodyLimit::max(limit));
+    if let Some(cors) = cors {
+        router = router.layer(cors);
+    }
+    router.with_state(state)
 }

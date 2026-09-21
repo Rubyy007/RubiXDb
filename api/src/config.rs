@@ -46,6 +46,16 @@ pub struct Config {
     pub rate_limit_burst: u32,
     pub compaction_auto_trigger: bool,
     pub compaction_trigger_count: usize,
+    /// Origins allowed to make cross-origin requests (`RUBIXDB_CORS_
+    /// ALLOWED_ORIGINS`, comma-separated, e.g.
+    /// `https://console.example.com`) -- empty by default (no CORS
+    /// headers at all, same-origin only), the safest default for a
+    /// mutable admin API. A separately-hosted frontend (the normal
+    /// deployment shape for this console -- `PHASE_FRONTEND_
+    /// ARCHITECTURE.md`) must set this explicitly; it is never
+    /// wildcarded (`*`) regardless of configuration, since credentials
+    /// (the `Authorization` header) are in play.
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -155,6 +165,14 @@ impl Config {
             // default. Still fully overridable per-deployment.
             compaction_auto_trigger: env_or("RUBIXDB_COMPACTION_AUTO_TRIGGER", true)?,
             compaction_trigger_count: env_or("RUBIXDB_COMPACTION_TRIGGER_COUNT", 4)?,
+            cors_allowed_origins: env_var("RUBIXDB_CORS_ALLOWED_ORIGINS")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }

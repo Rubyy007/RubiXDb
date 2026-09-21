@@ -85,6 +85,7 @@ mod tests {
             rate_limit_burst: 1000,
             compaction_auto_trigger: false,
             compaction_trigger_count: 4,
+            cors_allowed_origins: vec![],
         }
     }
 
