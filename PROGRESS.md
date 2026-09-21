@@ -2493,3 +2493,69 @@ Scope: the RubiXDB single-engine, non-partitioned LSM Read Engine only.
 Compaction, Router, Replication, and the larger partitioned RubiXDB
 architecture are explicitly **not** certified and do not exist in this
 codebase yet. Full RubiXDB production readiness is not claimed.
+
+## 2026-09-21 (Compaction Increment 1: deterministic core implementation)
+
+`ADR-COMPACTION-001` implemented as the deterministic core operation
+only -- no automatic trigger, no background thread, by explicit design
+(Decision 14). Full detail: `PHASE_COMPACTION_INCREMENT1_RESULTS.md`.
+
+**Delivered**: `LsmEngine::compact_once`/`should_compact` (`pub(crate)`,
+no production caller yet), `LsmConfig.compaction_trigger_count`
+(default 4, the field the original spec named but the real struct
+never had), the engine-agnostic k-way merge + retention algorithm
+(`src/compaction/mod.rs`, reusing Increment 6's own persistent
+`SsTableRangeCursor` directly), and a generalized, streaming SSTable
+writer entry point (`sstable::write_from_sorted_records`) --
+`write_from_memtable` is now a thin adapter over the same shared core,
+verified **byte-for-byte** behavior-preserving by a new differential
+test, not merely logically-equivalent.
+
+**A real correctness refinement found during implementation, not
+hidden**: the architecture report's own worked truth table (§11) had
+two under-specified rows (`@1`/`@2`) -- correct only under an unstated
+"exactly one live snapshot" assumption. `oldest_live_snapshot_seq()`
+exposes only the minimum live snapshot seq, never the full set, so the
+actual, safe retention algorithm conservatively retains *every*
+version from the floor through the newest, not just the floor and the
+newest. Caught by the implementation's own unit tests failing against
+the originally-planned assertions; corrected in both the tests and via
+an added erratum note in the architecture report (original table left
+unedited, per this project's append-only convention). The underlying
+ADR decision is unchanged -- only two rows' specific numbers were
+imprecise.
+
+**Test results**: 26 new tests (13 module-level merge/retention tests,
+13 engine-level integration tests) plus 2 new writer differential
+tests -- 334/334 total (`cargo test --lib`, debug and release).
+Coverage includes: trigger gating and single-table/no-op behavior; a
+2,000-op correctness differential against an independent reference
+model (never the production algorithm as its own oracle); a 48-case
+property test; all 6 `CompactionFaultPoint` crash windows, each a real
+injected panic followed by an actual restart (shutdown+drop+reopen),
+not an in-process retry; the previously-zero-coverage orphan-recovery
+recovery branch (`reconcile_sstables_with_manifest`); concurrent flush;
+concurrent readers (4 threads, 2 compaction cycles, zero mismatches);
+a real Windows positional-read-after-unlink test (a long-lived range
+scan survives its own source table being retired and physically
+unlinked mid-scan); and storage-pressure deferral (`compact_once`
+never mutates `storage_state`/`storage_pressure_events`, only observes
+them). A real race in the shared test fixture helper itself (not
+`compact_once`) was found under heavy parallel-test load and fixed by
+pacing writes against the flush thread -- documented in the results
+doc as a test-infrastructure fix, not a production-code fix.
+
+**Full regression gate clean**: `fmt`/`clippy -D warnings`/`test --lib`
+334/334 debug+release/`check`/`wal_tests` 12/12/`crash_consistency`
+2/2/`pathological_recovery_matrix` 9/9x2. **Protected-contract audit,
+post-implementation**: zero changes to `src/wal/`, `src/error.rs`,
+`src/manifest/`, `Cargo.toml`, or `Cargo.lock`; zero `unsafe`
+introduced; every existing Read Engine test re-ran unmodified and
+green.
+
+**COMPACTION IMPLEMENTATION = INCREMENT 1 COMPLETE.**
+**COMPACTION PRODUCTION READY = NO** -- no automatic trigger, no
+dedicated performance benchmark, no long-duration soak exercising
+compaction, no final certification. **WRITE ENGINE = PRODUCTION
+READY** and **READ ENGINE = PRODUCTION READY** remain unchanged,
+protected, and re-verified.

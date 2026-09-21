@@ -10,7 +10,7 @@ use crate::error::EngineError;
 use crate::memtable::MemTable;
 use crate::sstable::format::FOOTER_SIZE;
 use crate::sstable::test_support::TempDir;
-use crate::sstable::writer::{write_from_memtable, SsTableWriterConfig};
+use crate::sstable::writer::{write_from_memtable, write_from_sorted_records, SsTableWriterConfig};
 use crate::sstable::{discover, RecordValue, SsTable};
 
 fn build(dir: &Path, id: u64, memtable: &MemTable, config: &SsTableWriterConfig) -> SsTable {
@@ -473,4 +473,113 @@ mod property {
             prop_assert_eq!(actual_iter, expected_iter);
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// `ADR-COMPACTION-001` Decision 3/brief §9: writer differential test --
+// `write_from_memtable` and `write_from_sorted_records` must produce
+// logically (here: byte-) identical SSTables for identical logical
+// records, since both now share the identical construction core.
+// ---------------------------------------------------------------------
+
+#[test]
+fn write_from_memtable_and_write_from_sorted_records_produce_byte_identical_output() {
+    let tmp = TempDir::new("writer-differential");
+    let mut m = MemTable::new(64 * 1024 * 1024);
+    for i in 0..50u64 {
+        m.put(
+            format!("key{i:04}").as_bytes(),
+            i * 2 + 1,
+            format!("val{i}").as_bytes(),
+        );
+    }
+    for i in (0..50u64).step_by(3) {
+        m.delete(format!("key{i:04}").as_bytes(), i * 2 + 2);
+    }
+    let config = small_block_config();
+
+    let meta_a = write_from_memtable(&m, 1, tmp.path(), &config).unwrap();
+    let bytes_a = std::fs::read(&meta_a.path).unwrap();
+
+    // Same logical records, same order, same exact entry-count hint
+    // (`memtable.entry_count()`) -- deterministic bloom sizing means
+    // this must be byte-identical, not merely logically equivalent.
+    let entry_count_hint = m.entry_count() as u64;
+    let records = m
+        .range(Bound::Unbounded, Bound::Unbounded)
+        .map(|((key, seq), value)| {
+            let rv = match value {
+                crate::memtable::MemtableValue::Put(v) => RecordValue::Put(v.clone()),
+                crate::memtable::MemtableValue::Tombstone => RecordValue::Tombstone,
+            };
+            Ok((key.clone(), *seq, rv))
+        })
+        .collect::<Vec<crate::error::Result<_>>>();
+    let meta_b = write_from_sorted_records(
+        records.into_iter(),
+        2,
+        tmp.path(),
+        &config,
+        entry_count_hint,
+    )
+    .unwrap();
+    let bytes_b = std::fs::read(&meta_b.path).unwrap();
+
+    assert_eq!(
+        meta_a.min_seq, meta_b.min_seq,
+        "min_seq must match between the two writer entry points"
+    );
+    assert_eq!(
+        meta_a.max_seq, meta_b.max_seq,
+        "max_seq must match between the two writer entry points"
+    );
+    assert_eq!(
+        meta_a.record_count, meta_b.record_count,
+        "record_count must match between the two writer entry points"
+    );
+    assert_eq!(
+        bytes_a, bytes_b,
+        "write_from_memtable and write_from_sorted_records must produce byte-identical \
+         output for identical logical records with the same entry-count hint -- they now \
+         share one construction core (ADR-COMPACTION-001 Decision 3)"
+    );
+
+    // And the two resulting tables must agree on every read, not just
+    // on raw bytes -- an independent, semantic-level confirmation.
+    let table_a = SsTable::open(&meta_a.path, 1).unwrap();
+    let table_b = SsTable::open(&meta_b.path, 2).unwrap();
+    for i in 0..50u64 {
+        let key = format!("key{i:04}");
+        assert_eq!(
+            table_a.get_versioned(key.as_bytes(), u64::MAX).unwrap(),
+            table_b.get_versioned(key.as_bytes(), u64::MAX).unwrap(),
+            "get_versioned must agree for key {key}"
+        );
+    }
+}
+
+#[test]
+fn write_from_sorted_records_propagates_the_first_error_and_aborts() {
+    let tmp = TempDir::new("writer-error-propagation");
+    let config = small_block_config();
+    let records: Vec<crate::error::Result<(Vec<u8>, u64, RecordValue)>> = vec![
+        Ok((b"a".to_vec(), 1, RecordValue::Put(b"v".to_vec()))),
+        Err(EngineError::Corruption {
+            detail: "synthetic upstream error".into(),
+        }),
+        Ok((b"z".to_vec(), 3, RecordValue::Put(b"v".to_vec()))),
+    ];
+    let result = write_from_sorted_records(records.into_iter(), 1, tmp.path(), &config, 3);
+    assert!(
+        matches!(result, Err(EngineError::Corruption { .. })),
+        "the first Err from the input iterator must abort the build and propagate, got \
+         {result:?}"
+    );
+    // Only an untrusted .tmp (if anything) may remain -- never a
+    // published .sst the caller never asked for.
+    let published = tmp.path().join(crate::sstable::sstable_filename(1));
+    assert!(
+        !published.exists(),
+        "no .sst file may be published when the record stream itself errors"
+    );
 }

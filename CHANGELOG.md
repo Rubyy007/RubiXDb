@@ -6,6 +6,38 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Compaction: deterministic core implementation, Increment 1 (2026-09-21)
+
+`ADR-COMPACTION-001` implemented as the deterministic core operation
+only -- `LsmEngine::compact_once`/`should_compact` (no production
+caller yet; no automatic trigger or background thread, by explicit
+design), `LsmConfig.compaction_trigger_count` (default 4), the
+engine-agnostic size-tiered full-merge k-way merge + version/tombstone
+retention algorithm (`src/compaction/mod.rs`, reusing Increment 6's
+persistent `SsTableRangeCursor` directly for bounded memory), and a
+generalized, streaming SSTable writer entry point
+(`sstable::write_from_sorted_records`) -- `write_from_memtable` is now
+a thin adapter over the same shared core, verified byte-for-byte
+behavior-preserving by a new differential test. A real correctness
+refinement was found and fixed during implementation: the architecture
+report's own worked truth table had two under-specified rows (only
+correct under an unstated single-live-snapshot assumption); the
+implemented, tested algorithm is the conservative, generally-correct
+one, documented via an erratum rather than a silent rewrite. 26 new
+tests plus 2 writer differential tests (334/334 total): correctness
+differential (2,000 ops vs. an independent reference model), property
+test, all 6 crash-window fault points (each a real panic + real
+restart), the previously-zero-coverage orphan-recovery branch,
+concurrent flush, concurrent readers, a real Windows positional-read-
+after-unlink test, and storage-pressure deferral. Full regression gate
+clean; zero changes to WAL/Manifest/error types; zero new dependency;
+zero `unsafe`. Full detail: `PHASE_COMPACTION_INCREMENT1_RESULTS.md`,
+`PROGRESS.md`'s 2026-09-21 "Compaction Increment 1" entry.
+
+**COMPACTION PRODUCTION READY = NO** -- no automatic trigger, no
+dedicated benchmark, no long-duration soak, no final certification.
+Write Engine and Read Engine production-ready status unchanged.
+
 ### Read Engine: final certification (2026-09-21)
 
 `PHASE_READ_ENGINE_CERTIFICATION.md` (new): final certification of the

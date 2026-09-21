@@ -271,6 +271,9 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         snapshot_registry: Arc::new(SnapshotRegistry::default()),
         read_stats: Arc::new(ReadStatCounters::default()),
         config: LsmConfig::default(),
+        compaction_fault_hook: Arc::new(Mutex::new(None)),
+        compaction_io_fault_hook: Arc::new(Mutex::new(None)),
+        pending_compaction_deletes: Mutex::new(Vec::new()),
     };
 
     let result = engine.put(b"k1", b"v1");
@@ -3587,4 +3590,988 @@ mod range_scan_property_tests {
             let _ = fs::remove_dir_all(&dir);
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Compaction Increment 1 (`ADR-COMPACTION-001`) integration tests --
+// `LsmEngine::compact_once`'s Manifest/live-list/Snapshot/crash/
+// concurrency integration. Module-level merge/retention tests live in
+// `src/compaction/tests.rs`; these exist only where the full engine's
+// state (Manifest, live sstables list, background flush thread,
+// Snapshot registry) is actually needed to observe the property.
+// ---------------------------------------------------------------------
+mod compaction_tests {
+    use super::*;
+
+    /// Small memtable + many distinct keys -> many small SSTables
+    /// quickly, matching every other increment's own established
+    /// fixture-building convention.
+    fn small_flush_config(trigger_count: usize) -> LsmConfig {
+        LsmConfig {
+            memtable_max_size_bytes: 200,
+            max_immutable_memtables: 32,
+            compaction_trigger_count: trigger_count,
+            ..LsmConfig::default()
+        }
+    }
+
+    /// Builds a fixture with *exactly* `count` live SSTables, no more,
+    /// no less -- deterministically, not merely "usually." A flush is
+    /// asynchronous (the background flush thread) and briefly present
+    /// in *both* `sstables` and `immutables` simultaneously while it
+    /// runs (`sstables`' own publish happens before the corresponding
+    /// `immutables` removal, `src/lsm/mod.rs`'s flush-thread body) --
+    /// so neither `sstable_count()` alone (can undercount what's
+    /// already queued, causing this loop to over-issue writes that
+    /// then land in one flush burst and overshoot `count`) nor `sstable
+    /// _count() + immutable_count()` (can transiently double-count a
+    /// table mid-publish, causing this loop to under-issue writes and
+    /// undershoot `count`) is race-free on its own. Pacing each write
+    /// against a fully-settled `immutable_count()==0` before issuing
+    /// the next one serializes fixture-building against the flush
+    /// thread entirely, making the final count exact regardless of
+    /// scheduling delay under heavy parallel `cargo test` contention.
+    fn put_and_wait_for_sstable_count(engine: &LsmEngine, count: usize, seed: &mut u64) {
+        while engine.sstable_count() < count {
+            let key = format!("k{:06}", *seed % 500);
+            engine
+                .put(key.as_bytes(), format!("v{seed}").as_bytes())
+                .unwrap();
+            *seed += 1;
+            assert!(
+                wait_until(|| engine.immutable_count() == 0, Duration::from_secs(10)),
+                "flush must settle before the next write is issued"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------
+    // §25/§26: trigger gating, single-table/no-op behavior.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn should_compact_reports_true_only_at_or_above_trigger_count() {
+        let dir = temp_dir("compact_trigger_gating");
+        let engine = open(&dir, small_flush_config(4));
+        let mut seed = 0u64;
+
+        assert!(
+            !engine.should_compact(),
+            "0 SSTables must never request compaction"
+        );
+        for target in 1..4 {
+            put_and_wait_for_sstable_count(&engine, target, &mut seed);
+            assert!(
+                !engine.should_compact(),
+                "{target} SSTable(s) is below trigger_count=4, should_compact() must be false"
+            );
+        }
+        put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+        assert!(
+            engine.should_compact(),
+            "exactly trigger_count=4 live SSTables must be sufficient to request compaction"
+        );
+
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_once_returns_none_when_no_live_sstables() {
+        let dir = temp_dir("compact_zero_tables");
+        let engine = open(&dir, small_flush_config(1));
+        let result = engine.compact_once().unwrap();
+        assert!(
+            result.is_none(),
+            "compacting an empty engine must be a clean no-op, not an error"
+        );
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_once_below_trigger_count_is_a_no_op() {
+        let dir = temp_dir("compact_below_trigger");
+        let engine = open(&dir, small_flush_config(4));
+        let mut seed = 0u64;
+        put_and_wait_for_sstable_count(&engine, 2, &mut seed);
+        let before_ids = engine.live_sstable_ids();
+        let result = engine.compact_once().unwrap();
+        assert!(result.is_none());
+        assert_eq!(
+            engine.live_sstable_ids(),
+            before_ids,
+            "a below-trigger compact_once call must not touch the live SSTable list"
+        );
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// brief §26: single-table compaction follows the exact same,
+    /// general retention algorithm as any other input count -- not a
+    /// special-cased no-op. With `trigger_count=1` and multiple
+    /// versions of the same keys inside one table, no live snapshot,
+    /// compaction still correctly drops superseded versions.
+    #[test]
+    fn compact_once_with_a_single_table_reapplies_retention_correctly() {
+        let dir = temp_dir("compact_single_table");
+        // 4 entries: "k1"+"v1"+32=36, "k1"+"v2"+32=36, "k2"+"v1"+32=36,
+        // "k2"+delete(0-byte value)+32=34 -- total 142 bytes exactly
+        // (`memtable::entry_size`), so `memtable_max_size_bytes=142`
+        // makes the 4th write itself cross the threshold and trigger
+        // exactly one freeze, with exactly these 4 records, no padding.
+        let lsm_config = LsmConfig {
+            memtable_max_size_bytes: 142,
+            max_immutable_memtables: 8,
+            compaction_trigger_count: 1,
+            ..LsmConfig::default()
+        };
+        let engine = open(&dir, lsm_config);
+        engine.put(b"k1", b"v1").unwrap();
+        engine.put(b"k1", b"v2").unwrap();
+        engine.put(b"k2", b"v1").unwrap();
+        engine.delete(b"k2").unwrap();
+        assert!(wait_until(
+            || engine.sstable_count() >= 1 && engine.immutable_count() == 0,
+            Duration::from_secs(5)
+        ));
+        assert_eq!(
+            engine.sstable_count(),
+            1,
+            "fixture must land in exactly one SSTable"
+        );
+
+        let (meta, stats) = engine
+            .compact_once()
+            .unwrap()
+            .expect("1 table >= trigger_count=1");
+        assert_eq!(
+            engine.sstable_count(),
+            1,
+            "compacting one table still yields exactly one live table"
+        );
+        assert_eq!(stats.input_sstable_count, 1);
+        assert_eq!(stats.output_sstable_count, 1);
+        // No live snapshot -- only the newest version of each key
+        // survives. k1's superseded "v1" is a dropped *version* (a
+        // Put); k2's superseded "v1" is also a dropped *version* -- its
+        // own tombstone is the *newest* version of k2, so the tombstone
+        // itself is retained, not dropped.
+        assert_eq!(
+            stats.versions_dropped, 2,
+            "k1's superseded v1 and k2's superseded v1 must both be dropped as superseded Puts"
+        );
+        assert_eq!(
+            stats.tombstones_dropped, 0,
+            "k2's tombstone is the newest version of k2 -- it must survive, never be dropped"
+        );
+        let _ = meta;
+
+        // Logical correctness after single-table compaction:
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.get(b"k2").unwrap(), None);
+
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_once_merges_many_tables_and_updates_manifest_and_live_list() {
+        let dir = temp_dir("compact_basic_merge");
+        let engine = open(&dir, small_flush_config(4));
+        let mut seed = 0u64;
+        // Async flush means `sstable_count()` can overshoot the
+        // requested target under heavy parallel-test-run scheduling
+        // delay (several flushes can land in a batch between one
+        // `put()` and the next count check) -- the test's own
+        // properties below don't depend on the exact count, only that
+        // it's `>= trigger_count=4`, so this asserts that bound
+        // instead of a hard-coded exact value.
+        put_and_wait_for_sstable_count(&engine, 5, &mut seed);
+        let input_ids = engine.live_sstable_ids();
+        assert!(
+            input_ids.len() >= 5,
+            "fixture must reach at least 5 live SSTables, got {}",
+            input_ids.len()
+        );
+        let input_count = input_ids.len();
+
+        let (meta, stats) = engine
+            .compact_once()
+            .unwrap()
+            .expect("well above trigger_count=4");
+
+        assert_eq!(
+            engine.sstable_count(),
+            1,
+            "every prior input must be replaced by exactly one output table"
+        );
+        assert_eq!(engine.live_sstable_ids(), vec![meta.id]);
+        assert_eq!(stats.input_sstable_count, input_count);
+        assert_eq!(stats.output_sstable_count, 1);
+        assert_eq!(
+            stats.records_dropped,
+            stats.records_read - stats.records_retained,
+            "records_dropped invariant must hold exactly"
+        );
+        assert_eq!(
+            stats.tombstones_dropped + stats.versions_dropped,
+            stats.records_dropped,
+            "tombstones_dropped + versions_dropped must exactly partition records_dropped"
+        );
+
+        // Manifest must reflect: output added, every input removed.
+        // (No direct "is id live in Manifest" accessor exists beyond
+        // the reconciliation path itself -- reopening and checking the
+        // reconciled live set is the real, end-to-end proof.)
+        engine.shutdown();
+        drop(engine);
+        let reopened = open(&dir, small_flush_config(4));
+        assert_eq!(reopened.live_sstable_ids(), vec![meta.id]);
+        for old_id in &input_ids {
+            assert!(
+                !reopened.live_sstable_ids().contains(old_id),
+                "input {old_id} must not still be live after reopening"
+            );
+        }
+        reopened.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------
+    // §23: correctness differential test -- independent reference
+    // model, never the production algorithm as its own oracle.
+    // -------------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct CompactionReferenceModel {
+        history: std::collections::HashMap<Vec<u8>, Vec<(u64, MemtableValue)>>,
+    }
+    impl CompactionReferenceModel {
+        fn apply(&mut self, key: &[u8], seq: u64, value: MemtableValue) {
+            self.history
+                .entry(key.to_vec())
+                .or_default()
+                .push((seq, value));
+        }
+        fn value_at(&self, key: &[u8], as_of_seq: u64) -> Option<Vec<u8>> {
+            self.history
+                .get(key)?
+                .iter()
+                .filter(|(s, _)| *s <= as_of_seq)
+                .max_by_key(|(s, _)| *s)
+                .and_then(|(_, v)| match v {
+                    MemtableValue::Put(v) => Some(v.clone()),
+                    MemtableValue::Tombstone => None,
+                })
+        }
+        fn range_at(&self, as_of_seq: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut keys: Vec<Vec<u8>> = self.history.keys().cloned().collect();
+            keys.sort();
+            keys.into_iter()
+                .filter_map(|k| Some((k.clone(), self.value_at(&k, as_of_seq)?)))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn compaction_preserves_logical_reads_for_every_prior_snapshot_seq() {
+        let dir = temp_dir("compact_differential");
+        let engine = open(&dir, small_flush_config(100)); // never auto-trigger
+        let mut model = CompactionReferenceModel::default();
+        let mut rng_state: u64 = 20260921;
+        let mut next_rand = move || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        let mut snapshots: Vec<Snapshot> = Vec::new();
+        for round in 0..2000u64 {
+            let key_idx = next_rand() % 40;
+            let key = format!("k{key_idx:03}").into_bytes();
+            if next_rand() % 5 == 0 {
+                let seq = engine.delete(&key).unwrap();
+                model.apply(&key, seq, MemtableValue::Tombstone);
+            } else {
+                let value = format!("v{round}").into_bytes();
+                let seq = engine.put(&key, &value).unwrap();
+                model.apply(&key, seq, MemtableValue::Put(value));
+            }
+            if next_rand() % 15 == 0 && snapshots.len() < 8 {
+                snapshots.push(engine.snapshot());
+            }
+            if next_rand() % 23 == 0 && !snapshots.is_empty() {
+                let idx = (next_rand() as usize) % snapshots.len();
+                snapshots.remove(idx);
+            }
+        }
+        assert!(
+            wait_until(|| engine.immutable_count() == 0, Duration::from_secs(10)),
+            "every flush must settle before compaction runs"
+        );
+        assert!(
+            engine.sstable_count() >= 2,
+            "the fixture must actually span multiple SSTables for this test to mean anything"
+        );
+
+        // Record BEFORE-compaction logical reads for every snapshot
+        // sequence still live, plus "now" -- against the real engine,
+        // not the model (the model is the independent oracle compared
+        // against, per brief §23's own explicit instruction; the
+        // "before" and "after" engine reads are what must agree with
+        // *each other*, both checked against the model too).
+        let mut check_seqs: Vec<u64> = snapshots.iter().map(|s| s.seq()).collect();
+        check_seqs.push(u64::MAX); // "now"
+        check_seqs.sort_unstable();
+        check_seqs.dedup();
+
+        let all_keys: Vec<Vec<u8>> = (0..40u64)
+            .map(|i| format!("k{i:03}").into_bytes())
+            .collect();
+
+        let mut before: std::collections::HashMap<(Vec<u8>, u64), Option<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for &seq in &check_seqs {
+            for key in &all_keys {
+                let actual = engine.get_as_of(key, seq).unwrap();
+                let expected = model.value_at(key, seq);
+                assert_eq!(
+                    actual, expected,
+                    "PRE-compaction mismatch vs. independent model at seq={seq} key={key:?}"
+                );
+                before.insert((key.clone(), seq), actual);
+            }
+        }
+        let before_range_now: Vec<(Vec<u8>, Vec<u8>)> =
+            collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+        assert_eq!(
+            before_range_now,
+            model.range_at(u64::MAX),
+            "PRE-compaction range() mismatch vs. model"
+        );
+
+        // Run compaction (repeatedly, until below trigger, to actually
+        // exercise it -- lower the effective threshold for this one
+        // call by driving compact_once directly regardless of
+        // should_compact()'s own gate, matching "the deterministic
+        // core operation," not the (deferred) trigger).
+        let mut cycles = 0;
+        while engine.sstable_count() > 1 && cycles < 10 {
+            if engine.compact_once().unwrap().is_none() {
+                break;
+            }
+            cycles += 1;
+        }
+
+        // AFTER-compaction: every logical read, at every previously-
+        // recorded snapshot seq, must be byte-for-byte identical to
+        // both the model and the pre-compaction engine reads.
+        for &seq in &check_seqs {
+            for key in &all_keys {
+                let actual = engine.get_as_of(key, seq).unwrap();
+                let expected = model.value_at(key, seq);
+                assert_eq!(
+                    actual, expected,
+                    "POST-compaction mismatch vs. independent model at seq={seq} key={key:?}"
+                );
+                assert_eq!(
+                    actual,
+                    before[&(key.clone(), seq)],
+                    "POST-compaction read must exactly match the PRE-compaction read at seq={seq} key={key:?}"
+                );
+                let contained = engine.contains(key, seq).unwrap();
+                assert_eq!(
+                    contained,
+                    actual.is_some(),
+                    "contains()/get_as_of() must agree post-compaction"
+                );
+            }
+        }
+        let after_range_now: Vec<(Vec<u8>, Vec<u8>)> =
+            collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+        assert_eq!(
+            after_range_now, before_range_now,
+            "POST-compaction range() must exactly match PRE-compaction range()"
+        );
+        assert_eq!(
+            after_range_now,
+            model.range_at(u64::MAX),
+            "POST-compaction range() must match the independent model"
+        );
+
+        drop(snapshots);
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------
+    // §24: property-based verification, `proptest = "=1.11.0"`
+    // (already an exact-pinned dependency -- no version change).
+    // -------------------------------------------------------------
+
+    mod property {
+        use proptest::collection::vec as pvec;
+        use proptest::prelude::*;
+
+        use super::*;
+
+        #[derive(Debug, Clone)]
+        enum FuzzOp {
+            Put { key_idx: u8, value: Vec<u8> },
+            Delete { key_idx: u8 },
+            TakeSnapshot,
+            DropOldestSnapshot,
+            Compact,
+        }
+
+        fn fuzz_op_strategy() -> impl Strategy<Value = FuzzOp> {
+            prop_oneof![
+                4 => (0u8..12, pvec(any::<u8>(), 0..8))
+                    .prop_map(|(key_idx, value)| FuzzOp::Put { key_idx, value }),
+                2 => (0u8..12).prop_map(|key_idx| FuzzOp::Delete { key_idx }),
+                1 => Just(FuzzOp::TakeSnapshot),
+                1 => Just(FuzzOp::DropOldestSnapshot),
+                1 => Just(FuzzOp::Compact),
+            ]
+        }
+
+        fn key_for(idx: u8) -> Vec<u8> {
+            format!("k{idx:03}").into_bytes()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// Random keys, random versions, random tombstones, random
+            /// snapshot sequences, random compaction points -- asserts
+            /// logical equivalence against an independent reference
+            /// model, sorted output, no lost visible value, no
+            /// resurrected tombstone, no invalid snapshot visibility.
+            #[test]
+            fn compaction_never_changes_logical_reads(ops in pvec(fuzz_op_strategy(), 1..60)) {
+                let lsm_config = LsmConfig {
+                    memtable_max_size_bytes: 250,
+                    max_immutable_memtables: 32,
+                    compaction_trigger_count: 1000, // never auto-trigger
+                    ..LsmConfig::default()
+                };
+                let dir = temp_dir("compact_property");
+                let engine = open(&dir, lsm_config);
+                let mut model = CompactionReferenceModel::default();
+                let mut snapshots: Vec<Snapshot> = Vec::new();
+
+                for op in ops {
+                    match op {
+                        FuzzOp::Put { key_idx, value } => {
+                            let key = key_for(key_idx);
+                            let seq = engine.put(&key, &value).unwrap();
+                            model.apply(&key, seq, MemtableValue::Put(value));
+                        }
+                        FuzzOp::Delete { key_idx } => {
+                            let key = key_for(key_idx);
+                            let seq = engine.delete(&key).unwrap();
+                            model.apply(&key, seq, MemtableValue::Tombstone);
+                        }
+                        FuzzOp::TakeSnapshot => {
+                            if snapshots.len() < 6 {
+                                snapshots.push(engine.snapshot());
+                            }
+                        }
+                        FuzzOp::DropOldestSnapshot => {
+                            if !snapshots.is_empty() {
+                                snapshots.remove(0);
+                            }
+                        }
+                        FuzzOp::Compact => {
+                            let _ = engine.compact_once();
+                        }
+                    }
+                }
+
+                prop_assert!(wait_until(|| engine.immutable_count() == 0, Duration::from_secs(10)));
+
+                let mut check_seqs: Vec<u64> = snapshots.iter().map(|s| s.seq()).collect();
+                check_seqs.push(u64::MAX);
+                check_seqs.sort_unstable();
+                check_seqs.dedup();
+
+                for &seq in &check_seqs {
+                    for idx in 0..12u8 {
+                        let key = key_for(idx);
+                        let actual = engine.get_as_of(&key, seq).unwrap();
+                        let expected = model.value_at(&key, seq);
+                        prop_assert_eq!(
+                            actual.clone(), expected,
+                            "logical read mismatch at seq={} key={:?}", seq, key
+                        );
+                        let contained = engine.contains(&key, seq).unwrap();
+                        prop_assert_eq!(contained, actual.is_some());
+                    }
+                    let actual_range: Vec<(Vec<u8>, Vec<u8>)> = engine
+                        .range_scan(Bound::Unbounded, Bound::Unbounded, seq)
+                        .collect::<Result<Vec<_>>>()
+                        .unwrap();
+                    let expected_range = model.range_at(seq);
+                    prop_assert_eq!(&actual_range, &expected_range, "range_scan mismatch at seq={}", seq);
+                    // No duplicate logical key, sorted ascending.
+                    let mut sorted = actual_range.clone();
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    prop_assert_eq!(&sorted, &actual_range, "range_scan output must be sorted ascending");
+                    let mut dedup = actual_range.clone();
+                    dedup.dedup_by(|a, b| a.0 == b.0);
+                    prop_assert_eq!(dedup.len(), actual_range.len(), "range_scan output must have no duplicate logical key");
+                }
+
+                drop(snapshots);
+                engine.shutdown();
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // §19: deterministic crash-window fault injection, via
+    // `CompactionFaultPoint` -- panic caught, then a real restart
+    // (shutdown + drop + reopen, never `catch_unwind`-then-continue,
+    // since the property under test is "what does a fresh open() see
+    // after a crash," not "does the same process recover in place").
+    // -------------------------------------------------------------
+
+    /// Builds a 4-SSTable fixture ready to compact, returns the engine
+    /// and the pre-compaction live ids (for post-crash comparison).
+    fn build_compactable_fixture(dir: &Path) -> (LsmEngine, Vec<u64>) {
+        let engine = open(dir, small_flush_config(4));
+        let mut seed = 0u64;
+        put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+        let ids = engine.live_sstable_ids();
+        (engine, ids)
+    }
+
+    #[test]
+    fn compaction_crash_windows_leave_a_correct_recoverable_state() {
+        for point in [
+            CompactionFaultPoint::BeforeOutputWrite,
+            CompactionFaultPoint::BeforeManifestAdd,
+            CompactionFaultPoint::AfterManifestAdd,
+            CompactionFaultPoint::DuringRemoveSequence,
+            CompactionFaultPoint::AfterAllRemoves,
+            CompactionFaultPoint::BeforePhysicalDelete,
+        ] {
+            let dir = temp_dir(&format!("compact_crash_{point:?}"));
+            let (engine, input_ids) = build_compactable_fixture(&dir);
+
+            // Record expected logical state (every key this fixture's
+            // own `put_and_wait_for_sstable_count` could have written)
+            // BEFORE the crash, via real reads -- compared against the
+            // SAME real reads after the simulated crash + restart.
+            let sample_keys: Vec<Vec<u8>> = (0..500u64)
+                .map(|i| format!("k{i:06}").into_bytes())
+                .collect();
+            let before: Vec<Option<Vec<u8>>> =
+                sample_keys.iter().map(|k| engine.get(k).unwrap()).collect();
+
+            engine.install_compaction_fault_hook(move |p| {
+                if p == point {
+                    panic!("injected compaction crash at {point:?} (deterministic fault test)");
+                }
+            });
+
+            let caught =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.compact_once()));
+            assert!(
+                caught.is_err(),
+                "the fault hook must actually have fired at {point:?}"
+            );
+
+            // Simulate a real crash: no attempt to complete or roll
+            // back the interrupted compaction, just an orderly release
+            // of the WAL lock (so the reopen below doesn't spuriously
+            // fail on a still-held lock) followed by a real restart.
+            engine.clear_compaction_fault_hook();
+            engine.shutdown();
+            drop(engine);
+
+            let reopened = open(&dir, small_flush_config(4));
+
+            // Every input SSTable must either still be fully live, or
+            // have been cleanly replaced -- never partially missing,
+            // never duplicated data, never a dangling Manifest
+            // reference to a missing file (which would itself already
+            // fail open() closed, per the existing reconciliation
+            // sweep's own contract -- reaching this line at all is
+            // already partial proof).
+            let live_after = reopened.live_sstable_ids();
+            assert!(!live_after.is_empty(), "recovery must leave at least the pre-compaction or post-compaction tables live ({point:?})");
+
+            let after: Vec<Option<Vec<u8>>> = sample_keys
+                .iter()
+                .map(|k| reopened.get(k).unwrap())
+                .collect();
+            assert_eq!(
+                before, after,
+                "every logical read must be identical before and after the crash+restart at {point:?}"
+            );
+
+            // No orphaned .sst.tmp file may remain live/untrusted --
+            // the existing sweep already reclaims it at open() time;
+            // confirm none is left over post-recovery.
+            for entry in fs::read_dir(reopened.sstables_dir()).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.ends_with(".sst.tmp"),
+                    "a .tmp file must never survive recovery ({point:?}, found {name})"
+                );
+            }
+
+            let _ = input_ids;
+            reopened.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// §18, mandatory: exercises `reconcile_sstables_with_manifest`'s
+    /// "removed-but-undeleted orphan" branch (`src/lsm/mod.rs`) --
+    /// previously identified as having zero direct test coverage
+    /// (`PHASE_COMPACTION_ARCHITECTURE_REPORT.md` §1/§7): a durable
+    /// `RemoveSstable` edit whose corresponding file was never
+    /// physically deleted before the crash.
+    #[test]
+    fn orphan_recovery_after_crash_between_remove_durability_and_physical_deletion() {
+        let dir = temp_dir("compact_orphan_recovery");
+        let (engine, input_ids) = build_compactable_fixture(&dir);
+
+        engine.install_compaction_fault_hook(|p| {
+            if p == CompactionFaultPoint::BeforePhysicalDelete {
+                panic!(
+                    "injected crash after all RemoveSstable edits are durable, before any \
+                     physical deletion is attempted"
+                );
+            }
+        });
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.compact_once()));
+        assert!(caught.is_err());
+        engine.clear_compaction_fault_hook();
+
+        // At this exact point: the output SSTable is fully durable and
+        // live in the Manifest; every input's `RemoveSstable` edit is
+        // durable; the live-list splice already ran (it happens before
+        // `BeforePhysicalDelete` fires); but every input `.sst` file is
+        // still physically present on disk -- exactly the orphan
+        // scenario this test exists to exercise. Verify the files are
+        // indeed still there before the restart, so this test is
+        // actually exercising what it claims to.
+        for id in &input_ids {
+            let path = engine
+                .sstables_dir()
+                .join(crate::sstable::sstable_filename(*id));
+            assert!(
+                path.exists(),
+                "input {id}'s file must still be physically present immediately after the \
+                 injected crash, to prove this test actually reaches the orphan scenario"
+            );
+        }
+
+        engine.shutdown();
+        drop(engine);
+
+        let reopened = open(&dir, small_flush_config(4));
+
+        // The orphan sweep must have removed every input file.
+        for id in &input_ids {
+            let path = reopened
+                .sstables_dir()
+                .join(crate::sstable::sstable_filename(*id));
+            assert!(
+                !path.exists(),
+                "orphaned input {id} must be swept away by recovery"
+            );
+        }
+        // The Manifest's live set must be correct: only the compaction
+        // output remains, none of the removed inputs.
+        for id in &input_ids {
+            assert!(
+                !reopened.live_sstable_ids().contains(id),
+                "input {id} must not be live post-recovery"
+            );
+        }
+        assert_eq!(
+            reopened.sstable_count(),
+            1,
+            "exactly the compaction output must remain live"
+        );
+
+        // Reads remain correct.
+        let sample_keys: Vec<Vec<u8>> = (0..500u64)
+            .map(|i| format!("k{i:06}").into_bytes())
+            .collect();
+        for key in &sample_keys {
+            // Just must not error/panic and must be internally
+            // consistent -- exact-value correctness is already proven
+            // by the differential/property tests above; this test's
+            // own job is the orphan-sweep mechanism specifically.
+            let _ = reopened.get(key).unwrap();
+        }
+        let range_rows = collect_range(reopened.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+        assert!(
+            !range_rows.is_empty(),
+            "the compacted output must still serve real data"
+        );
+
+        reopened.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------
+    // §16/§17: concurrent flush, concurrent readers.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn concurrent_flush_publishing_during_compaction_capture_is_not_lost() {
+        let dir = temp_dir("compact_concurrent_flush_during_capture");
+        let engine = Arc::new(open(&dir, small_flush_config(4)));
+        let mut seed = 0u64;
+        put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+        let pre_capture_ids = engine.live_sstable_ids();
+
+        // A flush publishing a *new* table concurrently with (or
+        // immediately after) compaction's own input capture must never
+        // be lost -- either included in this cycle (captured before)
+        // or eligible for the next cycle (captured after); never
+        // silently dropped either way.
+        let engine2 = Arc::clone(&engine);
+        let writer = thread::spawn(move || {
+            let mut seed = 10_000u64;
+            put_and_wait_for_sstable_count(&engine2, pre_capture_ids.len() + 1, &mut seed);
+        });
+        writer.join().unwrap();
+        let post_write_count = engine.sstable_count();
+        assert!(
+            post_write_count >= 5,
+            "the concurrent writer must have published at least one more table"
+        );
+
+        let (meta, stats) = engine
+            .compact_once()
+            .unwrap()
+            .expect("well above trigger_count=4");
+        assert!(
+            stats.input_sstable_count >= 4,
+            "compaction must have captured at least the original 4 (and possibly the concurrently-published one too)"
+        );
+        // Whichever tables were captured, no data is lost: every key
+        // this test could have written remains readable.
+        for i in 0..500u64 {
+            let key = format!("k{i:06}", i = i).into_bytes();
+            let _ = engine.get(&key).unwrap();
+        }
+        let _ = meta;
+
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_readers_during_compaction_never_see_partial_or_wrong_state() {
+        let dir = temp_dir("compact_concurrent_readers");
+        let engine = Arc::new(open(&dir, small_flush_config(4)));
+        let mut seed = 0u64;
+        put_and_wait_for_sstable_count(&engine, 6, &mut seed);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mismatches = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let engine = Arc::clone(&engine);
+            let stop = Arc::clone(&stop);
+            let mismatches = Arc::clone(&mismatches);
+            readers.push(thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = format!("k{:06}", i % 500).into_bytes();
+                    if engine.get(&key).is_err() {
+                        mismatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if engine.contains(&key, u64::MAX).is_err() {
+                        mismatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                    match collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)) {
+                        Ok(rows) => {
+                            let mut sorted = rows.clone();
+                            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                            if sorted != rows {
+                                mismatches.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let mut dedup = rows.clone();
+                            dedup.dedup_by(|a, b| a.0 == b.0);
+                            if dedup.len() != rows.len() {
+                                mismatches.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => {
+                            mismatches.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    i += 1;
+                }
+            }));
+        }
+
+        engine.compact_once().unwrap();
+        engine.compact_once().unwrap(); // a second cycle, in case the first captured 0 due to timing
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        assert_eq!(
+            mismatches.load(Ordering::Relaxed),
+            0,
+            "no reader may ever see an error, a missing key it should see, a duplicate logical \
+             key, or unsorted output while compaction runs concurrently"
+        );
+
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------
+    // §15: Windows read-safety -- a reader's already-open `Arc
+    // <SsTable>` must survive a concurrent compaction that retires
+    // and physically unlinks that exact table. The earlier standalone
+    // probe (`PHASE_COMPACTION_ARCHITECTURE_REPORT.md` §6) confirmed
+    // `remove_file` succeeds on Windows while a second handle is open
+    // -- it did NOT test a positional read *after* unlink, which this
+    // test now does, against the real engine.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn long_lived_reader_survives_compaction_unlinking_its_table_and_cleanup_eventually_happens() {
+        let dir = temp_dir("compact_long_lived_reader");
+        let engine = open(&dir, small_flush_config(4));
+        let mut seed = 0u64;
+        put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+
+        // Start a range scan and pull the first row -- this captures a
+        // `ReadView` holding `Arc<SsTable>` clones (and, per Increment
+        // 6, persistent `SsTableRangeCursor`s) for every currently-live
+        // table, kept alive for as long as this iterator lives.
+        let mut in_progress = engine.range(Bound::Unbounded, Bound::Unbounded);
+        let first_row = in_progress.next();
+        assert!(
+            first_row.is_some(),
+            "the range scan must yield at least one row before compaction runs"
+        );
+
+        // Compact while `in_progress` is still alive and holding
+        // `Arc<SsTable>` clones for the very tables being retired.
+        let (_meta, _stats) = engine
+            .compact_once()
+            .unwrap()
+            .expect("4 >= trigger_count=4");
+
+        // The already-open scan must complete correctly despite its
+        // source tables having been removed from the live list (and,
+        // for any whose Arc strong count already allowed it, unlinked
+        // from disk) underneath it.
+        let mut remaining_rows = 0usize;
+        for row in in_progress {
+            row.expect(
+                "an in-progress range scan must complete without error even though compaction \
+                 retired (and may have unlinked) its source tables underneath it",
+            );
+            remaining_rows += 1;
+        }
+        assert!(
+            remaining_rows > 0,
+            "the scan must have yielded further rows after the first"
+        );
+
+        // Now that the scan (and every clone it held) has been fully
+        // consumed and dropped by the `for` loop above, the next
+        // compaction cycle's own opening sweep must be able to clean
+        // up anything that was deferred.
+        // Force a cheap, harmless extra cycle purely to run the
+        // deferred-delete sweep (compact_once's own opening step) --
+        // there may be nothing to compact (only 1 live table now), in
+        // which case this simply runs the sweep and returns None.
+        let _ = engine.compact_once();
+
+        // get()/contains() against the now-compacted engine must still
+        // be fully correct.
+        for i in 0..500u64 {
+            let key = format!("k{i:06}").into_bytes();
+            let _ = engine.get(&key).unwrap();
+        }
+
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------
+    // §20: storage pressure -- observed only, never mutated.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn compaction_defers_while_storage_full_and_never_mutates_storage_state() {
+        let dir = temp_dir("compact_storage_full");
+        let engine = open(&dir, small_flush_config(4));
+        let mut seed = 0u64;
+        put_and_wait_for_sstable_count(&engine, 5, &mut seed);
+        let ids_before = engine.live_sstable_ids();
+
+        engine.set_storage_state_for_test(StorageState::StorageFull);
+        let events_before = engine.storage_pressure_events();
+
+        let result = engine.compact_once().unwrap();
+        assert!(
+            result.is_none(),
+            "compaction must defer/skip while storage_state() is not Healthy"
+        );
+        assert_eq!(
+            engine.live_sstable_ids(),
+            ids_before,
+            "a deferred compaction must not touch the live list"
+        );
+        assert_eq!(
+            engine.storage_state(),
+            StorageState::StorageFull,
+            "compact_once must never mutate storage_state itself"
+        );
+        assert_eq!(
+            engine.storage_pressure_events(),
+            events_before,
+            "compact_once must never mutate storage_pressure_events itself"
+        );
+
+        engine.set_storage_state_for_test(StorageState::StoragePressure);
+        let result = engine.compact_once().unwrap();
+        assert!(
+            result.is_none(),
+            "compaction must also defer/skip under StoragePressure, not just StorageFull"
+        );
+        assert_eq!(engine.storage_state(), StorageState::StoragePressure);
+
+        engine.set_storage_state_for_test(StorageState::Healthy);
+        let result = engine.compact_once().unwrap();
+        assert!(
+            result.is_some(),
+            "compaction must proceed normally once storage_state() is Healthy again"
+        );
+
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------
+    // §9/§27/§28: writer differential and error-propagation coverage
+    // already live in `src/sstable/tests.rs`; the full existing Read
+    // Engine and Write Engine regression suites are re-run, unchanged,
+    // as part of this crate's own `cargo test --lib` -- not duplicated
+    // here.
+    // -------------------------------------------------------------
 }

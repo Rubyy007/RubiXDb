@@ -38,19 +38,22 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::compaction::CompactionStats;
 use crate::error::{EngineError, Result};
 use crate::execution::batch_coordinator::{BatchCoordinatorConfig, BatchCoordinatorPool};
 use crate::manifest::{self, Manifest, ManifestEdit, ManifestState};
 use crate::memtable::{MemTable, MemtableValue, DEFAULT_MAX_SIZE_BYTES};
-use crate::sstable::{self, RecordValue, SsTable, SsTableRangeCursor, SsTableWriterConfig};
+use crate::sstable::{
+    self, RecordValue, SsTable, SsTableRangeCursor, SsTableWriterConfig, SstableMeta,
+};
 use crate::wal::{self, FileWal, GroupCommitter, Wal, WalConfig, WalOp, WalOpOwned};
 
 /// `RubixDB-LSM-Engine-Specification-v1.0.md` §4.1's `LsmConfig`, plus
 /// the Phase-4B fields it also defines (`sstable_target_block_size`,
-/// `bloom_bits_per_key`) — still no `compaction_trigger_count` (no
-/// compaction this phase).
+/// `bloom_bits_per_key`) and, as of `ADR-COMPACTION-001` §25,
+/// `compaction_trigger_count`.
 #[derive(Debug, Clone)]
 pub struct LsmConfig {
     /// LSM Engine Spec §4.1's own `memtable_max_size_bytes` default (4
@@ -81,6 +84,15 @@ pub struct LsmConfig {
     /// (`PHASE5_ENOSPC_FAILURE_ANALYSIS.md` §5 traces the resulting
     /// 9,200-second retry storm to exactly that code path).
     pub storage_pressure_retry_interval: Duration,
+    /// `RubixDB-LSM-Engine-Specification-v1.0.md` §5.1 / `ADR-
+    /// COMPACTION-001` Decision 1/Decision 14: the live-SSTable count
+    /// at which `LsmEngine::should_compact()` reports `true` — default
+    /// 4, per the spec. Increment 1 defines this field and the
+    /// deterministic `should_compact()`/`compact_once()` operations
+    /// only; nothing in this codebase yet checks this field
+    /// automatically (no background trigger exists — `ADR-COMPACTION-
+    /// 001` Decision 14 explicitly defers that to a future increment).
+    pub compaction_trigger_count: usize,
 }
 
 impl Default for LsmConfig {
@@ -92,6 +104,7 @@ impl Default for LsmConfig {
             bloom_bits_per_key: crate::sstable::format::DEFAULT_BLOOM_BITS_PER_KEY,
             max_flush_retries: 3,
             storage_pressure_retry_interval: Duration::from_secs(5),
+            compaction_trigger_count: 4,
         }
     }
 }
@@ -249,6 +262,74 @@ type FlushIoFaultHook = Box<dyn Fn() -> Option<io::Error> + Send + Sync>;
 
 /// Same cheap-no-op-when-unset shape as `fire_flush_fault_hook`.
 fn fire_flush_io_fault_hook(hook: &Mutex<Option<FlushIoFaultHook>>) -> Option<io::Error> {
+    let hook = hook.lock().unwrap_or_else(|p| p.into_inner());
+    hook.as_ref().and_then(|f| f())
+}
+
+/// `ADR-COMPACTION-001` Decision 15: deterministic fault-injection
+/// points for `compact_once`, modeled directly on `FlushFaultPoint`
+/// (same always-compiled-enum-plus-`Mutex<Option<Hook>>` shape, same
+/// "production pays one uncontended mutex lock per step" cost). Named
+/// to cover every crash window `PHASE_COMPACTION_ARCHITECTURE_REPORT.
+/// md` §7 walked: `BeforeOutputWrite` (before output creation),
+/// `BeforeManifestAdd` (output file fsync+rename already durable,
+/// `AddSstable` not yet appended -- the "after output fsync/rename,
+/// before Manifest ADD" window), `AfterManifestAdd` (`AddSstable`
+/// durable, before any `RemoveSstable`), `DuringRemoveSequence` (fired
+/// once per input, immediately after that input's own `RemoveSstable`
+/// edit becomes durable -- covers "mid-REMOVE sequence"),
+/// `AfterAllRemoves` (every `RemoveSstable` durable, before the live-
+/// list splice and before any physical deletion attempt), and
+/// `BeforePhysicalDelete` (splice done, about to attempt unlinking any
+/// input whose `Arc` strong count already allows it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionFaultPoint {
+    BeforeOutputWrite,
+    BeforeManifestAdd,
+    AfterManifestAdd,
+    DuringRemoveSequence,
+    AfterAllRemoves,
+    BeforePhysicalDelete,
+}
+
+type CompactionFaultHook = Box<dyn Fn(CompactionFaultPoint) + Send + Sync>;
+
+/// Same cheap-no-op-when-unset shape as `fire_flush_fault_hook`. Every
+/// non-test caller of this function (and of `fire_compaction_io_fault_
+/// hook`, `compact_once`, `should_compact`, `sweep_pending_compaction_
+/// deletes`, `lock_sstables_write`, and the `pending_compaction_
+/// deletes` field below) does not exist yet -- `ADR-COMPACTION-001`
+/// Decision 14 explicitly defers automatic trigger wiring to a future
+/// increment, so `compact_once` itself is, by design, only reachable
+/// from tests this increment. Real, in-crate code, not unused or
+/// speculative -- just not yet wired to a production caller, by
+/// explicit ADR decision rather than oversight (mirrors this file's
+/// own pre-existing `flush_delay_ms` field's identical `#[allow(dead_
+/// code)]` justification).
+#[allow(dead_code)]
+fn fire_compaction_fault_hook(
+    hook: &Mutex<Option<CompactionFaultHook>>,
+    point: CompactionFaultPoint,
+) {
+    let hook = hook.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(f) = hook.as_ref() {
+        f(point);
+    }
+}
+
+/// `ADR-COMPACTION-001` Decision 15: mirrors `FlushIoFaultHook`
+/// exactly, but scoped to the one step Compaction's own output write
+/// can genuinely fail at (mirrors the 2026-09-19 soak's own real
+/// flush-side ENOSPC failure point) -- injected immediately before
+/// `sstable::write_from_sorted_records` is called, letting a test
+/// drive a real, classified `io::Error` through the same `EngineError::
+/// is_storage_exhausted` classification path a genuine disk-full
+/// condition would hit, without filling a real disk.
+type CompactionIoFaultHook = Box<dyn Fn() -> Option<io::Error> + Send + Sync>;
+
+/// Same cheap-no-op-when-unset shape as `fire_flush_io_fault_hook`.
+#[allow(dead_code)] // see `fire_compaction_fault_hook`'s own doc comment
+fn fire_compaction_io_fault_hook(hook: &Mutex<Option<CompactionIoFaultHook>>) -> Option<io::Error> {
     let hook = hook.lock().unwrap_or_else(|p| p.into_inner());
     hook.as_ref().and_then(|f| f())
 }
@@ -972,6 +1053,23 @@ pub struct LsmEngine {
     /// driven, without holding a reference back to the engine itself.
     read_stats: Arc<ReadStatCounters>,
     config: LsmConfig,
+    /// See `CompactionFaultHook`/`fire_compaction_fault_hook`. Test-only
+    /// in practice, always compiled — same convention as `flush_fault_
+    /// hook`.
+    compaction_fault_hook: Arc<Mutex<Option<CompactionFaultHook>>>,
+    /// See `CompactionIoFaultHook`/`fire_compaction_io_fault_hook`.
+    compaction_io_fault_hook: Arc<Mutex<Option<CompactionIoFaultHook>>>,
+    /// `ADR-COMPACTION-001` Decision 9: input SSTables already removed
+    /// from the Manifest and from the live `sstables` list by a
+    /// completed `compact_once` call, but whose `Arc` strong count was
+    /// still `> 1` (an in-flight reader) at the time — retried, never
+    /// blocked on, by the next `compact_once` call's own opening sweep
+    /// (`sweep_pending_compaction_deletes`). See `fire_compaction_
+    /// fault_hook`'s own doc comment for why this field, like every
+    /// other Compaction field/method in this struct, has no non-test
+    /// reader yet.
+    #[allow(dead_code)]
+    pending_compaction_deletes: Mutex<Vec<Arc<SsTable>>>,
 }
 
 impl LsmEngine {
@@ -1106,6 +1204,9 @@ impl LsmEngine {
             snapshot_registry: Arc::new(SnapshotRegistry::default()),
             read_stats: Arc::new(ReadStatCounters::default()),
             config: lsm_config,
+            compaction_fault_hook: Arc::new(Mutex::new(None)),
+            compaction_io_fault_hook: Arc::new(Mutex::new(None)),
+            pending_compaction_deletes: Mutex::new(Vec::new()),
         })
     }
 
@@ -1154,6 +1255,49 @@ impl LsmEngine {
             .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
+    /// `ADR-COMPACTION-001` Decision 15. Mirrors `install_flush_fault_
+    /// hook`'s exact shape and rationale. Ordinary production code
+    /// never calls this.
+    pub fn install_compaction_fault_hook(
+        &self,
+        hook: impl Fn(CompactionFaultPoint) + Send + Sync + 'static,
+    ) {
+        *self
+            .compaction_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// Removes any hook installed by `install_compaction_fault_hook`.
+    pub fn clear_compaction_fault_hook(&self) {
+        *self
+            .compaction_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// `ADR-COMPACTION-001` Decision 15. Mirrors `install_flush_io_
+    /// fault_hook`'s exact shape; injected immediately before `compact_
+    /// once` calls `sstable::write_from_sorted_records`. Ordinary
+    /// production code never calls this.
+    pub fn install_compaction_io_fault_hook(
+        &self,
+        hook: impl Fn() -> Option<io::Error> + Send + Sync + 'static,
+    ) {
+        *self
+            .compaction_io_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// Removes any hook installed by `install_compaction_io_fault_hook`.
+    pub fn clear_compaction_io_fault_hook(&self) {
+        *self
+            .compaction_io_fault_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
     /// `ADR-WE-SP-001` §14: current storage-health state.
     pub fn storage_state(&self) -> StorageState {
         StorageState::from_u8(self.storage_state.load(Ordering::Acquire))
@@ -1192,6 +1336,16 @@ impl LsmEngine {
     pub fn set_flush_delay_for_test(&self, delay: Duration) {
         self.flush_delay_ms
             .store(delay.as_millis() as u64, Ordering::Release);
+    }
+
+    /// Test-only: forces `storage_state()` directly, so a test can
+    /// exercise `compact_once`'s "observe `StoragePressure`/
+    /// `StorageFull`, defer/skip" behavior (`ADR-COMPACTION-001`
+    /// Decision 11) deterministically, without needing to actually
+    /// exhaust disk space. Never called by production code.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_storage_state_for_test(&self, state: StorageState) {
+        self.storage_state.store(state as u8, Ordering::Release);
     }
 
     /// `Put(key, value)` — operating brief §12. Submits through the
@@ -1651,6 +1805,214 @@ impl LsmEngine {
         self.lock_sstables_read().iter().map(|t| t.id()).collect()
     }
 
+    /// `ADR-COMPACTION-001` Decision 14: the deterministic trigger
+    /// *check* only — pure, no side effect, not wired to any automatic
+    /// caller in this increment. `LsmConfig.compaction_trigger_count`
+    /// (default 4, LSM Engine Spec §5.1). See `fire_compaction_fault_
+    /// hook`'s own doc comment for why this method, like `compact_
+    /// once`, has no non-test caller yet.
+    #[allow(dead_code)]
+    pub(crate) fn should_compact(&self) -> bool {
+        self.sstable_count() >= self.config.compaction_trigger_count
+    }
+
+    /// `ADR-COMPACTION-001`: one full, synchronous, deterministic
+    /// compaction cycle — the "core operation" Decision 13/Decision 14
+    /// define. Returns `Ok(None)` if compaction was skipped (storage
+    /// not `Healthy`, or fewer than `compaction_trigger_count` live
+    /// SSTables), never an error for a legitimate skip. No background
+    /// thread, no automatic scheduling — a test or a future trigger-
+    /// wiring increment calls this directly.
+    ///
+    /// Sequence (per `PHASE_COMPACTION_ARCHITECTURE_REPORT.md` §7 /
+    /// `ADR-COMPACTION-001` Decisions 2/3/7/8/9/10/11):
+    /// 1. Observe (never mutate) `storage_state()` — skip while not
+    ///    `Healthy` (Decision 11).
+    /// 2. Retry any previously-deferred physical deletions first
+    ///    (Decision 9's "next cycle retries").
+    /// 3. Brief read-lock capture of every live SSTable (§4) — released
+    ///    immediately, before the merge.
+    /// 4. Stream the k-way merge (`compaction::merge`) straight into
+    ///    the shared, generalized SSTable writer (`ADR-COMPACTION-001`
+    ///    Decision 3) — no lock held during this, the expensive, part.
+    /// 5. Manifest `AddSstable`, fsync; then one `RemoveSstable` per
+    ///    input, each fsync'd (Decision 7).
+    /// 6. One brief `sstables` write-lock: remove the input `Arc`s,
+    ///    insert the output `Arc` (Decision 10/§13).
+    /// 7. Attempt physical deletion of each input whose `Arc` strong
+    ///    count already allows it; defer (never block) the rest
+    ///    (Decision 9).
+    #[allow(dead_code)] // see `fire_compaction_fault_hook`'s own doc comment
+    pub(crate) fn compact_once(&self) -> Result<Option<(SstableMeta, CompactionStats)>> {
+        let start = Instant::now();
+
+        // Decision 11: observe only, never mutate `storage_state`.
+        if self.storage_state() != StorageState::Healthy {
+            return Ok(None);
+        }
+
+        // Decision 9: retry deferred deletions before (not instead of)
+        // attempting a new cycle.
+        self.sweep_pending_compaction_deletes();
+
+        if !self.should_compact() {
+            return Ok(None);
+        }
+
+        // §4: brief read-lock capture, released immediately.
+        let inputs: Vec<Arc<SsTable>> = { self.lock_sstables_read().clone() };
+        if inputs.is_empty() {
+            return Ok(None);
+        }
+
+        let input_sstable_count = inputs.len();
+        let input_bytes: u64 = inputs
+            .iter()
+            .map(|t| std::fs::metadata(t.path()).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        let entry_count_hint: u64 = inputs.iter().map(|t| t.record_count()).sum();
+        let oldest_live_snapshot_seq = self.oldest_live_snapshot_seq();
+
+        fire_compaction_fault_hook(
+            &self.compaction_fault_hook,
+            CompactionFaultPoint::BeforeOutputWrite,
+        );
+
+        if let Some(e) = fire_compaction_io_fault_hook(&self.compaction_io_fault_hook) {
+            return Err(EngineError::Io(e));
+        }
+
+        let output_id = self.next_sstable_id.fetch_add(1, Ordering::SeqCst);
+        let (records, merge_stats_handle) =
+            crate::compaction::merge(&inputs, oldest_live_snapshot_seq);
+        let writer_config = SsTableWriterConfig {
+            target_block_size: self.config.sstable_target_block_size,
+            bloom_bits_per_key: self.config.bloom_bits_per_key,
+        };
+        let output_meta = sstable::write_from_sorted_records(
+            records,
+            output_id,
+            &self.sstables_dir,
+            &writer_config,
+            entry_count_hint,
+        )?;
+        let output_bytes = std::fs::metadata(&output_meta.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let merge_stats = *merge_stats_handle.lock().unwrap_or_else(|p| p.into_inner());
+
+        fire_compaction_fault_hook(
+            &self.compaction_fault_hook,
+            CompactionFaultPoint::BeforeManifestAdd,
+        );
+
+        {
+            let mut manifest = self.manifest.lock().unwrap_or_else(|p| p.into_inner());
+            manifest.append_sync(ManifestEdit::AddSstable {
+                id: output_id,
+                min_seq: output_meta.min_seq,
+                max_seq: output_meta.max_seq,
+                file_size: output_bytes,
+            })?;
+        }
+
+        fire_compaction_fault_hook(
+            &self.compaction_fault_hook,
+            CompactionFaultPoint::AfterManifestAdd,
+        );
+
+        {
+            let mut manifest = self.manifest.lock().unwrap_or_else(|p| p.into_inner());
+            for input in &inputs {
+                manifest.append_sync(ManifestEdit::RemoveSstable { id: input.id() })?;
+                fire_compaction_fault_hook(
+                    &self.compaction_fault_hook,
+                    CompactionFaultPoint::DuringRemoveSequence,
+                );
+            }
+        }
+
+        fire_compaction_fault_hook(
+            &self.compaction_fault_hook,
+            CompactionFaultPoint::AfterAllRemoves,
+        );
+
+        // §13: one brief write-lock — remove the input `Arc`s, insert
+        // the output `Arc`. A concurrent flush's own splice (same
+        // `RwLock`) is naturally serialized against this one; its own
+        // newly-published table is never lost (it simply isn't among
+        // `inputs`, since it was captured/published after this cycle's
+        // own input snapshot — eligible for the *next* cycle).
+        let output_table = Arc::new(SsTable::open(&output_meta.path, output_id)?);
+        {
+            let mut list = self.lock_sstables_write();
+            let input_ids: HashSet<u64> = inputs.iter().map(|t| t.id()).collect();
+            list.retain(|t| !input_ids.contains(&t.id()));
+            if !list.iter().any(|t| t.id() == output_id) {
+                list.insert(0, output_table);
+            }
+        }
+
+        fire_compaction_fault_hook(
+            &self.compaction_fault_hook,
+            CompactionFaultPoint::BeforePhysicalDelete,
+        );
+
+        // Decision 9: unlink each input only once its `Arc` strong
+        // count has dropped to 1 (no reader — including this method's
+        // own now-dropped `list` entry — still holds a clone); defer,
+        // never block, on the rest.
+        let mut deferred = self
+            .pending_compaction_deletes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for input in inputs {
+            if Arc::strong_count(&input) == 1 {
+                let _ = std::fs::remove_file(input.path());
+            } else {
+                deferred.push(input);
+            }
+        }
+        drop(deferred);
+
+        let records_dropped = merge_stats.records_read - merge_stats.records_retained;
+        let stats = CompactionStats {
+            input_sstable_count,
+            output_sstable_count: 1,
+            input_bytes,
+            output_bytes,
+            records_read: merge_stats.records_read,
+            records_retained: merge_stats.records_retained,
+            records_dropped,
+            tombstones_dropped: merge_stats.tombstones_dropped,
+            versions_dropped: merge_stats.versions_dropped,
+            duration: start.elapsed(),
+            peak_temp_disk_bytes: input_bytes + output_bytes,
+        };
+
+        Ok(Some((output_meta, stats)))
+    }
+
+    /// `ADR-COMPACTION-001` Decision 9: retries physical deletion of
+    /// every input a prior `compact_once` call deferred (its `Arc`
+    /// strong count was still `> 1` at the time) — never blocks; an
+    /// input still referenced simply stays deferred for the next call.
+    #[allow(dead_code)] // see `fire_compaction_fault_hook`'s own doc comment
+    fn sweep_pending_compaction_deletes(&self) {
+        let mut deferred = self
+            .pending_compaction_deletes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        deferred.retain(|input| {
+            if Arc::strong_count(input) == 1 {
+                let _ = std::fs::remove_file(input.path());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Read-only access to the underlying pool's own stats — reuses the
     /// existing, unmodified observability surface rather than
     /// duplicating it.
@@ -1696,6 +2058,10 @@ impl LsmEngine {
     }
     fn lock_sstables_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<SsTable>>> {
         self.sstables.read().unwrap_or_else(|p| p.into_inner())
+    }
+    #[allow(dead_code)] // see `fire_compaction_fault_hook`'s own doc comment
+    fn lock_sstables_write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<Arc<SsTable>>> {
+        self.sstables.write().unwrap_or_else(|p| p.into_inner())
     }
 }
 

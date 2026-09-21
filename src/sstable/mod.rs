@@ -27,12 +27,12 @@ mod bloom;
 pub mod format;
 mod reader;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod writer;
 
 pub use bloom::BloomFilter;
 pub use reader::{SsTable, SsTableRangeCursor};
-pub use writer::{write_from_memtable, SsTableWriterConfig};
+pub use writer::{write_from_memtable, write_from_sorted_records, SsTableWriterConfig};
 
 use std::fs;
 use std::path::{Path, PathBuf};
