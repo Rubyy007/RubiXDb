@@ -6,6 +6,82 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Productization: Service API + frontend console (2026-09-22)
+
+Adds a Service API layer and a frontend console on top of the
+certified engine (Write/Read/Compaction), without modifying it:
+`Client -> HTTP API -> Service layer -> LsmEngine`. Router,
+Replication, Partitioning, and leveled compaction remain explicitly
+out of scope and are not started by this work.
+
+#### Added
+
+- **`rubixdb-api`** (new `api` workspace member, `axum` 0.7 + `tokio`,
+  workspace change to `Cargo.toml` limited to adding the member):
+  bearer API-key auth (`reader`/`admin` role hierarchy), per-principal
+  token-bucket rate limiting, an `EngineError` -> HTTP status/code
+  mapping that never leaks a raw `io::Error` or filesystem path into a
+  response body, a snapshot-lifecycle service around the engine's own
+  RAII `Snapshot`, bounded graceful shutdown with an injectable
+  shutdown trigger (directly testable rather than relying on OS signal
+  delivery), per-route p50/p95/p99 metrics, and a `CorsLayer` gated by
+  `RUBIXDB_CORS_ALLOWED_ORIGINS` (empty/same-origin-only by default,
+  never wildcards origin). Route surface: `/healthz`, `/v1/readyz`,
+  `/v1/whoami`, `/v1/status`, `/v1/metadata`, KV put/get/delete/exists
+  (`?as_of_seq=` historical reads), range scans, snapshot create/list/
+  get/release, compaction status/metrics (read-only), combined
+  service+engine metrics.
+- **`GET /v1/whoami`**: a gap found while building the frontend (no
+  way for a client to learn its own authenticated role) and closed as
+  one new route reading the `Principal` `auth_middleware` already
+  attaches to every request -- zero change to the auth model.
+- **`frontend`** (new directory, React 18 + TypeScript + Vite): a
+  database console -- Dashboard, Data Explorer (point lookup + range
+  query), Snapshots, Compaction (status/metrics only, no manual-
+  trigger control -- no such engine API exists), Health/Storage
+  (per-route metrics table), Settings. Design-token light/dark
+  theming, a small hand-built component set (no component-library
+  dependency), `@tanstack/react-query` for server state, one
+  `SessionContext` for global client state.
+
+#### Fixed
+
+- **Stale read cache after a write** (functional bug, found by
+  `frontend/e2e/workflow.spec.ts`'s own overwrite-then-re-read step):
+  `react-query` had no signal that a `PUT`/`DELETE` invalidated an
+  already-cached `["kv", "get", key, ...]` query under an unchanged
+  key. Fixed in `frontend/src/api/queries.ts`: `usePutMutation`/
+  `useDeleteMutation` now invalidate every cached `["kv", ...]` query
+  on success.
+- **Two color-contrast failures** caught by `axe-core`'s automated
+  audit against the real rendered app (`--color-healthy` 3.1:1,
+  `--color-text-faint` 3.19:1, both below WCAG AA's 4.5:1): darkened
+  in `frontend/src/styles/tokens.css`.
+- **Heading-hierarchy skip** (`<h1>` page titles directly followed by
+  `<h3>` `Card` titles, skipping `<h2>`), caught by `axe-core`'s
+  `heading-order` rule: `Card` titles now render as `<h2>`.
+- **Missing `<main>` landmark on the Connect screen** (it renders
+  outside `AppShell`, before any session exists): wrapped in a labeled
+  `<main>`.
+
+All four backend fixes/additions and the frontend bug fixes above are
+purely additive or corrective to the new API/frontend layer -- zero
+change to `src/wal/`, `src/manifest/`, `src/error.rs`, `src/
+compaction/`, or any other certified-engine path (`git diff --stat --
+src/` empty across the whole phase). **WRITE ENGINE = PRODUCTION
+READY**, **READ ENGINE = PRODUCTION READY**, and **COMPACTION =
+PRODUCTION READY** are unchanged and re-verified (347/347 lib tests
+debug+release, `wal_tests` 12/12, `crash_consistency` 2/2,
+`pathological_recovery_matrix` 9/9). The new API/frontend layer's own
+readiness rests on its own tests: `rubixdb-api` 29/29 unit + 15/15
+real integration tests (real engine, no mocking); frontend 17/17 unit/
+component tests + 10/10 real-backend Playwright e2e tests (full
+workflow, role-gating, invalid-key rejection, `axe-core` a11y audit of
+all 7 screens, responsive checks). Overall RubiXDB production
+readiness is **not** declared by this work. Full account:
+`PHASE_API_ARCHITECTURE.md`, `PHASE_API_IMPLEMENTATION.md`,
+`PHASE_FRONTEND_ARCHITECTURE.md`, `PHASE_FRONTEND_IMPLEMENTATION.md`.
+
 ### Compaction: production performance + resource + endurance validation, Increment 3 (2026-09-22)
 
 Closed every gate Increment 2 left open, with one purely additive

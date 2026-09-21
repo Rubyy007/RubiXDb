@@ -2750,3 +2750,81 @@ increment, a new, separately-scoped increment. **WRITE ENGINE =
 PRODUCTION READY** and **READ ENGINE = PRODUCTION READY** remain
 unchanged, protected, and re-verified by this increment's own full
 regression gate.
+
+## 2026-09-22
+
+**Implemented:** Productization phase -- a Service API layer and a
+frontend console built *on top of* the certified engine, per
+`PHASE_API_ARCHITECTURE.md`/`PHASE_API_IMPLEMENTATION.md` and
+`PHASE_FRONTEND_ARCHITECTURE.md`/`PHASE_FRONTEND_IMPLEMENTATION.md`.
+This is new surface area, not a change to the certified engine: the
+architecture is Client -> HTTP API -> Service layer -> the unmodified
+`LsmEngine`. Router, Replication, Partitioning, and leveled compaction
+were explicitly not started, per the phase's own stop condition.
+
+- **`rubixdb-api`** (new `api` workspace member, `axum` 0.7 + `tokio`):
+  bearer API-key auth with a `reader`/`admin` role hierarchy, per-
+  principal token-bucket rate limiting, a typed `EngineError` ->
+  HTTP-status/code mapping that never leaks a raw `io::Error` or
+  filesystem path into a response body, a snapshot lifecycle service
+  wrapping the engine's own RAII `Snapshot`, bounded graceful shutdown
+  (`server::serve()`, injectable shutdown trigger, tested directly
+  rather than relying on real OS signal delivery), per-route p50/p95/
+  p99 latency metrics, and a CORS layer (`RUBIXDB_CORS_ALLOWED_
+  ORIGINS`, empty/same-origin-only by default, never wildcards origin).
+  Full route surface: health/readiness/whoami, status/metadata, KV
+  put/get/delete/exists (with `?as_of_seq=` historical reads), range
+  scans, snapshot create/list/get/release, compaction status/metrics
+  (read-only -- no force-compaction control exists, because no such
+  engine API exists), and combined service+engine metrics.
+- **`frontend`** (new directory, React 18 + TypeScript + Vite, no
+  component-library dependency): a database console with Dashboard,
+  Data Explorer (point lookup + range query, consolidating "Query/
+  workspace" and "Result viewer" since no SQL layer exists to give
+  those separate meaning), Snapshots, Compaction (status/metrics only,
+  no manual-trigger control), Health/Storage (its per-route metrics
+  table doubles as the "Logs/errors" screen -- no log-retrieval
+  endpoint exists on the backend to back a real log viewer), and
+  Settings. Design tokens (light/dark via `prefers-color-scheme` +
+  override), a small hand-built component set, `@tanstack/react-query`
+  for server state, one `SessionContext` for the only genuinely-global
+  client state (session-storage by default, local-storage only on
+  explicit opt-in).
+- **One backend gap closed for the frontend's sake, documented rather
+  than silently added:** `GET /v1/whoami`, so the console can learn
+  its own authenticated role -- zero change to the auth model itself.
+- **Five real bugs found by real (unmocked) testing, fixed at the
+  source:** a stale-read-cache bug (`PUT`/`DELETE` did not invalidate
+  cached `["kv", ...]` react-query reads, fixed via explicit
+  invalidation in `api/queries.ts`), two `axe-core`-caught color-
+  contrast failures (`--color-healthy`, `--color-text-faint`,
+  darkened in `tokens.css`), a heading-hierarchy skip (`Card` titles
+  now render as `<h2>`, not `<h3>`), and a missing `<main>` landmark on
+  the pre-session Connect screen.
+
+**Tests passing:** Engine (unchanged, re-verified after every change
+batch): 347/347 lib tests debug+release, `wal_tests` 12/12,
+`crash_consistency` 2/2, `pathological_recovery_matrix` 9/9, fmt/
+clippy/`check --workspace --all-targets --all-features` all clean.
+Backend (`rubixdb-api`): 29/29 unit tests, 15/15 real integration tests
+(`tower::ServiceExt::oneshot` against the real router + real engine,
+including a real-process-restart persistence test and a CORS test).
+Frontend: 17/17 vitest unit/component tests, 10/10 Playwright e2e
+tests against the real built frontend + real `rubixdb-api.exe` binary
+on a separate origin (full workflow, role-gating, invalid-key
+rejection, `axe-core` accessibility audit of all 7 screens, responsive
+viewport checks at desktop/tablet/small). Production frontend build
+succeeds (`dist/index.html` 0.45 kB, CSS 10.27 kB/2.62 kB gzip, JS
+239.59 kB/74.56 kB gzip).
+
+**Protected-engine audit:** `git diff --stat -- src/` empty across the
+entire phase -- zero changes to WAL, Write Engine, Read Engine,
+Compaction, SSTable/Manifest format, or snapshot semantics.
+
+**Explicitly not done / not declared:** Router, Replication,
+Partitioning, and leveled compaction were not started. Overall RubiXDB
+production readiness is **not** declared by this phase -- **WRITE
+ENGINE**, **READ ENGINE**, and **COMPACTION** remain independently
+**PRODUCTION READY** per their own certifications; the new API/
+frontend layer's readiness rests on its own test evidence above, not
+on the engine's.
