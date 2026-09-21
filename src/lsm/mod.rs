@@ -539,6 +539,101 @@ struct ReadStatCounters {
     sstables_consulted: AtomicU64,
 }
 
+/// Increment 3 (production performance/resource/endurance validation):
+/// cumulative, across-the-engine-lifetime Compaction health metrics,
+/// mirroring `ReadStats`'s own "cheap atomic counters, snapshot-copied
+/// on read" shape. Unlike `CompactionStats` (one instance per cycle,
+/// already returned directly by `compact_once`/logged by the worker),
+/// this is a running total plus the most recent cycle's own
+/// `CompactionStats` — needed to answer "is compaction keeping up over
+/// time" questions no single cycle's own stats can answer alone.
+/// Purely additive observability: updated only on a *successful*
+/// `compact_once_impl` cycle (mirroring the brief's own "each
+/// successful automatic Compaction should produce observable..."
+/// framing), never consulted by any correctness or trigger decision —
+/// same non-load-bearing status `ReadStats` already has.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionMetrics {
+    pub cycles_completed: u64,
+    pub input_sstables_total: u64,
+    pub input_bytes_total: u64,
+    pub output_bytes_total: u64,
+    pub records_read_total: u64,
+    pub records_retained_total: u64,
+    pub records_dropped_total: u64,
+    pub tombstones_dropped_total: u64,
+    pub versions_dropped_total: u64,
+    pub duration_total: Duration,
+    pub duration_max: Duration,
+    pub peak_temp_disk_bytes_max: u64,
+    pub last_cycle: Option<CompactionStats>,
+}
+
+#[derive(Default)]
+struct CompactionMetricCounters {
+    cycles_completed: AtomicU64,
+    input_sstables_total: AtomicU64,
+    input_bytes_total: AtomicU64,
+    output_bytes_total: AtomicU64,
+    records_read_total: AtomicU64,
+    records_retained_total: AtomicU64,
+    records_dropped_total: AtomicU64,
+    tombstones_dropped_total: AtomicU64,
+    versions_dropped_total: AtomicU64,
+    duration_total_nanos: AtomicU64,
+    duration_max_nanos: AtomicU64,
+    peak_temp_disk_bytes_max: AtomicU64,
+    last_cycle: Mutex<Option<CompactionStats>>,
+}
+
+/// Records one successful cycle's `CompactionStats` into the running
+/// totals. Called from `compact_once_impl` only on the `Ok(Some(..))`
+/// path — a failed/deferred/no-op cycle contributes nothing (there is
+/// no partial cycle to report; §11 of `ADR-COMPACTION-001`'s crash
+/// protocol already establishes a failure leaves no observable partial
+/// state, and this mirrors that for metrics).
+fn record_compaction_cycle(counters: &CompactionMetricCounters, stats: &CompactionStats) {
+    counters.cycles_completed.fetch_add(1, Ordering::Relaxed);
+    counters
+        .input_sstables_total
+        .fetch_add(stats.input_sstable_count as u64, Ordering::Relaxed);
+    counters
+        .input_bytes_total
+        .fetch_add(stats.input_bytes, Ordering::Relaxed);
+    counters
+        .output_bytes_total
+        .fetch_add(stats.output_bytes, Ordering::Relaxed);
+    counters
+        .records_read_total
+        .fetch_add(stats.records_read, Ordering::Relaxed);
+    counters
+        .records_retained_total
+        .fetch_add(stats.records_retained, Ordering::Relaxed);
+    counters
+        .records_dropped_total
+        .fetch_add(stats.records_dropped, Ordering::Relaxed);
+    counters
+        .tombstones_dropped_total
+        .fetch_add(stats.tombstones_dropped, Ordering::Relaxed);
+    counters
+        .versions_dropped_total
+        .fetch_add(stats.versions_dropped, Ordering::Relaxed);
+    let dur_nanos = stats.duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+    counters
+        .duration_total_nanos
+        .fetch_add(dur_nanos, Ordering::Relaxed);
+    counters
+        .duration_max_nanos
+        .fetch_max(dur_nanos, Ordering::Relaxed);
+    counters
+        .peak_temp_disk_bytes_max
+        .fetch_max(stats.peak_temp_disk_bytes, Ordering::Relaxed);
+    *counters
+        .last_cycle
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(stats.clone());
+}
+
 /// `ADR-RE-001` §1/§5: the `range_scan` consistency mechanism --
 /// captures a stable set of source references once, at construction
 /// time, so the k-way merge (`RangeScanIter`) can run lock-free against
@@ -1185,6 +1280,11 @@ pub struct LsmEngine {
     compaction_handle: Mutex<Option<JoinHandle<()>>>,
     /// Mirrors `flush_stop`'s own shape and purpose exactly.
     compaction_stop: Arc<AtomicBool>,
+    /// Increment 3: cumulative Compaction health metrics, updated by
+    /// `compact_once_impl` on every successful cycle regardless of
+    /// which caller (manual or the automatic worker) triggered it —
+    /// see `CompactionMetrics`/`record_compaction_cycle`.
+    compaction_metrics: Arc<CompactionMetricCounters>,
 }
 
 impl LsmEngine {
@@ -1275,6 +1375,7 @@ impl LsmEngine {
             Arc::new(Mutex::new(Vec::new()));
         let compaction_running = Arc::new(AtomicBool::new(false));
         let compaction_stop = Arc::new(AtomicBool::new(false));
+        let compaction_metrics = Arc::new(CompactionMetricCounters::default());
 
         // `ADR-COMPACTION-001` Increment 2 §4/§16: capacity-1 so a
         // `MaybeCompact` already sitting unconsumed coalesces any
@@ -1332,6 +1433,7 @@ impl LsmEngine {
                 Arc::clone(&compaction_running),
                 Arc::clone(&compaction_stop),
                 lsm_config.storage_pressure_retry_interval,
+                Arc::clone(&compaction_metrics),
             ))
         } else {
             None
@@ -1376,6 +1478,7 @@ impl LsmEngine {
             compaction_sender,
             compaction_handle: Mutex::new(compaction_handle),
             compaction_stop,
+            compaction_metrics,
         })
     }
 
@@ -2025,7 +2128,38 @@ impl LsmEngine {
             &self.compaction_io_fault_hook,
             &self.pending_compaction_deletes,
             &self.compaction_running,
+            &self.compaction_metrics,
         )
+    }
+
+    /// Increment 3: a point-in-time snapshot of cumulative Compaction
+    /// health metrics — see `CompactionMetrics`'s own doc comment.
+    /// Cheap (atomic loads plus one small `Mutex` lock for `last_
+    /// cycle`), safe to call frequently (e.g. from a soak harness's own
+    /// periodic sampling loop), and never consulted by any production
+    /// decision — purely observational, same status `read_stats()`
+    /// already has.
+    pub fn compaction_metrics(&self) -> CompactionMetrics {
+        let c = &self.compaction_metrics;
+        CompactionMetrics {
+            cycles_completed: c.cycles_completed.load(Ordering::Relaxed),
+            input_sstables_total: c.input_sstables_total.load(Ordering::Relaxed),
+            input_bytes_total: c.input_bytes_total.load(Ordering::Relaxed),
+            output_bytes_total: c.output_bytes_total.load(Ordering::Relaxed),
+            records_read_total: c.records_read_total.load(Ordering::Relaxed),
+            records_retained_total: c.records_retained_total.load(Ordering::Relaxed),
+            records_dropped_total: c.records_dropped_total.load(Ordering::Relaxed),
+            tombstones_dropped_total: c.tombstones_dropped_total.load(Ordering::Relaxed),
+            versions_dropped_total: c.versions_dropped_total.load(Ordering::Relaxed),
+            duration_total: Duration::from_nanos(c.duration_total_nanos.load(Ordering::Relaxed)),
+            duration_max: Duration::from_nanos(c.duration_max_nanos.load(Ordering::Relaxed)),
+            peak_temp_disk_bytes_max: c.peak_temp_disk_bytes_max.load(Ordering::Relaxed),
+            last_cycle: c
+                .last_cycle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        }
     }
 
     /// Read-only access to the underlying pool's own stats — reuses the
@@ -2377,6 +2511,7 @@ fn compact_once_impl(
     compaction_io_fault_hook: &Arc<Mutex<Option<CompactionIoFaultHook>>>,
     pending_compaction_deletes: &Arc<Mutex<Vec<Arc<SsTable>>>>,
     compaction_running: &Arc<AtomicBool>,
+    compaction_metrics: &Arc<CompactionMetricCounters>,
 ) -> Result<Option<(SstableMeta, CompactionStats)>> {
     let start = Instant::now();
 
@@ -2530,6 +2665,8 @@ fn compact_once_impl(
         peak_temp_disk_bytes: input_bytes + output_bytes,
     };
 
+    record_compaction_cycle(compaction_metrics, &stats);
+
     Ok(Some((output_meta, stats)))
 }
 
@@ -2576,6 +2713,7 @@ fn spawn_compaction_thread(
     compaction_running: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     fallback_interval: Duration,
+    compaction_metrics: Arc<CompactionMetricCounters>,
 ) -> JoinHandle<()> {
     thread::spawn(move || loop {
         match receiver.recv_timeout(fallback_interval) {
@@ -2620,6 +2758,7 @@ fn spawn_compaction_thread(
                     &compaction_io_fault_hook,
                     &pending_compaction_deletes,
                     &compaction_running,
+                    &compaction_metrics,
                 )
             }));
             match result {

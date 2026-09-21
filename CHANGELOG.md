@@ -6,6 +6,72 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Compaction: production performance + resource + endurance validation, Increment 3 (2026-09-22)
+
+Closed every gate Increment 2 left open, with one purely additive
+production-code change: `CompactionMetrics`/`LsmEngine::compaction_
+metrics()` (mirrors `ReadStats`'s own cumulative-counters-plus-
+snapshot shape), added because `compact_once`/`should_compact` remain
+intentionally `pub(crate)` (`ADR-COMPACTION-001` Decision 13,
+unchanged) and an external benchmark/soak harness otherwise has no way
+to observe per-cycle stats from the real automatic worker. No trigger
+model, retention rule, Manifest sequence, or concurrency model change.
+
+Three new harnesses (`examples/compaction_bench.rs`, `compaction_
+crash_cycle_test.rs`/`_child.rs`, `compaction_soak.rs`) delivered:
+performance sweep across 4-256 input SSTables and a 9-shape overlap x
+value-size sweep (measured on-disk storage-budget peak matched the
+ADR's own theoretical `input+output` figure exactly, 0.00% delta, at
+both 64 and 256 tables); concurrent read/write/compaction, snapshot,
+and tombstone/version endurance (0 mismatches across ~2.37M ops / 39
+cycles / 12 cycles respectively); a finding that compaction
+measurably *improves* read latency (point-read p50 ~9x lower, range
+p50 3-20x lower, compaction enabled vs. disabled, same workload) by
+bounding live SSTable count; 38/38 real external-process crash cycles
+through the automatic worker (18 targeted -- via a stdout-marker
+technique precisely hitting each of the 6 `CompactionFaultPoint`s --
+plus 20 random-delay); RSS growing only 9.7% while cumulative
+compacted-through data grew ~668x (bounded by live input-table count,
+per the ADR's own design intent); handles/threads returning **exactly**
+to the pre-open process baseline after shutdown across 100 repeated
+cycles.
+
+**The first real long-duration integrated production soak with
+automatic Compaction active**: 4 hours, the established production
+profile (8 writers, 16 readers, `LsmConfig::default()`), ~14.9M writes,
+~2.6M deletes, 3.3 billion point reads, 9.87M range scans, 193 real
+compaction cycles, 17.46M records dropped, RSS stable at 60-70MB
+throughout, live SSTable count never exceeding 3. **0 in-run
+mismatches, 0 post-recovery mismatches** across all 20,000
+independently-tracked keys, verified after a real shutdown + reopen.
+
+Three real bugs found and fixed in the soak's own correctness harness
+while building it (not in Compaction or the Read Engine): a range-
+bound wraparound producing inverted/empty scans near the keyspace
+boundary; a reference-model ring buffer breaking its own seq-sorted
+invariant under racing same-key writers (fixed via seq-sorted
+insertion); and a correctness comparison that ran into this project's
+own already-documented `snapshot_seq()` cross-thread cadence caveat
+(confirmed pre-existing and Compaction-unrelated by reproducing it
+with zero compaction cycles running, then fixed by pinning every
+comparison the same proven-race-free way point-checks already use). A
+resource-contention false positive (2 unrelated `wal::group_commit`
+tests, failing only under full-parallel-suite load concurrent with the
+soak's own 8w/16r load on the same machine) was traced and confirmed
+non-regressive before the authoritative gate was re-run cleanly with
+the soak no longer active.
+
+Full regression gate clean (347/347 debug+release, fmt/clippy,
+`wal_tests` 12/12, `crash_consistency` 2/2, `pathological_recovery_
+matrix` 9/9); zero changes to WAL/Manifest/error types/`src/compaction/
+mod.rs`; zero new dependency; zero `unsafe`. Full detail:
+`PHASE_COMPACTION_PERFORMANCE.md`, `PHASE_COMPACTION_INCREMENT3_
+ENDURANCE.md`, `PROGRESS.md`'s 2026-09-22 entry.
+
+**COMPACTION INCREMENT 3 = PASS. COMPACTION PRODUCTION READY = NO** --
+final certification is a new, separately-scoped increment. Write
+Engine and Read Engine production-ready status unchanged.
+
 ### Compaction: production trigger + execution integration, Increment 2 (2026-09-21)
 
 `ADR-COMPACTION-001` Amendment 1 implemented: a real, automatic

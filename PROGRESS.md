@@ -2650,5 +2650,103 @@ remaining: full performance characterization beyond the bounded
 baseline, a real OS-level resource benchmark (RSS/handles/threads,
 external to `cargo test`), long-duration write/read/compaction
 endurance, a storage-pressure endurance run, and a final certification
-matrix. **WRITE ENGINE = PRODUCTION READY** and **READ ENGINE =
-PRODUCTION READY** remain unchanged, protected, and re-verified.
+matrix. **WRITE ENGINE = PRODUCTION READY** and **READ ENGINE = PRODUCTION
+READY** remain unchanged, protected, and re-verified.
+
+## 2026-09-22 (Compaction Increment 3: production performance + resource + endurance validation)
+
+**Implemented:** closed every gate `PHASE_COMPACTION_INCREMENT2_
+RESULTS.md` §9 left open. One production-code change, purely
+additive: `CompactionMetrics`/`LsmEngine::compaction_metrics()`
+(`src/lsm/mod.rs`, mirrors `ReadStats`'s own cumulative-counters-plus-
+snapshot shape) -- needed because `compact_once`/`should_compact`
+remain `pub(crate)` by deliberate, still-honored ADR decision
+(`ADR-COMPACTION-001` Decision 13), so an external benchmark/soak
+harness has no other way to observe per-cycle `CompactionStats` from
+the real automatic worker. Updated only on a successful cycle, never
+consulted by any correctness/trigger decision, covered by its own new
+unit test. No trigger model, retention rule, Manifest sequence, or
+concurrency model change of any kind.
+
+**New harnesses** (`examples/`): `compaction_bench.rs` (performance
+sweep 4-256 input SSTables + a 9-shape overlap x value-size sweep,
+storage-budget validation, RSS/handle/thread scaling, automatic-
+trigger stress, concurrent read/write/compaction correctness,
+snapshot and tombstone/version endurance, read/write latency with
+compaction idle vs. active, SSTable-count stability, storage-pressure/
+failure-retry/shutdown endurance); `compaction_crash_cycle_test.rs` +
+`_child.rs` (real external `Child::kill()` crash cycles through the
+automatic worker specifically -- a targeted mode that precisely hits
+each of the 6 `CompactionFaultPoint`s via a stdout marker technique,
+plus a broader random-delay mode); `compaction_soak.rs` (the first
+real long-duration integrated production soak with automatic
+Compaction active, correctness-checked against an independently
+tracked reference model).
+
+**Three real bugs found and fixed in the soak's own correctness
+harness** (not in Compaction or the Read Engine -- each traced to its
+actual root cause, not assumed): a range-bound wraparound producing
+inverted/empty scans near the keyspace boundary; the reference model's
+ring buffer breaking its own seq-sorted invariant when two writers
+raced the same key (fixed via seq-sorted insertion instead of blind
+`push_back`); and a `get()`/`snapshot()`-based correctness comparison
+that ran directly into this project's own already-documented
+`snapshot_seq()` cross-thread cadence caveat (`read_engine_bench.rs::
+section_sanity`) -- confirmed as the same pre-existing, Compaction-
+unrelated characteristic (not a new defect) by reproducing it with
+**zero** compaction cycles running, then fixed by pinning every
+correctness comparison the same proven-race-free way point-checks
+already use (a real write's own already-applied seq, obtained via the
+model under its own lock, never a cross-thread-sampled watermark).
+
+**Headline results:**
+- Storage budget: measured on-disk peak matched the theoretical
+  `input+output` figure exactly (0.00% delta) at both 64 and 256
+  input tables.
+- Concurrent read/write/compaction: 0 mismatches across ~2.37M mixed
+  ops and 14 real cycles. Snapshot endurance: 0 mismatches across 39
+  cycles. Tombstone/version endurance: 0 mismatches across 12 cycles.
+- Compaction measurably *improves* read latency by bounding live
+  SSTable count -- point-read p50 dropped ~9x, range p50 dropped
+  3-20x, compaction enabled vs. disabled, same workload.
+- 38/38 real external-process crash cycles through the automatic
+  worker (18 targeted across all 6 `CompactionFaultPoint`s + 20
+  random-delay), all recovering cleanly with no orphaned files, no
+  regressed watermarks, no read errors.
+- RSS grew only 9.7% while cumulative compacted-through data grew
+  ~668x and cycle count grew 30x (bounded by live input-table count,
+  not cumulative volume, as the ADR intends). Handles/threads returned
+  **exactly** to the pre-open process baseline after shutdown across
+  100 repeated cycles -- no leak.
+- **4-hour production-profile soak** (8 writers, 16 readers,
+  `LsmConfig::default()` + automatic Compaction): ~14.9M writes, ~2.6M
+  deletes, 3.3 billion point reads, 9.87M range scans, 193 real
+  compaction cycles, 17.46M records dropped, RSS stable at 60-70MB
+  throughout, live SSTable count never exceeded 3 despite the
+  sustained write volume. **0 in-run mismatches, 0 post-recovery
+  mismatches** (all 20,000 tracked keys verified correct after a real
+  shutdown + reopen).
+- A resource-contention false positive was found, traced, and
+  resolved rather than silently retried: 2 unrelated `wal::group_
+  commit` tests failed once under full parallel-suite load while the
+  4-hour soak also ran concurrently on the same machine; both passed
+  cleanly in isolation while the soak was still running, confirming
+  contention (matching this project's own already-documented precedent
+  for exactly this class of finding), not a regression. The
+  authoritative final gate was re-run with the soak no longer active.
+
+**Full regression gate clean**: `fmt` / `clippy -D warnings` /
+`test --lib` 347/347 debug+release / `check --all-targets` /
+`wal_tests` 12/12 / `crash_consistency` (`--features test-util`) 2/2 /
+`pathological_recovery_matrix` 9/9. **Protected-contract audit**: zero
+changes to `src/wal/`, `src/error.rs`, `src/manifest/`, `src/
+compaction/mod.rs`, `Cargo.toml`, or `Cargo.lock`; zero new
+dependency; zero `unsafe` introduced.
+
+**COMPACTION INCREMENT 3 = PASS.** **COMPACTION PRODUCTION READY =
+NO** -- final certification (mirroring `PHASE_READ_ENGINE_
+CERTIFICATION.md`'s own structure) is explicitly out of scope for this
+increment, a new, separately-scoped increment. **WRITE ENGINE =
+PRODUCTION READY** and **READ ENGINE = PRODUCTION READY** remain
+unchanged, protected, and re-verified by this increment's own full
+regression gate.

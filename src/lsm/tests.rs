@@ -279,6 +279,7 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         compaction_sender: mpsc::sync_channel(1).0,
         compaction_handle: Mutex::new(None),
         compaction_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        compaction_metrics: Arc::new(CompactionMetricCounters::default()),
     };
 
     let result = engine.put(b"k1", b"v1");
@@ -4622,6 +4623,90 @@ mod compaction_tests {
     // as part of this crate's own `cargo test --lib` -- not duplicated
     // here.
     // -------------------------------------------------------------
+
+    /// Increment 3: `compaction_metrics()` counting semantics, mirroring
+    /// `ReadStats`'s own established counting-test style
+    /// (`read_stats_counts_range_scan_calls_and_sstable_consultation_
+    /// correctly`). Two manual `compact_once()` cycles against two
+    /// independently-built fixtures; asserts the cumulative totals equal
+    /// the exact sum of both cycles' own `CompactionStats`, and that
+    /// `last_cycle` reflects only the *second* cycle, not the first.
+    #[test]
+    fn compaction_metrics_accumulates_across_cycles_and_tracks_the_last_cycle() {
+        let dir = temp_dir("compaction_metrics");
+        let engine = open(&dir, small_flush_config(4));
+        let mut seed = 0u64;
+
+        let zero = engine.compaction_metrics();
+        assert_eq!(zero.cycles_completed, 0);
+        assert!(zero.last_cycle.is_none());
+
+        put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+        let (meta1, stats1) = engine
+            .compact_once()
+            .unwrap()
+            .expect("first cycle must run");
+
+        let after1 = engine.compaction_metrics();
+        assert_eq!(after1.cycles_completed, 1);
+        assert_eq!(
+            after1.input_sstables_total,
+            stats1.input_sstable_count as u64
+        );
+        assert_eq!(after1.input_bytes_total, stats1.input_bytes);
+        assert_eq!(after1.output_bytes_total, stats1.output_bytes);
+        assert_eq!(after1.records_read_total, stats1.records_read);
+        assert_eq!(after1.records_retained_total, stats1.records_retained);
+        assert_eq!(after1.records_dropped_total, stats1.records_dropped);
+        assert_eq!(after1.tombstones_dropped_total, stats1.tombstones_dropped);
+        assert_eq!(after1.versions_dropped_total, stats1.versions_dropped);
+        assert_eq!(after1.duration_total, stats1.duration);
+        assert_eq!(after1.duration_max, stats1.duration);
+        assert_eq!(after1.peak_temp_disk_bytes_max, stats1.peak_temp_disk_bytes);
+        assert_eq!(after1.last_cycle, Some(stats1.clone()));
+        assert_eq!(meta1.id, engine.live_sstable_ids()[0]);
+
+        put_and_wait_for_sstable_count(&engine, 5, &mut seed);
+        put_and_wait_for_sstable_count(&engine, 8, &mut seed);
+        let (_meta2, stats2) = engine
+            .compact_once()
+            .unwrap()
+            .expect("second cycle must run");
+
+        let after2 = engine.compaction_metrics();
+        assert_eq!(after2.cycles_completed, 2);
+        assert_eq!(
+            after2.input_sstables_total,
+            (stats1.input_sstable_count + stats2.input_sstable_count) as u64,
+            "input_sstables_total must be the exact sum across both cycles"
+        );
+        assert_eq!(
+            after2.records_read_total,
+            stats1.records_read + stats2.records_read
+        );
+        assert_eq!(
+            after2.records_dropped_total,
+            stats1.records_dropped + stats2.records_dropped
+        );
+        assert_eq!(
+            after2.duration_total,
+            stats1.duration + stats2.duration,
+            "duration_total must be the exact sum, not an average or a max"
+        );
+        assert_eq!(
+            after2.duration_max,
+            stats1.duration.max(stats2.duration),
+            "duration_max must be the max across cycles, not the latest cycle's own duration"
+        );
+        assert_eq!(
+            after2.last_cycle,
+            Some(stats2),
+            "last_cycle must reflect only the most recent cycle, not the first"
+        );
+
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// `ADR-COMPACTION-001` Increment 2's own new test suite: the
     /// automatic trigger + execution integration specifically --
