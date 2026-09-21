@@ -267,13 +267,18 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         flush_fault_hook: Arc::new(Mutex::new(None)),
         storage_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         storage_pressure_events: Arc::new(AtomicU64::new(0)),
+        flush_completions: Arc::new(AtomicU64::new(0)),
         flush_io_fault_hook: Arc::new(Mutex::new(None)),
         snapshot_registry: Arc::new(SnapshotRegistry::default()),
         read_stats: Arc::new(ReadStatCounters::default()),
         config: LsmConfig::default(),
         compaction_fault_hook: Arc::new(Mutex::new(None)),
         compaction_io_fault_hook: Arc::new(Mutex::new(None)),
-        pending_compaction_deletes: Mutex::new(Vec::new()),
+        pending_compaction_deletes: Arc::new(Mutex::new(Vec::new())),
+        compaction_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        compaction_sender: mpsc::sync_channel(1).0,
+        compaction_handle: Mutex::new(None),
+        compaction_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let result = engine.put(b"k1", b"v1");
@@ -3606,11 +3611,25 @@ mod compaction_tests {
     /// Small memtable + many distinct keys -> many small SSTables
     /// quickly, matching every other increment's own established
     /// fixture-building convention.
+    /// `ADR-COMPACTION-001` Increment 2 amendment: `compaction_auto_
+    /// trigger: false` here, deliberately -- every test in this module
+    /// was written (Increment 1) assuming full, deterministic manual
+    /// control over exactly when `compact_once` runs (building fixtures
+    /// with a precise live-SSTable count, then calling `compact_once`
+    /// explicitly). With automatic triggering on by default (Increment
+    /// 2's own real production posture), a background worker could
+    /// compact these fixtures out from under those tests before their
+    /// own explicit call ever runs. Increment 2's own new tests
+    /// (`mod auto_trigger_tests` below) explicitly construct configs
+    /// with `compaction_auto_trigger: true` (or `LsmConfig::default()`)
+    /// to exercise the real automatic-trigger behavior this helper
+    /// intentionally opts out of.
     fn small_flush_config(trigger_count: usize) -> LsmConfig {
         LsmConfig {
             memtable_max_size_bytes: 200,
             max_immutable_memtables: 32,
             compaction_trigger_count: trigger_count,
+            compaction_auto_trigger: false,
             ..LsmConfig::default()
         }
     }
@@ -3633,6 +3652,8 @@ mod compaction_tests {
     /// scheduling delay under heavy parallel `cargo test` contention.
     fn put_and_wait_for_sstable_count(engine: &LsmEngine, count: usize, seed: &mut u64) {
         while engine.sstable_count() < count {
+            let sstables_before = engine.sstable_count();
+            let completions_before = engine.flush_completions();
             let key = format!("k{:06}", *seed % 500);
             engine
                 .put(key.as_bytes(), format!("v{seed}").as_bytes())
@@ -3642,6 +3663,27 @@ mod compaction_tests {
                 wait_until(|| engine.immutable_count() == 0, Duration::from_secs(10)),
                 "flush must settle before the next write is issued"
             );
+            // `immutable_count()==0` alone only proves a flush job's
+            // memtable-removal step ran -- its tail (WAL purge, then the
+            // storage_state swap) can still be in flight. Callers of
+            // this helper (e.g. storage-pressure tests that force
+            // `storage_state` immediately afterward) need the *full*
+            // settle, or that forced state can be silently clobbered by
+            // this job's own delayed swap. See `flush_completions`'s doc
+            // comment. Only wait for it when this particular `put` is
+            // actually the one that pushed the memtable over its freeze
+            // threshold (`sstable_count()` went up) -- most `put`s don't,
+            // and `flush_completions` would then never advance.
+            if engine.sstable_count() > sstables_before {
+                assert!(
+                    wait_until(
+                        || engine.flush_completions() > completions_before,
+                        Duration::from_secs(10)
+                    ),
+                    "flush job must fully settle (past its storage_state swap) before the next \
+                     write is issued"
+                );
+            }
         }
     }
 
@@ -3724,6 +3766,12 @@ mod compaction_tests {
             memtable_max_size_bytes: 142,
             max_immutable_memtables: 8,
             compaction_trigger_count: 1,
+            // A `trigger_count` this low is met the instant a single
+            // table exists -- with automatic triggering left on, the
+            // background worker would race this test's own manual
+            // `compact_once()` call below. Manual control only, exactly
+            // like `small_flush_config`'s own identical reasoning.
+            compaction_auto_trigger: false,
             ..LsmConfig::default()
         };
         let engine = open(&dir, lsm_config);
@@ -4574,4 +4622,867 @@ mod compaction_tests {
     // as part of this crate's own `cargo test --lib` -- not duplicated
     // here.
     // -------------------------------------------------------------
+
+    /// `ADR-COMPACTION-001` Increment 2's own new test suite: the
+    /// automatic trigger + execution integration specifically --
+    /// `compaction_auto_trigger: true` throughout, and (with one
+    /// explicitly-justified exception below) no manual `compact_once()`
+    /// calls. Increment 1's own module-level tests above already prove
+    /// `compact_once_impl`'s core merge/retention/crash-window
+    /// correctness exhaustively via the manual entry point; this module
+    /// does not re-derive that -- it proves the *orchestration* the
+    /// background worker adds on top: real automatic firing, exactly
+    /// one concurrent holder, storage-pressure deferral/resume,
+    /// failure retry, shutdown, snapshot safety, deferred-deletion
+    /// retry, a bounded production-like run, a crash reached via the
+    /// real automatic path, bounded resource safety, and bounded
+    /// performance/storage/latency measurement.
+    mod auto_trigger_tests {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::time::Instant;
+
+        use super::*;
+
+        fn auto_trigger_config(trigger_count: usize) -> LsmConfig {
+            LsmConfig {
+                memtable_max_size_bytes: 200,
+                max_immutable_memtables: 32,
+                compaction_trigger_count: trigger_count,
+                compaction_auto_trigger: true,
+                ..LsmConfig::default()
+            }
+        }
+
+        fn dir_total_bytes(dir: &Path) -> u64 {
+            fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+
+        fn live_sst_file_count(engine: &LsmEngine) -> usize {
+            fs::read_dir(engine.sstables_dir())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".sst"))
+                .count()
+        }
+
+        // ---------------------------------------------------------
+        // Deterministic trigger threshold (§ "deterministic trigger
+        // threshold tests, 3/4/5/many SSTables at trigger_count=4").
+        // ---------------------------------------------------------
+
+        #[test]
+        fn auto_trigger_fires_at_and_above_threshold_never_below() {
+            for built in [3usize, 4, 5, 9] {
+                let dir = temp_dir(&format!("auto_trigger_threshold_{built}"));
+                // Build the exact fixture size *offline* first
+                // (`compaction_auto_trigger: false`) -- deterministic,
+                // no race against a live worker -- then reopen with the
+                // worker enabled to observe its real reaction. Building
+                // it directly against a live worker (as an earlier
+                // version of this test did) is fundamentally racy for
+                // `built > trigger_count`: once a warm worker reacts to
+                // the 4th publish, `put_and_wait_for_sstable_count`'s
+                // own `sstable_count() < built` condition can become
+                // permanently unreachable if the worker keeps
+                // collapsing the count back down before a 5th/9th
+                // table is ever simultaneously live -- an infinite loop
+                // this exact redesign was written to rule out (found
+                // empirically: the analogous pattern in this module's
+                // own resource-safety test hung for this reason).
+                {
+                    let engine = open(&dir, small_flush_config(4));
+                    let mut seed = 0u64;
+                    put_and_wait_for_sstable_count(&engine, built, &mut seed);
+                    engine.shutdown();
+                }
+                let engine = open(&dir, auto_trigger_config(4));
+                if built < 4 {
+                    // Below trigger_count is a deterministic, instantaneous
+                    // state check -- no timing race, nothing to wait for.
+                    assert!(
+                        !engine.should_compact(),
+                        "{built} SSTables is below trigger_count(4) -- must never auto-compact"
+                    );
+                } else {
+                    assert!(
+                        wait_until(|| engine.sstable_count() == 1, Duration::from_secs(10)),
+                        "{built} SSTables is at/above trigger_count(4) -- the automatic worker \
+                         must compact down to exactly 1 output SSTable with no manual \
+                         `compact_once()` call"
+                    );
+                }
+                engine.shutdown();
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Re-entrancy: the smallest primitive itself, under real
+        // concurrent contention.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn compaction_run_guard_permits_exactly_one_concurrent_holder() {
+            let flag = AtomicBool::new(false);
+            let currently_held = AtomicUsize::new(0);
+            let max_concurrent_held = AtomicUsize::new(0);
+            thread::scope(|scope| {
+                for _ in 0..16 {
+                    scope.spawn(|| {
+                        for _ in 0..500 {
+                            if let Some(_guard) = CompactionRunGuard::try_acquire(&flag) {
+                                let now = currently_held.fetch_add(1, Ordering::SeqCst) + 1;
+                                max_concurrent_held.fetch_max(now, Ordering::SeqCst);
+                                thread::yield_now();
+                                currently_held.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                max_concurrent_held.load(Ordering::SeqCst),
+                1,
+                "CompactionRunGuard must never allow more than one concurrent holder"
+            );
+        }
+
+        // ---------------------------------------------------------
+        // Storage-pressure deferral + resume, via the real automatic
+        // worker (not a manual `compact_once()` call).
+        // ---------------------------------------------------------
+
+        #[test]
+        fn auto_trigger_defers_while_storage_full_and_resumes_once_healthy() {
+            let dir = temp_dir("auto_trigger_storage_full_resume");
+            // Phase 1: build a fixture at/above trigger_count with no
+            // worker running at all (`compaction_auto_trigger: false`)
+            // -- deterministic, no race, reusing the already-proven
+            // `small_flush_config`/`put_and_wait_for_sstable_count`
+            // helpers from Increment 1's own module.
+            {
+                let engine = open(&dir, small_flush_config(4));
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, 5, &mut seed);
+                engine.shutdown();
+            }
+            // Phase 2: reopen the same directory with the worker
+            // enabled. The reconciled fixture (5 live SSTables, above
+            // trigger_count=4) is already the live set the instant
+            // `open()` returns, and no flush runs on this reopen
+            // (nothing new was written) -- so the freshly spawned
+            // worker's *first* wake can only be its own periodic
+            // fallback tick (`recv_timeout(fallback_interval)`), never
+            // an immediate `MaybeCompact`. Forcing `StorageFull`
+            // immediately after `open()` returns is therefore
+            // guaranteed to land before the worker's first evaluation:
+            // a handful of synchronous Rust calls cannot lose a race
+            // against a timer that has not yet started counting down
+            // from a nonzero interval.
+            let config = LsmConfig {
+                storage_pressure_retry_interval: Duration::from_millis(300),
+                ..auto_trigger_config(4)
+            };
+            let engine = open(&dir, config);
+            assert!(
+                engine.sstable_count() >= 4,
+                "the reconciled fixture must already be at/above trigger_count on reopen"
+            );
+            engine.set_storage_state_for_test(StorageState::StorageFull);
+            let ids_while_full = engine.live_sstable_ids();
+
+            // Bounded, intentional negative check: storage_state is
+            // never touched by anything else during this window (no
+            // more writes occur, and nothing else in this test mutates
+            // it), so this is a deterministic statement about the
+            // worker's own gating logic, not a "hope nothing happened"
+            // sleep -- bounded to a small, fixed multiple of the
+            // worker's own configured fallback interval.
+            thread::sleep(Duration::from_millis(300 * 4));
+            assert_eq!(
+                engine.live_sstable_ids(),
+                ids_while_full,
+                "the automatic worker must never compact while storage_state() is not Healthy"
+            );
+            assert_eq!(
+                engine.storage_state(),
+                StorageState::StorageFull,
+                "deferring must never itself mutate storage_state"
+            );
+
+            // Recovery: once storage_state returns to Healthy, the
+            // worker's own next fallback tick must pick the still-
+            // pending trigger back up automatically -- no manual
+            // `compact_once()` call.
+            engine.set_storage_state_for_test(StorageState::Healthy);
+            assert!(
+                wait_until(|| engine.sstable_count() == 1, Duration::from_secs(10)),
+                "the automatic worker must resume and complete compaction once storage_state \
+                 recovers"
+            );
+
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // Retry-after-failure, via the real automatic worker.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn auto_trigger_retries_after_a_failed_attempt_via_the_next_fallback_tick() {
+            let dir = temp_dir("auto_trigger_retry_after_failure");
+            // Build the fixture offline first, deterministically (see
+            // `auto_trigger_fires_at_and_above_threshold_never_below`'s
+            // own comment for why building directly against a live
+            // worker is unbounded), then reopen with the worker enabled
+            // and the fault hook already installed before its first
+            // (fallback-tick-driven) evaluation.
+            {
+                let engine = open(&dir, small_flush_config(4));
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+                engine.shutdown();
+            }
+            let config = LsmConfig {
+                storage_pressure_retry_interval: Duration::from_millis(150),
+                ..auto_trigger_config(4)
+            };
+            let engine = open(&dir, config);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let attempts2 = Arc::clone(&attempts);
+            engine.install_compaction_io_fault_hook(move || {
+                if attempts2.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Some(std::io::Error::other(
+                        "injected compaction output-write failure",
+                    ))
+                } else {
+                    None
+                }
+            });
+
+            assert!(
+                wait_until(
+                    || attempts.load(Ordering::SeqCst) >= 1,
+                    Duration::from_secs(10)
+                ),
+                "the automatic worker must actually have attempted a compaction"
+            );
+            // The worker's documented retry policy (no busy-retry --
+            // exactly the next real trigger or periodic fallback tick)
+            // means recovery is not instantaneous; the bounded
+            // `wait_until` below covers exactly that, deterministically.
+            assert!(
+                wait_until(|| engine.sstable_count() == 1, Duration::from_secs(10)),
+                "the automatic worker must eventually retry and succeed after a transient \
+                 failure, with no manual intervention"
+            );
+            assert!(
+                attempts.load(Ordering::SeqCst) >= 2,
+                "the successful attempt must be a genuine retry, not the original call somehow \
+                 succeeding"
+            );
+
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // Shutdown: no leak, no deadlock, in-progress compaction
+        // completes, never a partial publish.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn shutdown_lets_an_in_progress_automatic_compaction_finish_before_returning() {
+            let dir = temp_dir("auto_trigger_shutdown_inflight");
+            // Build the fixture offline first, deterministically (see
+            // `auto_trigger_fires_at_and_above_threshold_never_below`'s
+            // own comment): the injected fault hook below only fires
+            // *after* a compaction's own merge/write step already
+            // completed (`BeforeManifestAdd`), so it cannot protect the
+            // earlier window in which the test thread must observe
+            // `sstable_count() == 4` while building directly against a
+            // live worker -- that race is exactly as unbounded here as
+            // it was for the other tests this same pattern was applied
+            // to.
+            {
+                let engine = open(&dir, small_flush_config(4));
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+                engine.shutdown();
+            }
+            let config = LsmConfig {
+                storage_pressure_retry_interval: Duration::from_millis(150),
+                ..auto_trigger_config(4)
+            };
+            let engine = open(&dir, config);
+            engine.install_compaction_fault_hook(|p| {
+                if p == CompactionFaultPoint::BeforeManifestAdd {
+                    // Bounded, deliberate delay simulating a real
+                    // in-progress compaction -- gives this test's own
+                    // concurrent `shutdown()` call below a real, fixed
+                    // window in which a cycle is genuinely in flight.
+                    thread::sleep(Duration::from_millis(200));
+                }
+            });
+
+            // Bounded, deliberate wait so `shutdown()` below lands
+            // while a cycle is genuinely in flight: the worker's first
+            // evaluation (no flush occurs on this reopen) comes from
+            // its own 150ms fallback tick, after which the injected
+            // hook holds it inside the compaction for a further 200ms
+            // -- this test's own assertions below hold regardless of
+            // the exact interleaving, but this gives the scenario the
+            // test is actually named for a fair, real chance to occur.
+            thread::sleep(Duration::from_millis(180));
+
+            let start = Instant::now();
+            engine.shutdown();
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "shutdown must not hang waiting on an in-progress compaction (took {elapsed:?})"
+            );
+            drop(engine);
+
+            let reopened = open(&dir, small_flush_config(4));
+            // Either the compaction fully completed before shutdown (1
+            // live table) or it had not yet published anything (4 live
+            // tables) -- never a partial state.
+            let count = reopened.sstable_count();
+            assert!(
+                count == 1 || count == 4,
+                "shutdown during an in-flight compaction must never leave a partially-published \
+                 state (found {count} live SSTables)"
+            );
+            for entry in fs::read_dir(reopened.sstables_dir()).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                assert!(
+                    !name.to_string_lossy().ends_with(".sst.tmp"),
+                    "a .tmp file must never survive shutdown during an in-flight compaction"
+                );
+            }
+            reopened.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // Snapshot safety under real automatic triggering.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn auto_trigger_never_drops_a_live_snapshot_or_changes_its_reads() {
+            let dir = temp_dir("auto_trigger_snapshot_safety");
+            let engine = open(&dir, auto_trigger_config(4));
+            engine.put(b"k1", b"v1-old").unwrap();
+            let snap = engine.snapshot();
+            let snap_seq = snap.seq();
+            engine.put(b"k1", b"v1-new").unwrap();
+
+            // Exactly `trigger_count` (4), not more: `put_and_wait_for_
+            // sstable_count`'s own convergence loop is only guaranteed
+            // reachable against a live, already-warm worker when the
+            // target is *at* trigger_count -- the loop's own top-of-
+            // iteration check can see "4" the instant it is reached,
+            // before the worker has necessarily reacted even once. A
+            // target *above* trigger_count is racy against a warm
+            // worker (see `auto_trigger_fires_at_and_above_threshold_
+            // never_below`'s own comment for the empirically-found
+            // infinite loop this avoids).
+            let mut seed = 1_000u64;
+            put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+            assert!(
+                wait_until(|| engine.sstable_count() == 1, Duration::from_secs(10)),
+                "automatic compaction must still run with a live snapshot outstanding"
+            );
+
+            assert_eq!(
+                engine.oldest_live_snapshot_seq(),
+                Some(snap_seq),
+                "the live snapshot's own seq must remain the oldest live watermark, unaffected \
+                 by automatic compaction"
+            );
+            assert_eq!(
+                engine.get_as_of(b"k1", snap_seq).unwrap(),
+                Some(b"v1-old".to_vec()),
+                "the snapshot's own historical read must be unaffected by automatic compaction"
+            );
+            assert_eq!(
+                engine.get(b"k1").unwrap(),
+                Some(b"v1-new".to_vec()),
+                "the latest read must reflect the newest write regardless of automatic \
+                 compaction"
+            );
+
+            drop(snap);
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // Deferred physical deletion, retried automatically.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn auto_trigger_eventually_retries_a_deferred_physical_deletion() {
+            let dir = temp_dir("auto_trigger_deferred_delete");
+            // Build the fixture offline first, deterministically (see
+            // `auto_trigger_fires_at_and_above_threshold_never_below`'s
+            // own comment for why building directly against a live
+            // worker is unbounded), then reopen with the worker enabled
+            // and the holder range iterator already set up before its
+            // first (fallback-tick-driven) evaluation.
+            {
+                let engine = open(&dir, small_flush_config(4));
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+                engine.shutdown();
+            }
+            let config = LsmConfig {
+                storage_pressure_retry_interval: Duration::from_millis(200),
+                ..auto_trigger_config(4)
+            };
+            let engine = open(&dir, config);
+
+            // Hold every current input's `Arc<SsTable>` open via a
+            // live, only-partially-drained range iterator --
+            // `SsTableRangeCursor` (`ADR-RE-002`) retains an owned
+            // `Arc<SsTable>` clone per source internally, so as long as
+            // this iterator is not dropped, no input's `Arc::strong_
+            // count` can reach 1, forcing the compaction about to run
+            // to defer every input's physical deletion.
+            let mut holder = engine.range(Bound::Unbounded, Bound::Unbounded);
+            let _ = holder.next();
+
+            assert!(
+                wait_until(|| engine.sstable_count() == 1, Duration::from_secs(10)),
+                "automatic compaction must still complete (Manifest + live-list splice) even \
+                 though physical deletion of its inputs must defer"
+            );
+            let present_while_held = live_sst_file_count(&engine);
+            assert!(
+                present_while_held >= 2,
+                "the compacted-away input files must still be physically present while an \
+                 external reader holds them open (found {present_while_held} .sst files)"
+            );
+
+            // Release the hold -- nothing else in the engine will
+            // independently retry a sweep except the automatic
+            // worker's own periodic fallback tick (no new flush/
+            // trigger occurs from here on).
+            drop(holder);
+            assert!(
+                wait_until(
+                    || live_sst_file_count(&engine) == 1,
+                    Duration::from_secs(10)
+                ),
+                "the automatic worker's own periodic fallback tick must eventually retry and \
+                 complete the deferred physical deletion, with no further trigger"
+            );
+
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // Bounded, production-like integration run, via the real
+        // automatic worker, verified against an independent model.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn auto_trigger_bounded_production_like_integration_matches_reference_model() {
+            let dir = temp_dir("auto_trigger_integration");
+            let engine = open(&dir, auto_trigger_config(4));
+            let mut model = CompactionReferenceModel::default();
+            let mut rng_state: u64 = 20260921 ^ 0xA11CE;
+            let mut next_rand = move || {
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 7;
+                rng_state ^= rng_state << 17;
+                rng_state
+            };
+
+            for round in 0..400u64 {
+                let key_idx = next_rand() % 30;
+                let key = format!("k{key_idx:03}").into_bytes();
+                if next_rand() % 5 == 0 {
+                    let seq = engine.delete(&key).unwrap();
+                    model.apply(&key, seq, MemtableValue::Tombstone);
+                } else {
+                    let value = format!("v{round}").into_bytes();
+                    let seq = engine.put(&key, &value).unwrap();
+                    model.apply(&key, seq, MemtableValue::Put(value));
+                }
+            }
+            assert!(wait_until(
+                || engine.immutable_count() == 0,
+                Duration::from_secs(10)
+            ));
+            assert!(
+                wait_until(|| engine.sstable_count() <= 3, Duration::from_secs(10)),
+                "automatic compaction must keep the live SSTable count low across 400 writes at \
+                 trigger_count=4 (currently {})",
+                engine.sstable_count()
+            );
+
+            let all_keys: Vec<Vec<u8>> = (0..30u64)
+                .map(|i| format!("k{i:03}").into_bytes())
+                .collect();
+            let now_seq = engine.snapshot_seq();
+            for key in &all_keys {
+                let actual = engine.get_as_of(key, now_seq).unwrap();
+                let expected = model.value_at(key, now_seq);
+                assert_eq!(
+                    actual, expected,
+                    "mismatch vs. independent model for key={key:?}"
+                );
+            }
+            let range_now =
+                collect_range(engine.range(Bound::Unbounded, Bound::Unbounded)).unwrap();
+            assert_eq!(
+                range_now,
+                model.range_at(now_seq),
+                "range() must match the independent model"
+            );
+
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // Crash reached via the real automatic path (not a manually-
+        // wrapped `compact_once()` call): the panic is caught inside
+        // `spawn_compaction_thread`'s own `catch_unwind`, never
+        // propagating to this test thread -- exactly the real
+        // production behavior. Reuses one already-validated recovery
+        // branch (`AfterAllRemoves`) from the exhaustive manual crash-
+        // window sweep above; this test's own job is proving that
+        // branch is *reachable and correct through the automatic
+        // trigger*, not re-deriving every fault point again.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn auto_trigger_crash_mid_compaction_recovers_correctly_after_restart() {
+            let dir = temp_dir("auto_trigger_crash_recovery");
+            // Build the fixture offline first (`compaction_auto_
+            // trigger: false`) -- deterministic, no race against a live
+            // worker (see `auto_trigger_fires_at_and_above_threshold_
+            // never_below`'s own comment for why racing a live worker
+            // to observe `sstable_count()` reach a target is
+            // fundamentally unbounded). Then reopen with the worker
+            // enabled and the fault hook already installed; with no
+            // flush occurring on this reopen, the worker's first
+            // evaluation comes from its own short periodic fallback
+            // tick.
+            {
+                let engine = open(&dir, small_flush_config(4));
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+                engine.shutdown();
+            }
+            let config = LsmConfig {
+                storage_pressure_retry_interval: Duration::from_millis(150),
+                ..auto_trigger_config(4)
+            };
+            let engine = open(&dir, config);
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired2 = Arc::clone(&fired);
+            engine.install_compaction_fault_hook(move |p| {
+                if p == CompactionFaultPoint::AfterAllRemoves
+                    && !fired2.swap(true, Ordering::SeqCst)
+                {
+                    panic!(
+                        "injected automatic-compaction crash at {p:?} (deterministic fault test)"
+                    );
+                }
+            });
+
+            assert!(
+                wait_until(|| fired.load(Ordering::SeqCst), Duration::from_secs(10)),
+                "the automatic worker must actually have reached the injected fault point"
+            );
+            // Treat this exactly like a real process crash: no attempt
+            // to keep using this engine, just an orderly release of the
+            // WAL lock followed by a real restart.
+            engine.clear_compaction_fault_hook();
+            engine.shutdown();
+            drop(engine);
+
+            let reopened = open(&dir, small_flush_config(4));
+            let sample_keys: Vec<Vec<u8>> = (0..500u64)
+                .map(|i| format!("k{i:06}").into_bytes())
+                .collect();
+            for key in &sample_keys {
+                let _ = reopened.get(key).unwrap();
+            }
+            assert!(
+                !reopened.live_sstable_ids().is_empty(),
+                "recovery must leave at least the pre- or post-compaction tables live"
+            );
+            for entry in fs::read_dir(reopened.sstables_dir()).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                assert!(
+                    !name.to_string_lossy().ends_with(".sst.tmp"),
+                    "no .tmp file may survive recovery"
+                );
+            }
+            reopened.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // Bounded resource safety across repeated automatic cycles.
+        // Real OS-level RSS/handle sampling is out of scope here, by
+        // the same established precedent as `sstable_count_and_
+        // immutable_memory_track_flushes_exactly_no_extra_retention`
+        // above (a `cargo test --lib`-internal OS-metrics sample would
+        // be noisy and platform-specific); this locks in the actual
+        // code-level resource-safety invariants instead: the live
+        // SSTable count stays bounded, and every physically-present
+        // `.sst` file eventually corresponds to a live SSTable -- no
+        // leaked/orphaned files across many repeated cycles.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn repeated_automatic_compaction_cycles_leave_no_leaked_files_or_stuck_deletions() {
+            let dir = temp_dir("auto_trigger_resource_safety");
+            let mut seed = 0u64;
+            const CYCLES: usize = 8;
+            for cycle in 0..CYCLES {
+                // Build this cycle's fixture *offline* first
+                // (`compaction_auto_trigger: false`) -- deterministic,
+                // no race against a live worker. An earlier version of
+                // this test built fixtures directly against an already-
+                // running worker (`put_and_wait_for_sstable_count`
+                // targeting `sstable_count()` while the worker actively
+                // races to reduce it back down); that is fundamentally
+                // unbounded, not merely slow -- it can take hundreds of
+                // retries before the test thread's own poll happens to
+                // land in the ~30ms window before the worker's own
+                // reaction, found empirically (the same root cause
+                // `auto_trigger_fires_at_and_above_threshold_never_
+                // below`'s own two-phase redesign exists to avoid).
+                {
+                    let engine = open(&dir, small_flush_config(4));
+                    put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+                    engine.shutdown();
+                }
+                // Now enable the worker and let it collapse this
+                // cycle's fixture automatically -- a one-directional,
+                // monotonic wait (the count only ever goes *down* once
+                // triggered), unlike racing to observe it hold *at* a
+                // value against a thread that is also trying to reduce
+                // it.
+                let engine = open(&dir, auto_trigger_config(4));
+                assert!(
+                    wait_until(|| engine.sstable_count() == 1, Duration::from_secs(10)),
+                    "cycle {cycle}: automatic worker must collapse the reopened fixture to \
+                     exactly 1 live SSTable"
+                );
+                // A bounded wait, not a one-shot check: the logical
+                // splice (what `sstable_count()`/`live_sstable_ids()`
+                // reflect) and the physical file deletion that follows
+                // it are two separate steps within the same worker call
+                // -- `sstable_count()==1` can already be observable a
+                // moment before the physical `remove_file` calls have
+                // actually run (found empirically: a one-shot `assert_
+                // eq!` here failed intermittently with 4 files still on
+                // disk immediately after the count itself read 1).
+                assert!(
+                    wait_until(
+                        || engine.live_sstable_ids().len() == live_sst_file_count(&engine),
+                        Duration::from_secs(10)
+                    ),
+                    "cycle {cycle}: every physically-present .sst file must eventually \
+                     correspond exactly to a live SSTable -- no leaked/orphaned files"
+                );
+                engine.shutdown();
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // ---------------------------------------------------------
+        // First bounded compaction performance benchmark + real
+        // storage-budget measurement. Single run per input size, no
+        // soak, no tuning -- measurement only, per this increment's
+        // own explicit scope limit.
+        // ---------------------------------------------------------
+
+        #[test]
+        fn bounded_compaction_performance_and_storage_budget_baseline() {
+            println!(
+                "\ninput_sstables,duration_ms,input_bytes,output_bytes,records_read,\
+                 records_retained,peak_temp_disk_bytes_theoretical,actual_dir_peak_bytes"
+            );
+            for input_count in [4usize, 8, 16, 32, 64] {
+                let dir = temp_dir(&format!("compact_perf_{input_count}"));
+                let config = LsmConfig {
+                    memtable_max_size_bytes: 4096,
+                    max_immutable_memtables: 128,
+                    // `compaction_auto_trigger: false` already rules
+                    // out any background worker running during fixture
+                    // build; `compaction_trigger_count: 1` (not `input_
+                    // count + 1`, which would make the manual `compact_
+                    // once()` call below always see `sstable_count() <
+                    // compaction_trigger_count` and no-op) just ensures
+                    // that manual call is never itself gated by the
+                    // trigger-count check.
+                    compaction_trigger_count: 1,
+                    compaction_auto_trigger: false,
+                    ..LsmConfig::default()
+                };
+                let engine = open(&dir, config);
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, input_count, &mut seed);
+                assert_eq!(engine.sstable_count(), input_count);
+
+                let sampler_dir = engine.sstables_dir().to_path_buf();
+                let sampler_stop = Arc::new(AtomicBool::new(false));
+                let sampler_stop2 = Arc::clone(&sampler_stop);
+                let peak = Arc::new(AtomicU64::new(dir_total_bytes(&sampler_dir)));
+                let peak2 = Arc::clone(&peak);
+                let sampler = thread::spawn(move || {
+                    while !sampler_stop2.load(Ordering::Relaxed) {
+                        let now = dir_total_bytes(&sampler_dir);
+                        peak2.fetch_max(now, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                });
+
+                let result = engine.compact_once().unwrap();
+                sampler_stop.store(true, Ordering::Relaxed);
+                sampler.join().unwrap();
+
+                let (_meta, stats) =
+                    result.expect("compaction must actually run for a full fixture");
+                let actual_peak = peak.load(Ordering::Relaxed);
+
+                println!(
+                    "{input_count},{},{},{},{},{},{},{actual_peak}",
+                    stats.duration.as_millis(),
+                    stats.input_bytes,
+                    stats.output_bytes,
+                    stats.records_read,
+                    stats.records_retained,
+                    stats.peak_temp_disk_bytes,
+                );
+
+                assert_eq!(stats.output_sstable_count, 1);
+                assert_eq!(
+                    stats.records_read - stats.records_retained,
+                    stats.tombstones_dropped + stats.versions_dropped
+                );
+                assert!(
+                    actual_peak <= stats.peak_temp_disk_bytes + 64 * 1024,
+                    "measured on-disk peak ({actual_peak}) must not exceed the theoretical ~2x \
+                     bound ({}) by more than sampling slack -- input_count={input_count}",
+                    stats.peak_temp_disk_bytes
+                );
+
+                engine.shutdown();
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Bounded write/read latency impact under concurrent writers
+        // + readers + real automatic compaction. Records actual
+        // results; no arbitrary pass/fail threshold (none was already
+        // defined for this increment).
+        // ---------------------------------------------------------
+
+        #[test]
+        fn bounded_write_read_latency_under_concurrent_automatic_compaction() {
+            let dir = temp_dir("auto_trigger_latency_impact");
+            let config = LsmConfig {
+                memtable_max_size_bytes: 4096,
+                max_immutable_memtables: 64,
+                ..auto_trigger_config(4)
+            };
+            let engine = Arc::new(open(&dir, config));
+
+            for i in 0..200u64 {
+                engine.put(format!("k{i:06}").as_bytes(), b"warm").unwrap();
+            }
+            assert!(wait_until(
+                || engine.immutable_count() == 0,
+                Duration::from_secs(10)
+            ));
+
+            const WRITE_OPS: usize = 2000;
+            const READ_OPS: usize = 2000;
+            let write_latencies = Arc::new(Mutex::new(Vec::<Duration>::with_capacity(WRITE_OPS)));
+            let read_latencies = Arc::new(Mutex::new(Vec::<Duration>::with_capacity(READ_OPS)));
+
+            let writer = {
+                let engine = Arc::clone(&engine);
+                let latencies = Arc::clone(&write_latencies);
+                thread::spawn(move || {
+                    for i in 0..WRITE_OPS as u64 {
+                        let key = format!("k{:06}", i % 200);
+                        let value = format!("v{i}");
+                        let start = Instant::now();
+                        engine.put(key.as_bytes(), value.as_bytes()).unwrap();
+                        latencies.lock().unwrap().push(start.elapsed());
+                    }
+                })
+            };
+            let reader = {
+                let engine = Arc::clone(&engine);
+                let latencies = Arc::clone(&read_latencies);
+                thread::spawn(move || {
+                    for i in 0..READ_OPS as u64 {
+                        let key = format!("k{:06}", i % 200);
+                        let start = Instant::now();
+                        let _ = engine.get(key.as_bytes()).unwrap();
+                        latencies.lock().unwrap().push(start.elapsed());
+                    }
+                })
+            };
+            writer.join().unwrap();
+            reader.join().unwrap();
+            assert!(wait_until(
+                || engine.immutable_count() == 0,
+                Duration::from_secs(10)
+            ));
+
+            fn summarize(mut xs: Vec<Duration>) -> (Duration, Duration, Duration) {
+                xs.sort();
+                let p50 = xs[xs.len() / 2];
+                let p99 = xs[(xs.len() * 99) / 100];
+                let max = *xs.last().unwrap();
+                (p50, p99, max)
+            }
+            let (w50, w99, wmax) = summarize(
+                Arc::try_unwrap(write_latencies)
+                    .unwrap()
+                    .into_inner()
+                    .unwrap(),
+            );
+            let (r50, r99, rmax) = summarize(
+                Arc::try_unwrap(read_latencies)
+                    .unwrap()
+                    .into_inner()
+                    .unwrap(),
+            );
+            println!(
+                "\nlatency under concurrent automatic compaction ({WRITE_OPS} writes / \
+                 {READ_OPS} reads, trigger_count=4):\n  write p50={w50:?} p99={w99:?} \
+                 max={wmax:?}\n  read  p50={r50:?} p99={r99:?} max={rmax:?}"
+            );
+
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 }

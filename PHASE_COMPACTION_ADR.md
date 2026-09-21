@@ -797,3 +797,405 @@ maintainer decision on whether to open a new, separately-scoped
 Compaction implementation increment, informed by this ADR and
 `PHASE_COMPACTION_ARCHITECTURE_REPORT.md` — not an automatic
 continuation from this audit.
+
+---
+
+## Amendment 1 (2026-09-21): Increment 2 — automatic trigger + execution integration
+
+**Context.** Decision 14 above deliberately deferred trigger wiring.
+Increment 1 (`PHASE_COMPACTION_INCREMENT1_RESULTS.md`) then implemented
+the deterministic core (`compact_once`/`should_compact`) with zero
+production caller. Increment 2's brief required exactly one thing this
+ADR had not yet resolved: **how** `compact_once`'s logic gets called
+automatically, and everything that follows from that choice
+(concurrency, shutdown, retry, storage-pressure interaction, default
+rollout posture). This amendment records those decisions with the same
+Decision/Reason/Alternatives/Safety/Performance/Tests-required
+structure as the original 17 — nothing above is edited or
+retroactively rewritten.
+
+### A1. Decision: Execution model — background worker thread, not synchronous post-flush
+
+**Decision:** A dedicated background compaction worker thread
+(`spawn_compaction_thread`, `src/lsm/mod.rs`), started by `LsmEngine::
+open` only when `LsmConfig.compaction_auto_trigger` is `true` (A5
+below), mirroring `spawn_flush_thread`'s own existing shape as closely
+as the two components' different jobs allow: a free function taking
+cloned field `Arc`s (never `&LsmEngine`, since `open()` returns a bare
+`Self` and a spawned thread cannot borrow it), driven by a channel, with
+its own stop flag and `JoinHandle`.
+
+**Reason.** The brief required this decision be grounded in *this
+project's own actual contracts*, not external convention, and
+explicitly named the criteria to check it against — each addressed
+directly:
+
+- **Writer blocking.** A synchronous post-flush check (running
+  `compact_once` directly inline, on the flush thread, right after a
+  publish — analogous to `freeze_locked`'s own inline capacity check)
+  would block that same flush thread for the full duration of the
+  merge (tens to hundreds of milliseconds measured this increment,
+  §5 below, scaling with total live data volume, Decision 1's own
+  acknowledged cost) before it could process the *next* queued
+  immutable MemTable. Under sustained write load this directly risks
+  `max_immutable_memtables` backpressure (`CapacityExceeded`,
+  `PHASE4A_FAILURE_MODEL.md`) purely as a side effect of compaction's
+  own housekeeping — an availability cost this codebase's own
+  established priority (`ADR-WE-SP-001`: availability over
+  housekeeping) does not accept implicitly. A background worker keeps
+  the flush thread's own job (publish, checkpoint, purge) exactly as
+  fast as it was before Increment 2, unconditionally.
+- **Flush interaction.** The flush thread only ever sends a
+  best-effort, non-blocking notification (`compaction_sender.try_send
+  (CompactionMsg::MaybeCompact)`, dropped silently if the bounded(1)
+  channel is already full) immediately after publishing — zero
+  coupling to compaction's own duration.
+- **Concurrent reads.** Unaffected either way — Decision 10's brief
+  write-lock-splice-only concurrency model is identical regardless of
+  which thread calls `compact_once_impl`.
+- **Snapshot lifetime.** Unaffected — `oldest_live_snapshot_seq()`
+  (Decision 5) is read fresh by whichever thread runs the merge; a
+  background worker changes *when* that read happens, never its
+  result's meaning.
+- **Storage-pressure behavior.** Unaffected — Decision 11's
+  observe-only gate is evaluated identically regardless of caller
+  thread.
+- **Compaction re-entry.** A background worker introduces the *first*
+  real possibility of two overlapping trigger sources (a flush's own
+  notification racing a manual `compact_once()` call, or the worker's
+  own catch-up loop racing a fresh notification) — resolved by A2
+  below, the smallest possible primitive, not a synchronous design's
+  problem to solve differently.
+- **Shutdown.** Resolved explicitly by A3 below — a synchronous
+  design would have no separate shutdown contract to define at all
+  (it would simply run inline), which is itself evidence a background
+  worker is the more complex choice **only** where genuine new
+  behavior (independent lifecycle, needing its own stop/join contract)
+  actually exists, not complexity added without cause.
+- **Failure propagation.** A synchronous inline call could let a
+  compaction failure propagate into (or otherwise perturb) the flush
+  thread's own error handling, a certified, protected path
+  (`ADR-WE-SP-001`). A background worker fully isolates compaction's
+  own failure handling (A4 below) from flush's, by construction —
+  they are different threads with independent `catch_unwind`
+  boundaries.
+- **Resource ownership.** One additional, always-either-`Some`-or-
+  `None` `JoinHandle` field, mirroring `flush_handle`'s own existing
+  `Mutex<Option<JoinHandle<()>>>` pattern exactly — no new resource
+  *kind* is introduced, only one more instance of an already-proven
+  shape.
+
+**Alternatives considered.** *Synchronous post-flush* (the "what
+`freeze_locked` does" analogy) — rejected per the writer-blocking
+analysis above, the single most concrete, measurable cost difference
+between the two designs. *A dedicated `Condvar`-based worker instead
+of a channel* — rejected: a bounded `mpsc::sync_channel` already gives
+free coalescing (a full channel silently drops a redundant
+notification) and a built-in blocking `recv_timeout` for the dual
+wake-source design (A4), with no additional synchronization primitive
+to reason about.
+
+**Safety impact.** None beyond what A2–A6 individually account for —
+this decision is the *shape* of the caller, not a new correctness
+rule.
+
+**Performance impact.** Strictly better than the rejected synchronous
+alternative for writer latency (writers never wait on compaction);
+worse than "no automatic trigger at all" only in the sense that a
+background thread now exists and periodically wakes (bounded by the
+existing `storage_pressure_retry_interval` cadence, no new timer
+introduced — A4).
+
+**Tests required.** Covered by §6 of `PHASE_COMPACTION_INCREMENT2_
+RESULTS.md`'s own test list — automatic firing at/above threshold with
+no manual call, no writer-blocking regression (the existing write-path
+test suite, unmodified, still green).
+
+### A2. Decision: Re-entrancy — one `AtomicBool` RAII guard, not a global lock
+
+**Decision:** `CompactionRunGuard` (`src/lsm/mod.rs`) — a
+`compare_exchange(false, true)` on one shared `Arc<AtomicBool>`
+(`compaction_running`), acquired at the start of `compact_once_impl`'s
+real work (after the trigger-count check, so "below threshold" and
+"another compaction already running" are both legitimate, cheap,
+`Ok(None)` skip reasons) and released via `Drop` on every exit path,
+including `?`-propagated errors and panics unwound through
+`catch_unwind`.
+
+**Reason.** The brief explicitly required "the smallest primitive,"
+naming a global engine lock as unacceptable. `compact_once_impl` is
+now reachable from three places — the manual `LsmEngine::compact_once`
+method, the background worker's own trigger-driven call, and the same
+worker's own catch-up loop — any two of which could otherwise overlap
+(a manual test call racing the worker, or the worker's catch-up loop
+racing a fresh `MaybeCompact`-driven call it hasn't returned from yet).
+One boolean is exactly sufficient: compaction cycles are never nested
+or pipelined by design (Decision 1, full-merge, one cycle at a time),
+so "is one already running" is the entire question that needs
+answering.
+
+**Alternatives considered.** *A `Mutex<()>` held for the cycle's
+duration* — rejected: a blocking lock would make a losing caller
+*wait* rather than cheaply skip, reintroducing exactly the kind of
+implicit blocking A1's writer-blocking analysis rejected, just moved
+to a different caller. *A global engine lock* — explicitly rejected by
+the brief itself.
+
+**Safety impact.** Guarantees at most one compaction cycle's merge/
+write/Manifest-transition/splice sequence is ever in flight at a time,
+without introducing any new blocking for any other engine operation
+(readers, writers, snapshots are entirely unaffected — the guard only
+gates compaction against compaction).
+
+**Performance impact.** One uncontended `compare_exchange` per
+attempted cycle — negligible, identical cost class to the existing
+`storage_state` atomic checks already on this same path.
+
+**Tests required.** `compaction_run_guard_permits_exactly_one_
+concurrent_holder` (§6 of the results doc) — a direct stress test of
+the primitive itself (16 threads, 500 acquire/release attempts each,
+asserting the maximum observed concurrent holder count is exactly 1),
+independent of engine/thread-timing considerations entirely.
+
+### A3. Decision: Shutdown contract
+
+**Decision:** `LsmEngine::shutdown()` (extended, `src/lsm/mod.rs`),
+after its existing flush-thread shutdown sequence, does exactly:
+`compaction_stop.store(true)`, then a **blocking** `compaction_sender.
+send(CompactionMsg::Shutdown)` (not `try_send`), then joins the worker
+handle if one exists. The worker's own loop checks `compaction_stop`
+at the top of its catch-up loop (before starting a *new* cycle) but
+never mid-cycle — an in-progress compaction is always allowed to run
+to completion; it is never aborted.
+
+**Reason, per point, exactly as the brief required this be determined
+before coding:**
+
+- **New work stops scheduling.** `compaction_stop` is set *before* the
+  `Shutdown` message is sent, so by the time the worker could possibly
+  observe the message, the stop flag is already visible (`Release`/
+  `Acquire` ordering on both).
+- **In-progress compaction policy.** Runs to completion, never
+  aborted — the same reasoning as Decision 9's own "never force-close
+  an in-flight operation" principle, applied to the compaction cycle
+  itself rather than a reader holding one of its inputs.
+- **No worker leak.** The `JoinHandle` is always joined before
+  `shutdown()` returns (mirroring `flush_handle`'s own identical,
+  already-certified pattern) — `Mutex<Option<JoinHandle<()>>>`'s
+  `.take()` makes a second `shutdown()` call a safe no-op (`None`
+  found, nothing to join), exactly like the flush thread's own
+  contract.
+- **No join deadlock.** The blocking `send` cannot deadlock: either
+  the worker thread is alive and will drain the channel promptly
+  (it returns to `recv_timeout` quickly whenever there is no real
+  compaction work — a channel of capacity 1 has at most one item to
+  drain), or the worker has already exited on its own, in which case
+  `send` to a disconnected channel returns an `Err` immediately without
+  blocking.
+- **No partial publish.** Unaffected by shutdown specifically — this
+  is Decision 7/Decision 8's own existing crash-consistency guarantee,
+  which does not distinguish "the process crashed" from "the process
+  shut down mid-cycle then a later `open()` reconciled state"; both
+  are already-handled windows.
+- **No lost Manifest state.** Same reasoning — an in-progress cycle's
+  Manifest edits are each individually fsync'd durable as they happen
+  (Decision 7), regardless of whether the *process* later continues
+  running or shuts down.
+
+**A real bug found and fixed while determining this contract**: an
+earlier version of this shutdown code used `try_send(Shutdown)`
+(mirroring the flush thread's own notification-style `try_send`
+usage elsewhere) rather than a blocking `send`. Since the channel is
+bounded to capacity 1, a `MaybeCompact` notification already sitting
+unconsumed in the channel would make `try_send(Shutdown)` silently
+fail to enqueue — the worker would then only notice the stop request
+via its own periodic fallback tick (up to `storage_pressure_retry_
+interval` later, default 5s). Under a property test issuing heavy
+write load against dozens of engines, this compounded into a real,
+measured, multi-minute slowdown that looked like a hang under an
+external 60-second timeout probe — found empirically during this
+increment's own stability verification, not hypothesized. Fixed by
+switching specifically the `Shutdown` message (only) to a blocking
+`send`, per the "no join deadlock" reasoning above.
+
+**Alternatives considered.** *Abort an in-progress cycle on shutdown*
+— rejected per Decision 9's own established principle, extended here.
+*`try_send` for `Shutdown`* — the bug above; superseded by the fix,
+not a live alternative.
+
+**Safety impact.** Strictly positive — the fix closes a real
+(non-correctness, but real-availability/latency) defect found this
+increment.
+
+**Performance impact.** `shutdown()` may now wait up to one in-flight
+compaction cycle's own duration (§5's measured range) before
+returning, when a cycle happens to be running at the moment of the
+call — an accepted, bounded cost, consistent with "never abort
+in-progress work" outweighing "shutdown must be instantaneous."
+
+**Tests required.** `shutdown_lets_an_in_progress_automatic_
+compaction_finish_before_returning` (§6 of the results doc) — an
+injected, bounded delay inside the compaction fault hook gives
+`shutdown()` a real, deterministic window in which a cycle is
+genuinely in flight; asserts `shutdown()` returns promptly (no hang)
+and the resulting state is never partially published.
+
+### A4. Decision: Retry/backoff policy — no busy-retry, dual wake source
+
+**Decision:** On `Err` (or a caught panic) from `compact_once_impl`,
+the worker logs once (`eprintln!`) and does **not** retry immediately
+— it simply lets its own outer loop return to waiting. That wait uses
+`mpsc::Receiver::recv_timeout(fallback_interval)`, where
+`fallback_interval` reuses the existing `LsmConfig.storage_pressure_
+retry_interval` value (no new config field introduced). This gives
+two independent wake sources unified into one code path: a real
+`MaybeCompact` notification (sent by the flush thread right after any
+new publish) and this periodic fallback tick — so a failed or
+deferred cycle is retried either by the next real trigger, or, if
+write traffic stops entirely, by the next fallback tick, whichever
+comes first.
+
+**Reason.** The brief explicitly forbade "an infinite retry loop,
+busy-looping, storm, or log spam." A fixed, bounded fallback cadence
+reusing an *existing* config value (rather than a new, speculative
+one) satisfies "deterministic retry/backoff policy... documented in
+the ADR" without inventing a second timer concept for one subsystem
+to reason about. Reusing `storage_pressure_retry_interval`
+specifically is deliberate, not arbitrary: both are "how often should
+a background component re-check whether it's safe/useful to act
+again" cadences, and a storage-pressure episode is precisely the kind
+of condition (Decision 11) that would otherwise leave a compaction
+permanently deferred with no future flush ever arriving to notify it
+again (once `max_immutable_memtables` backpressure engages, writes —
+and therefore flushes, and therefore `MaybeCompact` notifications —
+can themselves stop).
+
+**Alternatives considered.** *Exponential backoff* — rejected as
+unnecessary complexity: a single fixed interval already bounds worst-
+case retry latency, and compaction failures are not expected to be
+frequent enough (Decision 8's crash-window analysis: every window is
+already correctly recoverable) to need backoff's specific benefit
+(avoiding pile-up under a *sustained* failure storm) — the "log once,
+don't spam" requirement is already met by logging on `Err` exactly
+once per attempt, not per retry-loop-iteration. *A dedicated new
+`compaction_retry_interval` config field* — rejected per the brief's
+own "avoid introducing a new, potentially-speculative config field"
+instruction elsewhere in this same brief, and unnecessary given the
+existing field's own cadence is already the right order of magnitude
+for this purpose.
+
+**Safety impact.** None new — a failed cycle simply leaves the live
+set unchanged (Decision 11's own "observe only" pattern, generalized:
+a failure never leaves compaction's own state half-applied, per
+Decision 7/8's crash-consistency guarantee already covering every
+mid-cycle failure window identically to a mid-cycle crash).
+
+**Performance impact.** Bounded worst-case retry latency of one
+`fallback_interval` (default 5s) after a failure with no subsequent
+write traffic; effectively immediate retry (next `MaybeCompact`) under
+any ongoing write load.
+
+**Tests required.** `auto_trigger_retries_after_a_failed_attempt_via_
+the_next_fallback_tick` (§6 of the results doc) — a synthetic,
+fires-exactly-once `CompactionIoFaultHook` forces the first automatic
+attempt to fail, then asserts the worker eventually retries and
+succeeds with no manual intervention, and that the retry is genuinely
+a second attempt (an attempt counter), not the first call somehow
+succeeding.
+
+### A5. Decision: `compaction_auto_trigger` — new config field, default `false`
+
+**Decision:** `LsmConfig.compaction_auto_trigger: bool` (new field) —
+`LsmEngine::open` spawns the background worker (A1) if and only if
+this is `true`. **Default: `false`.** `compact_once()`/`should_
+compact()` (the manual entry points) remain directly callable
+regardless of this flag's value, unaffected either way — this is a
+gate on automatic wiring only, not a new trigger *criterion*
+(`compaction_trigger_count`, Decision 14, is unchanged).
+
+**Reason.** This default was **reversed during this increment**, and
+the reversal is recorded here rather than silently applied. The
+initial implementation defaulted `compaction_auto_trigger` to `true`
+(closer to what a "finished" feature's eventual production default
+should probably be) reasoning that automatic compaction should simply
+work once implemented. This was found, empirically, to be the wrong
+default for *this* rollout step: `compaction_trigger_count`'s own
+spec-mandated default (4) is low enough that a great many pre-
+existing tests and fixtures across this crate — not just this phase's
+own — legitimately accumulate more than 4 live SSTables in the course
+of testing something else entirely (memory-growth regression tests,
+range-scan fixtures, recovery matrices). Defaulting automatic
+triggering *on* would have silently started compacting out from under
+all of that already-certified, already-passing test surface the
+moment this field shipped — directly the kind of "silently weaken an
+existing guarantee" outcome this project's own standing principle
+forbids. This was not a hypothetical risk: it was caught this
+increment by two concrete, reproducible test failures the first time
+`default = true` was tried — `compact_once_with_a_single_table_
+reapplies_retention_correctly` (an Increment 1 test using `compaction_
+trigger_count: 1`, which a live background worker raced against that
+test's own manual `compact_once()` call) and a broader class of
+Increment 1 fixture-building helpers that assume full, deterministic,
+manual control over exactly when compaction runs. `false` is the
+conservative, standard rollout posture for a new automatic subsystem:
+the full capability is implemented, tested, and available to any
+caller that explicitly opts in (this increment's own new `auto_
+trigger_tests` module does exactly that), without silently changing
+behavior for every existing caller that has not.
+
+**Alternatives considered.** *Default `true`* — the initial choice;
+reversed per the Reason above, with the two concrete failures as the
+evidence. *A separate `#[cfg(test)]`-only default* — rejected:
+would hide the real production default behind a build-configuration
+difference, making `cargo test`'s own behavior diverge from what a
+real caller using `LsmConfig::default()` gets, exactly the kind of
+"test-only illusion of coverage" this project's own culture has
+consistently rejected in every prior phase.
+
+**Safety impact.** Strictly conservative — no existing caller's
+observed behavior changes by taking this update, since the new
+capability is opt-in.
+
+**Performance impact.** None for existing callers (no worker spawned
+unless explicitly requested); the documented cost profile above (A1,
+A4) for any caller that does opt in.
+
+**Tests required.** `small_flush_config`'s own Increment 1 fixture
+helper and the one affected single-table-retention test both now
+explicitly set `compaction_auto_trigger: false` with a doc comment
+explaining why (protecting Increment 1's own test surface, unmodified
+in its assertions); the new `auto_trigger_tests` module explicitly
+opts in per test, per A1 above.
+
+### A6. Note: a genuinely unbounded test-design hazard found and generalized (not a production defect)
+
+Not a new architectural decision — recorded here because it shaped
+several of this increment's own tests and is exactly the kind of
+"measure, don't assume" finding this project's standing culture
+requires surfacing rather than quietly working around. Several of
+this increment's first-draft tests built a fixture by looping `put()`
+calls against an **already-running** background worker until the test
+thread's own `sstable_count()` poll happened to observe the live count
+at or above `compaction_trigger_count`. Because the worker's own
+reaction (capture → merge → splice) can complete inside the same
+tens-of-milliseconds window the test thread needs to notice the count
+crossed the threshold, this is a genuine race the test thread loses
+far more often than it wins once the worker is already warm — in one
+observed run, a fixture-rebuild loop needed 725 individual `put()`
+calls (not 4) before the test thread's own check happened to land in
+the narrow pre-splice window. This is not unbounded in the strict
+mathematical sense (each retry is an independent, non-degenerate
+chance of winning) but is unbounded *in practice* for test-timeout
+purposes, and was traced directly to one specific test hanging past a
+60-second external timeout probe during this increment's own
+verification. **Fix, applied uniformly across every affected test**:
+build any fixture that must reach or exceed `compaction_trigger_count`
+*offline* first (`compaction_auto_trigger: false`, using Increment 1's
+own already-proven-deterministic fixture-building helper), then reopen
+with the worker enabled to observe its real, automatic reaction — a
+one-directional, monotonic wait (the count only ever goes *down* once
+triggered) rather than a race to observe it hold *at* a value against
+a thread also trying to reduce it. No production code was implicated
+or changed by this finding — it is purely a test-construction hazard,
+specific to writing tests *against* an automatic system whose whole
+job is to react to the same condition the test is trying to observe.

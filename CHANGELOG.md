@@ -6,6 +6,50 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Compaction: production trigger + execution integration, Increment 2 (2026-09-21)
+
+`ADR-COMPACTION-001` Amendment 1 implemented: a real, automatic
+background compaction worker (`spawn_compaction_thread`), wired to
+`LsmEngine::open` behind a new opt-in `LsmConfig.compaction_auto_
+trigger` flag (**default `false`**, deliberately -- reversed from an
+initial `true` default after two concrete Increment-1 test failures
+showed it would otherwise silently start compacting under already-
+certified test surface). Dual wake source (flush-triggered
+notification + periodic fallback tick, reusing the existing `storage_
+pressure_retry_interval`, no new config field); `CompactionRunGuard`
+(one `AtomicBool` RAII guard, the smallest primitive preventing
+concurrent compactions, no global lock); `shutdown()` extended with an
+explicit, tested contract (in-progress cycle always completes, never
+aborted, no leak, no deadlock, no partial publish). Two real bugs
+found and fixed empirically: a `shutdown()` message-loss bug
+(`try_send` vs. blocking `send` on the bounded worker channel) that
+caused a real multi-minute slowdown under heavy test load; and a
+narrow pre-existing race in a shared test fixture helper (fixed via a
+new, additive `flush_completions` observability counter). A separate,
+genuinely unbounded test-design hazard (racing an already-running
+worker to observe a live SSTable count) was found and fixed uniformly
+across every affected test by building fixtures offline first, then
+reopening with the worker enabled. 12 new tests (346/346 total,
+`cargo test --lib`, debug and release, run twice post-fix with zero
+flakiness): deterministic threshold firing, direct re-entrancy
+stress test, storage-pressure defer/resume, failure+retry, shutdown
+mid-cycle, snapshot safety, deferred-deletion retry, a bounded
+production-like integration run, crash recovery through the real
+automatic path, bounded resource safety, and a first bounded
+performance/storage-budget/latency baseline (measured on-disk peak
+matched the ADR's own theoretical `input+output` figure exactly).
+Full regression gate clean; zero changes to WAL/Manifest/error types;
+zero new dependency; zero `unsafe`. Full detail: `PHASE_COMPACTION_
+INCREMENT2_RESULTS.md`, `PHASE_COMPACTION_ADR.md` Amendment 1,
+`PROGRESS.md`'s 2026-09-21 "Compaction Increment 2" entry.
+
+**COMPACTION CORE = PASS. COMPACTION TRIGGER INTEGRATION = PASS.
+COMPACTION PRODUCTION READY = NO** -- remaining: full performance
+characterization, a real OS-level resource benchmark, long-duration
+endurance, storage-pressure endurance, and a final certification
+matrix. Write Engine and Read Engine production-ready status
+unchanged.
+
 ### Compaction: deterministic core implementation, Increment 1 (2026-09-21)
 
 `ADR-COMPACTION-001` implemented as the deterministic core operation

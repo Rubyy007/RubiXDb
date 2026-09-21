@@ -1,11 +1,11 @@
 //! Size-tiered, full-merge compaction, per LSM Engine Spec Section 5
-//! and `ADR-COMPACTION-001`. Increment 1: the deterministic core
-//! operation only — no automatic trigger, no background thread
-//! (`ADR-COMPACTION-001` Decision 14). `LsmEngine::compact_once`
-//! (`src/lsm/mod.rs`) wires this into a real engine's Manifest/
-//! sstables-list/Snapshot-registry integration; this module owns only
-//! the merge algorithm, the retention rule, and the output-record
-//! stream, none of which know about `LsmEngine` itself.
+//! and `ADR-COMPACTION-001`. Increment 1 built the deterministic core
+//! operation; Increment 2 wires it to a real, automatic background
+//! trigger (`LsmEngine`'s own compaction worker thread, `src/lsm/
+//! mod.rs`'s `spawn_compaction_thread`/`compact_once_impl`) — this
+//! module itself is unchanged by that wiring: it owns only the merge
+//! algorithm, the retention rule, and the output-record stream, none
+//! of which know about `LsmEngine`, threads, or triggers at all.
 
 use std::collections::VecDeque;
 use std::ops::Bound;
@@ -48,17 +48,11 @@ pub struct CompactionStats {
     pub peak_temp_disk_bytes: u64,
 }
 
-// `ADR-COMPACTION-001` Decision 14: this increment deliberately wires
-// no automatic trigger, so every non-test caller of the items below
-// (`MergeStats`, `retain_versions`, `CompactionMergeIter`, `merge`)
-// does not exist yet -- `LsmEngine::compact_once` (`src/lsm/mod.rs`)
-// is itself only called from tests this increment, for the same
-// reason (mirrors that method's own identical `#[allow(dead_code)]`
-// justification). Real, in-crate callers, not a speculative or
-// unused API -- just not yet wired to anything production calls
-// automatically, by explicit ADR decision, not oversight.
+// As of Increment 2, `MergeStats`/`retain_versions`/
+// `CompactionMergeIter`/`merge` all have a real, automatic production
+// caller: `compact_once_impl` (`src/lsm/mod.rs`), driven by the
+// background compaction worker thread.
 #[derive(Debug, Default, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct MergeStats {
     pub(crate) records_read: u64,
     pub(crate) records_retained: u64,
@@ -100,7 +94,6 @@ pub(crate) struct MergeStats {
 /// anything older than it) and is safe to drop. If `oldest_live_
 /// snapshot_seq` is `None` (no live snapshot at all), only the newest
 /// version survives — there is nothing to protect.
-#[allow(dead_code)] // see the `MergeStats` doc comment above
 pub(crate) fn retain_versions(
     versions: Vec<(u64, RecordValue)>,
     oldest_live_snapshot_seq: Option<u64>,
@@ -158,7 +151,6 @@ pub(crate) fn retain_versions(
 /// pending output records are buffered at a time (`pending`), never
 /// the whole merge result — `ADR-COMPACTION-001` Decision 3/Decision
 /// 12's bounded-memory requirement.
-#[allow(dead_code)] // see the `MergeStats` doc comment above
 pub(crate) struct CompactionMergeIter {
     cursors: Vec<Option<std::iter::Peekable<SsTableRangeCursor>>>,
     pending: VecDeque<(Vec<u8>, u64, RecordValue)>,
@@ -174,7 +166,6 @@ pub(crate) struct CompactionMergeIter {
 }
 
 impl CompactionMergeIter {
-    #[allow(dead_code)] // see the `MergeStats` doc comment above
     fn new(
         inputs: &[Arc<SsTable>],
         oldest_live_snapshot_seq: Option<u64>,
@@ -293,7 +284,6 @@ impl Iterator for CompactionMergeIter {
 /// compact_once` (`src/lsm/mod.rs`) for the full integration sequence
 /// this is one step of. Kept separate and engine-agnostic so it can be
 /// tested (and reasoned about) without a real `LsmEngine`.
-#[allow(dead_code)] // see the `MergeStats` doc comment above
 pub(crate) fn merge(
     inputs: &[Arc<SsTable>],
     oldest_live_snapshot_seq: Option<u64>,

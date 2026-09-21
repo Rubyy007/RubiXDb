@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a175b36005df4e0fbbf66823ac64b5216ad0be9ba6c53298736ab3ab6bbf7ef6 # shrinks to ops = [Put { key_idx: 0, value: [80, 14, 237, 232, 84, 73] }, Put { key_idx: 2, value: [247, 214, 211, 51, 112, 250, 173, 175, 61] }, Delete { key_idx: 3 }, Delete { key_idx: 7 }, Delete { key_idx: 2 }, Put { key_idx: 2, value: [83, 50, 5, 165, 80, 45, 192, 41] }, Delete { key_idx: 6 }, Put { key_idx: 0, value: [113, 220, 198, 106, 81, 169, 61] }, Put { key_idx: 7, value: [43, 208, 66, 44, 68, 187, 199, 87, 236, 105, 171] }, Put { key_idx: 5, value: [141, 99, 166, 85, 75, 94] }, Put { key_idx: 6, value: [105, 30, 204, 192, 125, 224, 246, 107, 221] }, Delete { key_idx: 4 }, Delete { key_idx: 8 }, Delete { key_idx: 1 }, Delete { key_idx: 6 }, Delete { key_idx: 9 }, Put { key_idx: 8, value: [64, 225, 42, 219, 229, 112, 214, 206, 222, 111] }, Put { key_idx: 9, value: [245, 73, 80, 1, 184, 84, 226, 37] }, Put { key_idx: 3, value: [237, 225, 252, 238, 152] }, Put { key_idx: 3, value: [210, 243, 193, 201, 189, 75] }, Put { key_idx: 4, value: [9, 251, 10, 72, 127, 130] }, Delete { key_idx: 0 }, Delete { key_idx: 4 }, Delete { key_idx: 5 }, Delete { key_idx: 5 }, Delete { key_idx: 7 }, Put { key_idx: 1, value: [171, 151, 118, 12, 26, 58, 225, 59, 88, 125] }, Delete { key_idx: 6 }]

@@ -2559,3 +2559,96 @@ dedicated performance benchmark, no long-duration soak exercising
 compaction, no final certification. **WRITE ENGINE = PRODUCTION
 READY** and **READ ENGINE = PRODUCTION READY** remain unchanged,
 protected, and re-verified.
+
+## 2026-09-21 (Compaction Increment 2: production trigger + execution integration)
+
+`ADR-COMPACTION-001` Amendment 1 designed and implemented: a real,
+automatic background compaction worker, wired to `LsmEngine::open`
+behind a new opt-in `LsmConfig.compaction_auto_trigger` flag (default
+`false`, deliberately -- see below). Full detail: `PHASE_COMPACTION_
+INCREMENT2_RESULTS.md`; full amendment reasoning: `PHASE_COMPACTION_
+ADR.md` Amendment 1.
+
+**Delivered**: `spawn_compaction_thread` (background worker, dual wake
+source -- flush-triggered notification + periodic fallback tick reusing
+the existing `storage_pressure_retry_interval`, no new config field);
+`compact_once_impl` (Increment 1's own `compact_once` body extracted
+into a free function over cloned `Arc`s, shared byte-identically by
+both the manual entry point and the new worker); `CompactionRunGuard`
+(one `AtomicBool` RAII guard -- the smallest primitive preventing two
+concurrent compactions, no global engine lock); `shutdown()` extended
+with a real, explicit contract (new work stops scheduling, an in-
+progress cycle always completes, never aborted, no worker leak, no
+join deadlock, no partial publish).
+
+**Two real bugs found and fixed empirically, not hypothesized**: (a)
+`shutdown()`'s original `try_send(Shutdown)` could silently lose the
+stop message against an already-full bounded(1) channel, causing a
+real, measured multi-minute slowdown under heavy property-test load
+that looked like a hang under a 60s external timeout -- fixed by
+switching that one send to blocking `send` (provably non-deadlocking).
+(b) A narrow pre-existing race in the shared `put_and_wait_for_
+sstable_count` test helper (`immutable_count()==0` alone doesn't prove
+a flush job's own tail -- including its unconditional `storage_state`
+swap-to-`Healthy` -- has finished) intermittently broke an Increment 1
+storage-pressure test; fixed with a new, purely additive `flush_
+completions` observability counter.
+
+**A default-value reversal, recorded not hidden**: `compaction_auto_
+trigger` was initially implemented defaulting to `true`; reversed to
+`false` after two concrete Increment-1 test failures showed a live
+background worker would otherwise silently start compacting out from
+under a great deal of already-certified, already-passing test surface
+across the whole crate the moment this field shipped -- exactly the
+"silently weaken an existing guarantee" outcome this project's own
+standing principle forbids. `compact_once()`/`should_compact()` remain
+directly, manually callable regardless of the flag.
+
+**A genuinely unbounded test-design hazard found and generalized**:
+building a fixture by looping `put()` against an *already-running*
+worker races the worker's own reaction -- one observed case needed 725
+individual writes (not 4) before the test thread's own poll happened
+to land in the narrow pre-splice window. Fixed uniformly across every
+affected test (6 of 12 new tests) by building offline first
+(`compaction_auto_trigger: false`, reusing Increment 1's own
+deterministic fixture helper unmodified) then reopening with the
+worker enabled -- a one-directional, monotonic wait, never a race
+against a thread also trying to reduce the same count.
+
+**Test results**: 12 new tests (`auto_trigger_tests`, nested in
+`compaction_tests`) -- 346/346 total (`cargo test --lib`, debug and
+release), the new module run twice consecutively (161.33s, 153.33s)
+post-fix with zero flakiness. Coverage: deterministic threshold firing
+(3/4/5/9 SSTables); direct re-entrancy-primitive stress test (16
+threads); storage-pressure defer + auto-resume through the real
+worker; failure + automatic retry via a fires-once IO fault hook;
+shutdown during a genuinely in-flight cycle (bounded injected delay);
+live-snapshot safety across an automatic cycle; deferred-physical-
+deletion retry via the worker's own fallback tick; a 400-op bounded
+production-like integration run against an independent reference
+model, purely automatic; crash recovery reached through the real
+automatic path (panic caught by the worker's own `catch_unwind`, a
+real restart); bounded resource safety (8 repeated cycles, zero leaked
+files, zero worker-thread leak); a first bounded performance/storage-
+budget baseline (4/8/16/32/64 input tables -- measured on-disk peak
+matched the theoretical `input+output` figure exactly at every size);
+bounded write/read latency under concurrent writers+readers+real
+automatic compaction (read p99 stayed sub-millisecond throughout).
+
+**Full regression gate clean**: `fmt` (one pass applied, no behavior
+change) / `clippy -D warnings` / `test --lib` 346/346 debug+release /
+`check --all-targets` / `wal_tests` 12/12 / `crash_consistency`
+(`--features test-util`) 2/2 / `pathological_recovery_matrix` 9/9.
+**Protected-contract audit**: zero changes to `src/wal/`, `src/
+error.rs`, `src/manifest/`, `Cargo.toml`, or `Cargo.lock`; Read Engine
+public API surface unchanged; zero new dependency; zero `unsafe`
+introduced.
+
+**COMPACTION CORE = PASS** (unchanged, re-verified). **COMPACTION
+TRIGGER INTEGRATION = PASS.** **COMPACTION PRODUCTION READY = NO** --
+remaining: full performance characterization beyond the bounded
+baseline, a real OS-level resource benchmark (RSS/handles/threads,
+external to `cargo test`), long-duration write/read/compaction
+endurance, a storage-pressure endurance run, and a final certification
+matrix. **WRITE ENGINE = PRODUCTION READY** and **READ ENGINE =
+PRODUCTION READY** remain unchanged, protected, and re-verified.
