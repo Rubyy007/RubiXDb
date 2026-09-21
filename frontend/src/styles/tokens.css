@@ -1,0 +1,119 @@
+/* RubiXDB console design tokens — PHASE_FRONTEND_ARCHITECTURE.md §4.
+   Light theme is the default; dark theme via prefers-color-scheme,
+   overridable by an explicit [data-theme] attribute set in Settings. */
+
+:root {
+  /* spacing (4px scale) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  /* typography */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  --font-size-xs: 12px;
+  --font-size-sm: 13px;
+  --font-size-md: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 20px;
+  --font-size-2xl: 24px;
+
+  /* radii / elevation */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);
+
+  /* neutral scale (light) */
+  --color-bg: #ffffff;
+  --color-bg-subtle: #f6f7f9;
+  --color-bg-raised: #ffffff;
+  --color-border: #e2e5ea;
+  --color-border-strong: #c7cbd3;
+  --color-text: #17181c;
+  --color-text-muted: #5a5f6b;
+  /* Darkened from #8b909c (2.9:1 measured / axe-core measured 3.19:1
+     on white for a real rendered hint element) after the same
+     real audit found it failing WCAG AA's 4.5:1 for normal-size text
+     -- e2e/a11y.spec.ts. */
+  --color-text-faint: #5f6570;
+
+  /* brand / accent */
+  --color-accent: #3a5cf0;
+  --color-accent-hover: #2c48d6;
+  --color-accent-contrast: #ffffff;
+
+  /* semantic status — used everywhere a state needs a color, never
+     introduced ad hoc per-screen. Darkened from an earlier pass after
+     axe-core's own real, automated contrast audit (e2e/a11y.spec.ts)
+     found the original --color-healthy (#1a9e5c on #e6f7ee) at only
+     3.1:1 against WCAG AA's 4.5:1 requirement for this text size --
+     these values are verified to clear 4.5:1 against their own -bg
+     pairing, not merely eyeballed. */
+  --color-healthy: #0d6b3c;
+  --color-healthy-bg: #e6f7ee;
+  --color-pressure: #8a5a00;
+  --color-pressure-bg: #fdf3e0;
+  --color-danger: #a4222f;
+  --color-danger-bg: #fbe9eb;
+
+  --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: #14161a;
+    --color-bg-subtle: #1b1e24;
+    --color-bg-raised: #1f232a;
+    --color-border: #2b2f38;
+    --color-border-strong: #3c414d;
+    --color-text: #e8e9ec;
+    --color-text-muted: #a7acb8;
+    --color-text-faint: #757b88;
+
+    --color-accent: #6d87ff;
+    --color-accent-hover: #8398ff;
+    --color-accent-contrast: #0b0d10;
+
+    --color-healthy: #3ecb84;
+    --color-healthy-bg: #123322;
+    --color-pressure: #e2a53c;
+    --color-pressure-bg: #3a2c0e;
+    --color-danger: #f0616e;
+    --color-danger-bg: #3a1418;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #14161a;
+  --color-bg-subtle: #1b1e24;
+  --color-bg-raised: #1f232a;
+  --color-border: #2b2f38;
+  --color-border-strong: #3c414d;
+  --color-text: #e8e9ec;
+  --color-text-muted: #a7acb8;
+  --color-text-faint: #757b88;
+
+  --color-accent: #6d87ff;
+  --color-accent-hover: #8398ff;
+  --color-accent-contrast: #0b0d10;
+
+  --color-healthy: #3ecb84;
+  --color-healthy-bg: #123322;
+  --color-pressure: #e2a53c;
+  --color-pressure-bg: #3a2c0e;
+  --color-danger: #f0616e;
+  --color-danger-bg: #3a1418;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+}

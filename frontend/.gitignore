@@ -1,0 +1,25 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# vite/vitest/tsc artifacts
+*.tsbuildinfo
+.vite
+
+# playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+.e2e-data
+
+# editors
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# env files that may hold secrets -- never committed
+.env
+.env.local
+.env.*.local
