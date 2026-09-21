@@ -6,6 +6,55 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Read Engine: final certification (2026-09-21)
+
+`PHASE_READ_ENGINE_CERTIFICATION.md` (new): final certification of the
+single-engine, non-partitioned LSM Read Engine, commit `22be3e4`.
+30-row certification matrix (point lookup through protected Write
+Engine integrity) -- **30/30 PASS, 0 FAIL, 0 mandatory OPEN**. Full
+protected-path audit (`git diff` against the Write Engine's own
+certification baseline) confirms zero changes to WAL, Group Commit,
+Batch Coordinator, Manifest, checkpoint, WAL purge, or `StoragePressure`
+logic across the entire Read Engine phase. Final regression gate and a
+bounded (not a new soak) performance reconfirmation both re-run clean
+at certification time. Known, explicitly non-blocking limitations
+documented rather than hidden: no Compaction yet (read amplification
+still scales with live SSTable count), and the "no memory leak" finding
+rests on source-level ownership analysis plus two converging soak
+observations rather than an external memory profiler (none available
+in this environment).
+
+**READ ENGINE PRODUCTION READY = YES** -- scoped explicitly to the
+single-engine, non-partitioned LSM Read Engine. Compaction, Router,
+Replication, and the larger partitioned RubiXDB architecture are not
+certified and do not exist in this codebase yet; full RubiXDB
+production readiness is not claimed.
+
+### Read Engine: fresh 4-hour integrated soak against the optimized implementation, Increment 7 (2026-09-21)
+
+Re-validated `ADR-RE-002` Option A against a fresh, full 4-hour,
+production-profile integrated write/read soak (identical profile to
+Increment 4's own: 8 writers, 16 readers, seed 20260920), not just the
+controlled `overlap_repro` benchmark. `RESULT=PASS`: 8,372,161
+writes+deletes, 6,116,654 reads, 678,708 range scans (every one
+checked against the independent reference model at an aged snapshot,
+zero disagreed), zero in-run/post-recovery mismatches, clean recovery,
+zero storage pressure events. `range_large` p50 improved **3.26x-3.89x**
+against Increment 4 at matched SSTable counts (landing inside Increment
+6's own 3.20x-3.69x controlled-benchmark prediction), with a flatter
+growth curve (~1.25 apparent exponent vs. Increment 4's ~2.20).
+`blocks_read`-based amplification improved 5.73x-8.05x at matched
+counts. RSS-vs-SSTable-count fit tightened from R²=0.698 to **R²=0.984**
+-- the large non-monotonic RSS swings Increment 4's own soak showed are
+essentially gone under the same real workload with the bottleneck
+fixed. A separate, bounded crash/recovery run (20/20 cycles) confirmed
+real post-recovery read correctness. Full regression gate re-run clean.
+Full detail: `PHASE_READ_ENGINE_INCREMENT7_SOAK.md` (new), `PROGRESS.
+md`'s Increment 7 entry. **Increment 7 = PASS. Status unchanged: READ
+ENGINE PRODUCTION READY = NO** -- final evidence consolidation,
+performance validation, resource validation, and the certification
+matrix remain outstanding.
+
 ### Read Engine: persistent range source cursors, `ADR-RE-002` Option A, Implementation Increment 6 (2026-09-20)
 
 Implemented the optimization Increment 5's investigation identified and

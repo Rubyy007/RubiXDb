@@ -618,3 +618,49 @@ to start another soak). **READ ENGINE PRODUCTION READY remains NO** —
 final corruption/recovery validation, final integrated endurance
 validation, final performance validation, and the final certification
 matrix are still outstanding, unstarted gates.
+
+## Run: 2026-09-21 (Increment 7: fresh 4-hour integrated soak, post-optimization)
+
+The "not yet re-validated against another real 4-hour soak" gap above
+is now closed. Full detail, methodology, every raw number: `PHASE_
+READ_ENGINE_INCREMENT7_SOAK.md` (new). Summary here, not a duplicate.
+
+Same profile as Increment 4's own soak exactly (`duration_secs=14400
+writer_count=8 reader_count=16 seed=20260920 sample_interval_
+secs=120`), run against the optimized (`ADR-RE-002` Option A, commit
+`22be3e4`) implementation, against a new directory (Increment 4's own
+`E:\rubixdb_read_write_soak_main` was already removed by that soak's
+own on-PASS cleanup and was not reused). `RESULT=PASS`:
+`in_run_mismatches=0 post_recovery_mismatches=0 recovery_ok=true
+capacity_backpressure_events=0 final_sstables=305 final_rss_
+kb=1,712,740`. All 678,708 range scans issued were checked against the
+independent reference model at an aged snapshot; zero disagreed.
+
+**Range-scan latency, compared directly against Increment 4 at matched
+SSTable counts (not cherry-picked -- every comparison point uses a
+SSTable count equal to or slightly higher for Increment 7, the harder
+case)**: `range_large` p50 improved **3.26x-3.89x** across four matched
+checkpoints (~58 to ~289 SSTables) — landing squarely inside the
+3.20x-3.69x Increment 6's own controlled `overlap_repro` benchmark
+predicted. The growth curve itself is also flatter, not just uniformly
+scaled: apparent exponent ~1.25 (vs. Increment 4's own ~2.20) fit over
+this soak's own SSTable-count range. `blocks_read`-based read
+amplification (counting point unchanged by Increment 6) improved
+5.73x-8.05x at matched counts — somewhat larger than the controlled
+benchmark's 4.714x, consistent with the real workload's broader key
+distribution compounding the effect further.
+
+**Resource behavior improved measurably too, not just held steady**:
+RSS-vs-SSTable-count linear fit tightened from R²=0.698 (Increment 4)
+to **R²=0.984** this run — only 1 of 115 sample-to-sample transitions
+showed any RSS decrease at all (vs. Increment 4's largest single-window
+drop of −704,440 KB). Consistent with, not proven to cause, the
+hypothesis that Increment 4's own long, CPU/allocation-heavy
+`range_large` stalls were entangled with the OS-level working-set
+volatility that document's own memory investigation flagged as its
+best available (not fully proven) explanation.
+
+**Increment 7 = PASS.** `READ ENGINE PRODUCTION READY` remains **NO**
+— final evidence consolidation, final performance validation, final
+resource validation, and `PHASE_READ_ENGINE_CERTIFICATION.md` (does
+not exist yet) are still outstanding.
