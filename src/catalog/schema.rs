@@ -238,12 +238,13 @@ impl TableRow {
 // system.columns
 // ---------------------------------------------------------------------
 
-pub const COLUMNS_SCHEMA: [CatalogValueType; 5] = [
+pub const COLUMNS_SCHEMA: [CatalogValueType; 6] = [
     CatalogValueType::Text,
     CatalogValueType::U8,
     CatalogValueType::Bool,
     CatalogValueType::Blob, // default_value; NULL bit means "no default"
     CatalogValueType::U32,
+    CatalogValueType::Blob, // type_params (RELATIONAL ADR AMENDMENT 003 RA.4); NULL for every type except DECIMAL/NUMERIC
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +260,12 @@ pub struct ColumnRow {
     pub nullable: bool,
     pub default_value: Option<Vec<u8>>,
     pub added_in_schema_version: u32,
+    /// `RELATIONAL ADR AMENDMENT 003` RA.4: `[precision:u8, scale:u8]`
+    /// for `DECIMAL`/`NUMERIC` columns, `None` for every other type — a
+    /// bare `data_type` tag has no room for a parameterized type's own
+    /// parameters. Additive trailing field (D31): appended after every
+    /// pre-existing `system.columns` field, never reordering them.
+    pub type_params: Option<Vec<u8>>,
 }
 
 impl ColumnRow {
@@ -269,6 +276,7 @@ impl ColumnRow {
             Some(CatalogValue::Bool(self.nullable)),
             self.default_value.clone().map(CatalogValue::Blob),
             Some(CatalogValue::U32(self.added_in_schema_version)),
+            self.type_params.clone().map(CatalogValue::Blob),
         ]
     }
 
@@ -284,6 +292,7 @@ impl ColumnRow {
         let default_value = optional_blob(&mut fields)?;
         let added_in_schema_version =
             expect_u32(&mut fields, "system.columns.added_in_schema_version")?;
+        let type_params = optional_blob(&mut fields)?;
         Ok(ColumnRow {
             table_id,
             ordinal,
@@ -292,6 +301,7 @@ impl ColumnRow {
             nullable,
             default_value,
             added_in_schema_version,
+            type_params,
         })
     }
 }
@@ -631,6 +641,7 @@ mod tests {
             nullable: false,
             default_value: Some(vec![0, 0, 0, 0]),
             added_in_schema_version: 1,
+            type_params: None,
         };
         let encoded = encode_row(1, &with_default.to_fields());
         let (_, fields) = decode_row(&encoded, &COLUMNS_SCHEMA).unwrap();
@@ -645,6 +656,40 @@ mod tests {
         assert_eq!(
             ColumnRow::from_fields(3, 0, fields).unwrap(),
             without_default
+        );
+    }
+
+    /// `RELATIONAL ADR AMENDMENT 003` RA.4: `type_params` round-trips for
+    /// a `DECIMAL`-shaped column (`[precision, scale]`) and is `NULL` for
+    /// an ordinary column.
+    #[test]
+    fn column_row_round_trips_type_params_for_decimal_and_without() {
+        let decimal_column = ColumnRow {
+            table_id: 3,
+            ordinal: 1,
+            name: "amount".to_string(),
+            data_type: 6,
+            nullable: false,
+            default_value: None,
+            added_in_schema_version: 1,
+            type_params: Some(vec![10, 2]), // DECIMAL(10, 2)
+        };
+        let encoded = encode_row(1, &decimal_column.to_fields());
+        let (_, fields) = decode_row(&encoded, &COLUMNS_SCHEMA).unwrap();
+        assert_eq!(
+            ColumnRow::from_fields(3, 1, fields).unwrap(),
+            decimal_column
+        );
+
+        let ordinary_column = ColumnRow {
+            type_params: None,
+            ..decimal_column
+        };
+        let encoded = encode_row(1, &ordinary_column.to_fields());
+        let (_, fields) = decode_row(&encoded, &COLUMNS_SCHEMA).unwrap();
+        assert_eq!(
+            ColumnRow::from_fields(3, 1, fields).unwrap(),
+            ordinary_column
         );
     }
 

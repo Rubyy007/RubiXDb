@@ -3648,3 +3648,411 @@ increment implements the rest of D4.
 point standing between this ADR's already-decided architecture (D1–D33,
 AMENDMENT 001) and a concrete, implementable catalog. The implementation
 increment may now proceed directly against this specification.
+
+---
+
+# RELATIONAL ADR AMENDMENT 003
+
+**Status**: append-only, D1–D33 and AMENDMENTs 001–002 untouched in
+substance. The catalog increment (commit `d66029d`) is certified and not
+reopened. This amendment resolves the row-storage foundation's own
+remaining open points: D4's type system states *which* transform each
+type uses ("sign-flipped big-endian," "monotonic bit-transform") but not
+its exact bytes; composite-key concatenation of a variable-length `TEXT`/
+`BLOB` column is not specified at all; and `system.columns`' existing
+5-field schema (CA.2) has no room for `DECIMAL(p,s)`'s parameters.
+
+## RA.1 Row-value (non-key) encoding for the full D4 type system
+
+**Decision**: a `RelationalValue` enum with one variant per D4 type —
+`Boolean(bool)`, `Integer(i32)`, `Bigint(i64)`, `Real(f32)`,
+`Double(f64)`, `Decimal(i128, u8)` (scaled value, scale), `Text(String)`,
+`Blob(Vec<u8>)`, `Date(i32)`, `Time(i64)`, `Timestamp(i64)` — built on
+D3's exact `RowValue` envelope (`format_version:u8 || schema_version:u32
+LE || null_bitmap || values`, reused byte-for-byte from `catalog::
+encoding`, not reimplemented). Row-value (non-key) encoding, per D4's
+own "may be length-prefixed, not order-preserving" latitude: every
+fixed-width type LE (matching this codebase's own pervasive LE
+convention for non-key-ordered fields, `catalog::encoding`'s own
+precedent); `TEXT`/`BLOB` length-prefixed (`len:u32 LE || bytes`,
+identical to `catalog::encoding`'s existing `Text`/`Blob` handling).
+
+**Reason**: this is a direct, mechanical extension of `catalog::
+encoding`'s already-certified `RowValue` codec (same envelope, same
+per-field conventions) to the full D4 type set CA.5 explicitly deferred
+("nothing in [the catalog] increment's schema needs [it] yet"). Reusing
+rather than reimplementing the envelope means every property already
+proven for catalog rows (null-bitmap boundary correctness, truncated-
+input fails closed, format-version rejection) transfers unconditionally.
+
+**Alternatives rejected**: *A second, independent `RowValue` codec for
+user-table rows, separate from `catalog::encoding`'s.* Rejected:
+duplicates an already-certified format for no benefit — D1 explicitly
+requires user rows and catalog rows to share "the same `RowValue`
+format" (D1's own words), and two independently-maintained
+implementations of the identical envelope is exactly the kind of drift
+risk this project consistently avoids elsewhere (D8's own "avoid
+maintaining two implementations... that could silently drift apart"
+reasoning, applied here to a codec rather than an expression evaluator).
+
+**Correctness/Security/Performance/Memory/Persistence/Recovery impact**:
+identical to D3/D4's own already-stated impacts — this section only
+supplies the concrete field-by-field encoding those decisions already
+committed to providing. **Testing requirements**: round-trip for every
+`RelationalValue` variant, `NULL`-bitmap correctness at representative
+column counts (already proven generically by `catalog::encoding`'s own
+tests; re-exercised here only to confirm the full type set specifically,
+not to re-derive the bitmap logic itself).
+
+## RA.2 Order-preserving key encoding — exact transforms
+
+**Decision**, per type (used only for primary-key columns in this
+increment — D6: the primary key *is* the physical row key, and D5
+forbids `NULL` primary-key columns, so **no key-encoding path in this
+increment ever needs to represent `NULL`**):
+
+- **`BOOLEAN`**: `[0u8]` / `[1u8]` — already totally ordered as raw
+  bytes.
+- **`INTEGER` (`i32`) / `DATE` (`i32` days-since-epoch)**: sign-flip —
+  `(v as u32) ^ 0x8000_0000`, big-endian, 4 bytes. Standard two's-
+  complement-to-unsigned-order transform: XOR-ing the sign bit maps
+  `i32::MIN → 0x00000000` and `i32::MAX → 0xFFFFFFFF`, with every value
+  in between preserving numeric order as unsigned-byte order (verified
+  directly: `-1 → 0x7FFFFFFF`, `0 → 0x80000000`, `1 → 0x80000001` — the
+  transform is monotonic across the entire `i32` range by construction,
+  not merely at these sample points, since XOR by a constant is an order-
+  preserving bijection on the reinterpreted-as-unsigned representation
+  exactly at the sign boundary two's complement already places its
+  discontinuity).
+- **`BIGINT` (`i64`) / `TIMESTAMP` (`i64` µs-since-epoch)**: identical
+  transform, 8 bytes, XOR `0x8000_0000_0000_0000`.
+- **`DECIMAL`/`NUMERIC`** (scaled `i128`): identical transform, 16
+  bytes, XOR `0x8000_0000_0000_0000_0000_0000_0000_0000` — bounded
+  precision `p ≤ 38` (fits `i128`'s ~38 decimal digits exactly, the
+  natural, standard bound this representation imposes, not an arbitrary
+  choice) enforced at encode time, `CatalogError`/row-storage-equivalent
+  `InvalidInput` above it.
+- **`TIME`** (`i64` µs-since-midnight, **not** signed-flipped): plain
+  `to_be_bytes()`, no transform — D4 states this type is "non-negative,"
+  and a non-negative `i64`'s sign bit is always `0`, so its ordinary
+  two's-complement big-endian representation already equals unsigned
+  big-endian order across the entire valid (non-negative) range; a sign-
+  flip transform here would be a needless no-op at best and a bug if the
+  non-negativity precondition were ever silently violated. **Negative
+  `TIME` values are rejected at encode time** (`InvalidInput`), defense
+  in depth — this decision's own correctness (no sign-flip) depends on
+  that precondition actually holding, not merely being assumed.
+- **`REAL` (`f32`) / `DOUBLE` (`f64`)**: the standard IEEE-754 monotonic
+  bit-transform D4's Reason already named — reinterpret the bit pattern
+  as an unsigned integer; if the sign bit is set (negative), flip *every*
+  bit; otherwise (positive or zero) flip *only* the sign bit. `NaN` is
+  rejected at encode time (D4: "NaN excluded from key-bearing columns"),
+  `InvalidInput`. **`-0.0` is canonicalized to `+0.0` before the
+  transform** (`if v == 0.0 { v = 0.0 }` — Rust's `==` already treats
+  `-0.0 == 0.0`, so this reassignment forces the positive-zero bit
+  pattern regardless of which one was passed in) — a case D4's own
+  Reason text does not call out, but which the review directive's own
+  explicit "zero" test requirement exists to catch: `-0.0` and `+0.0`
+  are the *same* value under IEEE-754 equality (`logical_compare(-0.0,
+  0.0) = Equal`), so `encode(-0.0)` and `encode(0.0)` must be byte-
+  identical for this module's own stated invariant
+  (`byte_lexicographic_compare(encode(a), encode(b))` must match
+  `logical_compare(a, b)`) to hold — without canonicalization, the naive
+  transform gives them *different* bit patterns (`+0.0`'s sign bit is
+  `0`, flipped to `1`; `-0.0`'s sign bit is `1`, all bits flipped, which
+  is *not* the same result), a real, easy-to-miss correctness defect
+  this amendment closes explicitly rather than discovering it later via
+  a failing property test.
+- **`TEXT` / `BLOB`**: **escape-then-terminate**, not raw bytes,
+  regardless of the column's position within a composite key (RA.3
+  explains why raw bytes are insufficient the moment a variable-length
+  field can be followed by anything else, and this decision applies the
+  one general rule uniformly rather than two rules keyed on position).
+  For each content byte: `0x00` is emitted as `0x00 0xFF`; every other
+  byte is emitted unchanged; the encoding ends with a `0x00 0x00`
+  terminator. This is the standard "escaped-null-terminated" order-
+  preserving variable-length encoding (used by, e.g., FoundationDB's and
+  CockroachDB's key-encoding layers for exactly this problem) — proven
+  correct here by direct case analysis (not merely cited as standard):
+  for any two byte strings `A`, `B` where `A` is a strict prefix of `B`,
+  `A`'s encoding is `A`'s escaped bytes followed immediately by `0x00
+  0x00`, while `B`'s encoding continues past that point with `B`'s next
+  byte *escaped* — the *smallest* possible continuation byte after an
+  escaped `0x00` is `0xFF` (the escape's second byte), and every non-
+  `0x00` byte encodes to itself (`0x01`–`0xFF`, none smaller than `0x00`)
+  — so at the exact byte position where `A`'s terminator's second byte
+  (`0x00`) sits, `B`'s corresponding byte is *never* smaller than `0x00`
+  and is `0x00` only if `B`'s own terminator happens to align there too
+  (impossible unless `A = B`, since `B` still has more content) —
+  therefore `A`'s encoding is always lexicographically less than `B`'s,
+  matching `A` (the prefix) sorting before `B` under ordinary string
+  comparison, exactly as required.
+- **Composite primary keys**: the order-preserving encodings of each
+  declared PK column, concatenated in declared column order, with no
+  additional separator between fixed-width components (unambiguous: each
+  occupies its own known, fixed byte span) — `TEXT`/`BLOB` components'
+  own terminator already delimits them unambiguously from whatever
+  follows, fixed-width or not.
+
+**Reason**: this is the concrete byte-level specification the review
+directive's own "byte_lexicographic_compare(encode(a), encode(b)) must
+match logical_compare(a, b)" invariant requires, and D4's Reason
+paragraph already named the *technique* for every type but not its exact
+bytes — this section removes every remaining degree of freedom before
+implementation, so the property tests below are checking a specified
+contract, not reverse-engineering one from whatever the code happens to
+do.
+
+**Alternatives rejected**:
+- *No terminator for a `TEXT`/`BLOB` column when it is provably the last
+  component of a composite key (or the whole key).* Rejected: a
+  position-dependent encoding rule (terminated when not-last, raw when
+  last) is strictly more code, strictly more surface for a future bug
+  (a column reordering or an added trailing column silently changing an
+  existing column's required encoding), and costs only 2 bytes to avoid
+  — not a real saving worth the complexity or risk.
+  Applying the terminator unconditionally is simpler and provably
+  correct in every position, including alone.
+- *Length-prefixing `TEXT`/`BLOB` in keys (as the row-value encoding
+  already does) instead of escape-terminating.* Rejected: a length
+  prefix is **not** order-preserving for variable-length content —
+  `"ab"` (length 2) prefixed as `0x00000002` would sort *before*
+  `"b"` (length 1) prefixed as `0x00000001` only by coincidence of this
+  example, but in general a length-prefixed encoding's ordering is
+  governed by *length first*, not content — exactly the correctness
+  defect D4's whole "order-preserving key encoding" requirement exists
+  to prevent.
+- *A sentinel-byte-based escaping scheme other than `0x00`→`0x00 0xFF`*
+  (e.g., escaping `0xFF` instead). Rejected: the chosen scheme is the
+  standard, most commonly implemented one in comparable systems, and the
+  proof above depends specifically on `0x00` being the terminator's
+  leading byte and `0xFF` being the *unique maximum* byte value (so no
+  legitimately-encoded continuation byte can ever be smaller than the
+  escape's second byte) — an arbitrary alternative choice would need its
+  own from-scratch correctness proof for no benefit.
+
+**Correctness impact**: this section is *the* correctness specification
+for every ordering guarantee (`ORDER BY`, range scan, index range scan)
+a future increment's executor will depend on — an error here is silent
+and produces wrong query results with no engine-level signal, exactly
+D4's own stated risk. **Security impact**: `NaN`/negative-`TIME`
+rejection at encode time prevents a malformed value from ever reaching
+physical storage in a form whose ordering guarantee doesn't hold.
+**Performance impact**: every transform is O(1) (fixed-width types) or
+O(n) in content length with a small constant (`TEXT`/`BLOB`, one branch
+per byte) — no parsing, no allocation beyond the output buffer.
+**Memory impact**: bounded by the value's own size (already bounded by
+the row-size limit, RA.6). **Persistence/Recovery impact**: none beyond
+RA.1/D3 (key bytes are read back verbatim by the certified engine; no
+recovery-specific logic here). **Testing requirements**: the review
+directive's own explicit list — negative/zero/positive/`BIGINT`-boundary
+integer ordering, floating-point ordering including negative values and
+`-0.0`/`+0.0` equivalence, `DECIMAL` sign handling, composite-key
+ordering, `TEXT`/`BLOB` length-boundary cases (including a value that is
+a byte-prefix of another, and a value containing embedded `0x00`
+bytes) — each as a property test comparing `byte_lexicographic_compare
+(encode(a), encode(b))` against an independently-computed
+`logical_compare(a, b)`, never inspection alone, matching the review
+directive's own explicit "do not claim ordering correctness from
+inspection alone" instruction.
+
+## RA.3 Table row key layout and catalog integration
+
+**Decision**: reuses the Architecture document's §5 layout exactly, no
+new design here — `Table row key := 0x01 || table_id:u32 BE ||
+0x00000000:u32 BE || encoded_pk_columns` (the `0x00000000` is the
+reserved `index_id = 0` slot the Architecture document already assigns
+to "the table itself," keeping the table-row layout structurally
+uniform with a future increment's index-entry-key layout, which uses
+the same position for a real `index_id > 0`). A new `TableStore`
+(`src/relational/table_store.rs`) resolves `table_id`/column list/`pk_
+ordinals`/`schema_version` from the existing, unmodified
+`CatalogService` for every operation — **never** a second, duplicated
+metadata structure (the review directive's own explicit "the catalog
+remains the source of truth" instruction).
+
+**Reason**: the physical key layout was already fully decided (§5); this
+section states only that it is implemented as specified, with the one
+genuinely new piece of judgment being *how* row storage looks up a
+table's shape — resolved by direct `CatalogService` calls on every
+operation (no separate cache, matching D1's own "no separate catalog
+cache is required for correctness" position, applied consistently here).
+
+**Alternatives rejected**: *Cache a table's schema in `TableStore` after
+first lookup, invalidated on `ALTER TABLE`.* Rejected for this
+increment: no `ALTER TABLE` exists yet to invalidate against, and a
+stale-cache correctness bug is exactly the kind of premature-
+optimization risk this project consistently defers until a real,
+measured need exists (matching D7's own index-cache deferral reasoning).
+
+**Correctness/Security/Performance/Memory/Persistence/Recovery impact**:
+identical to D2/D6's own already-stated impacts. **Testing
+requirements**: table-scan namespace isolation at neighboring/min/max
+`table_id` values (the review directive's own explicit requirement),
+verified as actual physical range boundaries, not only post-filtering.
+
+## RA.4 `system.columns` extension: `type_params` (additive, not a redesign)
+
+**Decision**: `system.columns` gains one new **trailing** `RowValue`
+field, `type_params: BLOB` (nullable — `NULL` for every type except
+`DECIMAL`/`NUMERIC`, which store `[precision:u8, scale:u8]`). This is
+the one genuinely new catalog-schema change in this increment.
+
+**Reason**: `system.columns.data_type:u8` (CA.2) is a bare type *tag* —
+it has no room for `DECIMAL(p,s)`'s two parameters, and CA.5 explicitly
+scoped this gap out of the catalog increment ("this increment's own
+catalog rows never themselves contain a `DECIMAL`... value... it will be
+built... when a future increment's user-table row storage actually needs
+it" — this is that future increment). D31's own schema-evolution design
+— "`ADD COLUMN` is non-breaking... the field exists from v1 so a future
+increment... is additive, not a retrofit" — is the direct license for
+exactly this kind of change: a new *trailing* field, appended to an
+existing row schema, is the specific shape D31 already declared safe.
+This is **not** a redesign of the catalog increment's architecture,
+namespace, ID allocation, atomicity model, or any existing field's
+meaning — every one of those is untouched.
+
+**Honest limitation, stated explicitly rather than silently assumed
+away**: this increment does not implement or test true D31 backward-
+compatible decoding of a *genuinely pre-existing, already-deployed*
+`system.columns` row encoded under the 5-field (pre-`type_params`)
+shape — no such deployment exists (the catalog increment shipped no
+release, has no external users, and every test in this codebase creates
+its own fresh catalog). A real such row, if one ever existed, would
+currently fail closed with a decode error (`InvalidInput`, truncated-
+buffer) rather than transparently defaulting the missing field to
+`NULL` — safe (no silent corruption), but not yet the graceful D31
+behavior. True per-row-`schema_version`-aware decoding (selecting the
+historical field-count shape a specific row was actually written under,
+keyed by its own recorded `schema_version`) is real future work,
+tracked here rather than pretended to already exist.
+
+**Alternatives rejected**:
+- *Store `type_params` in a new, separate system table.* Rejected:
+  splits one logical column definition across two catalog reads for
+  every access, for a value that is intrinsically part of "what this
+  column is" — no benefit over one additional field on the row that
+  already represents the column.
+- *Encode `(precision, scale)` inside unused bits of the existing
+  `data_type:u8` tag.* Rejected: `u8` has no unused bits once every D4
+  type has its own tag value; conflating "which type" with "this type's
+  parameters" in one byte is also simply confusing, not merely tight.
+
+**Correctness impact**: `DECIMAL` columns cannot be correctly encoded/
+decoded/ordered without knowing their declared `(precision, scale)` —
+this field is what makes that possible at all. **Security impact**:
+none beyond D1/D25 (still an ordinary catalog field, same access path).
+**Performance impact**: one additional `BLOB` field, `NULL` (zero
+value-bytes, per D3's own "per non-null column" rule) for every non-
+`DECIMAL` column — negligible. **Memory/Persistence/Recovery impact**:
+identical to any other catalog field, inherited. **Testing
+requirements**: `system.columns` round-trip with and without `type_
+params` present (mirroring the existing `default_value` field's own
+already-tested present/absent pattern); a `DECIMAL` column's `type_
+params` correctly round-tripping through `CREATE TABLE` and back; the
+full existing catalog test suite re-run unmodified and still passing
+(confirms this additive change did not disturb any existing catalog
+behavior).
+
+## RA.5 `TableStore` — row-level primitives and atomicity
+
+**Decision**: `TableStore::put_row`/`get_row`/`delete_row`/`scan_table`,
+each resolving the target table's catalog shape first (RA.3), then
+operating through the certified `LsmEngine` directly — `get_row`/
+`scan_table` via `get`/`range_scan` (D2's namespace-bounded range,
+verified as physical boundaries per RA.3's testing requirement);
+`put_row`/`delete_row` via **exactly one `LsmEngine::write_batch` call
+each** (never independent `put`/`delete`), even though a single-row
+mutation touches only one physical key in this increment (no secondary
+indexes are maintained yet — that is D7/D11's future scope) — chosen
+now, not deferred, because every future increment that adds index
+maintenance to `put_row`/`delete_row` extends an *already-atomic*
+operation rather than retrofitting atomicity onto one that was written
+assuming it never needed it.
+
+**Reason**: the review directive's own explicit instruction ("Multi-row
+mutations that must become atomically visible must use `write_batch`...
+Do not implement atomicity using multiple independent writes") — applied
+here even at N=1 specifically so `put_row`/`delete_row`'s call shape
+never has to change when N becomes greater than 1 (secondary index
+maintenance, a future increment), matching `RELATIONAL ADR AMENDMENT
+001` AA.5's own already-proven N=1-parity property (a single-member
+`write_batch` costs the same as a direct `put`/`delete`, so there is no
+performance argument for the direct call either).
+
+**Alternatives rejected**: *Call `LsmEngine::put`/`delete` directly now
+(no index maintenance exists yet to need atomicity with), switching to
+`write_batch` only once a future increment adds indexes.* Rejected: a
+later "switch every call site's mechanism" change is exactly the kind of
+retrofit this project's own "small, verified increments" discipline
+prefers to avoid by building the extensible shape from the start, at
+zero extra cost (AA.5's own N=1-parity proof means there is no
+performance reason to prefer the direct call even temporarily).
+
+**Correctness impact**: `put_row`/`delete_row`'s atomicity is `write_
+batch`'s own already-proven atomicity (`RELATIONAL ADR AMENDMENT 001`
+AA.3), inherited unconditionally, not re-derived. **Security impact**:
+none beyond D25 (authorization enforcement remains explicitly deferred
+to D15's binder, per the review directive's own "do not implement
+authorization enforcement unless the existing architecture explicitly
+requires a storage-layer check at this stage" — it does not). **Performance
+impact**: N=1 `write_batch` parity, already measured (AA.1's benchmark).
+**Memory impact**: bounded by the row-size limit (RA.6). **Persistence/
+Recovery impact**: inherited from `write_batch`/D12, zero new code.
+**Testing requirements**: the review directive's own full list —
+persistence (insert→restart→get, insert→restart→scan, delete→restart→
+verify-gone), concurrent reads/writes/scans, a delete/read race
+(`RELATIONAL ADR AMENDMENT 001` AA.3's atomicity proof re-exercised
+through row storage specifically, not re-derived), multi-row `write_
+batch` visibility (a batch of several rows via one `TableStore` call,
+if this increment exposes one — see below).
+
+**Multi-row batch put**: `TableStore::put_rows(&self, table_id, rows:
+&[RelationalRow]) -> Result<u64>` — a genuinely multi-row atomic write
+through one `write_batch` call, included in this increment specifically
+to give the review directive's own "multi-row write_batch visibility"
+testing requirement something real to exercise beyond N=1, without
+requiring any SQL layer to drive it (a direct Rust-level batch API, the
+same shape `CatalogService::create_table` already established for
+multi-row catalog mutations).
+
+## RA.6 Resource limits (reused, not reinvented)
+
+**Decision**: `RelationalValue`/row encoding reuses the Architecture
+document §4's already-stated limits exactly — max row size 1 MiB, max
+column count 1,600 per table (already enforced by `CatalogService::
+create_table`, RA.5 adds no new column-count check) — enforced **before**
+encoding begins (checking the caller-supplied `RelationalValue` slice's
+total prospective size analytically, the same "reject before allocating"
+discipline `RELATIONAL ADR AMENDMENT 001` AA.6 already established for
+`write_batch`) and again via the existing engine-level `max_record_len`
+bound `write_batch`/`encode_wal_frame` already enforce unconditionally
+(defense in depth — two independent checks, neither trusting the other
+alone).
+
+**Reason**: reusing already-decided limits, enforced the same way
+`write_batch` already enforces its own, means no new limit-configuration
+surface, no new failure-mode taxonomy, and no risk of the row-storage
+layer's own limit silently disagreeing with the engine's.
+
+**Alternatives rejected**: *A new, independently-configured row-size
+limit distinct from `max_record_len`.* Rejected: two independently-
+tunable limits for the same underlying concern (how large can one
+physical value be) is unnecessary configuration surface with no stated
+requirement driving it.
+
+**Correctness/Security/Performance/Memory/Persistence/Recovery impact**:
+identical to `RELATIONAL ADR AMENDMENT 001` AA.6's own already-stated
+impacts, applied to row encoding instead of batch construction.
+**Testing requirements**: an oversized-row rejection test (a row whose
+encoded size exceeds the 1 MiB limit, rejected before any engine call —
+verified by asserting no WAL record is written for the rejected
+attempt, mirroring AA.6's own test pattern exactly).
+
+---
+
+**Row-storage-foundation implementability**: RA.1–RA.6 resolve every
+open point standing between this ADR's already-decided architecture
+(D1–D33, AMENDMENTs 001–002) and a concrete, implementable relational
+row-storage layer. The implementation increment may now proceed
+directly against this specification.

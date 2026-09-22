@@ -35,6 +35,9 @@ pub struct ColumnDef {
     pub data_type: u8,
     pub nullable: bool,
     pub default_value: Option<Vec<u8>>,
+    /// `RELATIONAL ADR AMENDMENT 003` RA.4: `[precision:u8, scale:u8]`
+    /// for `DECIMAL`/`NUMERIC`, `None` otherwise.
+    pub type_params: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +402,7 @@ impl CatalogService {
                 nullable: column.nullable,
                 default_value: column.default_value.clone(),
                 added_in_schema_version: 1,
+                type_params: column.type_params.clone(),
             };
             ops.push(WriteOp::Put {
                 key: catalog_key(SYSTEM_TABLE_COLUMNS, &column_pk(table_id, ordinal)),

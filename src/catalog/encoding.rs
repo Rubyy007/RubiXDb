@@ -129,14 +129,20 @@ fn null_bitmap_len(column_count: usize) -> usize {
     column_count.div_ceil(8)
 }
 
-/// Encodes D3's `RowValue`: `format_version:u8 || schema_version:u32 LE
-/// || null_bitmap || values` — `values` holds only the non-`NULL`
-/// entries of `fields`, in order (D3: "per non-null column... a `NULL`
-/// column consumes zero value bytes, its presence recorded only in the
-/// bitmap"). `fields.len()` must equal the row's declared column count
-/// (the null bitmap is sized from it) — callers always pass every
-/// column, `None` for `NULL`.
-pub fn encode_row(schema_version: u32, fields: &[Option<CatalogValue>]) -> Vec<u8> {
+/// D3's `RowValue` envelope (`format_version:u8 || schema_version:u32 LE
+/// || null_bitmap || values`), generic over the per-field value
+/// representation — shared verbatim by this module's own `encode_row`
+/// (`CatalogValue`) and `relational::value`'s row codec (`RelationalValue`,
+/// `RELATIONAL ADR AMENDMENT 003` RA.1), so both domains' rows write the
+/// identical on-disk envelope from one implementation, never two
+/// independently-maintained copies of the same format (D1's own "the
+/// exact same `RowValue` format user rows use" requirement, honored at
+/// the code level, not merely the byte-layout level).
+pub fn encode_row_envelope<T>(
+    schema_version: u32,
+    fields: &[Option<T>],
+    mut encode_value: impl FnMut(&T, &mut Vec<u8>),
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(ROW_FORMAT_VERSION);
     out.extend_from_slice(&schema_version.to_le_bytes());
@@ -153,6 +159,17 @@ pub fn encode_row(schema_version: u32, fields: &[Option<CatalogValue>]) -> Vec<u
         encode_value(field, &mut out);
     }
     out
+}
+
+/// Encodes D3's `RowValue`: `format_version:u8 || schema_version:u32 LE
+/// || null_bitmap || values` — `values` holds only the non-`NULL`
+/// entries of `fields`, in order (D3: "per non-null column... a `NULL`
+/// column consumes zero value bytes, its presence recorded only in the
+/// bitmap"). `fields.len()` must equal the row's declared column count
+/// (the null bitmap is sized from it) — callers always pass every
+/// column, `None` for `NULL`.
+pub fn encode_row(schema_version: u32, fields: &[Option<CatalogValue>]) -> Vec<u8> {
+    encode_row_envelope(schema_version, fields, encode_value)
 }
 
 fn encode_value(value: &CatalogValue, out: &mut Vec<u8>) {
@@ -189,6 +206,20 @@ pub fn decode_row(
     bytes: &[u8],
     schema: &[CatalogValueType],
 ) -> Result<(u32, Vec<Option<CatalogValue>>)> {
+    decode_row_envelope(bytes, schema.len(), |i, bytes, pos| {
+        decode_value(schema[i], bytes, pos)
+    })
+}
+
+/// The decode-side counterpart of `encode_row_envelope` — see its doc
+/// comment. `decode_value(field_index, bytes, pos)` decodes one non-
+/// `NULL` field at `field_index` (so a caller whose per-field type
+/// depends on position, e.g. a schema array, can look it up).
+pub fn decode_row_envelope<T>(
+    bytes: &[u8],
+    field_count: usize,
+    mut decode_value: impl FnMut(usize, &[u8], &mut usize) -> Result<T>,
+) -> Result<(u32, Vec<Option<T>>)> {
     let mut pos = 0usize;
     let format_version = read_u8(bytes, &mut pos)?;
     if format_version != ROW_FORMAT_VERSION {
@@ -198,16 +229,16 @@ pub fn decode_row(
     }
     let schema_version = read_u32(bytes, &mut pos)?;
 
-    let bitmap_len = null_bitmap_len(schema.len());
+    let bitmap_len = null_bitmap_len(field_count);
     let bitmap = read_bytes(bytes, &mut pos, bitmap_len)?.to_vec();
 
-    let mut fields = Vec::with_capacity(schema.len());
-    for (i, field_type) in schema.iter().enumerate() {
+    let mut fields = Vec::with_capacity(field_count);
+    for i in 0..field_count {
         let is_null = (bitmap[i / 8] >> (i % 8)) & 1 == 1;
         if is_null {
             fields.push(None);
         } else {
-            fields.push(Some(decode_value(*field_type, bytes, &mut pos)?));
+            fields.push(Some(decode_value(i, bytes, &mut pos)?));
         }
     }
     Ok((schema_version, fields))
@@ -240,7 +271,12 @@ fn decode_value(
     })
 }
 
-fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+/// Bounds-checked, panic-free primitive byte readers, `pub(crate)` so
+/// `relational::value` can reuse them for the additional numeric widths
+/// D4's full type system needs (`RELATIONAL ADR AMENDMENT 003` RA.1) —
+/// the same "never index/allocate from an unvalidated length" discipline
+/// applied consistently across both row codecs, from one implementation.
+pub(crate) fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
         .ok_or_else(|| CatalogError::InvalidInput {
@@ -255,23 +291,40 @@ fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u
     Ok(slice)
 }
 
-fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {
+pub(crate) fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {
     Ok(read_bytes(bytes, pos, 1)?[0])
 }
 
-fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16> {
+pub(crate) fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16> {
     let raw = read_bytes(bytes, pos, 2)?;
     Ok(u16::from_le_bytes(raw.try_into().expect("exactly 2 bytes")))
 }
 
-fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+pub(crate) fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
     let raw = read_bytes(bytes, pos, 4)?;
     Ok(u32::from_le_bytes(raw.try_into().expect("exactly 4 bytes")))
 }
 
-fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64> {
+pub(crate) fn read_i32(bytes: &[u8], pos: &mut usize) -> Result<i32> {
+    let raw = read_bytes(bytes, pos, 4)?;
+    Ok(i32::from_le_bytes(raw.try_into().expect("exactly 4 bytes")))
+}
+
+pub(crate) fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64> {
     let raw = read_bytes(bytes, pos, 8)?;
     Ok(i64::from_le_bytes(raw.try_into().expect("exactly 8 bytes")))
+}
+
+pub(crate) fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    let raw = read_bytes(bytes, pos, 8)?;
+    Ok(u64::from_le_bytes(raw.try_into().expect("exactly 8 bytes")))
+}
+
+pub(crate) fn read_i128(bytes: &[u8], pos: &mut usize) -> Result<i128> {
+    let raw = read_bytes(bytes, pos, 16)?;
+    Ok(i128::from_le_bytes(
+        raw.try_into().expect("exactly 16 bytes"),
+    ))
 }
 
 /// Encodes a list of `u16` ordinals as a `CatalogValue::Blob`:

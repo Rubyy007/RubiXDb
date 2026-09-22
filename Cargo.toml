@@ -53,3 +53,7 @@ required-features = ["bench"]
 [[bench]]
 name = "write_batch_bench"
 harness = false
+
+[[bench]]
+name = "table_store_bench"
+harness = false

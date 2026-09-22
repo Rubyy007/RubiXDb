@@ -6,6 +6,70 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 4 (row-storage foundation) (2026-09-22)
+
+Connects the certified catalog (Increment 3, `d66029d`) to actual user-
+table row storage. Before writing code, `RELATIONAL ADR AMENDMENT 003`
+resolved the increment's own open points: exact order-preserving key
+transforms for every D4 type (byte-level, property-tested — including
+the `-0.0`/`+0.0` canonicalization edge case and the escape-then-
+terminate scheme for `TEXT`/`BLOB` inside composite keys), and how
+`DECIMAL`'s precision/scale gets persisted given the catalog's existing
+`data_type:u8` tag alone had no room for it.
+
+#### Added
+
+- **`src/relational/`** (new module: `value`, `key`, `table_store`,
+  `error`): `RelationalValue`/`RelationalType` (D4's full closed type
+  set), order-preserving key encoding for every type, the table-row
+  physical key layout implemented exactly as already specified
+  (Architecture doc §5), and `TableStore` — `put_row`/`put_rows`/
+  `get_row`/`delete_row`/`scan_table`. Every mutation is exactly one
+  `LsmEngine::write_batch` call, even at N=1, verified directly by
+  asserting the engine's sequence counter advances by exactly one per
+  call. Every read resolves the table's shape from the unmodified
+  `CatalogService` — no second metadata structure.
+- **`system.columns.type_params`** (`src/catalog/schema.rs`): one new,
+  additive trailing field (`[precision, scale]` for `DECIMAL`/`NUMERIC`)
+  — D31-licensed, not a catalog redesign; every pre-existing field
+  untouched, and the full existing 44-test catalog suite re-run
+  unmodified and still passing.
+- `catalog::encoding`'s `RowValue` envelope (`format_version`/
+  `schema_version`/`null_bitmap` header) refactored into `encode_row_
+  envelope`/`decode_row_envelope`, generic over the per-domain value
+  type, so catalog rows and relational rows share the identical codec —
+  not two independently-maintained copies of the same on-disk format.
+- 79 new tests, including property tests for ordering (integer/`BIGINT`/
+  `DECIMAL`/`DATE`/`TIMESTAMP`/`REAL`/`DOUBLE`/`TEXT`/`BLOB` — proptest
+  generators, not hand-picked cases), table-scan namespace isolation
+  verified as actual physical range boundaries (neighboring/min/max
+  `table_id`), restart persistence, concurrent access (16-thread `put_
+  row`, concurrent scan during writes, a delete/read race), and a
+  differential test against an independent `BTreeMap` reference model.
+- `benches/table_store_bench.rs`: measured, real overhead of `put_row`/
+  `get_row`/`scan_table` over raw `LsmEngine` calls (see PROGRESS.md for
+  the actual numbers — the read path shows a genuine ~20x cost from
+  per-call, uncached catalog resolution; the `fsync`-dominated write
+  path shows no measurable difference).
+
+#### Explicitly not implemented in this increment
+
+No SQL parser/binder/executor, no `CREATE TABLE`/`INSERT`/`UPDATE`/
+`DELETE`/`SELECT` SQL, no query planning/joins/aggregation, no index
+maintenance wired into `put_row`/`delete_row` yet (deliberately shaped
+to need no call-site change when added), no authorization enforcement.
+`RELATIONAL DATABASE PRODUCTION READY = NO.`
+
+#### Regression gate
+
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, `cargo test --workspace` and `--release
+--workspace` (468 `rubixdb` lib tests + 30 `rubixdb-api` tests, debug
+and release), `wal_tests`, `pathological_recovery_matrix`, `crash_
+consistency --features test-util` — all clean, all passing, both before
+and after this increment. `src/manifest/`, `src/compaction/`, `src/
+sstable/`, `src/wal/`, `api/` untouched.
+
 ### Relational database: Increment 3 (persistent catalog) (2026-09-22)
 
 Adds the persistent relational catalog on top of the certified

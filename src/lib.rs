@@ -13,6 +13,7 @@ pub mod execution;
 pub mod lsm;
 pub mod manifest;
 pub mod memtable;
+pub mod relational;
 pub mod sstable;
 pub mod wal;
 

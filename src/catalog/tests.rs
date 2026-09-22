@@ -72,18 +72,21 @@ fn some_columns() -> Vec<ColumnDef> {
             data_type: 2,
             nullable: false,
             default_value: None,
+            type_params: None,
         },
         ColumnDef {
             name: "name".to_string(),
             data_type: 7,
             nullable: true,
             default_value: None,
+            type_params: None,
         },
         ColumnDef {
             name: "amount".to_string(),
             data_type: 3,
             nullable: false,
             default_value: Some(vec![0; 8]),
+            type_params: None,
         },
     ]
 }
@@ -330,6 +333,7 @@ fn create_table_rejects_nullable_primary_key_column() {
         data_type: 2,
         nullable: true,
         default_value: None,
+        type_params: None,
     }];
     let err = catalog.create_table(1, "t", &columns, &[0]).unwrap_err();
     assert!(matches!(
@@ -354,12 +358,14 @@ fn create_table_rejects_duplicate_column_names() {
             data_type: 2,
             nullable: false,
             default_value: None,
+            type_params: None,
         },
         ColumnDef {
             name: "id".to_string(),
             data_type: 2,
             nullable: false,
             default_value: None,
+            type_params: None,
         },
     ];
     let err = catalog.create_table(1, "t", &columns, &[0]).unwrap_err();
