@@ -51,7 +51,19 @@ function PointLookup() {
           <Input
             label="Key"
             value={keyText}
-            onChange={(e) => setKeyText(e.target.value)}
+            onChange={(e) => {
+              setKeyText(e.target.value);
+              // Editing the key after a lookup re-arms it -- without
+              // this, `getQuery`/`existsQuery` stay `enabled` from the
+              // previous click and silently re-fire on every keystroke
+              // (a live query against whatever partial/not-yet-written
+              // key is currently in the box), which is both wasteful
+              // and surprising for a button that reads as an explicit,
+              // deliberate action. A real 404-per-keystroke instance of
+              // this was found by `e2e/production_validation.spec.ts`'s
+              // own repeated-workflow stability test.
+              setLookupEnabled(false);
+            }}
             placeholder="e.g. user:1234"
             mono
           />

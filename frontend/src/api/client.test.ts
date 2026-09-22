@@ -52,6 +52,16 @@ describe("ApiClient", () => {
     expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
+  it("does not clear the session on a 403 -- a role limit is not an expired credential", async () => {
+    mockFetchOnce(403, {
+      error: { code: "FORBIDDEN", message: "this API key's role does not permit this operation" },
+    });
+    const onUnauthorized = vi.fn();
+    const client = new ApiClient(session, onUnauthorized);
+    await expect(client.put("a2V5", "dmFs")).rejects.toBeInstanceOf(ApiRequestError);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
   it("propagates the error code/message/detail from the response body", async () => {
     mockFetchOnce(507, {
       error: { code: "STORAGE_EXHAUSTED", message: "persistent storage is exhausted", detail: "x" },

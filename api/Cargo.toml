@@ -20,6 +20,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 [dev-dependencies]
 rubixdb = { path = "..", features = ["test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

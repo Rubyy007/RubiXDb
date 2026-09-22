@@ -1,0 +1,10 @@
+=== RubiXDB API load test: concurrency sweep [10, 25, 50, 100, 250], 20s per level ===
+server pid=18264 data_dir=C:\Users\Ruby\AppData\Local\Temp\rubixdb_api_load_srv_1790047025078839200
+warm-up complete: 2000 keys populated
+concurrency,duration_secs,total_ops,ok,err,error_rate_pct,throughput_ops_sec,p50_ms,p95_ms,p99_ms,max_ms,peak_active_requests,rss_kb_start,rss_kb_end,handles_start,handles_end,threads_start,threads_end
+10,20.0,70537,70537,0,0.000,3525.2,0.96,8.21,15.44,115.32,8,6092,24564,90,102,15,15
+25,20.0,53617,53617,0,0.000,2678.4,7.80,21.15,35.11,110.87,8,24564,32116,102,102,15,12
+50,20.0,37539,37539,0,0.000,1875.0,24.79,53.71,70.28,135.94,8,32116,30868,102,102,12,12
+100,20.1,29150,29150,0,0.000,1453.5,64.14,134.49,169.36,258.34,8,30868,44712,102,102,12,12
+250,20.2,26087,26087,0,0.000,1290.0,185.95,358.74,434.48,548.59,8,44712,42008,102,102,12,12
+=== load test complete ===
