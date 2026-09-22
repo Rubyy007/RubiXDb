@@ -6,6 +6,7 @@
 //! `RubixDB-LSM-Engine-Specification-v1.0.md` at the repository root. Where
 //! this code and those documents disagree, the documents win.
 
+pub mod catalog;
 pub mod compaction;
 pub mod error;
 pub mod execution;

@@ -2949,3 +2949,99 @@ DATABASE PRODUCTION READY = NO.** Write/Read/Compaction remain
 independently PRODUCTION READY, unaffected -- confirmed by the full
 regression gate above, not merely asserted. Full account: `PHASE_
 RELATIONAL_TRANSACTION_STORAGE_RESULTS.md`.
+
+## 2026-09-22 (Relational database: Increment 3 -- persistent catalog)
+
+**Implemented:** before writing code, `RELATIONAL ADR AMENDMENT 002`
+(appended to `PHASE_RELATIONAL_DATABASE_ADR.md`, D1-D33 and AMENDMENT
+001 untouched) resolved the catalog's own remaining open points that
+neither the ADR nor the Architecture document had pinned down to a
+concrete, implementable byte layout: exact per-system-table column
+schemas and primary keys (CA.2), durable/restart-safe/collision-free ID
+allocation with no D10 transaction layer yet to lean on for conflict
+detection (CA.1), `system_table_id` constant assignment, catalog
+bootstrap (CA.3), and this increment's own explicitly-scoped-down DROP
+semantics -- direct atomic catalog-row removal, not D13's full
+`DROPPING`-marker-plus-background-sweep design, since no table-row
+storage exists yet for a sweep to have anything to act on (CA.4).
+
+Then the implementation: `src/catalog/` (`encoding.rs`, `schema.rs`,
+`service.rs`, `error.rs`) -- the seven `system.*` tables (D1) as
+ordinary rows in the certified `LsmEngine`'s own keyspace under the
+reserved `0x00` namespace (D2), every mutation going through exactly
+one certified `write_batch` call (D9/D13), every read an ordinary
+`get`/`range_scan`, no separate catalog cache, no new WAL, no
+independent catalog file. `CatalogService` provides `bootstrap`
+(idempotent), `create_schema`/`create_table`/`create_index`/
+`create_constraint`/`grant`/`revoke`, matching reads, and `drop_table`/
+`drop_index`/`drop_schema`.
+
+**ID allocation** (the review directive's own explicit focus): every
+ID is read from and incremented as an ordinary durable catalog row --
+never a process-local counter as the source of truth, no hash
+derivation, no external sequence service. A new, narrowly-scoped
+`Mutex` internal to `CatalogService` (not a change to the engine's own
+locking model) serializes this process's own catalog-mutating calls --
+a real fix for a real race `write_batch`'s atomicity alone cannot
+close (two concurrent `CREATE TABLE` calls reading the same "next
+table_id" before either commits would otherwise both succeed, both
+durable, both claiming the same physical namespace region). Verified
+directly: 16 concurrent `CREATE TABLE` calls never produce a duplicate
+`table_id`; `table_id` allocation continues from its durable value
+after a real restart, never resets.
+
+**Proven, not just argued:** `create_table`'s multi-row mutation (table
+row + N column rows + PK index row + two ID counters) is exactly one
+`write_batch` call, not several independent `put`/`delete` calls --
+verified by asserting the engine's own sequence counter advances by
+exactly one per `create_table`, regardless of column count (`write_
+batch`'s own certified AA.1 property, exercised through the catalog
+layer). A concurrent-scan test races 25 rounds of `create_table` against
+concurrent `get_table_by_name`/`get_columns`/`list_indexes` reads,
+asserting a table is never visible with some but not all of its
+children present -- zero inconsistent observations.
+
+**Tests:** 43 new (`cargo test --lib catalog::`) -- encode/decode
+round-trips for every system table and `NULL`-bitmap boundary,
+namespace isolation from pre-existing flat-KV keys (D2/D32), restart/
+recovery (catalog rows and ID counters both survive a real engine
+close/reopen), `DROP TABLE` cascade with cross-table isolation, grants
+uniqueness (duplicate grant rejected, revoke is idempotent), and
+invalid-input rejection (empty name, no columns, no primary key,
+nullable PK column, duplicate column names, out-of-range ordinals).
+
+**Full regression gate, before and after this increment:** `cargo fmt
+--all -- --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, `cargo test --workspace` and `--release
+--workspace` -- 416 `rubixdb` lib tests + 30 `rubixdb-api` tests, debug
+and release, all passing. `wal_tests` 12/12, `pathological_recovery_
+matrix` 9/9, `crash_consistency --features test-util` 2/2 (release).
+`src/manifest/`, `src/compaction/`, `src/sstable/`, `src/wal/`, `src/
+error.rs`, `api/` completely untouched (`git diff --stat` empty for
+each) -- this increment's only source changes are the new `src/
+catalog/` module and one added `pub mod catalog;` line in `src/lib.rs`.
+No new external dependency (`Cargo.toml`/`Cargo.lock` unchanged).
+
+**Flagged, confirmed pre-existing, not caused by this increment:** the
+same `group_commit` throughput test pair (`m1_2_hundred_writers_
+throughput`/`m1_3_thousand_writers_throughput`) already flagged as a
+pre-existing, machine-throughput-dependent baseline characteristic in
+Increment 2 (verified there via `git stash` against the clean baseline)
+recurs identically here. `tests/` has zero diff from this increment
+(`git diff --stat -- tests/` empty), confirming it cannot be this
+increment's own doing.
+
+**Security audit:** no `unsafe`, no new logging of key/value/catalog-
+row contents, no unbounded allocation from untrusted input (the one
+`Vec::with_capacity` sized by a decoded length, in `decode_u16_list`,
+is capped at 65,536 elements regardless of what the decoded count
+claims), no new panic paths in non-test code, no new external
+dependency.
+
+**Explicitly not done / not declared:** no SQL parser/binder/executor,
+no `CREATE TABLE` SQL syntax, no `INSERT`/`UPDATE`/`DELETE` execution,
+no user-table row storage, no authorization *enforcement* (`system.
+grants` rows are stored; nothing yet checks them -- D15's binder,
+a later increment). **RELATIONAL DATABASE PRODUCTION READY = NO.**
+Write/Read/Compaction remain independently PRODUCTION READY,
+unaffected.

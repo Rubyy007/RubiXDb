@@ -3310,3 +3310,341 @@ decision.
 documentation.** No source code changes accompany this amendment — the
 next step is the implementation-time document and the `write_batch`
 code itself, both still pending.
+
+---
+
+# RELATIONAL ADR AMENDMENT 002
+
+**Status**: append-only, D1–D33 and AMENDMENT 001 untouched. `write_batch`
+(D9, resolved by AMENDMENT 001) is implemented and certified (`PHASE_
+RELATIONAL_TRANSACTION_STORAGE_RESULTS.md`, "WRITE BATCH = PASS"). This
+amendment resolves the catalog increment's own remaining open points —
+questions D1/D2/D7/D13/D25/D31 name a shape for but do not pin down to
+an exact, implementable byte layout: per-system-table column schemas
+and primary keys, `system_table_id` constant assignment, durable ID
+allocation under concurrency (with no D10 transaction/conflict-
+detection layer yet to lean on), and this increment's own DROP scope
+given no table-row storage exists yet to sweep.
+
+## CA.1 Durable, restart-safe, collision-free ID allocation
+
+**Decision**: every allocatable catalog ID (`database_id`, `schema_id`,
+`table_id`, `index_id`, `constraint_id`, `grant_id` — all `u32`) is
+allocated from a **durable counter stored as an ordinary catalog row**
+(`system_table_id = 0`, a reserved counters pseudo-table, keyed by a
+fixed 1-byte counter-kind tag — never a process-local variable as the
+source of truth), read and incremented inside the **same `write_batch`
+call** that creates the object the ID names. Concurrency safety within
+one process is provided by a `Mutex<()>` internal to the new
+`CatalogService` (`src/catalog/mod.rs`), held across the whole
+"read current counter value, construct the object's rows, `write_batch`
+them together" critical section for every catalog-mutating operation —
+serializing catalog DDL within this process, never table-row DML (no
+such thing exists yet) and never ordinary reads.
+
+**Reason**: the review directive requires durable, restart-safe IDs,
+forbids a process-local counter as the *source of truth*, forbids hash-
+derived IDs, and forbids an external sequence service — a catalog row
+read fresh at every allocation satisfies all three simultaneously, for
+free, via D1's own "catalog rows inherit WAL durability" property. The
+`Mutex` is **not** the ID's storage — it is a concurrency-serialization
+device closing a real race D10 would otherwise have closed: `write_
+batch` (AMENDMENT 001) provides atomicity but, without D10's snapshot-
+based conflict detection (not implemented in this increment — no SQL
+executor exists to drive `BEGIN`/`COMMIT` yet), it provides no read-
+then-write compare-and-swap. Two concurrent `CREATE TABLE` calls that
+each read the same "next `table_id`" value and each `write_batch`
+independently would both succeed, both durable, both claiming the same
+`table_id` — a physical-namespace collision, not merely a logical race.
+A single, narrowly-scoped `Mutex` around catalog-DDL's own allocate-
+then-write critical section is a real, in-process fix for a real,
+in-process hazard; it is not a workaround for a correctness property
+this increment is pretending doesn't apply. This is sufficient — not a
+compromise — because the certified engine already permits at most one
+process to hold a given data directory open at a time (`FileWal`'s own
+exclusive directory lock, relied on unchanged here); there is no cross-
+process catalog-writer concurrency this design needs to additionally
+defend against.
+
+**Alternatives rejected**:
+- *Derive IDs from a hash of the object's name.* Explicitly forbidden
+  by the review directive, and would break D2's own fixed-width-BE-
+  for-ordering correctness argument if a hash were ever used as a
+  physical-key-ordering ID rather than an opaque identifier.
+- *An external sequence service.* Explicitly forbidden, and unjustified
+  complexity — a catalog row already provides exactly the required
+  durability with zero new infrastructure.
+- *No serialization at all, accepting last-write-wins on collision.*
+  Rejected: a `table_id` collision is not a benign "someone's edit was
+  overwritten" outcome (SQL `CREATE TABLE`'s own ordinary, acceptable
+  race) — it is two *different* tables' data physically interleaved
+  under D2's namespace scheme, a storage-corruption-class defect.
+- *A separate counter per system table (7 counters) vs. one shared
+  counter keyed by counter-kind.* Adopted the latter (one reserved
+  pseudo-table, `system_table_id = 0`, rows keyed by a 1-byte counter-
+  kind tag) over 7 independent top-level constants purely for a smaller,
+  more uniform key space — not a correctness-relevant choice either way.
+
+**Correctness impact**: this is what makes D2's "table_id/index_id
+uniquely and collision-freely identify one physical namespace region"
+claim actually hold under concurrent DDL, not only in the single-writer
+case. **Security impact**: none directly — DDL authorization is D25's
+concern, deferred per CA.4 below. **Performance impact**: DDL (rare,
+administrative) is serialized process-wide; ordinary catalog *reads*
+and, later, table-row DML are entirely unaffected — the lock's scope is
+deliberately as narrow as the hazard it closes. **Memory impact**: none
+— the `Mutex` guards no additional state beyond itself. **Persistence
+impact**: one new reserved catalog row per counter kind, ordinary
+durability. **Recovery impact**: none beyond D12 — a crash mid-
+allocation leaves the counter at its last durably-committed value
+(inherited from `write_batch`'s own all-or-nothing guarantee, AMENDMENT
+001 AA.1/AA.3); recovery replays it like any other catalog row, never
+needing a special "recompute the counter" pass. **Testing requirements**:
+concurrent `CREATE TABLE` from many threads asserting no two tables ever
+receive the same `table_id`; ID persistence across a real restart (next
+allocation after reopen continues from the durable value, never resets
+to a low number); an ID-allocation-then-crash-before-apply test (the
+counter's own durability is exactly `write_batch`'s, already proven).
+
+## CA.2 Per-system-table schema
+
+**Decision**: `system_table_id` constants (fixed, `u32`, chosen small
+and stable — a future system table, if ever added, gets the next
+unused value, never reusing one):
+
+| `system_table_id` | Table | Primary key | Notes |
+|---|---|---|---|
+| 0 | (reserved: ID counters, CA.1) | counter_kind:u8 | not a user-visible catalog table |
+| 1 | `system.databases` | `database_id:u32` | v1: exactly one live row, bootstrapped (CA.3) |
+| 2 | `system.schemas` | `schema_id:u32` | `public` always exists (bootstrapped) |
+| 3 | `system.tables` | `table_id:u32` | |
+| 4 | `system.columns` | `(table_id:u32, ordinal:u16)` | genuinely composite — ordinal is stable per D1 Architecture §1 ("never reorders") |
+| 5 | `system.indexes` | `index_id:u32` | includes a `PRIMARY`-kind row per table (D13's own `CREATE TABLE` example), even though D6 stores no separate physical PK structure — this row is catalog/introspection metadata only |
+| 6 | `system.constraints` | `constraint_id:u32` | |
+| 7 | `system.grants` | `grant_id:u32` | surrogate — see rationale below |
+
+Row-value columns (`RowValue` per D3 — `format_version:u8 ||
+schema_version:u32 LE || null_bitmap || values`; PK columns above are
+never re-stored in the value, D3's own rule):
+
+- **`system.databases`**: `name:TEXT`, `created_at:TIMESTAMP(i64 µs)`.
+- **`system.schemas`**: `database_id:u32`, `name:TEXT`,
+  `created_at:TIMESTAMP`.
+- **`system.tables`**: `schema_id:u32`, `name:TEXT`,
+  `pk_ordinals:BLOB` (a length-prefixed `u16` list — the composite
+  primary key's column ordinals, in key order), `schema_version:u32`
+  (D31, starts at 1), `state:u8` (`0=ACTIVE`, `1=DROPPING` — CA.4),
+  `created_at:TIMESTAMP`.
+- **`system.columns`**: `name:TEXT`, `data_type:u8` (D4's type tag —
+  only the subset a catalog-only increment needs to round-trip is
+  implemented now, CA.5), `nullable:BOOLEAN`, `has_default:BOOLEAN`,
+  `default_value:BLOB` (present iff `has_default`), `added_in_schema_
+  version:u32` (D31).
+- **`system.indexes`**: `table_id:u32`, `name:TEXT`, `kind:u8`
+  (`0=PRIMARY`, `1=UNIQUE`, `2=NON_UNIQUE`), `column_ordinals:BLOB`
+  (length-prefixed `u16` list, index-column order), `state:u8`
+  (`0=ACTIVE`, `1=BUILDING` — backfill state, unused until a future
+  increment actually backfills a non-empty table, D7), `created_at`.
+- **`system.constraints`**: `table_id:u32`, `name:TEXT`, `kind:u8`
+  (`0=PRIMARY_KEY`, `1=UNIQUE`, `2=NOT_NULL`, `3=CHECK`),
+  `column_ordinals:BLOB` (empty for `CHECK`), `check_expression:TEXT`
+  (empty for non-`CHECK` kinds — D8's expression engine does not exist
+  yet; stored as opaque source text for a future increment to parse/
+  bind/evaluate, never evaluated here), `added_in_schema_version:u32`.
+- **`system.grants`**: `principal:TEXT`, `object_kind:u8`
+  (`0=DATABASE`, `1=SCHEMA`, `2=TABLE`), `object_id:u32`,
+  `privilege:u8` (`0=SELECT`,`1=INSERT`,`2=UPDATE`,`3=DELETE`,`4=DDL`,
+  `5=CREATE_INDEX` — D25's own enumerated list), `granted_at:TIMESTAMP`.
+
+**`system.grants`'s primary key is a surrogate `grant_id:u32`, not the
+logical `(principal, object_kind, object_id, privilege)` tuple**,
+because `principal` is variable-length `TEXT` and D4 only specifies
+TEXT's *row-value* encoding ("length-prefixed") and its *standalone*
+key encoding ("raw bytes") — neither ADR nor Architecture document
+defines an order-preserving encoding for a variable-length field
+*followed by more fields* inside one composite key (the general
+technique — escape embedded terminator bytes, then append a terminator
+— is a real, well-understood construction, but inventing and shipping
+it here, unreviewed, for the one table that needs it, is exactly the
+kind of "substitute an ad-hoc encoding where the ADR defines a binary
+layout" the review directive forbids when a layout *is* defined, and an
+unreviewed invention when it is not). A surrogate integer PK avoids the
+question entirely; **logical uniqueness of `(principal, object_kind,
+object_id, privilege)` is enforced in the `CatalogService`**, inside
+the same `Mutex`-serialized critical section CA.1 already established
+(read-check-then-write, race-free for the same reason CA.1 is): a
+`grant` call that would duplicate an existing tuple is rejected before
+`write_batch` is invoked.
+
+**Reason**: every field above is the direct, minimal representation of
+what D1/D6/D7/D8/D13/D25/D31 already say each object needs to record —
+nothing here introduces a *new* catalog capability; it makes the ones
+those decisions already named concretely encodable and testable.
+
+**Alternatives rejected**:
+- *Invent and ship an order-preserving variable-length-field-inside-a-
+  composite-key encoding now, to give `system.grants` a "proper"
+  composite physical key.* Rejected for the reason above — an
+  unreviewed, novel encoding technique introduced unilaterally in an
+  implementation increment, for a problem a surrogate key avoids
+  cleanly, is unjustified risk for zero behavioral benefit.
+- *Store `pk_ordinals`/`column_ordinals` as one `system.columns`-style
+  row per (table, position) instead of a single length-prefixed `BLOB`
+  in the owning row.* Rejected: these lists are small (bounded by
+  D3/Architecture §4's own 1,600-column-per-table cap), read-and-
+  written as a unit every time, and splitting them into N additional
+  catalog rows would multiply write-batch member count and read-path
+  row count for a list that is never queried by individual element —
+  exactly the "column-per-cell" write-amplification D3 already rejected
+  for ordinary table rows, applied consistently here.
+
+**Correctness/Security/Performance/Memory/Persistence/Recovery
+impact**: identical to D1/D3's own already-stated impacts — this
+section only fixes the concrete field list those decisions already
+committed to providing *a* correct, complete field list for.
+**Testing requirements**: round-trip encode/decode for every system
+table's `RowValue` (present/absent-default fields, `NULL`-bitmap edge
+cases at every table's actual column count), the grants-uniqueness-
+enforced-at-the-service-layer property specifically (duplicate grant
+rejected, non-duplicate accepted), boundary tests for every `BLOB`-
+encoded ordinal list at 0/1/many elements.
+
+## CA.3 Catalog bootstrap
+
+**Decision**: `CatalogService::bootstrap(&self) -> Result<()>` is
+idempotent (a no-op if catalog rows already exist — checked by range-
+scanning `system.databases` first) and, on a genuinely empty catalog,
+creates exactly two rows in one `write_batch`: the single v1 database
+(`system.databases`, `database_id = 1`, `name = "default"`) and its
+`public` schema (`system.schemas`, `schema_id = 1`, `database_id = 1`,
+`name = "public"`) — matching the Architecture document's own §1
+statement that both always exist. `LsmEngine::open` does **not** call
+`bootstrap` automatically in this increment (no caller — API/CLI
+wiring is a later increment's scope); `bootstrap` is a public
+`CatalogService` method a future increment's startup path calls once.
+
+**Reason**: "a `public` schema always exists" (Architecture §1) needs
+exactly one, explicit, idempotent creation path — not an implicit
+assumption every catalog-reading code path would otherwise need to
+special-case ("what if `public` doesn't exist yet").
+
+**Alternatives rejected**: *Auto-bootstrap inside `CatalogService::new`.*
+Rejected: `new` should be a cheap, infallible-in-practice constructor
+(wrap an `Arc<LsmEngine>`); bootstrapping is a real, `write_batch`-
+issuing, fallible operation with its own idempotency contract — keeping
+it a separate, explicit call matches this project's own "no hidden
+work in a constructor" convention (e.g. `LsmEngine::open`'s own
+explicit, single, well-documented recovery sequence, never implicit).
+
+**Correctness/Security/Performance/Memory/Persistence/Recovery
+impact**: bootstrap is itself just two ordinary catalog rows via one
+`write_batch` — no new impact beyond D1/D9's own already-stated ones.
+**Testing requirements**: bootstrap-on-empty-catalog creates exactly
+the two expected rows; bootstrap-when-already-bootstrapped is a true
+no-op (no new `write_batch` call, verified via `next_seq` not
+advancing); concurrent `bootstrap` calls from multiple threads never
+create duplicate default-database/`public`-schema rows (serialized by
+CA.1's same `Mutex`).
+
+## CA.4 DROP scope for this increment
+
+**Decision**: `DROP TABLE`/`DROP INDEX`/`DROP SCHEMA` in this increment
+perform a **direct, atomic catalog-row removal** via one `write_batch`
+(the table/index/schema's own row, plus — for `DROP TABLE` — its
+`system.columns`, `system.indexes`, and `system.constraints` rows) —
+**not** D13's full two-phase `DROPPING`-marker-then-background-sweep
+protocol. This is a deliberate, explicitly-scoped-down application of
+D13, not a reinterpretation of it: D13's sweep phase exists specifically
+to bound the cost of physically removing a large table's *row and index
+data* — and **no table-row storage exists in this increment** ("Do NOT
+implement user-table row storage" is this increment's own explicit
+scope boundary). There is structurally nothing for a sweep to sweep
+yet. Once a future increment adds table-row storage, `DROP TABLE` must
+be revisited to implement D13's full `DROPPING`-marker-plus-background-
+sweep design exactly as written — this section does not weaken D13; it
+states precisely which slice of D13 has substance today and which does
+not yet.
+
+**Reason**: implementing a background-sweep worker now, with nothing
+for it to ever sweep, would be exactly the kind of speculative,
+unneeded-by-the-current-phase machinery this project's own "don't add
+complexity the current phase doesn't need" principle forbids — and
+would be untestable in any way that actually exercises its resumable-
+on-crash behavior, since no crash-mid-sweep scenario can exist without
+real row data to interrupt sweeping.
+
+**Alternatives rejected**: *Implement the `DROPPING` marker state
+(`system.tables.state`) but not the sweep, leaving dropped tables stuck
+`DROPPING` forever.* Rejected: worse than a direct removal — it invents
+a state with no code path that ever resolves it, a dangling half-
+feature. *Implement the full sweep now, against an empty/nonexistent
+row set, "for completeness."* Rejected: untestable in its own most
+important dimension (crash-mid-sweep-with-real-data) and pure
+speculative complexity per the reasoning above.
+
+**Correctness impact**: a dropped table/index/schema becomes invisible
+atomically (its catalog row is gone the instant the `write_batch`
+commits) — identical to D13's own stated catalog-visibility guarantee,
+just without a physical-data phase that has nothing to act on yet.
+**Security impact**: none beyond D13. **Performance impact**: O(catalog
+rows touched) — cheap, bounded, matching D13's own "small-table DROP
+TABLE" cost class exactly (this increment has no large-table case to
+diverge from it). **Memory impact**: none. **Persistence/Recovery
+impact**: ordinary catalog-row deletion, inherited durability/recovery,
+zero new code. **Testing requirements**: `DROP TABLE` removes exactly
+its own table/columns/indexes/constraints rows and no others (cross-
+table isolation, D2); a dropped table's name becomes immediately
+available for reuse; crash immediately after a `DROP TABLE` `write_
+batch` commits (recovery shows the table gone, not partially gone —
+this is exactly AMENDMENT 001's own atomicity proof, re-exercised
+against catalog rows specifically, not a new proof).
+
+## CA.5 Catalog-scoped value encoding (not the full D4 type system)
+
+**Decision**: this increment implements a small, closed `CatalogValue`
+enum — `U8`, `U16`, `U32`, `I64` (used only for `TIMESTAMP` fields
+here), `Bool`, `Text`, `Blob` — sufficient to encode every field CA.2's
+schema actually uses, built on D3's exact `RowValue` envelope
+(`format_version || schema_version || null_bitmap || values`) and D4's
+stated encoding conventions for the types it reuses (fixed-width for
+numeric/bool, length-prefixed for `TEXT`/`BLOB`). It is **not** the
+full D4 type system (`DECIMAL`, `REAL`, `DOUBLE`, `DATE`, `TIME`, full
+`TIMESTAMP` semantics, order-preserving sign-flip/bit-transform *key*
+encodings for signed/float types) — those exist only where D4 actually
+requires them: user-table columns, which do not exist in this
+increment ("Do NOT implement user-table row storage"). `system.columns.
+data_type:u8` stores D4's full type tag set (so a future increment's
+user-table rows can be typed correctly the moment they exist), but
+this increment's own catalog rows never themselves contain a `DECIMAL`/
+`REAL`/`DOUBLE`/`DATE`/`TIME` value — `CatalogValue` has no such variant
+because nothing in CA.2's schema needs one yet.
+
+**Reason**: building the full, general D4 type system (order-preserving
+transforms for every numeric/temporal type, `DECIMAL`'s scaled-`i128`
+arithmetic, etc.) has no caller in this increment — every catalog field
+CA.2 defines is a `u8`/`u16`/`u32`/`i64`/`bool`/`TEXT`/`BLOB`. Building
+it now "for completeness" would be exactly the untested, unexercised,
+premature-complexity pattern this project consistently rejects
+elsewhere (D7's index-cache deferral, D13's DROP-sweep-now-vs-later
+reasoning above) — it will be built, tested, and property-tested
+against real boundary values when a future increment's user-table row
+storage actually needs it, not speculatively now.
+
+**Alternatives rejected**: *Build the full D4 type system now, even
+though only a subset is exercised.* Rejected per Reason above.
+
+**Correctness/Security/Performance/Memory/Persistence/Recovery
+impact**: identical to D3/D4's own stated impacts, scoped to the subset
+actually implemented. **Testing requirements**: round-trip for every
+`CatalogValue` variant actually implemented, `NULL`-bitmap correctness
+at every system table's real column count (CA.2) — the full D4
+type-system testing requirements (numeric ordering property tests,
+etc.) are out of scope here and remain binding on whichever future
+increment implements the rest of D4.
+
+---
+
+**Catalog increment implementability**: CA.1–CA.5 resolve every open
+point standing between this ADR's already-decided architecture (D1–D33,
+AMENDMENT 001) and a concrete, implementable catalog. The implementation
+increment may now proceed directly against this specification.

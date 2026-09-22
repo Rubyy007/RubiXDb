@@ -6,6 +6,79 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 3 (persistent catalog) (2026-09-22)
+
+Adds the persistent relational catalog on top of the certified
+`write_batch` primitive (Increment 2). Before writing any code,
+`RELATIONAL ADR AMENDMENT 002` resolved the catalog's own remaining open
+points — per-system-table column schemas and primary keys, durable ID
+allocation under concurrency (with no D10 transaction/conflict-detection
+layer yet to lean on), `system_table_id` constant assignment, and this
+increment's own explicitly-scoped-down DROP semantics (no table-row
+storage exists yet for D13's background-sweep phase to act on).
+
+#### Added
+
+- **`src/catalog/`** (new module: `encoding`, `schema`, `service`,
+  `error`): the seven `system.*` tables (D1) as ordinary rows in the
+  certified `LsmEngine`'s own keyspace, under the reserved `0x00`
+  namespace (D2). Every mutation is one `LsmEngine::write_batch` call
+  (D9/D13) — `CREATE TABLE` writes its `system.tables` row, every
+  `system.columns` row, and its default `PRIMARY`-kind `system.indexes`
+  row atomically, in exactly one call (verified directly: the engine's
+  sequence counter advances by exactly one per `create_table`, not one
+  per row).
+- **`CatalogService`**: `bootstrap` (idempotent — creates the single v1
+  database and its `public` schema on a genuinely empty catalog, a true
+  no-op otherwise), `create_schema`/`create_table`/`create_index`/
+  `create_constraint`/`grant`/`revoke`, matching `get_*`/`list_*` reads
+  (ordinary `range_scan`s, no separate catalog cache), and `drop_table`/
+  `drop_index`/`drop_schema` (direct atomic catalog-row removal — this
+  increment's own explicit slice of D13, not its full `DROPPING`-marker-
+  plus-background-sweep design, since no table-row storage exists yet
+  for a sweep to act on).
+- **Durable, restart-safe, collision-free ID allocation**: every ID is
+  read from and incremented as an ordinary catalog row (never a
+  process-local counter as the source of truth), inside the same
+  `write_batch` as the object it names. A new, narrowly-scoped
+  `Mutex` internal to `CatalogService` serializes this process's own
+  catalog-mutating calls — closing a real intra-process ID-collision
+  race `write_batch`'s atomicity alone cannot close without a
+  transaction/conflict-detection layer (D10, not yet implemented).
+- 43 new tests: encode/decode round-trips for every system table and
+  every `NULL`-bitmap boundary, namespace-isolation from pre-existing
+  flat-KV keys, restart/recovery (catalog rows survive a real engine
+  close/reopen; ID allocation continues from its durable value, never
+  resets), concurrent `CREATE TABLE` (16 threads, zero `table_id`
+  collisions; same-name races, exactly one winner), concurrent scans
+  never observing a half-created table, `DROP TABLE` cascade + cross-
+  table isolation, grants uniqueness, and invalid-input rejection
+  (empty name, no columns, no primary key, nullable PK column,
+  duplicate column names, out-of-range ordinals).
+
+#### Explicitly not implemented in this increment
+
+No SQL parser/binder/executor, no `CREATE TABLE` SQL syntax, no
+`INSERT`/`UPDATE`/`DELETE` execution, no user-table row storage, no
+authorization *enforcement* (`system.grants` rows are stored; nothing
+yet checks them — that is D15's binder). `RELATIONAL DATABASE
+PRODUCTION READY = NO.`
+
+#### Regression gate
+
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, `cargo test --workspace` and `--release
+--workspace` (416 `rubixdb` lib tests + 30 `rubixdb-api` tests, debug
+and release), `wal_tests`, `pathological_recovery_matrix`, `crash_
+consistency --features test-util` — all clean, all passing, both
+before and after this increment. `src/manifest/`, `src/compaction/`,
+`src/sstable/`, `src/wal/`, `src/error.rs`, `api/` untouched (`git diff
+--stat` empty for each) — this increment's only source changes are the
+new `src/catalog/` module and one added line in `src/lib.rs`. The same
+pre-existing, machine-throughput-dependent `group_commit` test pair
+(`m1_2`/`m1_3`) noted in Increment 2 recurs identically — confirmed
+unrelated (`tests/` has zero diff from this increment).
+
 ### Relational database: Phase 0/1 architecture audit + Increment 2 (`write_batch` storage primitive) (2026-09-22)
 
 Begins the relational-database phase on top of the certified engine
