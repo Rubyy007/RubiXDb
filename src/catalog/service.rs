@@ -40,6 +40,15 @@ pub struct ColumnDef {
     pub type_params: Option<Vec<u8>>,
 }
 
+/// `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §14 (Resource limits) — bounds
+/// on `CREATE INDEX` itself, enforced before any allocation/write, so an
+/// adversarial or buggy caller cannot grow `system.indexes` or a single
+/// index's key width without bound (item 22/36 of the governing
+/// directive: "protect against... many concurrent builds... oversized
+/// index metadata").
+pub const MAX_INDEXES_PER_TABLE: usize = 64;
+pub const MAX_COLUMNS_PER_INDEX: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CounterKind {
     Database = 1,
@@ -376,7 +385,7 @@ impl CatalogService {
             name: format!("{name}_pkey"),
             kind: IndexKind::Primary,
             column_ordinals: pk_ordinals.to_vec(),
-            state: IndexState::Active,
+            state: IndexState::Ready,
             created_at,
         };
 
@@ -544,6 +553,14 @@ impl CatalogService {
                 detail: "an index must cover at least one column".to_string(),
             });
         }
+        if column_ordinals.len() > MAX_COLUMNS_PER_INDEX {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "an index may cover at most {MAX_COLUMNS_PER_INDEX} columns, got {}",
+                    column_ordinals.len()
+                ),
+            });
+        }
 
         let table = self
             .get_table(table_id)?
@@ -558,9 +575,17 @@ impl CatalogService {
                 });
             }
         }
-        if self.list_indexes(table_id)?.iter().any(|i| i.name == name) {
+        let existing_indexes = self.list_indexes(table_id)?;
+        if existing_indexes.iter().any(|i| i.name == name) {
             return Err(CatalogError::AlreadyExists {
                 object: format!("index {name:?}"),
+            });
+        }
+        if existing_indexes.len() >= MAX_INDEXES_PER_TABLE {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "table {table_id} already has {MAX_INDEXES_PER_TABLE} indexes (the maximum)"
+                ),
             });
         }
 
@@ -634,6 +659,151 @@ impl CatalogService {
         }];
         self.engine.write_batch(&ops)?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------
+    // Index lifecycle state transitions (`PHASE_RELATIONAL_INDEX_
+    // BACKFILL_ADR.md` §9). Each is a single durable `write_batch` Put
+    // of the row with only `state` changed — every other field
+    // (`column_ordinals`, `kind`, `name`, `created_at`) is preserved
+    // verbatim. `IndexBuilder` (`src/relational/index.rs`) is the only
+    // caller; it holds the affected table's epoch lock (write side) for
+    // `create_index` (the initial `Building`-state row insert, T0) and
+    // for `mark_index_dropping` specifically because *those two*
+    // transitions change which indexes
+    // `TableStore`'s write path must maintain — `mark_index_ready`/
+    // `mark_index_failed` do not change the maintained-index set (a
+    // `Building` index is already maintained; `Ready`/`Failed` doesn't
+    // stop or start that), so they need no epoch-lock coordination, only
+    // `ddl_lock`'s existing catalog-mutation serialization.
+    // -------------------------------------------------------------
+
+    fn transition_index_state(
+        &self,
+        index_id: u32,
+        allowed_from: &[IndexState],
+        to: IndexState,
+    ) -> Result<IndexRow> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut row = self
+            .get_index(index_id)?
+            .ok_or_else(|| CatalogError::NotFound {
+                object: format!("index {index_id}"),
+            })?;
+        if !allowed_from.contains(&row.state) {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "index {index_id} is in state {:?}, cannot transition to {to:?} \
+                     (allowed from {allowed_from:?})",
+                    row.state
+                ),
+            });
+        }
+        row.state = to;
+        let ops = vec![WriteOp::Put {
+            key: catalog_key(SYSTEM_TABLE_INDEXES, &index_id.to_be_bytes()),
+            value: encode_row(1, &row.to_fields()),
+        }];
+        self.engine.write_batch(&ops)?;
+        Ok(row)
+    }
+
+    /// `Building` -> `Ready`: the durable, atomic activation boundary
+    /// (`PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §7's T5). Only a
+    /// `Ready` index is ever query-usable.
+    pub fn mark_index_ready(&self, index_id: u32) -> Result<()> {
+        self.transition_index_state(index_id, &[IndexState::Building], IndexState::Ready)?;
+        Ok(())
+    }
+
+    /// `Building` -> `Failed`: a build was aborted (backfill error,
+    /// process restart choosing "restart" over "resume" and finding the
+    /// prior attempt unrecoverable, etc.) without ever reaching `Ready`.
+    /// Terminal — never maintained, never query-usable.
+    pub fn mark_index_failed(&self, index_id: u32) -> Result<()> {
+        self.transition_index_state(index_id, &[IndexState::Building], IndexState::Failed)?;
+        Ok(())
+    }
+
+    /// `Building`/`Ready`/`Failed` -> `Dropping`: `DROP INDEX`'s durable
+    /// first phase (D13's `DROPPING`-table precedent, applied to
+    /// indexes). The instant this commits, `TableStore`'s write path
+    /// stops maintaining the index (its own `list_indexes` call will see
+    /// `Dropping`, not `Building`/`Ready`) — the caller of this method is
+    /// responsible for holding the table's epoch write-lock across this
+    /// call so no writer's already-in-flight critical section can
+    /// straddle the boundary (see `IndexBuilder::drop_index_online`).
+    pub fn mark_index_dropping(&self, index_id: u32) -> Result<()> {
+        let row = self
+            .get_index(index_id)?
+            .ok_or_else(|| CatalogError::NotFound {
+                object: format!("index {index_id}"),
+            })?;
+        if row.kind == IndexKind::Primary {
+            return Err(CatalogError::InvalidInput {
+                detail: "the PRIMARY index cannot be dropped independently of its table"
+                    .to_string(),
+            });
+        }
+        self.transition_index_state(
+            index_id,
+            &[IndexState::Building, IndexState::Ready, IndexState::Failed],
+            IndexState::Dropping,
+        )?;
+        Ok(())
+    }
+
+    /// Final removal of a `Dropping` index's catalog row, once its
+    /// physical entry sweep has completed — the D13-mirrored second
+    /// phase. Idempotent from the caller's perspective (`NotFound` if
+    /// already removed, e.g. by a concurrent/retried sweep after a
+    /// crash) rather than requiring the caller to track completion
+    /// separately.
+    pub fn remove_index_row(&self, index_id: u32) -> Result<()> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let row = self
+            .get_index(index_id)?
+            .ok_or_else(|| CatalogError::NotFound {
+                object: format!("index {index_id}"),
+            })?;
+        if row.state != IndexState::Dropping {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "index {index_id} is in state {:?}, expected Dropping before final removal",
+                    row.state
+                ),
+            });
+        }
+        let ops = vec![WriteOp::Delete {
+            key: catalog_key(SYSTEM_TABLE_INDEXES, &index_id.to_be_bytes()),
+        }];
+        self.engine.write_batch(&ops)?;
+        Ok(())
+    }
+
+    /// Every `system.indexes` row currently in `state`, across every
+    /// table — used by crash recovery (`IndexBuilder::recover_
+    /// incomplete_builds`/`recover_incomplete_drops`) to find `Building`/
+    /// `Dropping` indexes left behind by a process that died mid-build or
+    /// mid-sweep. A full scan (surrogate `index_id` PK, CA.2's own
+    /// documented tradeoff, same as `list_indexes`) — acceptable, since
+    /// this only ever runs once at startup, never on a per-write path.
+    pub fn list_indexes_in_state(&self, state: IndexState) -> Result<Vec<IndexRow>> {
+        let (start, end) = system_table_range(SYSTEM_TABLE_INDEXES);
+        let mut out = Vec::new();
+        for row in self
+            .engine
+            .range_scan(as_bound_ref(&start), as_bound_ref(&end), u64::MAX)
+        {
+            let (key, value) = row?;
+            let index_id = pk_tail_u32(&key)?;
+            let (_, fields) = decode_row(&value, &INDEXES_SCHEMA)?;
+            let index = IndexRow::from_fields(index_id, fields)?;
+            if index.state == state {
+                out.push(index);
+            }
+        }
+        Ok(out)
     }
 
     // -------------------------------------------------------------

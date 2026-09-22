@@ -6,6 +6,56 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 5 (production secondary indexes, online `CREATE INDEX`) (2026-09-23)
+
+Adds real, persistent, online-buildable secondary indexes on top of the
+certified catalog and row-storage foundation. `PHASE_RELATIONAL_INDEX_
+BACKFILL_ADR.md` is the full decision record.
+
+#### Added
+
+- `src/relational/index_key.rs`: order-preserving, NULL-aware, composite
+  index-entry key encoding/decoding (a 1-byte presence tag per indexed
+  column: NULL sorts before every real value), whole-index/prefix/
+  arbitrary-`Bound` physical range construction.
+- `src/relational/index.rs`: `IndexBuilder` -- online `CREATE INDEX`
+  (snapshot-bounded, chunked backfill running concurrently with ordinary
+  writes; atomic `Building -> Ready` activation), `DROP INDEX` (bounded,
+  resumable physical sweep), crash recovery (`recover_incomplete_
+  builds`/`recover_incomplete_drops`, both restart-from-scratch, never
+  silently promote), `index_lookup`/`index_range_scan` (real index-then-
+  fetch, never a table-wide scan), bounded-cardinality stats.
+- `TableStore::epoch_lock`: a per-table `RwLock<()>` that (a) makes the
+  `Building`/`Dropping` catalog-state transition atomic with respect to
+  every ordinary writer's own maintained-index-set resolution, and (b)
+  makes each backfill chunk's final commit atomic with respect to
+  concurrent maintenance of the same rows -- together, these close a
+  "missed write" race and a "phantom entry" race (a stale backfilled
+  write resurrecting an entry for a row deleted mid-build), both proven
+  in the ADR and covered by deterministic, barrier-synchronized tests.
+- `catalog::schema::IndexState` extended to `{Ready, Building, Failed,
+  Dropping}` (`Active` renamed `Ready`, same on-disk tag `0`); new
+  `CatalogService` transitions `mark_index_ready`/`mark_index_failed`/
+  `mark_index_dropping`/`remove_index_row`/`list_indexes_in_state`;
+  `MAX_INDEXES_PER_TABLE`/`MAX_COLUMNS_PER_INDEX` resource limits.
+- `benches/secondary_index_bench.rs`: backfill throughput, index lookup/
+  range scan vs. full table scan, write amplification vs. indexed-column
+  count -- measured, not claimed (index equality lookup ~467x faster
+  than an equivalent full scan at 1-in-5,000 selectivity on this
+  machine; write latency flat across 0-10 indexes, `fsync`-dominated,
+  matching the row-storage increment's own identical finding).
+
+#### Fixed
+
+- `relational::key::table_row_range` bounded a table scan by the entire
+  `table_id` key prefix rather than just the `index_id = 0` slot -- a
+  latent defect (harmless before secondary indexes existed under the
+  same prefix, a real correctness bug the instant they do) found by this
+  increment's own tests, not by inspection. Fixed to bound exactly
+  `[table_id||0, table_id||1)`; the fix also happens to remove an
+  existing `u32::MAX`-`table_id` `Bound::Unbounded` special case,
+  replacing it with a precise `Bound::Excluded` in every case.
+
 ### Relational database: Increment 4 (row-storage foundation) (2026-09-22)
 
 Connects the certified catalog (Increment 3, `d66029d`) to actual user-

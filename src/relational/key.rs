@@ -31,19 +31,27 @@ pub fn table_row_key(table_id: u32, encoded_pk: &[u8]) -> Vec<u8> {
     key
 }
 
-/// The `[start, end)` range covering every row of one table (D2's
-/// namespace/`table_id` prefix) — used for `TableStore::scan_table`.
-/// Mirrors `catalog::encoding::system_table_range`'s own reasoning
-/// exactly, one namespace over.
+/// The `[start, end)` range covering every row of one table — bounded to
+/// exactly the `index_id = 0` slot (`table_row_key`'s own reserved
+/// meaning), **not** the whole `table_id` prefix. `PHASE_RELATIONAL_
+/// INDEX_BACKFILL_ADR.md` §1 corrects this function: before secondary
+/// indexes existed, `table_id`'s prefix contained nothing but `index_id =
+/// 0` rows, so bounding by "the next `table_id`" was harmlessly
+/// equivalent to bounding by "the next `index_id`." Once a secondary
+/// index (`index_id > 0`) physically lives under the *same* `table_id`
+/// prefix (`relational::index_key::index_entry_key`), that equivalence
+/// breaks: the old bound would silently include every index's entries in
+/// a plain table scan. Bounding to `[table_id||0, table_id||1)` instead
+/// makes this structurally impossible, matching `catalog::encoding::
+/// system_table_range`'s own "never trust a wider bound than the data's
+/// own reserved slot" discipline, one level deeper.
 pub fn table_row_range(table_id: u32) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     let start = table_row_key(table_id, &[]);
-    match table_id.checked_add(1) {
-        Some(next) => (
-            Bound::Included(start),
-            Bound::Excluded(table_row_key(next, &[])),
-        ),
-        None => (Bound::Included(start), Bound::Unbounded),
-    }
+    let mut end = Vec::with_capacity(1 + 4 + 4);
+    end.push(RELATIONAL_NAMESPACE);
+    end.extend_from_slice(&table_id.to_be_bytes());
+    end.extend_from_slice(&1u32.to_be_bytes());
+    (Bound::Included(start), Bound::Excluded(end))
 }
 
 /// RA.2: encodes one key-bearing value's order-preserving representation
@@ -108,7 +116,11 @@ pub fn decode_composite_key(
     Ok(out)
 }
 
-fn decode_key_value(
+/// `pub(crate)`: reused by `relational::index_key` to decode one indexed
+/// column's value after consuming its NULL/present presence tag (the
+/// primary-key composite-key decode path above never needs a presence
+/// tag, since PK columns are never `NULL` — D5).
+pub(crate) fn decode_key_value(
     field_type: RelationalType,
     bytes: &[u8],
     pos: &mut usize,

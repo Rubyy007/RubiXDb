@@ -3153,3 +3153,55 @@ deliberately shaped to need no call-site change when it is added.
 **RELATIONAL DATABASE PRODUCTION READY = NO.** Write/Read/Compaction
 remain independently PRODUCTION READY, unaffected. Full account:
 `PHASE_RELATIONAL_ROW_STORAGE_RESULTS.md`.
+
+---
+
+## 2026-09-23
+
+**Implemented:** Increment 5 -- production secondary indexes with
+online `CREATE INDEX`. `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` is the
+full decision record. `put_row`/`put_rows`/`delete_row` now maintain
+every `Building`/`Ready` secondary index atomically (one `write_batch`
+per row op, D11) -- the exact wiring `PHASE_RELATIONAL_ROW_STORAGE_
+RESULTS.md` had deliberately left for this increment. A new per-table
+"index epoch lock" (`TableStore::epoch_lock`, one `RwLock<()>`, reusing
+the same mutual-exclusion proof technique already certified for
+`write_batch`'s own atomicity) closes two concurrency races: a writer
+using a stale index list across the `Building` catalog transition, and
+a "phantom entry" race where a stale backfilled write could resurrect
+an entry for a row deleted mid-build. Both are proven in the ADR and
+directly tested with barrier-synchronized (never sleep-based)
+concurrency.
+
+**Found and fixed along the way:** a latent boundary bug in
+`relational::key::table_row_range` -- it bounded a table scan by the
+entire `table_id` key prefix, which silently included secondary-index
+entries (sharing that same prefix, `index_id > 0`) once they existed.
+Caught by this increment's own tests, not by inspection first.
+
+`IndexState` extended from `{Active, Building}` to `{Ready, Building,
+Failed, Dropping}` (`Active` renamed `Ready`, same on-disk tag).
+`DROP INDEX` is a bounded, resumable physical sweep (D13's `DROPPING`-
+table precedent, mirrored). Crash recovery restarts an interrupted
+build or sweep from scratch (never resumes from an unproven cursor,
+never silently promotes to `Ready`). `IndexBuilder::index_lookup`/
+`index_range_scan` are real index-then-fetch access paths -- measured
+~467x faster than an equivalent full table scan for a 1-in-5,000
+selective predicate. `UNIQUE` index physical structure exists;
+enforcement is correctly deferred to the not-yet-built transaction
+layer (D10), stated honestly, not faked.
+
+31 new tests (concurrency, crash recovery, restart persistence, a real
+automatic-compaction interaction test -- 49 real compaction cycles
+observed racing an in-progress backfill in one run -- resource limits,
+corruption handling). Full regression: 497 `rubixdb` + 30 `rubixdb-api`
+tests, debug and release, all passing; `wal_tests`/`pathological_
+recovery_matrix`/`crash_consistency` unchanged. `src/manifest/`,
+`src/compaction/`, `src/sstable/`, `src/wal/`, `api/` completely
+untouched -- no new storage-engine primitive was required; the whole
+protocol is built from the already-certified `snapshot`/`range_scan(...,
+as_of_seq)`/`write_batch`.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** Write/Read/Compaction
+remain independently PRODUCTION READY, unaffected. Full account:
+`PHASE_RELATIONAL_INDEX_INCREMENT5_RESULTS.md`.

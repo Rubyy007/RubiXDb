@@ -339,17 +339,45 @@ impl IndexKind {
     }
 }
 
+/// `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §9's catalog state machine —
+/// the authoritative logical state of one index, superseding the
+/// two-state (`Active`/`Building`) placeholder `RELATIONAL ADR AMENDMENT
+/// 002` shipped before online index creation existed. `Ready` is this
+/// increment's rename of the old `Active` (same numeric tag `0`, so any
+/// row persisted by the prior increment — the `PRIMARY`-kind index every
+/// `create_table` call writes — decodes unchanged); `Building`/`Failed`/
+/// `Dropping` are additive. Only a `Ready` index may ever be chosen by
+/// future query planning (no planner exists yet to enforce this, but the
+/// invariant is stated here as the contract that planner must honor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {
-    Active = 0,
+    /// Fully built, atomically activated, safe for query use.
+    Ready = 0,
+    /// Backfill in progress (or not yet started) — physically present
+    /// entries may be incomplete. Already receiving live maintenance
+    /// writes (`PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §4), but never
+    /// query-usable.
     Building = 1,
+    /// A build (or, if this project ever needs it, a re-verification)
+    /// failed and was not promoted to `Ready`. Terminal — not maintained,
+    /// not query-usable, kept only for operator visibility until the
+    /// caller drops it and a fresh `CREATE INDEX` is issued.
+    Failed = 2,
+    /// `DROP INDEX` has been durably recorded; no longer maintained by
+    /// new writes (`PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §11 mirrors
+    /// D13's `DROPPING`-table precedent). A bounded, resumable physical
+    /// sweep is removing its entries; the catalog row itself is deleted
+    /// once the sweep completes.
+    Dropping = 3,
 }
 
 impl IndexState {
     fn from_u8(v: u8) -> Result<Self> {
         match v {
-            0 => Ok(IndexState::Active),
+            0 => Ok(IndexState::Ready),
             1 => Ok(IndexState::Building),
+            2 => Ok(IndexState::Failed),
+            3 => Ok(IndexState::Dropping),
             other => Err(CatalogError::InvalidInput {
                 detail: format!("unknown IndexState {other}"),
             }),
@@ -702,7 +730,33 @@ mod tests {
                 name: "idx".to_string(),
                 kind,
                 column_ordinals: vec![0],
-                state: IndexState::Active,
+                state: IndexState::Ready,
+                created_at: 1000,
+            };
+            let encoded = encode_row(1, &row.to_fields());
+            let (_, fields) = decode_row(&encoded, &INDEXES_SCHEMA).unwrap();
+            assert_eq!(IndexRow::from_fields(1, fields).unwrap(), row);
+        }
+    }
+
+    /// `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §9: the full four-state
+    /// lifecycle round-trips, including the two states this increment
+    /// adds (`Failed`/`Dropping`).
+    #[test]
+    fn index_row_round_trips_every_state() {
+        for state in [
+            IndexState::Ready,
+            IndexState::Building,
+            IndexState::Failed,
+            IndexState::Dropping,
+        ] {
+            let row = IndexRow {
+                index_id: 1,
+                table_id: 3,
+                name: "idx".to_string(),
+                kind: IndexKind::NonUnique,
+                column_ordinals: vec![0],
+                state,
                 created_at: 1000,
             };
             let encoded = encode_row(1, &row.to_fields());

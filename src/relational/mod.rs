@@ -12,13 +12,19 @@
 //! architecture).
 
 pub mod error;
+pub mod index;
+pub mod index_key;
 pub mod key;
 pub mod table_store;
 pub mod value;
 
 pub use error::{RelationalError, Result};
+pub use index::{IndexBuilder, IndexStatsSnapshot};
 pub use table_store::{Row, TableStore, MAX_ROW_VALUE_BYTES};
 pub use value::{RelationalType, RelationalValue};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod index_tests;

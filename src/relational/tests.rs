@@ -408,16 +408,31 @@ fn scan_table_boundaries_at_min_and_max_and_neighboring_table_ids() {
     assert!(start_bytes <= inside_low && inside_low < end_bytes);
     assert!(start_bytes <= inside_high && inside_high < end_bytes);
 
+    // `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §1: a secondary-index
+    // entry for this *same* table_id (index_id > 0) must sort entirely
+    // at/after this range's end — the exact boundary bug the ADR fixes
+    // (the range used to be bounded by the next table_id, which wrongly
+    // included every index's entries under the same table_id prefix).
+    let an_index_entry =
+        crate::relational::index_key::index_entry_key(table_id, 1, &[], &[0x00]).unwrap();
+    assert!(
+        an_index_entry >= end_bytes,
+        "an index entry under the same table_id must not fall inside the table-row range"
+    );
+
     // table_id = 0 and table_id = u32::MAX (min/max) must not panic and
-    // must still produce a well-formed, non-overlapping range.
+    // must still produce a well-formed, non-overlapping range. Since the
+    // range is now bounded by `index_id` (0..1), not by `table_id + 1`,
+    // it is always a precise `Excluded` bound, even at `table_id =
+    // u32::MAX` (there is no `index_id` overflow to fall back from).
     let (min_start, min_end) = table_row_range(0);
     let (max_start, max_end) = table_row_range(u32::MAX);
     assert!(matches!(min_start, Bound::Included(_)));
     assert!(matches!(min_end, Bound::Excluded(_)));
     assert!(matches!(max_start, Bound::Included(_)));
     assert!(
-        matches!(max_end, Bound::Unbounded),
-        "table_id = u32::MAX has no next table_id to bound against"
+        matches!(max_end, Bound::Excluded(_)),
+        "table_id = u32::MAX must still produce a precise index_id-bounded end"
     );
 }
 

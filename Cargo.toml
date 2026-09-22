@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "table_store_bench"
 harness = false
+
+[[bench]]
+name = "secondary_index_bench"
+harness = false
