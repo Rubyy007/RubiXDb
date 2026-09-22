@@ -34,6 +34,14 @@ pub const OP_CHECKPOINT_MARKER: u8 = 3;
 /// only so recovery can name it explicitly in an error rather than falling
 /// through to "unknown op byte".
 pub const OP_ENGINE_SWITCH: u8 = 4;
+/// `RELATIONAL ADR AMENDMENT 001` AA.2: one frame atomically encoding N
+/// `PUT`/`DELETE` operations under one shared `seq` — the storage
+/// primitive `LsmEngine::write_batch` requires. Additive: `PUT`/
+/// `DELETE`/`CHECKPOINT_MARKER`'s existing byte layout and meaning are
+/// unchanged, and the frame-level `length || crc32c` envelope (this
+/// module) needs no changes at all to carry it — only `wal::ops`'s
+/// encode/decode match arms are extended.
+pub const OP_GROUP: u8 = 5;
 
 /// WAL Spec §2.6 default. Also used, independently, as the SSTable record
 /// format's length-field bound (LSM Engine Spec §2.2) via the same

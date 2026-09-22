@@ -56,6 +56,13 @@ pub enum EngineError {
     /// storage availability returns and the engine's storage state moves
     /// back toward `Healthy`.
     StorageExhausted { detail: String },
+    /// A caller-supplied argument violates a precondition that has
+    /// nothing to do with capacity/size (which is `CapacityExceeded`'s
+    /// job) — e.g. `LsmEngine::write_batch(&[])`, an empty batch with no
+    /// logical write to make durable (`RELATIONAL ADR AMENDMENT 001`
+    /// AA.1). Never carries key/value bytes or credentials, matching
+    /// every other variant's discipline.
+    InvalidArgument { detail: String },
 }
 
 impl fmt::Display for EngineError {
@@ -76,6 +83,9 @@ impl fmt::Display for EngineError {
             EngineError::Timeout { detail } => write!(f, "timeout: {detail}"),
             EngineError::StorageExhausted { detail } => {
                 write!(f, "storage exhausted: {detail}")
+            }
+            EngineError::InvalidArgument { detail } => {
+                write!(f, "invalid argument: {detail}")
             }
         }
     }

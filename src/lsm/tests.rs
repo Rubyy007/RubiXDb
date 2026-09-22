@@ -264,6 +264,7 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         flush_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         flush_delay_ms: Arc::new(AtomicU64::new(0)),
         capacity_pressure_events: AtomicU64::new(0),
+        batch_apply_delay_ms: AtomicU64::new(0),
         flush_fault_hook: Arc::new(Mutex::new(None)),
         storage_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         storage_pressure_events: Arc::new(AtomicU64::new(0)),
@@ -5568,6 +5569,504 @@ mod compaction_tests {
 
             engine.shutdown();
             let _ = fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// `LsmEngine::write_batch` — `RELATIONAL ADR AMENDMENT 001` AA.1–AA.9
+/// is the complete specification; every test here cites the section it
+/// verifies.
+mod write_batch_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    // --- AA.1: basic round-trip, seq semantics ---
+
+    #[test]
+    fn write_batch_multi_put_all_visible_at_returned_seq_none_before() {
+        let dir = temp_dir("wb_basic");
+        let engine = open(&dir, LsmConfig::default());
+        let seq = engine
+            .write_batch(&[
+                WriteOp::Put {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+                WriteOp::Put {
+                    key: b"k2".to_vec(),
+                    value: b"v2".to_vec(),
+                },
+            ])
+            .unwrap();
+        // AA.1: "what snapshot visibility means" — all-or-nothing at
+        // exactly one seq value.
+        assert_eq!(engine.get_as_of(b"k1", seq).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get_as_of(b"k2", seq).unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.get_as_of(b"k1", seq - 1).unwrap(), None);
+        assert_eq!(engine.get_as_of(b"k2", seq - 1).unwrap(), None);
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_mixed_put_delete_round_trips() {
+        let dir = temp_dir("wb_mixed");
+        let engine = open(&dir, LsmConfig::default());
+        engine.put(b"existing", b"old").unwrap();
+        let seq = engine
+            .write_batch(&[
+                WriteOp::Put {
+                    key: b"new".to_vec(),
+                    value: b"nv".to_vec(),
+                },
+                WriteOp::Delete {
+                    key: b"existing".to_vec(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(engine.get(b"new").unwrap(), Some(b"nv".to_vec()));
+        assert_eq!(engine.get(b"existing").unwrap(), None);
+        assert_eq!(
+            engine.get_as_of(b"existing", seq - 1).unwrap(),
+            Some(b"old".to_vec()),
+            "the batch's own tombstone must not be visible one seq earlier"
+        );
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_empty_is_rejected_with_invalid_argument() {
+        let dir = temp_dir("wb_empty");
+        let engine = open(&dir, LsmConfig::default());
+        let err = engine.write_batch(&[]).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidArgument { .. }));
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- AA.1/AA.6: batch size boundary ---
+
+    #[test]
+    fn write_batch_at_exactly_max_batch_ops_succeeds() {
+        let dir = temp_dir("wb_boundary_ok");
+        let lsm_config = LsmConfig {
+            max_batch_ops: 8,
+            ..LsmConfig::default()
+        };
+        let engine = open(&dir, lsm_config);
+        let ops: Vec<WriteOp> = (0..8u32)
+            .map(|i| WriteOp::Put {
+                key: format!("k{i}").into_bytes(),
+                value: b"v".to_vec(),
+            })
+            .collect();
+        assert!(engine.write_batch(&ops).is_ok());
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_over_max_batch_ops_fails_with_capacity_exceeded_and_writes_nothing() {
+        let dir = temp_dir("wb_boundary_over");
+        let lsm_config = LsmConfig {
+            max_batch_ops: 8,
+            ..LsmConfig::default()
+        };
+        let engine = open(&dir, lsm_config);
+        let ops: Vec<WriteOp> = (0..9u32)
+            .map(|i| WriteOp::Put {
+                key: format!("k{i}").into_bytes(),
+                value: b"v".to_vec(),
+            })
+            .collect();
+        let err = engine.write_batch(&ops).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::CapacityExceeded {
+                requested: 9,
+                max: 8
+            }
+        ));
+        // No partial write: none of the 9 keys should exist.
+        for i in 0..9u32 {
+            assert_eq!(engine.get(format!("k{i}").as_bytes()).unwrap(), None);
+        }
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- AA.4: same-key resolution within one batch ---
+
+    #[test]
+    fn write_batch_same_key_put_put_last_wins() {
+        let dir = temp_dir("wb_put_put");
+        let engine = open(&dir, LsmConfig::default());
+        engine
+            .write_batch(&[
+                WriteOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"x".to_vec(),
+                },
+                WriteOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"y".to_vec(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"y".to_vec()));
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_same_key_delete_then_put_ends_live() {
+        let dir = temp_dir("wb_delete_put");
+        let engine = open(&dir, LsmConfig::default());
+        engine
+            .write_batch(&[
+                WriteOp::Delete { key: b"a".to_vec() },
+                WriteOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"y".to_vec(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"y".to_vec()));
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_same_key_put_then_delete_ends_tombstoned() {
+        let dir = temp_dir("wb_put_delete");
+        let engine = open(&dir, LsmConfig::default());
+        engine
+            .write_batch(&[
+                WriteOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"x".to_vec(),
+                },
+                WriteOp::Delete { key: b"a".to_vec() },
+            ])
+            .unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), None);
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- AA.5: N=1 functional equivalence to put/delete (perf parity is
+    // measured separately, in benches/ — this is the correctness half) ---
+
+    #[test]
+    fn write_batch_single_put_behaves_like_put() {
+        let dir = temp_dir("wb_n1_put");
+        let engine = open(&dir, LsmConfig::default());
+        let seq = engine
+            .write_batch(&[WriteOp::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }])
+            .unwrap();
+        assert_eq!(engine.get_as_of(b"k", seq).unwrap(), Some(b"v".to_vec()));
+        assert_eq!(engine.get_as_of(b"k", seq - 1).unwrap(), None);
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_single_delete_behaves_like_delete() {
+        let dir = temp_dir("wb_n1_delete");
+        let engine = open(&dir, LsmConfig::default());
+        engine.put(b"k", b"v").unwrap();
+        engine
+            .write_batch(&[WriteOp::Delete { key: b"k".to_vec() }])
+            .unwrap();
+        assert_eq!(engine.get(b"k").unwrap(), None);
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- AA.1/AA.2/AA.7: crash recovery replays the whole batch or none ---
+
+    #[test]
+    fn write_batch_survives_restart_all_members_present() {
+        let dir = temp_dir("wb_recovery");
+        {
+            let engine = open(&dir, LsmConfig::default());
+            engine
+                .write_batch(&[
+                    WriteOp::Put {
+                        key: b"a".to_vec(),
+                        value: b"1".to_vec(),
+                    },
+                    WriteOp::Put {
+                        key: b"b".to_vec(),
+                        value: b"2".to_vec(),
+                    },
+                    WriteOp::Delete { key: b"c".to_vec() },
+                ])
+                .unwrap();
+            engine.shutdown();
+        }
+        // Reopen — WAL replay must reconstruct the exact same state via
+        // `apply_wal_op`'s `Group` arm (AA.1: "recovery replays exactly
+        // what live apply does").
+        let engine = open(&dir, LsmConfig::default());
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(engine.get(b"c").unwrap(), None);
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_recovery_preserves_same_key_last_wins_resolution() {
+        let dir = temp_dir("wb_recovery_lastwins");
+        {
+            let engine = open(&dir, LsmConfig::default());
+            engine
+                .write_batch(&[
+                    WriteOp::Put {
+                        key: b"a".to_vec(),
+                        value: b"x".to_vec(),
+                    },
+                    WriteOp::Put {
+                        key: b"a".to_vec(),
+                        value: b"y".to_vec(),
+                    },
+                ])
+                .unwrap();
+            engine.shutdown();
+        }
+        let engine = open(&dir, LsmConfig::default());
+        assert_eq!(
+            engine.get(b"a").unwrap(),
+            Some(b"y".to_vec()),
+            "recovery must reach the identical last-write-wins result live-apply reached"
+        );
+        engine.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- AA.3: concurrent-reader-never-sees-a-partial-batch ---
+
+    /// The direct proof-in-code of AA.3's atomicity claim: a reader
+    /// thread attempting a `range_scan` covering all four of a batch's
+    /// keys while `write_batch` is deliberately held mid-critical-
+    /// section (via `set_batch_apply_delay_for_test`, mirroring the
+    /// codebase's own established `set_flush_delay_for_test` pattern)
+    /// must observe either none or all of the batch's keys — never
+    /// some. `range_scan` is used specifically (not four separate
+    /// `get_as_of` calls) because `capture_read_view` takes the active-
+    /// MemTable read lock exactly **once** and copies the whole
+    /// matching key range in that single critical section
+    /// (`LsmEngine::capture_read_view`, `src/lsm/mod.rs`) — the same
+    /// `RwLock` mutual exclusion AA.3's proof rests on, applied across
+    /// all four keys in one lock acquisition, not four independent
+    /// ones (four separate `get_as_of` calls each re-acquire the lock
+    /// independently and can legitimately straddle an *entire* writer
+    /// critical section landing between two of them — a real property
+    /// of independent single-key reads, not a partial-batch-visibility
+    /// bug, and not what this test is about). `std::sync::Barrier` (not
+    /// a sleep) synchronizes the reader thread's start against the
+    /// writer thread's start.
+    #[test]
+    fn concurrent_reader_never_observes_a_partial_batch() {
+        let dir = temp_dir("wb_concurrent_reader");
+        let engine = Arc::new(open(&dir, LsmConfig::default()));
+        engine.set_batch_apply_delay_for_test(Duration::from_millis(50));
+
+        const KEYS: &[&[u8]] = &[b"k1", b"k2", b"k3", b"k4"];
+        const ITERATIONS: usize = 30;
+        let mut partial_observations = 0usize;
+        // Keys persist across rounds (never deleted), so "not yet
+        // applied" for round R means "still showing round R-1's value,"
+        // not `None` — `None` is only the correct "not yet applied"
+        // reading for round 0. Tracked so the assertion below checks
+        // for genuine cross-key inconsistency (some keys on round R,
+        // others on round R-1), not merely "not all equal to the
+        // current round's value."
+        let mut previous_value: Option<Vec<u8>> = None;
+
+        for round in 0..ITERATIONS {
+            let barrier = Arc::new(Barrier::new(2));
+            let writer_engine = Arc::clone(&engine);
+            let writer_barrier = Arc::clone(&barrier);
+            let value = format!("v{round}").into_bytes();
+            let value_for_writer = value.clone();
+            let writer = thread::spawn(move || {
+                writer_barrier.wait();
+                writer_engine
+                    .write_batch(&[
+                        WriteOp::Put {
+                            key: b"k1".to_vec(),
+                            value: value_for_writer.clone(),
+                        },
+                        WriteOp::Put {
+                            key: b"k2".to_vec(),
+                            value: value_for_writer.clone(),
+                        },
+                        WriteOp::Put {
+                            key: b"k3".to_vec(),
+                            value: value_for_writer.clone(),
+                        },
+                        WriteOp::Put {
+                            key: b"k4".to_vec(),
+                            value: value_for_writer,
+                        },
+                    ])
+                    .unwrap()
+            });
+
+            barrier.wait();
+            // Give the writer a small, bounded head start toward
+            // acquiring the write lock, then race a single `range_scan`
+            // against its (delayed) critical section — one lock
+            // acquisition covering all four keys at once.
+            thread::sleep(Duration::from_millis(5));
+            let snapshot = engine.snapshot();
+            let mut observed: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+                std::collections::HashMap::new();
+            for row in engine.range_scan(
+                Bound::Included(b"k1"),
+                Bound::Included(b"k4"),
+                snapshot.seq(),
+            ) {
+                let (k, v) = row.unwrap();
+                observed.insert(k, v);
+            }
+            let current_expected: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+                KEYS.iter().map(|k| (k.to_vec(), value.clone())).collect();
+            let previous_expected: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+                match &previous_value {
+                    Some(v) => KEYS.iter().map(|k| (k.to_vec(), v.clone())).collect(),
+                    None => std::collections::HashMap::new(),
+                };
+            // Atomic iff the single `range_scan` snapshot equals either
+            // the full post-batch state (`current_expected`) or the
+            // full pre-batch state (`previous_expected`, empty for
+            // round 0) — never a mix of the two across the four keys,
+            // which is exactly the partial-batch visibility AA.3
+            // forbids.
+            if observed != current_expected && observed != previous_expected {
+                partial_observations += 1;
+            }
+
+            writer.join().unwrap();
+            // After the writer has fully returned, every key must be
+            // present with this round's value — confirms the batch did
+            // eventually apply, whichever side of the race the read
+            // landed on.
+            for k in KEYS {
+                assert_eq!(engine.get(k).unwrap(), Some(value.clone()));
+            }
+            previous_value = Some(value);
+        }
+
+        assert_eq!(
+            partial_observations, 0,
+            "a concurrent reader observed a partial batch at least once across {ITERATIONS} \
+             interleavings — violates AA.3's atomicity proof"
+        );
+
+        engine.set_batch_apply_delay_for_test(Duration::from_millis(0));
+        Arc::try_unwrap(engine).ok().unwrap().shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- AA.4/AA.7: differential test against an independent, serialized
+    // reference model (never the production batch implementation as its
+    // own oracle) ---
+
+    mod differential {
+        use super::*;
+        use proptest::collection::vec as pvec;
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+
+        #[derive(Debug, Clone)]
+        enum FuzzWriteOp {
+            Put { key_idx: u8, value: Vec<u8> },
+            Delete { key_idx: u8 },
+        }
+
+        fn fuzz_write_op_strategy() -> impl Strategy<Value = FuzzWriteOp> {
+            prop_oneof![
+                (0u8..6, pvec(any::<u8>(), 0..8))
+                    .prop_map(|(key_idx, value)| FuzzWriteOp::Put { key_idx, value }),
+                (0u8..6).prop_map(|key_idx| FuzzWriteOp::Delete { key_idx }),
+            ]
+        }
+
+        fn key_for(idx: u8) -> Vec<u8> {
+            format!("k{idx}").into_bytes()
+        }
+
+        /// The independent reference model: applies the same logical
+        /// sequence of `FuzzWriteOp`s to a plain `BTreeMap`, using
+        /// exactly AA.4's documented rule (last operation in the
+        /// caller-supplied sequence wins per key) — computed with no
+        /// dependency whatsoever on `write_batch`'s own implementation.
+        fn reference_apply(ops: &[FuzzWriteOp]) -> BTreeMap<Vec<u8>, Vec<u8>> {
+            let mut state = BTreeMap::new();
+            for op in ops {
+                match op {
+                    FuzzWriteOp::Put { key_idx, value } => {
+                        state.insert(key_for(*key_idx), value.clone());
+                    }
+                    FuzzWriteOp::Delete { key_idx } => {
+                        state.remove(&key_for(*key_idx));
+                    }
+                }
+            }
+            state
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// Generates random batch contents — random batch sizes,
+            /// random keys (from a small, deliberately-colliding key
+            /// space so same-key and duplicate-key sequences are
+            /// actually exercised, not just distinct-key batches),
+            /// random values, `PUT`/`DELETE` mixed, and compares
+            /// `write_batch`'s resulting engine state against the
+            /// independent, serialized `BTreeMap` reference model —
+            /// review directive §26/§27.
+            #[test]
+            fn write_batch_matches_independent_serialized_reference_model(
+                ops in pvec(fuzz_write_op_strategy(), 1..40)
+            ) {
+                let dir = temp_dir("wb_differential");
+                let engine = open(&dir, LsmConfig::default());
+
+                let write_ops: Vec<WriteOp> = ops
+                    .iter()
+                    .map(|op| match op {
+                        FuzzWriteOp::Put { key_idx, value } => WriteOp::Put {
+                            key: key_for(*key_idx),
+                            value: value.clone(),
+                        },
+                        FuzzWriteOp::Delete { key_idx } => WriteOp::Delete {
+                            key: key_for(*key_idx),
+                        },
+                    })
+                    .collect();
+
+                engine.write_batch(&write_ops).unwrap();
+                let expected = reference_apply(&ops);
+
+                for idx in 0u8..6 {
+                    let key = key_for(idx);
+                    let actual = engine.get(&key).unwrap();
+                    let want = expected.get(&key).cloned();
+                    prop_assert_eq!(actual, want, "mismatch at key {:?}", key);
+                }
+
+                engine.shutdown();
+                let _ = fs::remove_dir_all(&dir);
+            }
         }
     }
 }

@@ -1662,6 +1662,24 @@ pub(crate) fn estimate_frame_len(op: &WalOp<'_>) -> usize {
         WalOp::Put { key, value } => 4 + key.len() + 4 + value.len(),
         WalOp::Delete { key } => 4 + key.len(),
         WalOp::CheckpointMarker { .. } => 8,
+        // `RELATIONAL ADR AMENDMENT 001` AA.2: `4` (member_count:u32 LE)
+        // plus, per member, `1` (tag byte) + its own PUT/DELETE-shaped
+        // body — the exact arithmetic `encode_wal_frame`'s `Group` arm
+        // uses, summed. Kept in sync by
+        // `estimate_frame_len_matches_the_real_encoder_for_group` below.
+        WalOp::Group { members } => {
+            4 + members
+                .iter()
+                .map(|m| {
+                    1 + match m {
+                        crate::wal::ops::GroupMember::Put { key, value } => {
+                            4 + key.len() + 4 + value.len()
+                        }
+                        crate::wal::ops::GroupMember::Delete { key } => 4 + key.len(),
+                    }
+                })
+                .sum::<usize>()
+        }
     };
     FRAME_HEADER_LEN + SEQ_AND_OP_TAG_LEN + op_body_len
 }
@@ -2458,7 +2476,30 @@ mod tests {
             key: b"hello",
             value: b"world!",
         };
-        let real = encode_wal_frame(1, op, crate::wal::DEFAULT_MAX_RECORD_LEN)
+        let real = encode_wal_frame(1, op.clone(), crate::wal::DEFAULT_MAX_RECORD_LEN)
+            .unwrap()
+            .len();
+        assert_eq!(estimate_frame_len(&op), real);
+    }
+
+    /// `RELATIONAL ADR AMENDMENT 001` AA.2: keeps `estimate_frame_len`'s
+    /// `Group` arithmetic honest against `encode_wal_frame`'s actual
+    /// output, exactly as the `Put` case above does — this is what lets
+    /// `BatchCoordinatorPool`'s queue-byte-budget accounting
+    /// (`estimate_frame_len(&op.as_wal_op())`) correctly account for a
+    /// large batch's real queued size.
+    #[test]
+    fn estimate_frame_len_matches_the_real_encoder_for_group() {
+        use crate::wal::ops::{encode_wal_frame, GroupMember};
+        let members = vec![
+            GroupMember::Put {
+                key: b"hello",
+                value: b"world!",
+            },
+            GroupMember::Delete { key: b"bye" },
+        ];
+        let op = WalOp::Group { members };
+        let real = encode_wal_frame(1, op.clone(), crate::wal::DEFAULT_MAX_RECORD_LEN)
             .unwrap()
             .len();
         assert_eq!(estimate_frame_len(&op), real);

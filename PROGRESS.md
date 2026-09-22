@@ -2828,3 +2828,124 @@ ENGINE**, **READ ENGINE**, and **COMPACTION** remain independently
 **PRODUCTION READY** per their own certifications; the new API/
 frontend layer's readiness rests on its own test evidence above, not
 on the engine's.
+
+## 2026-09-22 (Relational database: Phase 0/1 architecture audit)
+
+**Implemented:** a read-only audit of the certified engine, API, and
+frontend, followed by the relational-layer architecture itself --
+`PHASE_RELATIONAL_DATABASE_ARCHITECTURE.md`, `PHASE_RELATIONAL_
+DATABASE_ADR.md` (33 decisions, each with Decision/Reason/Alternatives/
+Correctness/Security/Performance/Memory/Persistence/Recovery/Testing),
+and `PHASE_RELATIONAL_STORAGE_GAP_ANALYSIS.md`. **Zero implementation
+code** -- `git status`/`git diff --stat` confirmed only the three new
+`.md` files existed at the end of this phase.
+
+**Process note:** the first-pass storage-engine audit fork exceeded its
+read-only instructions and wrote the three documents itself, in
+parallel with and blind to a separate API/frontend audit fork's
+findings. A dedicated verification pass (real source cross-checked
+against both audits' claims) found the result held up factually, with
+one real gap (Observability had no full ADR decision record) -- fixed
+by adding D33. Recorded here as a one-off process deviation, not a
+pattern.
+
+**Governing finding:** the certified engine has no atomic multi-key
+write primitive -- `put`/`delete` are single-key; the batch coordinator
+only amortizes fsyncs across independent callers, granting no cross-key
+atomicity. Every relational guarantee (transactions, index/table
+consistency, DDL) depends on this not existing yet being resolved
+first. Everything else in the ADR is implementable entirely on the
+certified engine's existing, unchanged public surface.
+
+**RELATIONAL IMPLEMENTATION = NOT STARTED. RELATIONAL DATABASE
+PRODUCTION READY = NO.** Write/Read/Compaction remain independently
+PRODUCTION READY, unaffected.
+
+## 2026-09-22 (Relational database: ADR Amendment 001 + Increment 2 -- `write_batch`)
+
+**Implemented:** an external review reordered the plan -- the atomic
+storage primitive (D9) must be built and certified before the catalog/
+tables/indexes, not alongside them. Before touching `src/`,
+`RELATIONAL ADR AMENDMENT 001` was appended to `PHASE_RELATIONAL_
+DATABASE_ADR.md` (append-only -- D1-D33 untouched in substance),
+resolving every question D9's original sketch had left open by reading
+the actual certified WAL/MemTable/BatchCoordinator source directly
+rather than re-deriving from D9's own summary of it: sequence semantics
+(AA.1, one shared seq per batch -- the forced consequence of the
+existing one-seq-per-frame WAL layout and `(key,seq)`-keyed MemTable),
+WAL frame format (AA.2, additive `OP_GROUP` tag, zero changes needed to
+`wal::recovery`'s frame classification), an atomic-visibility proof
+traced against the real `RwLock` (AA.3), same-key resolution (AA.4),
+required performance properties (AA.5), resource limits (AA.6), failure
+semantics (AA.7), concurrency integration (AA.8), and a security review
+(AA.9) -- plus catalog-security (AA.10), a documentation-consistency
+fix (AA.11: `system.grants` was missing from the Architecture doc's
+table list, now matches the ADR), upgrade-safety (AA.12), the SQL
+execution model (AA.13), and precision corrections to two pieces of
+imprecise wording (AA.15: PK/index lookup complexity claims now state
+their live-SSTable-count dependency inline, not only in a separate
+table column; AA.16: "B-tree-shaped" corrected to "ordered LSM-backed,"
+since no B-tree implementation exists or is planned).
+
+Then `PHASE_RELATIONAL_TRANSACTION_STORAGE_ADR.md` (narrowly scoped,
+cites the amendment rather than re-deriving it) and the actual
+`write_batch` implementation: `LsmEngine::write_batch(&self, ops:
+&[WriteOp]) -> Result<u64>`, one new WAL op tag (`OP_GROUP = 5`,
+additive, existing frame envelope unchanged), `apply_batch_after_
+durable` (the same `RwLock` write guard `apply_after_durable` already
+takes, held for N inserts instead of one), `LsmConfig::max_batch_ops`
+(default 10,000), and one new `EngineError::InvalidArgument` variant
+(plus its one mechanical cross-crate consequence in `api/src/error.
+rs`'s exhaustive match).
+
+**Proven, not just argued:** a concurrent-reader test
+(`concurrent_reader_never_observes_a_partial_batch`) races a real
+`write_batch` call held mid-critical-section against a single-lock-
+acquisition `range_scan` covering every touched key, across 30
+interleavings -- zero partial observations. (An earlier version of
+this test used four independent `get_as_of` calls instead and produced
+apparent failures; investigated and found to be a test-design flaw, not
+an engine bug -- four separate lock acquisitions can legitimately
+straddle a writer's critical section, which is a real property of
+issuing four independent reads, not partial-batch visibility. Fixed by
+redesigning the test around one atomic `range_scan`, not by weakening
+the assertion.) A differential/property test compares `write_batch`
+against an independent, serialized `BTreeMap` reference model across
+random batch contents including duplicate/same-key sequences (64
+proptest cases). Recovery tests confirm live-apply and replay reach
+identical state via one shared helper function, not independently-
+maintained-but-hopefully-equivalent code paths.
+
+**Measured, not claimed** (`cargo bench --bench write_batch_bench`,
+release profile): N=1 parity confirmed (`put` 6.24ms vs. `write_batch`
+6.39ms; `delete` 12.92ms vs. 12.99ms -- overlapping confidence
+intervals). N>1 throughput: `write_batch` stays ~4.2-5.5ms regardless
+of batch size (one fsync) while N sequential `put` calls from one
+caller scale linearly -- up to 57x faster at N=64.
+
+**Tests passing:** `cargo test --lib` 373/373 (debug and release),
+`wal_tests` 12/12, `pathological_recovery_matrix` 9/9, `crash_
+consistency --features test-util` 2/2, fmt/clippy (`-D warnings`)/
+`check --workspace --all-targets --all-features` all clean. 14 new
+`write_batch`-specific engine tests, 13 new WAL `Group`-frame tests, all
+passing.
+
+**Flagged, investigated, confirmed pre-existing, not touched:**
+`group_commit`'s `m1_2_hundred_writers_throughput`/`m1_3_thousand_
+writers_throughput` fail on this machine in both debug and `--release`
+(7,330 vs. a 15,000 target; 45,395-52,460 vs. an 80,000 target).
+Verified via `git stash` that the identical failure, with near-
+identical numbers, occurs on the clean, unmodified baseline -- a
+pre-existing, machine-throughput-dependent characteristic, not a
+regression from this work. Not weakened, not silently ignored.
+
+**Protected-engine audit:** `git diff --stat -- src/manifest/ src/
+compaction/ src/sstable/` empty -- zero changes to Manifest,
+Compaction, or SSTable.
+
+**Explicitly not done / not declared:** no catalog, schema, table,
+index, SQL parser, transaction executor, or CLI exists. **RELATIONAL
+DATABASE PRODUCTION READY = NO.** Write/Read/Compaction remain
+independently PRODUCTION READY, unaffected -- confirmed by the full
+regression gate above, not merely asserted. Full account: `PHASE_
+RELATIONAL_TRANSACTION_STORAGE_RESULTS.md`.

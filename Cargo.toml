@@ -49,3 +49,7 @@ harness = false
 name = "append"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "write_batch_bench"
+harness = false

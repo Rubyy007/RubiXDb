@@ -6,6 +6,84 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Phase 0/1 architecture audit + Increment 2 (`write_batch` storage primitive) (2026-09-22)
+
+Begins the relational-database phase on top of the certified engine
+(Write/Read/Compaction) and Service API. Phase 0/1 (read-only audit +
+architecture) produced `PHASE_RELATIONAL_DATABASE_ARCHITECTURE.md`,
+`PHASE_RELATIONAL_DATABASE_ADR.md`, and `PHASE_RELATIONAL_STORAGE_GAP_
+ANALYSIS.md` with **zero implementation code** — the audit's one
+governing finding: the certified engine has no atomic multi-key write
+primitive, which every relational guarantee (transactions, index/table
+consistency, DDL) depends on. A follow-up review reordered the plan: the
+atomic storage primitive must be built and certified *before* the
+catalog/tables/indexes. `RELATIONAL ADR AMENDMENT 001` resolved every
+open question in D9's original sequence-semantics/WAL-format/atomic-
+visibility/failure-semantics sketch precisely, against the actual
+certified code (not a summary of it), and this increment implements
+exactly what it specified — nothing else.
+
+#### Added
+
+- **`LsmEngine::write_batch(&self, ops: &[WriteOp]) -> Result<u64>`**
+  (`src/lsm/mod.rs`): atomically applies N `Put`/`Delete` operations
+  under one shared, durable sequence. Either every operation becomes
+  visible to a subsequent read or none do — proven, not merely argued,
+  by a concurrent-reader test racing a real `write_batch` call held
+  mid-critical-section against a single-lock-acquisition `range_scan`
+  covering every touched key, across 30 repeated interleavings, zero
+  partial observations. Same-physical-key operations within one batch
+  resolve deterministically (last-in-slice wins), via the existing
+  `MemTable` map-overwrite semantics, not a new rule.
+- **WAL `Group` frame** (`OP_GROUP = 5`, `src/wal/format.rs`,
+  `src/wal/ops.rs`): one new, additive op tag encoding N members inside
+  the existing, unmodified frame envelope. `PUT`/`DELETE`/`CHECKPOINT_
+  MARKER`'s byte layout is unchanged; `wal::recovery::walk_segment`
+  needed zero changes (frame classification is `op_tag`-agnostic), so
+  torn-trailing-batch-discarded and corrupt-non-tail-batch-fails-closed
+  are the existing, already-certified rule, extended for free. Decode
+  grows its member list incrementally (`.push()`, never `Vec::with_
+  capacity` from the untrusted on-disk `member_count`) — the concrete
+  defense against an attacker-controlled unbounded-allocation path.
+- **`LsmConfig::max_batch_ops`** (default 10,000, matching the
+  relational layer's own already-decided write-set-size default):
+  engine-level defense-in-depth cap, independent of whatever the
+  caller checks.
+- **`EngineError::InvalidArgument`** (`src/error.rs`): the one new
+  error variant this increment required (an empty batch has no logical
+  write to make durable) — mapped in `api/src/error.rs` to `400
+  VALIDATION_ERROR`, the minimal, mechanical change needed to keep the
+  workspace compiling (not an API feature addition).
+- `PHASE_RELATIONAL_TRANSACTION_STORAGE_ADR.md` (narrowly scoped
+  implementation-time document) and `PHASE_RELATIONAL_TRANSACTION_
+  STORAGE_RESULTS.md` (full measured results: benchmarks, security
+  audit, protected-path audit, regression-gate outcome).
+
+#### Measured (not claimed)
+
+- N=1 parity: `write_batch([Put])`/`write_batch([Delete])` show no
+  material regression against `put`/`delete` (overlapping confidence
+  intervals, `cargo bench --bench write_batch_bench`).
+- N>1 throughput: `write_batch` time stays ~4.2–5.5 ms regardless of N
+  (dominated by one `fsync`) while an equivalent serialized baseline (N
+  sequential `put` calls) grows linearly — up to 57x faster at N=64.
+
+#### Regression gate
+
+Full existing suite re-run unmodified and passing: `cargo fmt --check`,
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo test --lib` (373 passed) and `--release --lib` (373 passed),
+`wal_tests` (12), `pathological_recovery_matrix` (9), `crash_
+consistency --features test-util` (2). `src/manifest/`, `src/
+compaction/`, `src/sstable/` untouched (`git diff --stat` empty for
+each). One pre-existing, machine-throughput-dependent `group_commit`
+test pair (`m1_2`/`m1_3`) fails identically on the clean, unmodified
+baseline (verified via `git stash`) — not a regression, not weakened,
+not silently ignored.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** No catalog, schema,
+table, index, SQL, transaction executor, or CLI exists yet.
+
 ### Productization: Service API + frontend console (2026-09-22)
 
 Adds a Service API layer and a frontend console on top of the

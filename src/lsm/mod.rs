@@ -48,7 +48,9 @@ use crate::memtable::{MemTable, MemtableValue, DEFAULT_MAX_SIZE_BYTES};
 use crate::sstable::{
     self, RecordValue, SsTable, SsTableRangeCursor, SsTableWriterConfig, SstableMeta,
 };
-use crate::wal::{self, FileWal, GroupCommitter, Wal, WalConfig, WalOp, WalOpOwned};
+use crate::wal::{
+    self, FileWal, GroupCommitter, GroupMember, GroupMemberOwned, Wal, WalConfig, WalOp, WalOpOwned,
+};
 
 /// `RubixDB-LSM-Engine-Specification-v1.0.md` §4.1's `LsmConfig`, plus
 /// the Phase-4B fields it also defines (`sstable_target_block_size`,
@@ -123,6 +125,16 @@ pub struct LsmConfig {
     /// threshold) — a gate on whether that already-approved trigger is
     /// wired automatically at all.
     pub compaction_auto_trigger: bool,
+    /// `RELATIONAL ADR AMENDMENT 001` AA.1/AA.6: the hard ceiling on the
+    /// number of operations one `write_batch` call may contain, enforced
+    /// by the engine itself independently of whatever the relational
+    /// layer's own limit (D27) does above it — defense in depth, never
+    /// solely trusting an upstream caller to have already checked.
+    /// Default `10_000`, chosen to equal D27's already-decided
+    /// relational-layer default exactly, so the two bounds agree by
+    /// construction rather than being independently-chosen numbers that
+    /// could silently drift apart.
+    pub max_batch_ops: usize,
 }
 
 impl Default for LsmConfig {
@@ -136,6 +148,7 @@ impl Default for LsmConfig {
             storage_pressure_retry_interval: Duration::from_secs(5),
             compaction_trigger_count: 4,
             compaction_auto_trigger: false,
+            max_batch_ops: 10_000,
         }
     }
 }
@@ -222,6 +235,18 @@ pub struct RecoveryStats {
 /// newest visible version is a tombstone — operating brief §9/§14's own
 /// collapse rule, applied once here across every source, not per-source).
 pub type GetResult = Option<Vec<u8>>;
+
+/// One mutation inside an atomic `LsmEngine::write_batch` call —
+/// `RELATIONAL ADR AMENDMENT 001` AA.1. Owned buffers (not borrowed):
+/// `write_batch` maps each `WriteOp` to a `GroupMemberOwned` to submit
+/// through `BatchCoordinatorPool`, which requires owned data (the
+/// submitting caller's own stack frame is not guaranteed to outlive the
+/// wait — the same reason `WalOpOwned` itself is owned).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
 
 /// Message sent to the background flush thread (`PHASE4B_ADR.md`
 /// ADR-P4B-5). Not `pub` — an internal implementation detail of the
@@ -1184,6 +1209,18 @@ pub struct LsmEngine {
     /// this counter is purely observational, never consulted by any
     /// correctness decision.
     capacity_pressure_events: AtomicU64,
+    /// Test-only widening delay for `apply_batch_after_durable`'s
+    /// critical section — `RELATIONAL ADR AMENDMENT 001` AA.3's
+    /// concurrent-reader test (`set_batch_apply_delay_for_test`).
+    /// Mirrors `flush_delay_ms`'s own established rationale exactly: a
+    /// deterministic-enough way to widen an already-correct (lock-
+    /// protected) critical section so a concurrent-reader test can
+    /// reliably land a read attempt inside it, rather than depending on
+    /// incidental thread-scheduling timing. Zero (the always-on
+    /// production default) has no effect. Runs on the calling thread
+    /// itself (unlike `flush_delay_ms`, which the background flush
+    /// thread reads), so no `Arc` is needed here.
+    batch_apply_delay_ms: AtomicU64,
     /// See `FlushFaultPoint`/`fire_flush_fault_hook`. Shared with the
     /// background flush thread via the `Arc` `open()` clones into
     /// `spawn_flush_thread`; this copy is what `install_flush_fault_hook`/
@@ -1463,6 +1500,7 @@ impl LsmEngine {
             flush_stop,
             flush_delay_ms,
             capacity_pressure_events: AtomicU64::new(0),
+            batch_apply_delay_ms: AtomicU64::new(0),
             flush_fault_hook,
             storage_state,
             storage_pressure_events,
@@ -1618,6 +1656,18 @@ impl LsmEngine {
             .store(delay.as_millis() as u64, Ordering::Release);
     }
 
+    /// Test-only: makes every subsequent `write_batch` call sleep
+    /// `delay` while still holding the active-MemTable write lock, so a
+    /// concurrent-reader test can reliably land a read attempt inside
+    /// `apply_batch_after_durable`'s critical section — `RELATIONAL ADR
+    /// AMENDMENT 001` AA.3's proof. Mirrors `set_flush_delay_for_test`'s
+    /// exact rationale and pattern.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_batch_apply_delay_for_test(&self, delay: Duration) {
+        self.batch_apply_delay_ms
+            .store(delay.as_millis() as u64, Ordering::Release);
+    }
+
     /// Test-only: forces `storage_state()` directly, so a test can
     /// exercise `compact_once`'s "observe `StoragePressure`/
     /// `StorageFull`, defer/skip" behavior (`ADR-COMPACTION-001`
@@ -1658,6 +1708,52 @@ impl LsmEngine {
         Ok(position.seq)
     }
 
+    /// Atomically applies `ops` under one shared, durable sequence —
+    /// `RELATIONAL ADR AMENDMENT 001` AA.1–AA.9 is the complete,
+    /// authoritative specification; this implementation follows it
+    /// directly. Either every operation in `ops` becomes visible to a
+    /// subsequent read, or none do — no partial-batch state is ever
+    /// observable by any reader (AA.3's proof), including one racing the
+    /// batch, and including WAL-replay-driven recovery (AA.1).
+    ///
+    /// Rejects an empty batch (`InvalidArgument`, AA.1: there is no
+    /// logical write to make durable) and a batch exceeding
+    /// `LsmConfig::max_batch_ops` (`CapacityExceeded`, AA.6) — both
+    /// checked before any encoding, allocation, or WAL interaction, per
+    /// AA.6's enforcement-order requirement. Same-physical-key operations
+    /// within `ops` resolve deterministically, last-operation-in-`ops`-
+    /// wins (AA.4) — the ordinary `MemTable`/`BTreeMap` overwrite
+    /// behavior, not a new rule.
+    pub fn write_batch(&self, ops: &[WriteOp]) -> Result<u64> {
+        if ops.is_empty() {
+            return Err(EngineError::InvalidArgument {
+                detail: "write_batch requires at least one operation".to_string(),
+            });
+        }
+        if ops.len() > self.config.max_batch_ops {
+            return Err(EngineError::CapacityExceeded {
+                requested: ops.len() as u64,
+                max: self.config.max_batch_ops as u64,
+            });
+        }
+        self.reject_if_storage_full()?;
+
+        let members: Vec<GroupMemberOwned> = ops
+            .iter()
+            .map(|op| match op {
+                WriteOp::Put { key, value } => GroupMemberOwned::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                WriteOp::Delete { key } => GroupMemberOwned::Delete { key: key.clone() },
+            })
+            .collect();
+        let completion = self.pool.submit(WalOpOwned::Group(members))?;
+        let position = completion.wait()?;
+        self.apply_batch_after_durable(ops, position.seq)?;
+        Ok(position.seq)
+    }
+
     /// Applies one already-durable entry to the active MemTable, then
     /// freezes it if it just became full — one critical section under
     /// the write lock, so a concurrent freeze race between two callers
@@ -1666,6 +1762,38 @@ impl LsmEngine {
     fn apply_after_durable(&self, key: &[u8], seq: u64, value: MemtableValue) -> Result<()> {
         let mut active = self.lock_active_write();
         active.insert(key, seq, value);
+        if active.is_full() {
+            self.freeze_locked(&mut active)?;
+        }
+        Ok(())
+    }
+
+    /// `RELATIONAL ADR AMENDMENT 001` AA.3's proof, implemented exactly
+    /// as proven: the mechanical extension of `apply_after_durable` from
+    /// one insert to N, under the *same* write guard, held for the whole
+    /// batch instead of once per op. `RwLock`'s mutual-exclusion
+    /// guarantee is what makes "no reader ever observes a partial batch"
+    /// hold — no new lock, no new synchronization primitive. All N
+    /// members are inserted under the one shared `seq` in caller-
+    /// supplied order (AA.1/AA.4: same-key overwrite resolves
+    /// deterministically, last-in-`ops`-wins, via ordinary `MemTable`
+    /// map-overwrite semantics), and the existing `is_full()`/`freeze_
+    /// locked` check runs exactly once, after all N inserts — never
+    /// mid-batch, so a freeze can never split a batch across an active/
+    /// immutable boundary (AA.3 step 4).
+    fn apply_batch_after_durable(&self, ops: &[WriteOp], seq: u64) -> Result<()> {
+        let mut active = self.lock_active_write();
+        let delay_ms = self.batch_apply_delay_ms.load(Ordering::Acquire);
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        for op in ops {
+            let (key, value) = match op {
+                WriteOp::Put { key, value } => (key.as_slice(), Some(value.as_slice())),
+                WriteOp::Delete { key } => (key.as_slice(), None),
+            };
+            apply_kv_to_memtable(&mut active, seq, key, value);
+        }
         if active.is_full() {
             self.freeze_locked(&mut active)?;
         }
@@ -3148,6 +3276,34 @@ fn apply_wal_op(memtable: &mut MemTable, seq: u64, op: WalOp<'_>) {
         WalOp::Put { key, value } => memtable.put(key, seq, value),
         WalOp::Delete { key } => memtable.delete(key, seq),
         WalOp::CheckpointMarker { .. } => {}
+        // `RELATIONAL ADR AMENDMENT 001` AA.1: recovery replays exactly
+        // what live apply does — every member under the frame's one
+        // decoded `seq`, via the *same* `apply_kv_to_memtable` helper
+        // `apply_batch_after_durable` calls live, in the same caller-
+        // supplied order (so a same-key-in-batch resolves to the
+        // identical last-write-wins result on both paths, provably —
+        // not merely by coincidence — AA.4).
+        WalOp::Group { members } => {
+            for member in &members {
+                let (key, value) = match member {
+                    GroupMember::Put { key, value } => (*key, Some(*value)),
+                    GroupMember::Delete { key } => (*key, None),
+                };
+                apply_kv_to_memtable(memtable, seq, key, value);
+            }
+        }
+    }
+}
+
+/// Shared by `LsmEngine::apply_batch_after_durable` (live write path) and
+/// `apply_wal_op`'s `Group` arm (recovery replay) — `RELATIONAL ADR
+/// AMENDMENT 001` AA.1's "recovery replays exactly what live apply does"
+/// claim is a *provable* consequence of both paths calling this one
+/// function, not an independently-maintained behavioral equivalence.
+fn apply_kv_to_memtable(memtable: &mut MemTable, seq: u64, key: &[u8], value: Option<&[u8]>) {
+    match value {
+        Some(v) => memtable.put(key, seq, v),
+        None => memtable.delete(key, seq),
     }
 }
 

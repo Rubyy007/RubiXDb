@@ -241,7 +241,7 @@ mod tests {
         let mut f = MemFile::new();
         f.write_all(&encode_segment_header(1)).unwrap();
         for (seq, op) in records {
-            let frame = encode_wal_frame(*seq, *op, DEFAULT_MAX_RECORD_LEN).unwrap();
+            let frame = encode_wal_frame(*seq, op.clone(), DEFAULT_MAX_RECORD_LEN).unwrap();
             f.write_all(&frame).unwrap();
         }
         f

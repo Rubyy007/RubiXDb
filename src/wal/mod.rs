@@ -114,7 +114,7 @@ pub use file_io::WalFile;
 pub use format::{DEFAULT_MAX_RECORD_LEN, DEFAULT_MAX_SEGMENT_SIZE};
 pub use group_commit::GroupCommitter;
 pub use metrics::FsyncLatencyTracker;
-pub use ops::{WalOp, WalOpOwned};
+pub use ops::{GroupMember, GroupMemberOwned, WalOp, WalOpOwned};
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -1911,6 +1911,20 @@ mod tests {
             } => WalOpOwned::CheckpointMarker {
                 flushed_through_seq,
             },
+            WalOp::Group { members } => WalOpOwned::Group(
+                members
+                    .iter()
+                    .map(|m| match m {
+                        GroupMember::Put { key, value } => GroupMemberOwned::Put {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                        },
+                        GroupMember::Delete { key } => {
+                            GroupMemberOwned::Delete { key: key.to_vec() }
+                        }
+                    })
+                    .collect(),
+            ),
         }
     }
 }

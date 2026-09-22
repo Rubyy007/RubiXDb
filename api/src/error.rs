@@ -144,6 +144,12 @@ impl ApiError {
                 "persistent storage is exhausted".to_string(),
                 Some(detail.clone()),
             ),
+            ApiError::Engine(EngineError::InvalidArgument { detail }) => (
+                StatusCode::BAD_REQUEST,
+                "VALIDATION_ERROR",
+                "invalid argument".to_string(),
+                Some(detail.clone()),
+            ),
         }
     }
 }
@@ -307,6 +313,20 @@ mod tests {
                 detail: "x".to_string()
             })),
             (StatusCode::INSUFFICIENT_STORAGE, "STORAGE_EXHAUSTED")
+        );
+    }
+
+    #[test]
+    fn engine_invalid_argument_maps_to_400_and_carries_detail() {
+        let err = ApiError::Engine(EngineError::InvalidArgument {
+            detail: "write_batch requires at least one operation".to_string(),
+        });
+        let (status, code, _message, detail) = err.parts();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "VALIDATION_ERROR");
+        assert_eq!(
+            detail.as_deref(),
+            Some("write_batch requires at least one operation")
         );
     }
 }
