@@ -6,6 +6,59 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 9 (read-only query executor) (2026-09-24)
+
+Adds a production-grade query executor (`sql/src/exec/`, new module in
+the existing `rubixdb-sql` crate): `Plan/PhysicalPlan -> Execute ->
+Typed Result` against the real `TableStore`/`IndexBuilder`/
+`Transaction` primitives. `PHASE_RELATIONAL_QUERY_EXECUTOR_
+ARCHITECTURE.md` is the full decision record; `PHASE_RELATIONAL_QUERY_
+EXECUTOR_INCREMENT9_RESULTS.md` has the certification matrix and
+measured benchmark numbers. Only `SELECT` executes -- no write
+statement or DDL runs yet.
+
+#### Added
+
+- `sql/src/exec/{mod,expr_eval,operators}.rs`: a pull-based `Operator`
+  trait, one struct per `PhysicalPlan` node (`PkLookup`/`IndexScan`/
+  `SeqScan`, `Filter`, `Projection`, `Distinct`, `Sort`, `Limit`,
+  `NestedLoopJoin`/`IndexNestedLoop`); runtime `BoundExpr` evaluation
+  with real SQL three-valued logic (`NULL`/`AND`/`OR`/`NOT`/`IS [NOT]
+  NULL`/`BETWEEN`/`IN`/`LIKE`/`CASE`, plus the four registered scalar
+  functions); `LEFT JOIN` null-extension, residual-predicate
+  preservation, and per-outer-row correlated-key re-evaluation for
+  `IndexNestedLoop`, all directly tested.
+- `TableStore::get_row_as_of`/`scan_table_as_of`/`scan_table_rows_as_of`
+  (the last genuinely lazy) and `IndexBuilder::index_lookup_as_of`/
+  `index_range_scan_as_of` (core crate, additive): the snapshotted
+  scan-shaped read primitives the executor needed and the storage layer
+  did not yet expose -- closes a gap `IndexBuilder::scan_entries`'s own
+  Increment 5 doc comment had already named and deferred to "D10's
+  future transaction layer," which now exists. Plus a trivial
+  `Transaction::snapshot_seq()` getter.
+- `PhysicalAccess::table_ref` (planner, additive): the one gap in
+  Increment 8's own planner output this increment's executor needed
+  filled in -- without it, a self-join or even a bare predicateless
+  scan has no way to resolve a `ColumnRef` against its own row.
+- `sql/benches/query_executor_bench.rs`: PK-lookup layering (raw engine
+  get vs. `TableStore` vs. full executor), scan-vs-index selectivity
+  (~940x faster for a 1-in-10,000-selective indexed lookup), `LIMIT`
+  early termination (~11x faster, independently proven via
+  `rows_scanned` metrics), join-algorithm comparison (`IndexNestedLoop`
+  ~15x faster than plain `NestedLoop` for a selective 200x200 join).
+- 36 new executor tests plus 4 new core-crate regression tests for the
+  new snapshotted primitives.
+
+#### Fixed / Found
+
+- `ORDER BY ... DESC NULLS LAST` produced `NULL` values first instead
+  of last -- the sort comparator reversed the already-absolute `NULLS
+  FIRST`/`LAST` placement a second time whenever `DESC` was also
+  present. Found while writing a test covering exactly that
+  combination, not by inspection -- the fourth consecutive increment
+  where a real bug or gap was found this way (Increments 5/6/8's own
+  documented findings).
+
 ### Relational database: Increment 8 (rule-based query planner and optimizer) (2026-09-23)
 
 Adds a production-grade, rule-based query planner (`sql/src/plan/`, new

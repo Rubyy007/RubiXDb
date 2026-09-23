@@ -525,6 +525,24 @@ impl IndexBuilder {
         index_id: u32,
         prefix_values: &[Option<RelationalValue>],
     ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
+        self.index_lookup_as_of(index_id, prefix_values, u64::MAX)
+    }
+
+    /// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2: the
+    /// snapshotted counterpart `index_lookup` lacked. Closes a
+    /// previously-documented, accepted gap from Increment 5
+    /// (`scan_entries`'s own former doc comment called the un-
+    /// snapshotted index-then-fetch race "expected... under no active
+    /// transaction/snapshot isolation for reads — D10's future
+    /// transaction layer is what removes this"): D10 now exists
+    /// (Increment 7), and the executor (Increment 9) is its first real
+    /// caller for scan-shaped reads.
+    pub fn index_lookup_as_of(
+        &self,
+        index_id: u32,
+        prefix_values: &[Option<RelationalValue>],
+        as_of_seq: u64,
+    ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
         let index_row = self.ready_index(index_id)?;
         if prefix_values.is_empty() || prefix_values.len() > index_row.column_ordinals.len() {
             return Err(RelationalError::InvalidInput {
@@ -538,7 +556,12 @@ impl IndexBuilder {
         }
         let prefix_bytes = encode_indexed_columns(prefix_values)?;
         let (start, end) = index_entry_prefix_range(index_row.table_id, index_id, &prefix_bytes);
-        let rows = self.scan_entries(&index_row, as_bound_ref(&start), as_bound_ref(&end))?;
+        let rows = self.scan_entries(
+            &index_row,
+            as_bound_ref(&start),
+            as_bound_ref(&end),
+            as_of_seq,
+        )?;
         self.stats.index_lookups.fetch_add(1, Ordering::Relaxed);
         Ok(rows)
     }
@@ -556,6 +579,18 @@ impl IndexBuilder {
         start: Bound<Vec<Option<RelationalValue>>>,
         end: Bound<Vec<Option<RelationalValue>>>,
     ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
+        self.index_range_scan_as_of(index_id, start, end, u64::MAX)
+    }
+
+    /// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2 — see
+    /// `index_lookup_as_of`'s own doc comment.
+    pub fn index_range_scan_as_of(
+        &self,
+        index_id: u32,
+        start: Bound<Vec<Option<RelationalValue>>>,
+        end: Bound<Vec<Option<RelationalValue>>>,
+        as_of_seq: u64,
+    ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
         let index_row = self.ready_index(index_id)?;
         let encode_bound = |b: Bound<Vec<Option<RelationalValue>>>| -> Result<Bound<Vec<u8>>> {
             Ok(match b {
@@ -572,6 +607,7 @@ impl IndexBuilder {
             &index_row,
             as_bound_ref(&phys_start),
             as_bound_ref(&phys_end),
+            as_of_seq,
         )?;
         self.stats.index_range_scans.fetch_add(1, Ordering::Relaxed);
         Ok(rows)
@@ -582,6 +618,7 @@ impl IndexBuilder {
         index_row: &IndexRow,
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
+        as_of_seq: u64,
     ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
         let indexed_types = self.indexed_types(index_row)?;
         let table = self.catalog.get_table(index_row.table_id)?.ok_or_else(|| {
@@ -605,7 +642,7 @@ impl IndexBuilder {
 
         let mut out = Vec::new();
         let mut examined: u64 = 0;
-        for entry in self.engine.range_scan(start, end, u64::MAX) {
+        for entry in self.engine.range_scan(start, end, as_of_seq) {
             let (key, _value) = entry?;
             examined += 1;
             let body = key.get(9..).ok_or_else(|| RelationalError::InvalidInput {
@@ -614,15 +651,21 @@ impl IndexBuilder {
             let (_indexed_values, consumed) = decode_indexed_columns(&indexed_types, body)?;
             let pk_bytes = &body[consumed..];
             let pk_values = decode_composite_key(&pk_types, pk_bytes)?;
-            if let Some(row) = self.table_store.get_row(index_row.table_id, &pk_values)? {
+            // Both the index-entry scan above and this row fetch use the
+            // *same* `as_of_seq` (`u64::MAX` for the un-snapshotted
+            // `index_lookup`/`index_range_scan` callers, a real pinned
+            // seq for `..._as_of`) — this is what actually closes the
+            // index-then-fetch race the un-snapshotted path still has
+            // (see `index_lookup_as_of`'s own doc comment): a row
+            // deleted *after* `as_of_seq` still resolves here, exactly
+            // as D10 requires; one deleted strictly *before* it is
+            // correctly absent, not an error, same as always.
+            if let Some(row) =
+                self.table_store
+                    .get_row_as_of(index_row.table_id, &pk_values, as_of_seq)?
+            {
                 out.push((pk_values, row));
             }
-            // Else: the row was deleted between this entry's write and
-            // this read (an ordinary, expected index-then-fetch race
-            // under no active transaction/snapshot isolation for reads —
-            // D10's future transaction layer is what removes this,
-            // exactly as `PHASE_RELATIONAL_DATABASE_ADR.md` D7's own
-            // Testing requirements note). Skipped, not an error.
         }
         self.stats
             .index_entries_examined

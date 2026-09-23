@@ -11,6 +11,7 @@ pub mod bind;
 pub mod bound;
 pub mod convert;
 pub mod error;
+pub mod exec;
 pub mod functions;
 pub mod limits;
 pub mod metrics;
@@ -51,3 +52,6 @@ mod plan_tests;
 
 #[cfg(test)]
 mod plan_reference_model;
+
+#[cfg(test)]
+mod exec_tests;

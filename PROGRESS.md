@@ -3415,3 +3415,86 @@ explicit stop condition. Write/Read/Compaction, catalog, row storage,
 secondary indexes, the transaction engine, and the SQL parser/binder
 all remain independently PRODUCTION READY / PASS, unaffected. Full
 account: `PHASE_RELATIONAL_QUERY_PLANNER_INCREMENT8_RESULTS.md`.
+
+---
+
+## 2026-09-24
+
+**Implemented:** Increment 9 -- a production-grade, read-only query
+executor (`sql/src/exec/`, new module in the existing `rubixdb-sql`
+crate): `Plan/PhysicalPlan -> Execute -> Typed Result` against the real
+`TableStore`/`IndexBuilder`/`Transaction` primitives, via one pull-based
+`Operator` trait implemented by a struct per plan-node kind (`PkLookup`/
+`IndexScan`/`SeqScan`, `Filter`, `Projection`, `Distinct`, `Sort`,
+`Limit`, `NestedLoopJoin`). Only `SELECT` executes -- every write-shaped
+`Plan` (`Insert`/`Update`/`Delete`/`Ddl`) returns a controlled
+`UnsupportedExecution` error, never a silent no-op, per this increment's
+own "all writes are outside this increment" scope.
+
+Inspecting (never guessing) the actual planner/storage APIs surfaced two
+real, small, necessary primitive gaps, both closed with the smallest
+additive fix: `PhysicalAccess` (Increment 8) carried a table's `table_id`
+but not its `TableRefId`, insufficient for a self-join or even a bare
+predicateless scan to resolve `ColumnRef`s against -- fixed by adding
+`table_ref: u32` to every `PhysicalAccess` variant. And the storage
+layer had no snapshotted scan-shaped read (`Transaction::get_row` is
+snapshot-correct, but nothing scan-shaped was) -- exactly the gap
+`IndexBuilder::scan_entries`'s own Increment 5 doc comment had already
+named and deferred to "D10's future transaction layer," which now
+exists. Closed additively in the core crate: `TableStore::get_row_as_of`/
+`scan_table_as_of`/`scan_table_rows_as_of` (the last one genuinely
+**lazy**, wrapping the certified Read Engine's own already-lazy
+`RangeScanIter` directly -- a bare `SELECT * FROM huge_table` never
+materializes the whole table), `IndexBuilder::index_lookup_as_of`/
+`index_range_scan_as_of`, and a trivial `Transaction::snapshot_seq()`
+getter. `IndexScan` itself stays eagerly bounded rather than lazy (a
+stated, honest tradeoff -- `IndexBuilder`'s own internals would need a
+larger rework than this increment's evidence justifies), bounded by a
+new `ExecLimits::max_index_scan_rows` instead.
+
+Three-valued SQL logic (`NULL`/`AND`/`OR`/`NOT`/`IS [NOT] NULL`) is
+implemented directly, never via ordinary two-valued `bool`; `LEFT JOIN`
+correctly emits exactly one NULL-extended row per unmatched outer row
+(a `RowContext` mechanism using an empty `Row` as the null-extension
+placeholder, needing no catalog lookup to know the inner table's column
+count); `IndexNestedLoop` rebuilds its inner access fresh per outer row
+(never caching one outer row's lookup for another); residual predicates
+the planner attaches to an `IndexScan` are always evaluated, never
+dropped. A `RowContext`/`Tuple` design lets `Sort`/`Distinct` sit above
+`Projection` in Increment 8's own unmodified plan-node order while still
+resolving an `ORDER BY` expression outside the `SELECT` list, with zero
+planner changes.
+
+**A real bug found and fixed** (the same "found by writing a genuinely
+exhaustive test, not by inspection" pattern as Increments 5/6/8):
+`ORDER BY ... DESC NULLS LAST` produced `NULL` values first instead of
+last -- the sort comparator was reversing the already-absolute `NULLS
+FIRST`/`LAST` placement a second time whenever `DESC` was also present.
+Found by a test written to cover exactly that combination, fixed, both
+directions now regression-tested.
+
+36 new executor tests plus 4 new core-crate regression tests for the
+snapshotted primitives. Full regression: 542 `rubixdb` + 30
+`rubixdb-api` + 179 `rubixdb-sql` tests, debug and release, all passing;
+`wal_tests`/`pathological_recovery_matrix`/`crash_consistency`
+unchanged; `src/manifest/`, `src/compaction/`, `src/sstable/`,
+`src/wal/`, `api/`, `src/catalog/` completely untouched --
+`src/relational/txn.rs`'s only change is one additive, 14-line getter.
+
+`PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` is the full decision
+record, `PHASE_RELATIONAL_QUERY_EXECUTOR_INCREMENT9_RESULTS.md` the
+certification matrix and measured `cargo bench --bench query_executor_
+bench` numbers (an indexed equality lookup ~940x faster than the
+equivalent full scan at 1-in-10,000 selectivity; `LIMIT 10` against
+50,000 rows both ~11x faster and, independently, directly proven via
+`rows_scanned` metrics to touch only a tiny fraction of the table;
+`IndexNestedLoop` ~15x faster than plain `NestedLoop` for a selective
+200x200 join).
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** No CLI, HTTP SQL API, or
+frontend SQL console exists, and no write statement executes yet --
+this increment's own explicit stop condition. Write/Read/Compaction,
+catalog, row storage, secondary indexes, the transaction engine, the
+SQL parser/binder, and the query planner all remain independently
+PRODUCTION READY / PASS, unaffected. Full account: `PHASE_RELATIONAL_
+QUERY_EXECUTOR_INCREMENT9_RESULTS.md`.

@@ -331,6 +331,7 @@ fn order_only_index_access(
         if index.column_ordinals == ordinals {
             return Ok(Some(PhysicalAccess::IndexScan {
                 table_id: table.table_id,
+                table_ref: table.id.0,
                 index_id: index.index_id,
                 index_name: index.name.clone(),
                 mode: IndexAccessMode::Range {

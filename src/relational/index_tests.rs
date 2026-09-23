@@ -877,3 +877,101 @@ fn malformed_index_entry_key_is_rejected_without_panicking() {
         crate::relational::RelationalError::InvalidInput { .. }
     ));
 }
+
+// -----------------------------------------------------------------
+// `index_lookup_as_of`/`index_range_scan_as_of` —
+// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2's additive
+// snapshot-consistency primitive: closes the index-then-fetch race
+// `scan_entries`'s own former doc comment documented as accepted
+// pending "D10's future transaction layer" (Increment 7, now built) —
+// both the index-entry scan and the row fetch resolve at the same
+// pinned `as_of_seq`.
+// -----------------------------------------------------------------
+
+#[test]
+fn index_lookup_as_of_is_stable_against_a_later_write() {
+    let f = Fixture::new("index_lookup_as_of");
+    let table_id = create_simple_table(&f.catalog, "t");
+    let index_id = f
+        .builder
+        .create_index_online(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+        .unwrap();
+
+    f.store.put_row(table_id, &row(1, "alice", true)).unwrap();
+    let snapshot_seq = f.engine.snapshot().seq();
+    f.store.put_row(table_id, &row(2, "alice", true)).unwrap();
+
+    let now = f
+        .builder
+        .index_lookup_as_of(
+            index_id,
+            &[Some(RelationalValue::Text("alice".to_string()))],
+            u64::MAX,
+        )
+        .unwrap();
+    assert_eq!(now.len(), 2, "current lookup must see both rows");
+
+    let snapshotted = f
+        .builder
+        .index_lookup_as_of(
+            index_id,
+            &[Some(RelationalValue::Text("alice".to_string()))],
+            snapshot_seq,
+        )
+        .unwrap();
+    assert_eq!(
+        snapshotted.len(),
+        1,
+        "snapshotted lookup must not see the row inserted after the snapshot"
+    );
+    assert_eq!(snapshotted[0].0, vec![RelationalValue::Integer(1)]);
+
+    f.cleanup();
+}
+
+#[test]
+fn index_range_scan_as_of_is_stable_against_a_later_delete() {
+    let f = Fixture::new("index_range_as_of");
+    let table_id = create_simple_table(&f.catalog, "t");
+    let index_id = f
+        .builder
+        .create_index_online(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+        .unwrap();
+
+    f.store.put_row(table_id, &row(1, "alice", true)).unwrap();
+    let snapshot_seq = f.engine.snapshot().seq();
+    f.store
+        .delete_row(table_id, &[RelationalValue::Integer(1)])
+        .unwrap();
+
+    let now = f
+        .builder
+        .index_range_scan_as_of(
+            index_id,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            u64::MAX,
+        )
+        .unwrap();
+    assert!(
+        now.is_empty(),
+        "current range scan must not see the deleted row"
+    );
+
+    let snapshotted = f
+        .builder
+        .index_range_scan_as_of(
+            index_id,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            snapshot_seq,
+        )
+        .unwrap();
+    assert_eq!(
+        snapshotted.len(),
+        1,
+        "snapshotted range scan must still see the row as of the snapshot"
+    );
+
+    f.cleanup();
+}

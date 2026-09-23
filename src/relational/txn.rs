@@ -298,6 +298,20 @@ impl Transaction {
         self.state
     }
 
+    /// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2: the pinned
+    /// seq this transaction's `BEGIN` captured — the one piece of
+    /// snapshot state a caller outside this module needs to perform a
+    /// *consistent, scan-shaped* read (`TableStore::scan_table_as_of`,
+    /// `IndexBuilder::index_lookup_as_of`/`index_range_scan_as_of`) at
+    /// the same snapshot `get_row`'s own internal `get_as_of` call
+    /// already uses. Read-only; exposes no way to construct or mutate a
+    /// `Snapshot`, and this transaction's own registration in
+    /// `SnapshotRegistry` (keeping `oldest_live_snapshot_seq` correct)
+    /// is entirely unaffected by reading this value.
+    pub fn snapshot_seq(&self) -> u64 {
+        self.snapshot.seq()
+    }
+
     fn require_active(&self) -> Result<()> {
         match self.state {
             TxnState::Active => Ok(()),

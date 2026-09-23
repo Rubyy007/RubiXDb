@@ -76,6 +76,43 @@ pub enum SqlError {
     /// fire check on this crate's own output, not a user-facing SQL
     /// error class — reported the same safe way regardless.
     PlanValidation { detail: String },
+    /// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` (item 38): a
+    /// lower-layer storage/relational error surfaced during execution —
+    /// I/O failure, corruption (the certified Read Engine's own fail-
+    /// closed contract, item 39, propagated unchanged), or any other
+    /// `RelationalError`/`EngineError` this crate does not have a more
+    /// specific variant for. Carries only that error's own already-safe
+    /// `Display` text (never a filesystem path, physical key, or raw I/O
+    /// detail — the lower layers' own established discipline, reused).
+    Storage(String),
+    /// A physical-plan node this crate's executor has no implementation
+    /// for reached execution (item 65: "no plan node may silently fall
+    /// through... return `UnsupportedExecution`"). In practice
+    /// unreachable for any `Plan::Query` this crate's own planner
+    /// produces (every `PhysicalPlan` variant has a real operator), but
+    /// covers `Plan` variants this increment does not execute at all
+    /// (`Insert`/`Update`/`Delete`/`Ddl`/`Begin`/`Commit`/`Rollback` —
+    /// item 5: "All writes are outside this increment").
+    UnsupportedExecution { detail: String },
+    /// A caller-supplied runtime parameter is missing, `NULL` where the
+    /// bound expression's own context requires a value, or otherwise
+    /// does not match what `BoundExpr::Parameter`'s own resolved type
+    /// requires (item 34). Never carries the parameter's own value.
+    ExecutionParameter { detail: String },
+    /// Execution was cancelled by its caller before completion (item
+    /// 40) — a controlled stop, not a failure of the query itself.
+    Cancelled,
+    /// The execution deadline (item 41, `ExecLimits::deadline`) elapsed
+    /// before the query finished. Checked against `Instant::now()`
+    /// (monotonic), never wall-clock time.
+    DeadlineExceeded,
+    /// A `Transaction` operation this execution depended on reported a
+    /// snapshot-isolation conflict (D10) — reserved for when write
+    /// execution lands in a future increment; no code path in this
+    /// increment's read-only executor can produce it yet (`Transaction::
+    /// get_row` never conflict-checks; only `commit()` does, and nothing
+    /// here calls it with a non-empty write-set).
+    Conflict { detail: String },
 }
 
 impl fmt::Display for SqlError {
@@ -96,6 +133,16 @@ impl fmt::Display for SqlError {
             }
             SqlError::Catalog(detail) => write!(f, "catalog error: {detail}"),
             SqlError::PlanValidation { detail } => write!(f, "plan validation failed: {detail}"),
+            SqlError::Storage(detail) => write!(f, "storage error: {detail}"),
+            SqlError::UnsupportedExecution { detail } => {
+                write!(f, "unsupported execution: {detail}")
+            }
+            SqlError::ExecutionParameter { detail } => {
+                write!(f, "invalid execution parameter: {detail}")
+            }
+            SqlError::Cancelled => write!(f, "execution cancelled"),
+            SqlError::DeadlineExceeded => write!(f, "execution deadline exceeded"),
+            SqlError::Conflict { detail } => write!(f, "transaction conflict: {detail}"),
         }
     }
 }
@@ -105,6 +152,26 @@ impl std::error::Error for SqlError {}
 impl From<rubixdb::catalog::CatalogError> for SqlError {
     fn from(e: rubixdb::catalog::CatalogError) -> Self {
         SqlError::Catalog(e.to_string())
+    }
+}
+
+/// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §3: every `Table
+/// Store`/`IndexBuilder`/`Transaction` call the executor makes returns
+/// `rubixdb::relational::Result` — this is the one conversion point,
+/// classifying each `RelationalError` variant into the safe SQL-layer
+/// class it belongs to rather than a single catch-all (item 38).
+impl From<rubixdb::relational::RelationalError> for SqlError {
+    fn from(e: rubixdb::relational::RelationalError) -> Self {
+        use rubixdb::relational::RelationalError as RE;
+        match e {
+            RE::ResourceLimit { detail } => SqlError::ResourceLimit { detail },
+            RE::Conflict { detail } => SqlError::Conflict { detail },
+            RE::InvalidInput { detail } => SqlError::ExecutionParameter { detail },
+            RE::NotFound { .. }
+            | RE::Engine(_)
+            | RE::Catalog(_)
+            | RE::InvalidTransactionState { .. } => SqlError::Storage(e.to_string()),
+        }
     }
 }
 

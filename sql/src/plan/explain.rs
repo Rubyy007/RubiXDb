@@ -164,19 +164,21 @@ fn write_access(access: &PhysicalAccess, out: &mut String) {
     match access {
         PhysicalAccess::PkLookup {
             table_id,
+            table_ref,
             key_values,
             residual,
         } => {
             let keys: Vec<String> = key_values.iter().map(fmt_expr).collect();
             let _ = write!(
                 out,
-                "PkLookup table_id={table_id} key=({})",
+                "PkLookup table_id={table_id} table_ref=t{table_ref} key=({})",
                 keys.join(", ")
             );
             write_residual(residual, out);
         }
         PhysicalAccess::IndexScan {
             table_id,
+            table_ref,
             index_id,
             index_name,
             mode,
@@ -195,15 +197,16 @@ fn write_access(access: &PhysicalAccess, out: &mut String) {
             };
             let _ = write!(
                 out,
-                "IndexScan table_id={table_id} index_id={index_id} index_name={index_name} mode={mode_s}"
+                "IndexScan table_id={table_id} table_ref=t{table_ref} index_id={index_id} index_name={index_name} mode={mode_s}"
             );
             write_residual(residual, out);
         }
         PhysicalAccess::SeqScan {
             table_id,
+            table_ref,
             predicate,
         } => {
-            let _ = write!(out, "SeqScan table_id={table_id}");
+            let _ = write!(out, "SeqScan table_id={table_id} table_ref=t{table_ref}");
             write_residual(predicate, out);
         }
     }

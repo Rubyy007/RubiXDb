@@ -135,7 +135,7 @@ impl TableStore {
         let mut ops = Vec::with_capacity(1 + indexes.len() * 2);
         if !indexes.is_empty() {
             let old_row =
-                self.fetch_row_by_encoded_pk(&table, &columns, &pk_values, &encoded_pk)?;
+                self.fetch_row_by_encoded_pk(&table, &columns, &pk_values, &encoded_pk, u64::MAX)?;
             ops.extend(index_maintenance_ops(
                 table_id,
                 &indexes,
@@ -173,8 +173,13 @@ impl TableStore {
             let pk_values = extract_pk_values(&table, values);
             let encoded_pk = encode_composite_key(&pk_values)?;
             if !indexes.is_empty() {
-                let old_row =
-                    self.fetch_row_by_encoded_pk(&table, &columns, &pk_values, &encoded_pk)?;
+                let old_row = self.fetch_row_by_encoded_pk(
+                    &table,
+                    &columns,
+                    &pk_values,
+                    &encoded_pk,
+                    u64::MAX,
+                )?;
                 let new_row: Row = values.clone();
                 ops.extend(index_maintenance_ops(
                     table_id,
@@ -190,6 +195,22 @@ impl TableStore {
     }
 
     pub fn get_row(&self, table_id: u32, pk_values: &[RelationalValue]) -> Result<Option<Row>> {
+        self.get_row_as_of(table_id, pk_values, u64::MAX)
+    }
+
+    /// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2 — the
+    /// smallest additive primitive the SQL executor needs to fetch a
+    /// row consistently at a transaction's own pinned snapshot `seq`
+    /// (`Transaction::snapshot_seq`) rather than the current committed
+    /// state (`u64::MAX`, what `get_row` itself passes through here).
+    /// Never used for the write-set-overlay behavior `Transaction::
+    /// get_row` already provides — a plain snapshotted point read only.
+    pub fn get_row_as_of(
+        &self,
+        table_id: u32,
+        pk_values: &[RelationalValue],
+        as_of_seq: u64,
+    ) -> Result<Option<Row>> {
         let (table, columns) = self.resolve_table(table_id)?;
         if pk_values.len() != table.pk_ordinals.len() {
             return Err(RelationalError::InvalidInput {
@@ -201,7 +222,7 @@ impl TableStore {
             });
         }
         let encoded_pk = encode_composite_key(pk_values)?;
-        self.fetch_row_by_encoded_pk(&table, &columns, pk_values, &encoded_pk)
+        self.fetch_row_by_encoded_pk(&table, &columns, pk_values, &encoded_pk, as_of_seq)
     }
 
     fn fetch_row_by_encoded_pk(
@@ -210,9 +231,10 @@ impl TableStore {
         columns: &[ColumnRow],
         pk_values: &[RelationalValue],
         encoded_pk: &[u8],
+        as_of_seq: u64,
     ) -> Result<Option<Row>> {
         let key = table_row_key(table.table_id, encoded_pk);
-        match self.engine.get(&key)? {
+        match self.engine.get_as_of(&key, as_of_seq)? {
             None => Ok(None),
             Some(value_bytes) => Ok(Some(decode_full_row(
                 table,
@@ -251,7 +273,8 @@ impl TableStore {
 
         let mut ops = Vec::with_capacity(1 + indexes.len());
         if !indexes.is_empty() {
-            let old_row = self.fetch_row_by_encoded_pk(&table, &columns, pk_values, &encoded_pk)?;
+            let old_row =
+                self.fetch_row_by_encoded_pk(&table, &columns, pk_values, &encoded_pk, u64::MAX)?;
             ops.extend(index_maintenance_ops(
                 table_id,
                 &indexes,
@@ -270,17 +293,60 @@ impl TableStore {
     /// post-filtering). Returns `(primary_key_values, full_row)` pairs
     /// in primary-key order.
     pub fn scan_table(&self, table_id: u32) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
+        self.scan_table_as_of(table_id, u64::MAX)
+    }
+
+    /// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2 — the
+    /// snapshotted counterpart `scan_table` itself lacked: a `SeqScan`
+    /// executed inside a transaction must observe that transaction's own
+    /// pinned snapshot (D10), not whatever is currently committed at the
+    /// instant the scan happens to run. `range_scan`'s own `as_of_seq`
+    /// parameter already supports this — `scan_table` simply never
+    /// threaded a caller-supplied value through it before this increment
+    /// had a caller (the executor) that needed one.
+    pub fn scan_table_as_of(
+        &self,
+        table_id: u32,
+        as_of_seq: u64,
+    ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
         let (table, columns) = self.resolve_table(table_id)?;
         let (start, end) = table_row_range(table_id);
         let mut out = Vec::new();
         for row in self
             .engine
-            .range_scan(as_bound_ref(&start), as_bound_ref(&end), u64::MAX)
+            .range_scan(as_bound_ref(&start), as_bound_ref(&end), as_of_seq)
         {
             let (key, value) = row?;
             out.push(decode_table_row_entry(&table, &columns, &key, &value)?);
         }
         Ok(out)
+    }
+
+    /// `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2's second
+    /// required primitive: a genuinely **lazy**, row-at-a-time
+    /// counterpart to `scan_table_as_of`, for a `SeqScan` executor that
+    /// must not materialize an entire (possibly huge) table into memory
+    /// just to stream it through `LIMIT`/`Filter` — the "FINAL
+    /// PRODUCTION PRINCIPLE... NEVER MATERIALIZE UNBOUNDED DATA"
+    /// requirement, taken literally for the one access path with no
+    /// predicate-driven bound at all. Wraps the certified `LsmEngine::
+    /// range_scan`'s own already-lazy, bounded-memory `RangeScanIter`
+    /// (`ADR-RE-002`) directly — decodes one row per `next()` call, never
+    /// collects.
+    pub fn scan_table_rows_as_of(
+        &self,
+        table_id: u32,
+        as_of_seq: u64,
+    ) -> Result<impl Iterator<Item = Result<(Vec<RelationalValue>, Row)>> + '_> {
+        let (table, columns) = self.resolve_table(table_id)?;
+        let (start, end) = table_row_range(table_id);
+        Ok(self
+            .engine
+            .range_scan(as_bound_ref(&start), as_bound_ref(&end), as_of_seq)
+            .map(move |entry| {
+                let (key, value) = entry?;
+                decode_table_row_entry(&table, &columns, &key, &value)
+            }))
     }
 }
 

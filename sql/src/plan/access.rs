@@ -58,6 +58,16 @@ pub enum IndexAccessMode {
 pub enum PhysicalAccess {
     PkLookup {
         table_id: u32,
+        /// The `TableRefId` (`crate::bound::TableRefId::0`) this scan's
+        /// rows are bound to for the rest of the plan tree's own
+        /// `ColumnRef::table_ref`-keyed expression evaluation — the
+        /// executor's own required primitive, added this increment
+        /// (`PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md` §2): a
+        /// self-join (`FROM t a INNER JOIN t b ON ...`) has two `Access`
+        /// nodes sharing one `table_id` but two distinct `table_ref`s,
+        /// so `table_id` alone cannot disambiguate which row a `Column`
+        /// reference above this node means.
+        table_ref: u32,
         /// One `BoundExpr` per `pk_ordinals` position, in that order —
         /// never evaluated by the planner (item 23: a `Parameter`
         /// reference here is preserved exactly, not resolved).
@@ -70,6 +80,8 @@ pub enum PhysicalAccess {
     },
     IndexScan {
         table_id: u32,
+        /// See `PkLookup::table_ref`'s own doc comment.
+        table_ref: u32,
         index_id: u32,
         /// For `EXPLAIN`/diagnostics only — never re-resolved through
         /// it (item 24: the plan already carries the authoritative
@@ -80,6 +92,8 @@ pub enum PhysicalAccess {
     },
     SeqScan {
         table_id: u32,
+        /// See `PkLookup::table_ref`'s own doc comment.
+        table_ref: u32,
         predicate: Option<BoundExpr>,
     },
 }
@@ -112,6 +126,7 @@ pub fn plan_table_access(
         metrics.record_seq_scan();
         return Ok(PhysicalAccess::SeqScan {
             table_id,
+            table_ref,
             predicate: None,
         });
     };
@@ -153,6 +168,7 @@ pub fn plan_table_access(
         metrics.record_pk_lookup();
         return Ok(PhysicalAccess::PkLookup {
             table_id,
+            table_ref,
             key_values,
             residual,
         });
@@ -170,6 +186,7 @@ pub fn plan_table_access(
         }
         let Some((access, consumed_count, consumed)) = candidate_index_access(
             table_id,
+            table_ref,
             index.index_id,
             &index.name,
             &index.column_ordinals,
@@ -198,12 +215,14 @@ pub fn plan_table_access(
         return Ok(match access {
             PhysicalAccess::IndexScan {
                 table_id,
+                table_ref,
                 index_id,
                 index_name,
                 mode,
                 ..
             } => PhysicalAccess::IndexScan {
                 table_id,
+                table_ref,
                 index_id,
                 index_name,
                 mode,
@@ -220,6 +239,7 @@ pub fn plan_table_access(
     metrics.record_seq_scan();
     Ok(PhysicalAccess::SeqScan {
         table_id,
+        table_ref,
         predicate: Some(predicate.clone()),
     })
 }
@@ -240,9 +260,10 @@ fn residual_of(parts: &[BoundExpr], consumed: &[bool]) -> Option<BoundExpr> {
 /// conjuncts, or `None` if not even the index's first column has a
 /// usable predicate. Returns `(access, consumed_conjunct_count,
 /// consumed_mask)`.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn candidate_index_access(
     table_id: u32,
+    table_ref: u32,
     index_id: u32,
     index_name: &str,
     column_ordinals: &[u16],
@@ -271,6 +292,7 @@ fn candidate_index_access(
         return Some((
             PhysicalAccess::IndexScan {
                 table_id,
+                table_ref,
                 index_id,
                 index_name: index_name.to_string(),
                 mode: IndexAccessMode::Equality { prefix },
@@ -348,6 +370,7 @@ fn candidate_index_access(
     Some((
         PhysicalAccess::IndexScan {
             table_id,
+            table_ref,
             index_id,
             index_name: index_name.to_string(),
             mode: IndexAccessMode::Range { start, end },

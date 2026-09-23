@@ -867,6 +867,166 @@ fn delete_read_race_never_produces_a_decode_error() {
 }
 
 // -----------------------------------------------------------------
+// `scan_table_as_of` — `PHASE_RELATIONAL_QUERY_EXECUTOR_ARCHITECTURE.md`
+// §2's additive snapshot-consistency primitive (the SQL executor's own
+// required addition: a `SeqScan` running inside a transaction must
+// observe that transaction's pinned snapshot, not "now").
+// -----------------------------------------------------------------
+
+#[test]
+fn scan_table_as_of_is_stable_against_a_later_write() {
+    let dir = temp_dir("scan_as_of");
+    let engine = open(&dir);
+    let catalog = Arc::new(CatalogService::new(Arc::clone(&engine)));
+    catalog.bootstrap().unwrap();
+    let table_id = create_simple_table(&catalog, "t");
+    let store = TableStore::new(Arc::clone(&engine), Arc::clone(&catalog));
+
+    store
+        .put_row(
+            table_id,
+            &[
+                Some(RelationalValue::Integer(1)),
+                Some(RelationalValue::Text("before".to_string())),
+                None,
+            ],
+        )
+        .unwrap();
+    let snapshot_seq = engine.snapshot().seq();
+
+    store
+        .put_row(
+            table_id,
+            &[
+                Some(RelationalValue::Integer(2)),
+                Some(RelationalValue::Text("after".to_string())),
+                None,
+            ],
+        )
+        .unwrap();
+
+    let now = store.scan_table_as_of(table_id, u64::MAX).unwrap();
+    assert_eq!(now.len(), 2, "current scan must see both rows");
+
+    let snapshotted = store.scan_table_as_of(table_id, snapshot_seq).unwrap();
+    assert_eq!(
+        snapshotted.len(),
+        1,
+        "snapshotted scan must not see the row written after the snapshot"
+    );
+    assert_eq!(
+        snapshotted[0].1[1],
+        Some(RelationalValue::Text("before".to_string()))
+    );
+
+    // `scan_table` itself is `scan_table_as_of(.., u64::MAX)` verbatim.
+    assert_eq!(store.scan_table(table_id).unwrap().len(), 2);
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_table_rows_as_of_lazy_iterator_matches_the_eager_vec_variant() {
+    let dir = temp_dir("scan_rows_as_of");
+    let engine = open(&dir);
+    let catalog = Arc::new(CatalogService::new(Arc::clone(&engine)));
+    catalog.bootstrap().unwrap();
+    let table_id = create_simple_table(&catalog, "t");
+    let store = TableStore::new(Arc::clone(&engine), Arc::clone(&catalog));
+
+    for i in 0..25 {
+        store
+            .put_row(
+                table_id,
+                &[
+                    Some(RelationalValue::Integer(i)),
+                    Some(RelationalValue::Text(format!("v{i}"))),
+                    None,
+                ],
+            )
+            .unwrap();
+    }
+    let snapshot_seq = engine.snapshot().seq();
+    store
+        .put_row(
+            table_id,
+            &[
+                Some(RelationalValue::Integer(999)),
+                Some(RelationalValue::Text("late".to_string())),
+                None,
+            ],
+        )
+        .unwrap();
+
+    let eager = store.scan_table_as_of(table_id, snapshot_seq).unwrap();
+    let lazy: Vec<_> = store
+        .scan_table_rows_as_of(table_id, snapshot_seq)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(eager, lazy);
+    assert_eq!(
+        lazy.len(),
+        25,
+        "the lazy iterator must not see the post-snapshot row either"
+    );
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_row_as_of_is_stable_against_a_later_write() {
+    let dir = temp_dir("get_row_as_of");
+    let engine = open(&dir);
+    let catalog = Arc::new(CatalogService::new(Arc::clone(&engine)));
+    catalog.bootstrap().unwrap();
+    let table_id = create_simple_table(&catalog, "t");
+    let store = TableStore::new(Arc::clone(&engine), Arc::clone(&catalog));
+
+    store
+        .put_row(
+            table_id,
+            &[
+                Some(RelationalValue::Integer(1)),
+                Some(RelationalValue::Text("v1".to_string())),
+                None,
+            ],
+        )
+        .unwrap();
+    let snapshot_seq = engine.snapshot().seq();
+    store
+        .put_row(
+            table_id,
+            &[
+                Some(RelationalValue::Integer(1)),
+                Some(RelationalValue::Text("v2".to_string())),
+                None,
+            ],
+        )
+        .unwrap();
+
+    let snapshotted = store
+        .get_row_as_of(table_id, &[RelationalValue::Integer(1)], snapshot_seq)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshotted[1],
+        Some(RelationalValue::Text("v1".to_string()))
+    );
+
+    let current = store
+        .get_row(table_id, &[RelationalValue::Integer(1)])
+        .unwrap()
+        .unwrap();
+    assert_eq!(current[1], Some(RelationalValue::Text("v2".to_string())));
+
+    engine.shutdown();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// -----------------------------------------------------------------
 // Differential test: TableStore state matches an independent,
 // serialized reference model.
 // -----------------------------------------------------------------
