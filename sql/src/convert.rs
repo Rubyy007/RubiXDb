@@ -48,7 +48,9 @@ pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Sta
         sp::Statement::Insert(insert) => Ok(Statement::Insert(convert_insert(insert, &dg)?)),
         sp::Statement::Update(update) => Ok(Statement::Update(convert_update(update, &dg)?)),
         sp::Statement::Delete(delete) => Ok(Statement::Delete(convert_delete(delete, &dg)?)),
-        sp::Statement::CreateTable(ct) => Ok(Statement::CreateTable(convert_create_table(ct, limits)?)),
+        sp::Statement::CreateTable(ct) => {
+            Ok(Statement::CreateTable(convert_create_table(ct, limits)?))
+        }
         sp::Statement::CreateIndex(ci) => Ok(Statement::CreateIndex(convert_create_index(ci)?)),
         sp::Statement::CreateSchema {
             schema_name,
@@ -119,9 +121,11 @@ pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Sta
                     }))
                 }
                 sp::ObjectType::Index => {
-                    let table_name = table
-                        .as_ref()
-                        .ok_or_else(|| unsupported("DROP INDEX requires 'ON <table>' (index names are table-scoped)"))?;
+                    let table_name = table.as_ref().ok_or_else(|| {
+                        unsupported(
+                            "DROP INDEX requires 'ON <table>' (index names are table-scoped)",
+                        )
+                    })?;
                     let index_ident_name = convert_object_name(&names[0], limits)?;
                     if index_ident_name.0.len() != 1 {
                         return Err(SqlError::InvalidIdentifier {
@@ -130,7 +134,11 @@ pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Sta
                     }
                     Ok(Statement::DropIndex(DropIndex {
                         table: convert_object_name(table_name, limits)?,
-                        name: index_ident_name.0.into_iter().next().expect("checked len 1"),
+                        name: index_ident_name
+                            .0
+                            .into_iter()
+                            .next()
+                            .expect("checked len 1"),
                         if_exists: *if_exists,
                     }))
                 }
@@ -147,8 +155,16 @@ pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Sta
             options,
             describe_alias: _,
         } => {
-            if *analyze || *verbose || *query_plan || *estimate || format.is_some() || options.is_some() {
-                return Err(unsupported("EXPLAIN with modifiers (ANALYZE/VERBOSE/FORMAT/...)"));
+            if *analyze
+                || *verbose
+                || *query_plan
+                || *estimate
+                || format.is_some()
+                || options.is_some()
+            {
+                return Err(unsupported(
+                    "EXPLAIN with modifiers (ANALYZE/VERBOSE/FORMAT/...)",
+                ));
             }
             let inner = convert_statement(statement, limits)?;
             Ok(Statement::Explain(Explain {
@@ -163,7 +179,9 @@ pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Sta
             ..
         } => {
             if !modes.is_empty() || modifier.is_some() || !statements.is_empty() {
-                return Err(unsupported("BEGIN/START TRANSACTION with modes/modifiers/a statement block"));
+                return Err(unsupported(
+                    "BEGIN/START TRANSACTION with modes/modifiers/a statement block",
+                ));
             }
             Ok(Statement::Begin)
         }
@@ -245,7 +263,9 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
         sp::GroupByExpr::All(_) => return Err(unsupported("GROUP BY ALL")),
         sp::GroupByExpr::Expressions(exprs, modifiers) => {
             if !exprs.is_empty() || !modifiers.is_empty() {
-                return Err(unsupported("GROUP BY (aggregation binding is out of this increment's scope)"));
+                return Err(unsupported(
+                    "GROUP BY (aggregation binding is out of this increment's scope)",
+                ));
             }
         }
     }
@@ -267,7 +287,9 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
     } else if select.from.len() == 1 {
         Some(convert_table_with_joins(&select.from[0], dg, depth + 1)?)
     } else {
-        return Err(unsupported("multiple comma-separated FROM items (implicit CROSS JOIN)"));
+        return Err(unsupported(
+            "multiple comma-separated FROM items (implicit CROSS JOIN)",
+        ));
     };
 
     let selection = select
@@ -298,7 +320,10 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
             if !limit_by.is_empty() {
                 return Err(unsupported("LIMIT ... BY"));
             }
-            let limit = limit.as_ref().map(|e| convert_expr(e, dg, depth + 1)).transpose()?;
+            let limit = limit
+                .as_ref()
+                .map(|e| convert_expr(e, dg, depth + 1))
+                .transpose()?;
             let offset = offset
                 .as_ref()
                 .map(|o| convert_expr(&o.value, dg, depth + 1))
@@ -340,18 +365,22 @@ fn convert_select_item(item: &sp::SelectItem, dg: &DepthGuard, depth: usize) -> 
         }
         sp::SelectItem::QualifiedWildcard(kind, opts) => {
             if !is_default_wildcard_options(opts) {
-                return Err(unsupported("qualified * with EXCLUDE/REPLACE/RENAME options"));
+                return Err(unsupported(
+                    "qualified * with EXCLUDE/REPLACE/RENAME options",
+                ));
             }
             match kind {
-                sp::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                    Ok(SelectItem::QualifiedWildcard(convert_object_name(name, dg.limits)?))
-                }
+                sp::SelectItemQualifiedWildcardKind::ObjectName(name) => Ok(
+                    SelectItem::QualifiedWildcard(convert_object_name(name, dg.limits)?),
+                ),
                 sp::SelectItemQualifiedWildcardKind::Expr(_) => {
                     Err(unsupported("wildcard on an arbitrary expression"))
                 }
             }
         }
-        sp::SelectItem::ExprWithAliases { .. } => Err(unsupported("expression with multiple aliases")),
+        sp::SelectItem::ExprWithAliases { .. } => {
+            Err(unsupported("expression with multiple aliases"))
+        }
     }
 }
 
@@ -363,7 +392,11 @@ fn is_default_wildcard_options(opts: &sp::WildcardAdditionalOptions) -> bool {
         && opts.opt_ilike.is_none()
 }
 
-fn convert_table_with_joins(t: &sp::TableWithJoins, dg: &DepthGuard, depth: usize) -> Result<FromClause> {
+fn convert_table_with_joins(
+    t: &sp::TableWithJoins,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<FromClause> {
     dg.check(depth)?;
     let first = convert_table_factor(&t.relation, dg.limits)?;
     let joins = t
@@ -395,7 +428,9 @@ fn convert_table_factor(tf: &sp::TableFactor, limits: &SqlLimits) -> Result<Tabl
                 || json_path.is_some()
                 || *with_ordinality
             {
-                return Err(unsupported("table reference with function args/hints/version/partitions/ordinality"));
+                return Err(unsupported(
+                    "table reference with function args/hints/version/partitions/ordinality",
+                ));
             }
             Ok(TableRef {
                 name: convert_object_name(name, limits)?,
@@ -406,8 +441,7 @@ fn convert_table_factor(tf: &sp::TableFactor, limits: &SqlLimits) -> Result<Tabl
             })
         }
         sp::TableFactor::Derived { .. } => Err(unsupported("derived table (subquery in FROM)")),
-        other => Err(unsupported(format!("FROM item kind: {other:?}"))
-            .into_kind_only()),
+        other => Err(unsupported(format!("FROM item kind: {other:?}")).into_kind_only()),
     }
 }
 
@@ -423,7 +457,12 @@ impl IntoKindOnly for SqlError {
     fn into_kind_only(self) -> SqlError {
         match self {
             SqlError::Unsupported { detail } => SqlError::Unsupported {
-                detail: detail.split('(').next().unwrap_or(&detail).trim().to_string(),
+                detail: detail
+                    .split('(')
+                    .next()
+                    .unwrap_or(&detail)
+                    .trim()
+                    .to_string(),
             },
             other => other,
         }
@@ -462,14 +501,20 @@ fn convert_join(j: &sp::Join, dg: &DepthGuard, depth: usize) -> Result<Join> {
     Ok(Join { kind, table, on })
 }
 
-fn convert_order_by_item(item: &sp::OrderByExpr, dg: &DepthGuard, depth: usize) -> Result<OrderByItem> {
+fn convert_order_by_item(
+    item: &sp::OrderByExpr,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<OrderByItem> {
     if item.with_fill.is_some() {
         return Err(unsupported("ORDER BY ... WITH FILL"));
     }
     let descending = match item.options.sort {
         None | Some(sp::OrderBySort::Asc) => false,
         Some(sp::OrderBySort::Desc) => true,
-        Some(sp::OrderBySort::Using(_)) => return Err(unsupported("ORDER BY ... USING <operator>")),
+        Some(sp::OrderBySort::Using(_)) => {
+            return Err(unsupported("ORDER BY ... USING <operator>"))
+        }
     };
     Ok(OrderByItem {
         expr: convert_expr(&item.expr, dg, depth + 1)?,
@@ -496,7 +541,9 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
         || insert.settings.is_some()
         || insert.format_clause.is_some()
     {
-        return Err(unsupported("INSERT with dialect-specific modifiers (OR/IGNORE/ON CONFLICT/RETURNING/...)"));
+        return Err(unsupported(
+            "INSERT with dialect-specific modifiers (OR/IGNORE/ON CONFLICT/RETURNING/...)",
+        ));
     }
     let sp::TableObject::TableName(table_name) = &insert.table else {
         return Err(unsupported("INSERT target must be a plain table name"));
@@ -525,7 +572,10 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
     if let Some(cols) = &columns {
         if cols.len() > dg.limits.max_columns {
             return Err(SqlError::ResourceLimit {
-                detail: format!("INSERT column list exceeds max_columns ({})", dg.limits.max_columns),
+                detail: format!(
+                    "INSERT column list exceeds max_columns ({})",
+                    dg.limits.max_columns
+                ),
             });
         }
     }
@@ -538,11 +588,16 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
         return Err(unsupported("INSERT ... SELECT with WITH/ORDER BY/LIMIT"));
     }
     let sp::SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(unsupported("INSERT source must be a VALUES list (no INSERT ... SELECT)"));
+        return Err(unsupported(
+            "INSERT source must be a VALUES list (no INSERT ... SELECT)",
+        ));
     };
     if values.rows.len() > dg.limits.max_values_rows {
         return Err(SqlError::ResourceLimit {
-            detail: format!("VALUES row count exceeds max_values_rows ({})", dg.limits.max_values_rows),
+            detail: format!(
+                "VALUES row count exceeds max_values_rows ({})",
+                dg.limits.max_values_rows
+            ),
         });
     }
     let rows = values
@@ -551,7 +606,10 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
         .map(|row| {
             if row.content.len() > dg.limits.max_columns {
                 return Err(SqlError::ResourceLimit {
-                    detail: format!("VALUES row width exceeds max_columns ({})", dg.limits.max_columns),
+                    detail: format!(
+                        "VALUES row width exceeds max_columns ({})",
+                        dg.limits.max_columns
+                    ),
                 });
             }
             row.content
@@ -561,7 +619,11 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(Insert { table, columns, rows })
+    Ok(Insert {
+        table,
+        columns,
+        rows,
+    })
 }
 
 fn convert_update(update: &sp::Update, dg: &DepthGuard) -> Result<Update> {
@@ -612,13 +674,17 @@ fn convert_delete(delete: &sp::Delete, dg: &DepthGuard) -> Result<Delete> {
         || !delete.order_by.is_empty()
         || delete.limit.is_some()
     {
-        return Err(unsupported("DELETE with USING/RETURNING/ORDER BY/LIMIT/multi-table form"));
+        return Err(unsupported(
+            "DELETE with USING/RETURNING/ORDER BY/LIMIT/multi-table form",
+        ));
     }
     let sp::FromTable::WithFromKeyword(from) = &delete.from else {
         return Err(unsupported("DELETE without the FROM keyword"));
     };
     if from.len() != 1 || !from[0].joins.is_empty() {
-        return Err(unsupported("DELETE with more than one target or a joined target"));
+        return Err(unsupported(
+            "DELETE with more than one target or a joined target",
+        ));
     }
     let table = convert_table_factor(&from[0].relation, dg.limits)?;
     let selection = delete
@@ -685,10 +751,17 @@ fn convert_expr(e: &sp::Expr, dg: &DepthGuard, depth: usize) -> Result<Expr> {
             low: Box::new(convert_expr(low, dg, depth + 1)?),
             high: Box::new(convert_expr(high, dg, depth + 1)?),
         }),
-        sp::Expr::InList { expr, list, negated } => {
+        sp::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             if list.len() > dg.limits.max_list_elements {
                 return Err(SqlError::ResourceLimit {
-                    detail: format!("IN list exceeds max_list_elements ({})", dg.limits.max_list_elements),
+                    detail: format!(
+                        "IN list exceeds max_list_elements ({})",
+                        dg.limits.max_list_elements
+                    ),
                 });
             }
             Ok(Expr::InList {
@@ -769,7 +842,10 @@ fn convert_expr(e: &sp::Expr, dg: &DepthGuard, depth: usize) -> Result<Expr> {
         }
         sp::Expr::TypedString(ts) => convert_typed_string(ts),
         sp::Expr::Function(f) => convert_function(f, dg, depth),
-        other => Err(unsupported(format!("expression kind: {}", expr_kind_name(other)))),
+        other => Err(unsupported(format!(
+            "expression kind: {}",
+            expr_kind_name(other)
+        ))),
     }
 }
 
@@ -784,7 +860,12 @@ fn expr_kind_name(e: &sp::Expr) -> &'static str {
     }
 }
 
-fn convert_unary_op(op: &sp::UnaryOperator, inner: &sp::Expr, dg: &DepthGuard, depth: usize) -> Result<Expr> {
+fn convert_unary_op(
+    op: &sp::UnaryOperator,
+    inner: &sp::Expr,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<Expr> {
     // Fold a simple `-<number literal>` into one literal (not
     // `UnaryOp(Neg, Literal)`) so boundary values (e.g. BIGINT::MIN)
     // round-trip exactly through `crate::bind`'s numeric parsing —
@@ -841,9 +922,11 @@ fn is_integer_text(text: &str) -> bool {
 fn convert_value_expr(v: &sp::Value) -> Result<Expr> {
     match v {
         sp::Value::Placeholder(text) => {
-            let idx_text = text.strip_prefix('$').ok_or_else(|| SqlError::InvalidParameter {
-                detail: "only $n-style parameters are supported (no bare '?')".to_string(),
-            })?;
+            let idx_text = text
+                .strip_prefix('$')
+                .ok_or_else(|| SqlError::InvalidParameter {
+                    detail: "only $n-style parameters are supported (no bare '?')".to_string(),
+                })?;
             let idx: u32 = idx_text.parse().map_err(|_| SqlError::InvalidParameter {
                 detail: "parameter index must be a positive integer ($1, $2, ...)".to_string(),
             })?;
@@ -894,18 +977,31 @@ fn convert_typed_string(ts: &sp::TypedString) -> Result<Expr> {
         return Err(unsupported("ODBC-syntax typed string literal"));
     }
     let data_type = convert_data_type(&ts.data_type)?;
-    if !matches!(data_type, SqlDataType::Date | SqlDataType::Time | SqlDataType::Timestamp) {
+    if !matches!(
+        data_type,
+        SqlDataType::Date | SqlDataType::Time | SqlDataType::Timestamp
+    ) {
         return Err(unsupported("typed string literal for a non-temporal type"));
     }
-    let text = ts.value.clone().into_string().ok_or_else(|| SqlError::Parse {
-        detail: "typed string literal value must be a plain string".to_string(),
-    })?;
+    let text = ts
+        .value
+        .clone()
+        .into_string()
+        .ok_or_else(|| SqlError::Parse {
+            detail: "typed string literal value must be a plain string".to_string(),
+        })?;
     Ok(Expr::Literal(Literal::Typed { data_type, text }))
 }
 
 fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<Expr> {
-    if f.uses_odbc_syntax || !f.within_group.is_empty() || f.filter.is_some() || f.null_treatment.is_some() {
-        return Err(unsupported("function call with ODBC/WITHIN GROUP/FILTER/null-treatment modifiers"));
+    if f.uses_odbc_syntax
+        || !f.within_group.is_empty()
+        || f.filter.is_some()
+        || f.null_treatment.is_some()
+    {
+        return Err(unsupported(
+            "function call with ODBC/WITHIN GROUP/FILTER/null-treatment modifiers",
+        ));
     }
     if !matches!(f.parameters, sp::FunctionArguments::None) {
         return Err(unsupported("function call with a parametric argument list"));
@@ -914,7 +1010,9 @@ fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<E
         sp::FunctionArguments::None => Vec::new(),
         sp::FunctionArguments::List(list) => {
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
-                return Err(unsupported("function call with DISTINCT/ORDER BY inside the argument list"));
+                return Err(unsupported(
+                    "function call with DISTINCT/ORDER BY inside the argument list",
+                ));
             }
             if list.args.len() > dg.limits.max_columns {
                 return Err(SqlError::ResourceLimit {
@@ -924,12 +1022,16 @@ fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<E
             list.args
                 .iter()
                 .map(|a| match a {
-                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e, dg, depth + 1),
+                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                        convert_expr(e, dg, depth + 1)
+                    }
                     _ => Err(unsupported("named/wildcard function arguments")),
                 })
                 .collect::<Result<Vec<_>>>()?
         }
-        sp::FunctionArguments::Subquery(_) => return Err(unsupported("function call with a bare subquery argument")),
+        sp::FunctionArguments::Subquery(_) => {
+            return Err(unsupported("function call with a bare subquery argument"))
+        }
     };
     Ok(Expr::Function {
         name: convert_object_name(&f.name, dg.limits)?,
@@ -949,11 +1051,16 @@ fn convert_create_table(ct: &sp::CreateTable, limits: &SqlLimits) -> Result<Crea
         || ct.like.is_some()
         || ct.clone.is_some()
     {
-        return Err(unsupported("CREATE TABLE with OR REPLACE/TEMPORARY/EXTERNAL/AS SELECT/LIKE/CLONE"));
+        return Err(unsupported(
+            "CREATE TABLE with OR REPLACE/TEMPORARY/EXTERNAL/AS SELECT/LIKE/CLONE",
+        ));
     }
     if ct.columns.len() > limits.max_columns {
         return Err(SqlError::ResourceLimit {
-            detail: format!("CREATE TABLE column count exceeds max_columns ({})", limits.max_columns),
+            detail: format!(
+                "CREATE TABLE column count exceeds max_columns ({})",
+                limits.max_columns
+            ),
         });
     }
     let columns = ct
@@ -971,9 +1078,17 @@ fn convert_create_table(ct: &sp::CreateTable, limits: &SqlLimits) -> Result<Crea
                 }
                 table_primary_key = Some(index_columns_to_idents(&pk.columns, limits)?);
             }
-            sp::TableConstraint::Unique(_) => return Err(unsupported("table-level UNIQUE constraint (create the table, then CREATE UNIQUE INDEX)")),
-            sp::TableConstraint::ForeignKey(_) => return Err(unsupported("FOREIGN KEY constraints")),
-            sp::TableConstraint::Check(_) => return Err(unsupported("table-level CHECK constraints")),
+            sp::TableConstraint::Unique(_) => {
+                return Err(unsupported(
+                    "table-level UNIQUE constraint (create the table, then CREATE UNIQUE INDEX)",
+                ))
+            }
+            sp::TableConstraint::ForeignKey(_) => {
+                return Err(unsupported("FOREIGN KEY constraints"))
+            }
+            sp::TableConstraint::Check(_) => {
+                return Err(unsupported("table-level CHECK constraints"))
+            }
             other => return Err(unsupported(format!("table constraint kind: {other:?}"))),
         }
     }
@@ -994,7 +1109,9 @@ fn index_columns_to_idents(cols: &[sp::IndexColumn], limits: &SqlLimits) -> Resu
             }
             match &c.column.expr {
                 sp::Expr::Identifier(id) => convert_ident(id, limits),
-                _ => Err(unsupported("index/constraint column must be a plain column name")),
+                _ => Err(unsupported(
+                    "index/constraint column must be a plain column name",
+                )),
             }
         })
         .collect()
@@ -1018,7 +1135,9 @@ fn convert_column_def(c: &sp::ColumnDef, limits: &SqlLimits) -> Result<ColumnDef
                 nullable = false;
             }
             sp::ColumnOption::Unique(_) => {
-                return Err(unsupported("inline UNIQUE column option (create the table, then CREATE UNIQUE INDEX)"))
+                return Err(unsupported(
+                    "inline UNIQUE column option (create the table, then CREATE UNIQUE INDEX)",
+                ))
             }
             other => return Err(unsupported(format!("column option kind: {other:?}"))),
         }
@@ -1083,7 +1202,9 @@ fn convert_create_index(ci: &sp::CreateIndex) -> Result<CreateIndex> {
         || !ci.index_options.is_empty()
         || !ci.alter_options.is_empty()
     {
-        return Err(unsupported("CREATE INDEX with USING/CONCURRENTLY/INCLUDE/WITH/WHERE/options"));
+        return Err(unsupported(
+            "CREATE INDEX with USING/CONCURRENTLY/INCLUDE/WITH/WHERE/options",
+        ));
     }
     let dummy_limits = SqlLimits::default();
     Ok(CreateIndex {

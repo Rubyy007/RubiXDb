@@ -138,7 +138,9 @@ mod tests {
         let catalog = CatalogService::new(Arc::clone(&engine));
         catalog.bootstrap().unwrap();
         let ctx = AuthContext::admin("svc-a");
-        assert!(is_authorized(&catalog, &ctx, Privilege::Ddl, &[(ObjectKind::Table, 999)]).unwrap());
+        assert!(
+            is_authorized(&catalog, &ctx, Privilege::Ddl, &[(ObjectKind::Table, 999)]).unwrap()
+        );
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -150,8 +152,12 @@ mod tests {
         let catalog = CatalogService::new(Arc::clone(&engine));
         catalog.bootstrap().unwrap();
         let ctx = AuthContext::reader("svc-b");
-        assert!(is_authorized(&catalog, &ctx, Privilege::Select, &[(ObjectKind::Table, 1)]).unwrap());
-        assert!(!is_authorized(&catalog, &ctx, Privilege::Insert, &[(ObjectKind::Table, 1)]).unwrap());
+        assert!(
+            is_authorized(&catalog, &ctx, Privilege::Select, &[(ObjectKind::Table, 1)]).unwrap()
+        );
+        assert!(
+            !is_authorized(&catalog, &ctx, Privilege::Insert, &[(ObjectKind::Table, 1)]).unwrap()
+        );
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -171,14 +177,22 @@ mod tests {
             &catalog,
             &ctx,
             Privilege::Select,
-            &[(ObjectKind::Table, 42), (ObjectKind::Schema, 1), (ObjectKind::Database, 1)]
+            &[
+                (ObjectKind::Table, 42),
+                (ObjectKind::Schema, 1),
+                (ObjectKind::Database, 1)
+            ]
         )
         .unwrap());
         assert!(!is_authorized(
             &catalog,
             &ctx,
             Privilege::Insert,
-            &[(ObjectKind::Table, 42), (ObjectKind::Schema, 1), (ObjectKind::Database, 1)]
+            &[
+                (ObjectKind::Table, 42),
+                (ObjectKind::Schema, 1),
+                (ObjectKind::Database, 1)
+            ]
         )
         .unwrap());
         engine.shutdown();

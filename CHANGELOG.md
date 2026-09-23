@@ -6,6 +6,54 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 6 (SQL parser, internal AST, binder, authorization) (2026-09-23)
+
+Adds the SQL front-end foundation in a new `rubixdb-sql` workspace
+crate: parser integration, an internal AST decoupled from the
+third-party parser, and a binder that resolves catalog identifiers and
+authorization in one pass. `PHASE_RELATIONAL_SQL_GRAMMAR.md` is the
+full reference; `PHASE_RELATIONAL_SQL_INCREMENT6_RESULTS.md` has the
+certification matrix. No SQL execution exists.
+
+#### Added
+
+- `sql/` (crate `rubixdb-sql`): `ast`/`convert`/`parse`/`bind`/`bound`/
+  `auth`/`functions`/`temporal`/`error`/`limits`/`metrics` modules.
+  Depends on `sqlparser = "=0.63.0"` (Apache-2.0, pinned exact) and the
+  core `rubixdb` crate; never the reverse.
+- Supported grammar: `SELECT` (`INNER`/`LEFT JOIN`, `WHERE`, `ORDER BY`,
+  `LIMIT`/`OFFSET`, `DISTINCT`, wildcards), `INSERT`/`UPDATE`/`DELETE`,
+  `CREATE`/`DROP TABLE`/`INDEX`/`SCHEMA`/`DATABASE`, `EXPLAIN`, `BEGIN`/
+  `COMMIT`/`ROLLBACK` -- every internal AST statement variant documents
+  its own PARSED/BOUND/NOT-EXECUTABLE-YET boundary.
+- The binder (`bind::scope::resolve_table`) resolves identifiers and D25
+  authorization together: a nonexistent object and a forbidden-but-
+  existing one produce the identical error, never distinguishable.
+- `benches/sql_parser_bench.rs`, `benches/sql_binder_bench.rs` --
+  measured, not claimed (binder latency scales linearly with catalog
+  table count, traced to `CatalogService::list_tables`'s pre-existing
+  full-scan design; no cache added, per the directive's own "do not
+  introduce caching automatically").
+- 98 new tests: parser correctness, resource-limit boundaries,
+  `proptest` fuzzing, binder integration, SQL-injection/authorization-
+  bypass security tests, and an independent reference-model
+  differential test for column resolution.
+
+#### Fixed / Found
+
+- A long flat chain of binary operators (`1 + 1 + 1 + ...`) bypasses
+  `sqlparser`'s own parse-time recursion guard (Pratt-parsed
+  iteratively, never recursing) while still building a deep `Box<Expr>`
+  tree whose ordinary recursive `Drop` overflows the stack --
+  reproduced deterministically (a 20,000-term chain crashed the process,
+  not a returned error) and closed with a pre-parse operator-density
+  check, the only mitigation available without modifying the third-party
+  parser.
+- `PHASE_RELATIONAL_DATABASE_ARCHITECTURE.md` §1 promised an "Identifier
+  Rules" section in the ADR that was never written -- supplied in
+  `PHASE_RELATIONAL_SQL_GRAMMAR.md` §9, using the case-folding behavior
+  the Architecture doc's own prose already specified.
+
 ### Relational database: Increment 5 (production secondary indexes, online `CREATE INDEX`) (2026-09-23)
 
 Adds real, persistent, online-buildable secondary indexes on top of the

@@ -3205,3 +3205,59 @@ as_of_seq)`/`write_batch`.
 **RELATIONAL DATABASE PRODUCTION READY = NO.** Write/Read/Compaction
 remain independently PRODUCTION READY, unaffected. Full account:
 `PHASE_RELATIONAL_INDEX_INCREMENT5_RESULTS.md`.
+
+---
+
+## 2026-09-23 (later)
+
+**Implemented:** Increment 6 -- production SQL parser + internal AST +
+binder + authorization resolution, in a new `rubixdb-sql` workspace
+crate (`sql/`), depending on the core `rubixdb` crate and `sqlparser =
+"=0.63.0"` (never the reverse -- the core engine crate's own "zero new
+dependency" property is unaffected; `git diff --stat -- src/` for this
+increment is empty). `PHASE_RELATIONAL_SQL_GRAMMAR.md` is the
+structural/reference record, `PHASE_RELATIONAL_SQL_INCREMENT6_RESULTS.md`
+the certification matrix. No SQL execution exists -- every `Statement`
+variant's own doc comment states PARSED/BOUND/NOT EXECUTABLE YET.
+
+The binder resolves catalog identifiers and D25 authorization in the
+*same* pass (`bind::scope::resolve_table`) -- "does not exist" and
+"exists but forbidden" are structurally the same `UnknownObject` error,
+verified directly, never distinguishable to a caller. `JOIN` binding
+(`INNER`/`LEFT` only, D18), wildcard expansion using real catalog column
+order, and `BETWEEN`/`IN`/comparison type unification (a rigid
+column/function type always wins over a flexible literal's own
+context-free default, regardless of expression side) are all real,
+tested logic, not stubs.
+
+**A real vulnerability found and fixed**: `sqlparser`'s own recursion
+guard protects its *parsing* call stack, but a long flat chain of binary
+operators (`1 + 1 + 1 + ...`) is Pratt-parsed iteratively, never
+tripping that guard, while still building a correspondingly deep
+`Box<Expr>` tree -- Rust's ordinary recursive `Drop` for that tree then
+overflows the stack. Reproduced deterministically (a 20,000-term chain
+crashed the test binary with `STATUS_STACK_OVERFLOW`, not a returned
+error) before being closed with a pre-parse operator-density check
+(`parse::reject_pathological_operator_chains`) -- the only available
+mitigation without modifying `sqlparser` itself.
+
+98 new tests (parser correctness, resource-limit boundaries,
+`proptest`-driven fuzzing including the stack-overflow regression,
+binder integration against a real catalog, SQL-injection and
+authorization-bypass security tests, and an independent reference-model
+differential test for column resolution -- zero mismatches across a
+fixed matrix plus 64 generated cases). Full regression: 497 `rubixdb` +
+30 `rubixdb-api` + 98 `rubixdb-sql` tests, debug and release, all
+passing; `wal_tests`/`pathological_recovery_matrix`/`crash_consistency`
+unchanged. `src/manifest/`, `src/compaction/`, `src/sstable/`,
+`src/wal/`, `api/`, and the rest of `src/` are completely untouched.
+
+Also filled a genuine gap: `PHASE_RELATIONAL_DATABASE_ARCHITECTURE.md`
+§1 promised a dedicated "Identifier Rules" section in the ADR that was
+never actually written -- supplied in `PHASE_RELATIONAL_SQL_GRAMMAR.md`
+§9, using exactly the case-folding behavior the Architecture doc's own
+prose already committed to.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** Write/Read/Compaction/
+catalog/row-storage/secondary-indexes remain independently certified,
+unaffected. Full account: `PHASE_RELATIONAL_SQL_INCREMENT6_RESULTS.md`.

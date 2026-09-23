@@ -104,7 +104,12 @@ mod tests {
     fn registry_names_are_unique_and_lowercase() {
         let mut seen = std::collections::HashSet::new();
         for f in REGISTRY {
-            assert_eq!(f.name, f.name.to_lowercase(), "{} must be lowercase", f.name);
+            assert_eq!(
+                f.name,
+                f.name.to_lowercase(),
+                "{} must be lowercase",
+                f.name
+            );
             assert!(seen.insert(f.name), "duplicate function name {}", f.name);
         }
     }

@@ -23,3 +23,24 @@ pub use bound::BoundStatement;
 pub use error::{Result, SqlError};
 pub use limits::SqlLimits;
 pub use metrics::SqlMetrics;
+
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+mod parse_tests;
+
+#[cfg(test)]
+mod limits_tests;
+
+#[cfg(test)]
+mod fuzz_tests;
+
+#[cfg(test)]
+mod bind_tests;
+
+#[cfg(test)]
+mod security_tests;
+
+#[cfg(test)]
+mod reference_model;

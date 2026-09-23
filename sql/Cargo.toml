@@ -12,3 +12,11 @@ sqlparser = "=0.63.0"
 [dev-dependencies]
 proptest = "=1.11.0"
 criterion = "=0.8.2"
+
+[[bench]]
+name = "sql_parser_bench"
+harness = false
+
+[[bench]]
+name = "sql_binder_bench"
+harness = false

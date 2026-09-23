@@ -25,7 +25,8 @@ pub fn bind_insert(
     limits: &SqlLimits,
     stmt: &ast::Insert,
 ) -> Result<BoundInsert> {
-    let resolved = scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Insert)?;
+    let resolved =
+        scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Insert)?;
     let column_count = resolved.columns.len();
 
     let target_ordinals: Vec<u16> = match &stmt.columns {
@@ -35,7 +36,10 @@ pub fn bind_insert(
                 .map(|ident| {
                     if !seen.insert(ident.value.clone()) {
                         return Err(SqlError::InvalidIdentifier {
-                            detail: format!("duplicate column {:?} in INSERT column list", ident.value),
+                            detail: format!(
+                                "duplicate column {:?} in INSERT column list",
+                                ident.value
+                            ),
                         });
                     }
                     resolved
@@ -101,7 +105,12 @@ pub fn bind_insert(
                 });
             }
         }
-        bound_rows.push(full_row.into_iter().map(|o| o.expect("every slot filled above")).collect());
+        bound_rows.push(
+            full_row
+                .into_iter()
+                .map(|o| o.expect("every slot filled above"))
+                .collect(),
+        );
     }
 
     Ok(BoundInsert {
@@ -121,7 +130,8 @@ pub fn bind_update(
     limits: &SqlLimits,
     stmt: &ast::Update,
 ) -> Result<BoundUpdate> {
-    let resolved = scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Update)?;
+    let resolved =
+        scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Update)?;
     let pk_ordinals: HashSet<u16> = resolved.table.pk_ordinals.iter().copied().collect();
     let mut scope = Scope::default();
     scope.push(resolved, None, false);
@@ -199,7 +209,8 @@ pub fn bind_delete(
     limits: &SqlLimits,
     stmt: &ast::Delete,
 ) -> Result<BoundDelete> {
-    let resolved = scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Delete)?;
+    let resolved =
+        scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Delete)?;
     let mut scope = Scope::default();
     scope.push(resolved, None, false);
 

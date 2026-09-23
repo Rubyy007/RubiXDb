@@ -46,7 +46,9 @@ fn sql_data_type_tag_and_params(dt: ast::SqlDataType) -> (u8, Option<Vec<u8>>) {
         ast::SqlDataType::Bigint => (rv::TYPE_TAG_BIGINT, None),
         ast::SqlDataType::Real => (rv::TYPE_TAG_REAL, None),
         ast::SqlDataType::Double => (rv::TYPE_TAG_DOUBLE, None),
-        ast::SqlDataType::Decimal { precision, scale } => (rv::TYPE_TAG_DECIMAL, Some(vec![precision, scale])),
+        ast::SqlDataType::Decimal { precision, scale } => {
+            (rv::TYPE_TAG_DECIMAL, Some(vec![precision, scale]))
+        }
         ast::SqlDataType::Text => (rv::TYPE_TAG_TEXT, None),
         ast::SqlDataType::Blob => (rv::TYPE_TAG_BLOB, None),
         ast::SqlDataType::Date => (rv::TYPE_TAG_DATE, None),
@@ -69,10 +71,12 @@ pub fn relational_type_of(column: &ColumnRow) -> Result<RelationalType> {
         rv::TYPE_TAG_REAL => RelationalType::Real,
         rv::TYPE_TAG_DOUBLE => RelationalType::Double,
         rv::TYPE_TAG_DECIMAL => {
-            let params = column.type_params.as_ref().ok_or_else(|| SqlError::Catalog(format!(
-                "column {:?} is DECIMAL but has no type_params",
-                column.name
-            )))?;
+            let params = column.type_params.as_ref().ok_or_else(|| {
+                SqlError::Catalog(format!(
+                    "column {:?} is DECIMAL but has no type_params",
+                    column.name
+                ))
+            })?;
             let &[_precision, scale] = params.as_slice() else {
                 return Err(SqlError::Catalog(format!(
                     "column {:?}'s DECIMAL type_params must be exactly 2 bytes",
@@ -147,7 +151,8 @@ pub fn bind_create_table(
     limits: &SqlLimits,
     stmt: &ast::CreateTable,
 ) -> Result<BoundCreateTable> {
-    let (database_id, schema_id) = scope::resolve_schema_for_ddl(catalog, ctx, auth, metrics, &stmt.name)?;
+    let (database_id, schema_id) =
+        scope::resolve_schema_for_ddl(catalog, ctx, auth, metrics, &stmt.name)?;
 
     if stmt.columns.is_empty() {
         return Err(SqlError::TypeMismatch {
@@ -156,7 +161,10 @@ pub fn bind_create_table(
     }
     if stmt.columns.len() > limits.max_columns {
         return Err(SqlError::ResourceLimit {
-            detail: format!("CREATE TABLE column count exceeds max_columns ({})", limits.max_columns),
+            detail: format!(
+                "CREATE TABLE column count exceeds max_columns ({})",
+                limits.max_columns
+            ),
         });
     }
 
@@ -281,7 +289,14 @@ pub fn bind_create_index(
     limits: &SqlLimits,
     stmt: &ast::CreateIndex,
 ) -> Result<BoundCreateIndex> {
-    let resolved = scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::CreateIndex)?;
+    let resolved = scope::resolve_table(
+        catalog,
+        ctx,
+        auth,
+        metrics,
+        &stmt.table,
+        Privilege::CreateIndex,
+    )?;
     if stmt.columns.is_empty() {
         return Err(SqlError::TypeMismatch {
             detail: "CREATE INDEX requires at least one column".to_string(),
@@ -289,7 +304,10 @@ pub fn bind_create_index(
     }
     if stmt.columns.len() > limits.max_columns {
         return Err(SqlError::ResourceLimit {
-            detail: format!("CREATE INDEX column count exceeds max_columns ({})", limits.max_columns),
+            detail: format!(
+                "CREATE INDEX column count exceeds max_columns ({})",
+                limits.max_columns
+            ),
         });
     }
     let column_ordinals = stmt
@@ -311,11 +329,25 @@ pub fn bind_create_index(
         .name
         .as_ref()
         .map(|n| n.value.clone())
-        .unwrap_or_else(|| format!("{}_{}_idx", resolved.table.name, stmt.columns.iter().map(|c| c.value.as_str()).collect::<Vec<_>>().join("_")));
+        .unwrap_or_else(|| {
+            format!(
+                "{}_{}_idx",
+                resolved.table.name,
+                stmt.columns
+                    .iter()
+                    .map(|c| c.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join("_")
+            )
+        });
     Ok(BoundCreateIndex {
         table_id: resolved.table_id,
         name,
-        kind: if stmt.unique { IndexKind::Unique } else { IndexKind::NonUnique },
+        kind: if stmt.unique {
+            IndexKind::Unique
+        } else {
+            IndexKind::NonUnique
+        },
         column_ordinals,
         if_not_exists: stmt.if_not_exists,
     })
@@ -328,7 +360,14 @@ pub fn bind_drop_index(
     metrics: &SqlMetrics,
     stmt: &ast::DropIndex,
 ) -> Result<BoundDropIndex> {
-    let resolved = match scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::CreateIndex) {
+    let resolved = match scope::resolve_table(
+        catalog,
+        ctx,
+        auth,
+        metrics,
+        &stmt.table,
+        Privilege::CreateIndex,
+    ) {
         Ok(r) => r,
         Err(SqlError::UnknownObject { .. }) if stmt.if_exists => {
             return Ok(BoundDropIndex {

@@ -83,7 +83,11 @@ fn resolve_database_by_name(catalog: &CatalogService, name: &str) -> Result<u32>
 /// resolving each qualifying part against the catalog by name (never
 /// assuming an ID from position — item 33: physical/catalog IDs are
 /// never derived from anything but an authoritative catalog lookup).
-fn resolve_schema_scope(catalog: &CatalogService, ctx: &BindContext, name: &ast::ObjectName) -> Result<(u32, u32)> {
+fn resolve_schema_scope(
+    catalog: &CatalogService,
+    ctx: &BindContext,
+    name: &ast::ObjectName,
+) -> Result<(u32, u32)> {
     match name.0.len() {
         1 => Ok((ctx.database_id, ctx.default_schema_id)),
         2 => {
@@ -96,7 +100,9 @@ fn resolve_schema_scope(catalog: &CatalogService, ctx: &BindContext, name: &ast:
             Ok((database_id, schema_id))
         }
         n => Err(SqlError::InvalidIdentifier {
-            detail: format!("table name has {n} qualification parts; at most 3 (db.schema.table) are supported"),
+            detail: format!(
+                "table name has {n} qualification parts; at most 3 (db.schema.table) are supported"
+            ),
         }),
     }
 }
@@ -157,10 +163,16 @@ pub fn resolve_schema_for_ddl(
     // duplicated: the object being created does not exist yet, so only
     // its *parent* scope is ever looked up here.
     let (database_id, schema_id) = resolve_schema_scope(catalog, ctx, name)?;
-    let ancestors = [(ObjectKind::Schema, schema_id), (ObjectKind::Database, database_id)];
+    let ancestors = [
+        (ObjectKind::Schema, schema_id),
+        (ObjectKind::Database, database_id),
+    ];
     if !crate::auth::is_authorized(catalog, auth, Privilege::Ddl, &ancestors)? {
         metrics.record_authorization_denial();
-        return Err(unknown_schema(&format!("schema for {}", display_object_name(name))));
+        return Err(unknown_schema(&format!(
+            "schema for {}",
+            display_object_name(name)
+        )));
     }
     Ok((database_id, schema_id))
 }
@@ -181,14 +193,19 @@ pub fn resolve_database_for_ddl(
         2 => resolve_database_by_name(catalog, &name.0[0].value)?,
         n => {
             return Err(SqlError::InvalidIdentifier {
-                detail: format!("schema name has {n} qualification parts; at most 2 (db.schema) are supported"),
+                detail: format!(
+                    "schema name has {n} qualification parts; at most 2 (db.schema) are supported"
+                ),
             })
         }
     };
     let ancestors = [(ObjectKind::Database, database_id)];
     if !crate::auth::is_authorized(catalog, auth, Privilege::Ddl, &ancestors)? {
         metrics.record_authorization_denial();
-        return Err(unknown_database(&format!("database for {}", display_object_name(name))));
+        return Err(unknown_database(&format!(
+            "database for {}",
+            display_object_name(name)
+        )));
     }
     Ok(database_id)
 }
@@ -220,7 +237,12 @@ pub struct Scope {
 }
 
 impl Scope {
-    pub fn push(&mut self, resolved: ResolvedTable, alias: Option<&ast::Ident>, null_extended: bool) -> u32 {
+    pub fn push(
+        &mut self,
+        resolved: ResolvedTable,
+        alias: Option<&ast::Ident>,
+        null_extended: bool,
+    ) -> u32 {
         let table_ref_id = self.entries.len() as u32;
         let effective_name = alias
             .map(|a| a.value.clone())
@@ -237,7 +259,10 @@ impl Scope {
     /// A qualifier (`table.column`) match — exactly one scope entry's
     /// `effective_name` must equal `qualifier`.
     pub fn find_by_qualifier(&self, qualifier: &str) -> Result<&ScopeEntry> {
-        let mut matches = self.entries.iter().filter(|e| e.effective_name == qualifier);
+        let mut matches = self
+            .entries
+            .iter()
+            .filter(|e| e.effective_name == qualifier);
         let first = matches.next().ok_or_else(|| SqlError::UnknownObject {
             kind: "table reference",
             detail: qualifier.to_string(),

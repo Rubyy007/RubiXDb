@@ -39,15 +39,30 @@ pub fn bind_select(
             &from_clause.first.name,
             Privilege::Select,
         )?;
-        check_alias_not_duplicate(&scope, from_clause.first.alias.as_ref(), &resolved.table.name)?;
+        check_alias_not_duplicate(
+            &scope,
+            from_clause.first.alias.as_ref(),
+            &resolved.table.name,
+        )?;
         scope.push(resolved, from_clause.first.alias.as_ref(), false);
         from.push(BoundFromItem {
-            table: scope.entries.last().expect("just pushed").to_bound_table_ref(),
+            table: scope
+                .entries
+                .last()
+                .expect("just pushed")
+                .to_bound_table_ref(),
             join: None,
         });
 
         for join in &from_clause.joins {
-            let resolved = scope::resolve_table(catalog, ctx, auth, metrics, &join.table.name, Privilege::Select)?;
+            let resolved = scope::resolve_table(
+                catalog,
+                ctx,
+                auth,
+                metrics,
+                &join.table.name,
+                Privilege::Select,
+            )?;
             check_alias_not_duplicate(&scope, join.table.alias.as_ref(), &resolved.table.name)?;
             let null_extended = matches!(join.kind, ast::JoinKind::Left);
             scope.push(resolved, join.table.alias.as_ref(), null_extended);
@@ -57,7 +72,11 @@ pub fn bind_select(
             max_parameter = max_parameter.max(eb.max_parameter);
 
             from.push(BoundFromItem {
-                table: scope.entries.last().expect("just pushed").to_bound_table_ref(),
+                table: scope
+                    .entries
+                    .last()
+                    .expect("just pushed")
+                    .to_bound_table_ref(),
                 join: Some((join.kind, on)),
             });
         }
@@ -123,7 +142,11 @@ pub fn bind_select(
     })
 }
 
-fn check_alias_not_duplicate(scope: &Scope, alias: Option<&ast::Ident>, table_name: &str) -> Result<()> {
+fn check_alias_not_duplicate(
+    scope: &Scope,
+    alias: Option<&ast::Ident>,
+    table_name: &str,
+) -> Result<()> {
     let effective = alias.map(|a| a.value.as_str()).unwrap_or(table_name);
     if scope.entries.iter().any(|e| e.effective_name == effective) {
         return Err(SqlError::InvalidIdentifier {
@@ -157,7 +180,10 @@ fn bind_projection(
                 });
                 if out.len() > limits.max_columns {
                     return Err(SqlError::ResourceLimit {
-                        detail: format!("SELECT projection exceeds max_columns ({})", limits.max_columns),
+                        detail: format!(
+                            "SELECT projection exceeds max_columns ({})",
+                            limits.max_columns
+                        ),
                     });
                 }
             }
@@ -190,7 +216,11 @@ fn bind_projection(
     Ok(out)
 }
 
-fn expand_wildcard(entry: &ScopeEntry, out: &mut Vec<BoundSelectItem>, limits: &SqlLimits) -> Result<()> {
+fn expand_wildcard(
+    entry: &ScopeEntry,
+    out: &mut Vec<BoundSelectItem>,
+    limits: &SqlLimits,
+) -> Result<()> {
     // item 18: every column of an already-`Select`-authorized table is
     // itself authorized by construction (D25 v1 is table-level
     // granularity only) — no second per-column grant lookup here.
@@ -210,7 +240,10 @@ fn expand_wildcard(entry: &ScopeEntry, out: &mut Vec<BoundSelectItem>, limits: &
         });
         if out.len() > limits.max_columns {
             return Err(SqlError::ResourceLimit {
-                detail: format!("SELECT projection exceeds max_columns ({})", limits.max_columns),
+                detail: format!(
+                    "SELECT projection exceeds max_columns ({})",
+                    limits.max_columns
+                ),
             });
         }
     }

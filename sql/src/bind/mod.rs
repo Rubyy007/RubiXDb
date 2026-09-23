@@ -52,24 +52,36 @@ fn bind_statement_inner(
     stmt: &ast::Statement,
 ) -> Result<BoundStatement> {
     Ok(match stmt {
-        ast::Statement::Select(s) => BoundStatement::Select(select::bind_select(catalog, ctx, auth, metrics, limits, s)?),
-        ast::Statement::Insert(s) => BoundStatement::Insert(dml::bind_insert(catalog, ctx, auth, metrics, limits, s)?),
-        ast::Statement::Update(s) => BoundStatement::Update(dml::bind_update(catalog, ctx, auth, metrics, limits, s)?),
-        ast::Statement::Delete(s) => BoundStatement::Delete(dml::bind_delete(catalog, ctx, auth, metrics, limits, s)?),
+        ast::Statement::Select(s) => {
+            BoundStatement::Select(select::bind_select(catalog, ctx, auth, metrics, limits, s)?)
+        }
+        ast::Statement::Insert(s) => {
+            BoundStatement::Insert(dml::bind_insert(catalog, ctx, auth, metrics, limits, s)?)
+        }
+        ast::Statement::Update(s) => {
+            BoundStatement::Update(dml::bind_update(catalog, ctx, auth, metrics, limits, s)?)
+        }
+        ast::Statement::Delete(s) => {
+            BoundStatement::Delete(dml::bind_delete(catalog, ctx, auth, metrics, limits, s)?)
+        }
         ast::Statement::CreateDatabase(s) => {
             BoundStatement::CreateDatabase(ddl::bind_create_database(catalog, auth, metrics, s)?)
         }
         ast::Statement::CreateSchema(s) => {
             BoundStatement::CreateSchema(ddl::bind_create_schema(catalog, ctx, auth, metrics, s)?)
         }
-        ast::Statement::CreateTable(s) => {
-            BoundStatement::CreateTable(ddl::bind_create_table(catalog, ctx, auth, metrics, limits, s)?)
+        ast::Statement::CreateTable(s) => BoundStatement::CreateTable(ddl::bind_create_table(
+            catalog, ctx, auth, metrics, limits, s,
+        )?),
+        ast::Statement::DropTable(s) => {
+            BoundStatement::DropTable(ddl::bind_drop_table(catalog, ctx, auth, metrics, s)?)
         }
-        ast::Statement::DropTable(s) => BoundStatement::DropTable(ddl::bind_drop_table(catalog, ctx, auth, metrics, s)?),
-        ast::Statement::CreateIndex(s) => {
-            BoundStatement::CreateIndex(ddl::bind_create_index(catalog, ctx, auth, metrics, limits, s)?)
+        ast::Statement::CreateIndex(s) => BoundStatement::CreateIndex(ddl::bind_create_index(
+            catalog, ctx, auth, metrics, limits, s,
+        )?),
+        ast::Statement::DropIndex(s) => {
+            BoundStatement::DropIndex(ddl::bind_drop_index(catalog, ctx, auth, metrics, s)?)
         }
-        ast::Statement::DropIndex(s) => BoundStatement::DropIndex(ddl::bind_drop_index(catalog, ctx, auth, metrics, s)?),
         ast::Statement::Explain(e) => {
             let inner = bind_statement_inner(catalog, ctx, auth, metrics, limits, &e.statement)?;
             BoundStatement::Explain(Box::new(inner))

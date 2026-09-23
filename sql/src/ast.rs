@@ -70,7 +70,10 @@ pub enum Literal {
     /// `is_integer` is `true` iff the text contains neither `.` nor an
     /// exponent, the syntactic signal `crate::bind` uses to prefer an
     /// integer type when no other context applies (item 21).
-    Number { text: String, is_integer: bool },
+    Number {
+        text: String,
+        is_integer: bool,
+    },
     Text(String),
     /// `X'...'`/`x'...'` hex string literals only (item 6's `BLOB`).
     Blob(Vec<u8>),
@@ -79,7 +82,10 @@ pub enum Literal {
     /// '2024-01-01 12:00:00'`) — the only way item 6's temporal types
     /// enter an expression as a literal (there is no bare-number-to-
     /// `DATE` coercion, item 21).
-    Typed { data_type: SqlDataType, text: String },
+    Typed {
+        data_type: SqlDataType,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

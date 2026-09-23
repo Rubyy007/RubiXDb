@@ -14,7 +14,9 @@ use crate::limits::SqlLimits;
 use crate::temporal;
 
 fn type_mismatch(detail: impl Into<String>) -> SqlError {
-    SqlError::TypeMismatch { detail: detail.into() }
+    SqlError::TypeMismatch {
+        detail: detail.into(),
+    }
 }
 
 /// D21: exact-match only, `NULL`/untyped is always assignable — the
@@ -61,9 +63,15 @@ impl<'a> ExprBinder<'a> {
                     nullable: false,
                 })
             }
-            Expr::Between { expr, negated, low, high } => {
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
                 let bound = self.bind_shared(&[expr, low, high], None)?;
-                let [e, l, h]: [BoundExpr; 3] = bound.try_into().expect("bind_shared preserves length");
+                let [e, l, h]: [BoundExpr; 3] =
+                    bound.try_into().expect("bind_shared preserves length");
                 Ok(BoundExpr {
                     kind: BoundExprKind::Between {
                         expr: Box::new(e),
@@ -75,10 +83,17 @@ impl<'a> ExprBinder<'a> {
                     nullable: false,
                 })
             }
-            Expr::InList { expr, list, negated } => {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 if list.len() > self.limits.max_list_elements {
                     return Err(SqlError::ResourceLimit {
-                        detail: format!("IN list exceeds max_list_elements ({})", self.limits.max_list_elements),
+                        detail: format!(
+                            "IN list exceeds max_list_elements ({})",
+                            self.limits.max_list_elements
+                        ),
                     });
                 }
                 let mut all: Vec<&Expr> = vec![expr];
@@ -126,7 +141,10 @@ impl<'a> ExprBinder<'a> {
     fn bind_parameter(&mut self, idx: u32, expected: Option<RelationalType>) -> Result<BoundExpr> {
         if idx as usize > self.limits.max_parameters {
             return Err(SqlError::InvalidParameter {
-                detail: format!("parameter index exceeds max_parameters ({})", self.limits.max_parameters),
+                detail: format!(
+                    "parameter index exceeds max_parameters ({})",
+                    self.limits.max_parameters
+                ),
             });
         }
         self.max_parameter = self.max_parameter.max(idx);
@@ -137,10 +155,19 @@ impl<'a> ExprBinder<'a> {
         })
     }
 
-    fn bind_column(&mut self, col_ref: &ast::ColumnRef, expected: Option<RelationalType>) -> Result<BoundExpr> {
+    fn bind_column(
+        &mut self,
+        col_ref: &ast::ColumnRef,
+        expected: Option<RelationalType>,
+    ) -> Result<BoundExpr> {
         let scope = self.scope.ok_or_else(|| SqlError::UnknownObject {
             kind: "column",
-            detail: col_ref.parts.iter().map(|p| p.value.as_str()).collect::<Vec<_>>().join("."),
+            detail: col_ref
+                .parts
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
         })?;
         let (entry, column) = scope.resolve_column(col_ref)?;
         let ty = crate::bind::ddl::relational_type_of(column)?;
@@ -157,7 +184,12 @@ impl<'a> ExprBinder<'a> {
         })
     }
 
-    fn bind_unary(&mut self, op: UnaryOp, expr: &Expr, expected: Option<RelationalType>) -> Result<BoundExpr> {
+    fn bind_unary(
+        &mut self,
+        op: UnaryOp,
+        expr: &Expr,
+        expected: Option<RelationalType>,
+    ) -> Result<BoundExpr> {
         match op {
             UnaryOp::Not => {
                 let inner = self.bind(expr, Some(RelationalType::Boolean))?;
@@ -174,7 +206,9 @@ impl<'a> ExprBinder<'a> {
                 let inner = self.bind(expr, expected)?;
                 if let Some(ty) = inner.ty {
                     if !is_numeric(ty) {
-                        return Err(type_mismatch(format!("unary - requires a numeric operand, found {ty:?}")));
+                        return Err(type_mismatch(format!(
+                            "unary - requires a numeric operand, found {ty:?}"
+                        )));
                     }
                 }
                 let ty = inner.ty;
@@ -196,7 +230,12 @@ impl<'a> ExprBinder<'a> {
         let [l, r]: [BoundExpr; 2] = bound.try_into().expect("bind_shared preserves length");
         let is_comparison = matches!(
             op,
-            BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
         );
         let is_logical = matches!(op, BinaryOp::And | BinaryOp::Or);
         if is_logical {
@@ -204,7 +243,9 @@ impl<'a> ExprBinder<'a> {
             check_assignable(r.ty, RelationalType::Boolean)?;
         } else if let Some(ty) = l.ty.or(r.ty) {
             if !is_comparison && !is_numeric(ty) {
-                return Err(type_mismatch(format!("arithmetic operator requires a numeric operand, found {ty:?}")));
+                return Err(type_mismatch(format!(
+                    "arithmetic operator requires a numeric operand, found {ty:?}"
+                )));
             }
         }
         let ty = if is_comparison || is_logical {
@@ -225,29 +266,44 @@ impl<'a> ExprBinder<'a> {
     }
 
     /// Binds every expression in `exprs` under one shared, mutually
-    /// consistent type: a first pass binds each with `hint`; if any
-    /// resolved a concrete type, every still-untyped (bare `NULL`)
-    /// result is re-bound against that type, and every already-typed
-    /// result must equal it exactly (D21 — no cross-type coercion). Used
-    /// everywhere this crate needs "these N expressions must agree on
-    /// one type" (`BETWEEN`, `IN (...)`, binary comparisons, `CASE`
-    /// results) — one implementation, not N ad hoc ones.
-    fn bind_shared(&mut self, exprs: &[&Expr], hint: Option<RelationalType>) -> Result<Vec<BoundExpr>> {
-        let mut bound: Vec<BoundExpr> = exprs.iter().map(|e| self.bind(e, hint)).collect::<Result<_>>()?;
-        if let Some(ty) = bound.iter().find_map(|b| b.ty) {
-            for (i, e) in exprs.iter().enumerate() {
-                match bound[i].ty {
-                    None => bound[i] = self.bind(e, Some(ty))?,
-                    Some(t) if t != ty => {
-                        return Err(type_mismatch(format!(
-                            "expressions must share one type; found both {ty:?} and {t:?}"
-                        )))
-                    }
-                    Some(_) => {}
-                }
+    /// consistent type. A first pass binds each with `hint`. A bare
+    /// literal's type is *flexible* (`bind_numeric_literal`'s own
+    /// context-free default is only a fallback guess, never
+    /// authoritative); a column/parameter/function result's type is
+    /// *rigid* (fixed by the catalog or the function registry,
+    /// independent of any hint). The shared type is the first **rigid**
+    /// type found (regardless of which side it's on — `5 = orders.id`
+    /// and `orders.id = 5` must behave identically), falling back to the
+    /// first literal's own default only when every expression is a bare
+    /// literal. Every expression is then re-bound against that shared
+    /// type — a flexible literal conforms to it; a rigid expression is
+    /// re-validated against it, and `bind()`'s own `check_assignable`
+    /// raises `TypeMismatch` if it genuinely disagrees (D21 — no
+    /// cross-type coercion). Used everywhere this crate needs "these N
+    /// expressions must agree on one type" (`BETWEEN`, `IN (...)`,
+    /// binary comparisons, `CASE` results) — one implementation, not N
+    /// ad hoc ones.
+    fn bind_shared(
+        &mut self,
+        exprs: &[&Expr],
+        hint: Option<RelationalType>,
+    ) -> Result<Vec<BoundExpr>> {
+        let first_pass: Vec<BoundExpr> = exprs
+            .iter()
+            .map(|e| self.bind(e, hint))
+            .collect::<Result<_>>()?;
+        let rigid_ty = first_pass.iter().find_map(|b| {
+            if matches!(b.kind, BoundExprKind::Literal(_)) {
+                None
+            } else {
+                b.ty
             }
+        });
+        let ty = rigid_ty.or_else(|| first_pass.iter().find_map(|b| b.ty));
+        match ty {
+            Some(ty) => exprs.iter().map(|e| self.bind(e, Some(ty))).collect(),
+            None => Ok(first_pass),
         }
-        Ok(bound)
     }
 
     fn bind_case(
@@ -350,7 +406,11 @@ impl<'a> ExprBinder<'a> {
         })
     }
 
-    fn bind_literal(&mut self, lit: &Literal, expected: Option<RelationalType>) -> Result<BoundExpr> {
+    fn bind_literal(
+        &mut self,
+        lit: &Literal,
+        expected: Option<RelationalType>,
+    ) -> Result<BoundExpr> {
         match lit {
             Literal::Null => Ok(BoundExpr {
                 kind: BoundExprKind::Literal(None),
@@ -358,20 +418,34 @@ impl<'a> ExprBinder<'a> {
                 nullable: true,
             }),
             Literal::Boolean(b) => {
-                check_assignable(Some(RelationalType::Boolean), expected.unwrap_or(RelationalType::Boolean))?;
-                Ok(typed_literal(RelationalValue::Boolean(*b), RelationalType::Boolean))
+                check_assignable(
+                    Some(RelationalType::Boolean),
+                    expected.unwrap_or(RelationalType::Boolean),
+                )?;
+                Ok(typed_literal(
+                    RelationalValue::Boolean(*b),
+                    RelationalType::Boolean,
+                ))
             }
             Literal::Text(s) => {
                 let ty = expected.unwrap_or(RelationalType::Text);
                 check_assignable(Some(RelationalType::Text), ty)?;
-                Ok(typed_literal(RelationalValue::Text(s.clone()), RelationalType::Text))
+                Ok(typed_literal(
+                    RelationalValue::Text(s.clone()),
+                    RelationalType::Text,
+                ))
             }
             Literal::Blob(b) => {
                 let ty = expected.unwrap_or(RelationalType::Blob);
                 check_assignable(Some(RelationalType::Blob), ty)?;
-                Ok(typed_literal(RelationalValue::Blob(b.clone()), RelationalType::Blob))
+                Ok(typed_literal(
+                    RelationalValue::Blob(b.clone()),
+                    RelationalType::Blob,
+                ))
             }
-            Literal::Number { text, is_integer } => bind_numeric_literal(text, *is_integer, expected),
+            Literal::Number { text, is_integer } => {
+                bind_numeric_literal(text, *is_integer, expected)
+            }
             Literal::Typed { data_type, text } => bind_typed_literal(*data_type, text, expected),
         }
     }
@@ -401,7 +475,11 @@ pub fn is_numeric(ty: RelationalType) -> bool {
 /// `INTEGER`, falling back to `BIGINT` only if it doesn't fit; a
 /// decimal-looking literal (has a `.`/exponent) defaults to `DOUBLE`
 /// (a raw literal has no column to inherit a `DECIMAL` scale from).
-fn bind_numeric_literal(text: &str, is_integer: bool, expected: Option<RelationalType>) -> Result<BoundExpr> {
+fn bind_numeric_literal(
+    text: &str,
+    is_integer: bool,
+    expected: Option<RelationalType>,
+) -> Result<BoundExpr> {
     let target = match expected {
         Some(t) => t,
         None if is_integer => {
@@ -415,27 +493,27 @@ fn bind_numeric_literal(text: &str, is_integer: bool, expected: Option<Relationa
     };
     match target {
         RelationalType::Integer => {
-            let v: i32 = text
-                .parse()
-                .map_err(|_| type_mismatch(format!("numeric literal {text:?} does not fit in INTEGER")))?;
+            let v: i32 = text.parse().map_err(|_| {
+                type_mismatch(format!("numeric literal {text:?} does not fit in INTEGER"))
+            })?;
             Ok(typed_literal(RelationalValue::Integer(v), target))
         }
         RelationalType::Bigint => {
-            let v: i64 = text
-                .parse()
-                .map_err(|_| type_mismatch(format!("numeric literal {text:?} does not fit in BIGINT")))?;
+            let v: i64 = text.parse().map_err(|_| {
+                type_mismatch(format!("numeric literal {text:?} does not fit in BIGINT"))
+            })?;
             Ok(typed_literal(RelationalValue::Bigint(v), target))
         }
         RelationalType::Real => {
-            let v: f32 = text
-                .parse()
-                .map_err(|_| type_mismatch(format!("numeric literal {text:?} is not a valid REAL")))?;
+            let v: f32 = text.parse().map_err(|_| {
+                type_mismatch(format!("numeric literal {text:?} is not a valid REAL"))
+            })?;
             Ok(typed_literal(RelationalValue::Real(v), target))
         }
         RelationalType::Double => {
-            let v: f64 = text
-                .parse()
-                .map_err(|_| type_mismatch(format!("numeric literal {text:?} is not a valid DOUBLE")))?;
+            let v: f64 = text.parse().map_err(|_| {
+                type_mismatch(format!("numeric literal {text:?} is not a valid DOUBLE"))
+            })?;
             Ok(typed_literal(RelationalValue::Double(v), target))
         }
         RelationalType::Decimal { scale } => {
@@ -448,7 +526,9 @@ fn bind_numeric_literal(text: &str, is_integer: bool, expected: Option<Relationa
                 .map_err(|e| type_mismatch(e.to_string()))?;
             Ok(typed_literal(RelationalValue::Decimal(v, scale), target))
         }
-        other => Err(type_mismatch(format!("a numeric literal cannot bind to {other:?}"))),
+        other => Err(type_mismatch(format!(
+            "a numeric literal cannot bind to {other:?}"
+        ))),
     }
 }
 
@@ -470,7 +550,11 @@ pub fn parse_decimal_text(text: &str, scale: u8) -> Result<i128> {
     Ok(if negative { -magnitude } else { magnitude })
 }
 
-fn bind_typed_literal(data_type: ast::SqlDataType, text: &str, expected: Option<RelationalType>) -> Result<BoundExpr> {
+fn bind_typed_literal(
+    data_type: ast::SqlDataType,
+    text: &str,
+    expected: Option<RelationalType>,
+) -> Result<BoundExpr> {
     let ty = crate::bind::ddl::sql_data_type_to_relational(data_type)?;
     check_assignable(Some(ty), expected.unwrap_or(ty))?;
     match data_type {

@@ -9,7 +9,9 @@
 use crate::error::{Result, SqlError};
 
 fn parse_error(detail: impl Into<String>) -> SqlError {
-    SqlError::TypeMismatch { detail: detail.into() }
+    SqlError::TypeMismatch {
+        detail: detail.into(),
+    }
 }
 
 /// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian
@@ -93,7 +95,9 @@ fn parse_time_parts(text: &str) -> Result<(u32, u32, u32, u32)> {
     if hms.len() != 3 {
         return Err(parse_error("malformed TIME literal (expected HH:MM:SS)"));
     }
-    let h: u32 = hms[0].parse().map_err(|_| parse_error("malformed TIME literal: hour"))?;
+    let h: u32 = hms[0]
+        .parse()
+        .map_err(|_| parse_error("malformed TIME literal: hour"))?;
     let m: u32 = hms[1]
         .parse()
         .map_err(|_| parse_error("malformed TIME literal: minute"))?;
@@ -109,7 +113,9 @@ fn parse_time_parts(text: &str) -> Result<(u32, u32, u32, u32)> {
             return Err(parse_error("malformed TIME literal: fractional seconds"));
         }
         let padded = format!("{frac:0<6}");
-        padded.parse().map_err(|_| parse_error("malformed TIME literal: fractional seconds"))?
+        padded
+            .parse()
+            .map_err(|_| parse_error("malformed TIME literal: fractional seconds"))?
     } else {
         0
     };
@@ -164,7 +170,10 @@ mod tests {
     fn time_round_trips_with_and_without_fraction() {
         assert_eq!(parse_time("00:00:00").unwrap(), 0);
         assert_eq!(parse_time("23:59:59").unwrap(), 86_399_000_000);
-        assert_eq!(parse_time("12:00:00.5").unwrap(), 12 * 3_600_000_000 + 500_000);
+        assert_eq!(
+            parse_time("12:00:00.5").unwrap(),
+            12 * 3_600_000_000 + 500_000
+        );
         assert_eq!(parse_time("00:00:00.000001").unwrap(), 1);
     }
 
