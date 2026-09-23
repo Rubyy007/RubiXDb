@@ -15,6 +15,7 @@ pub mod functions;
 pub mod limits;
 pub mod metrics;
 pub mod parse;
+pub mod plan;
 pub mod temporal;
 
 pub use auth::AuthContext;
@@ -44,3 +45,9 @@ mod security_tests;
 
 #[cfg(test)]
 mod reference_model;
+
+#[cfg(test)]
+mod plan_tests;
+
+#[cfg(test)]
+mod plan_reference_model;

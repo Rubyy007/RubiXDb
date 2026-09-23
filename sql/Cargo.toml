@@ -20,3 +20,7 @@ harness = false
 [[bench]]
 name = "sql_binder_bench"
 harness = false
+
+[[bench]]
+name = "query_planner_bench"
+harness = false

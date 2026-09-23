@@ -582,3 +582,80 @@ fn metrics_record_bind_success_and_denial() {
     assert_eq!(snap.authorization_denials, 1);
     f.cleanup();
 }
+
+// -----------------------------------------------------------------
+// Regression: `bind_shared`'s exponential-time re-bind (found by
+// `plan_tests::deeply_nested_or_predicate_within_sql_limits_does_not_
+// overflow_the_planner` while building Increment 8's query planner,
+// not by inspection).
+// -----------------------------------------------------------------
+
+/// `bind_shared` used to unconditionally re-bind *every* operand
+/// against the newly-determined shared type, including operands that
+/// were already rigidly typed (a nested `BinaryOp`, a column, ...) and
+/// whose type could never change on a second pass. Because `bind_
+/// shared` sits on `bind`'s own recursive path (`bind_binary` calls it
+/// for every binary operator, including nested ones), that unconditional
+/// re-bind doubled the work at every nesting level -- `O(2^depth)`, not
+/// `O(depth)`, for a long chain of binary operators. A 20-term chain
+/// took ~4s; unfixed, this test's 100-term chain would have taken
+/// (extrapolating from the measured ~1.92x-per-term growth) on the
+/// order of `10^17` seconds -- a real, exploitable CPU-exhaustion
+/// vector reachable with an ordinary, resource-limit-compliant `WHERE`
+/// clause (`SqlLimits::max_expression_depth` alone does not stop it: a
+/// 100-term chain is well within the default 128-deep limit). This test
+/// asserts the fixed, linear-time behavior directly, with a real wall-
+/// clock bound generous enough to never flake on a slow CI machine but
+/// tight enough that any reintroduction of the `O(2^depth)` behavior
+/// fails it immediately (100 terms would need to take under ~85,000
+/// years at the old growth rate to slip under this bound by accident).
+#[test]
+fn long_or_chain_binds_in_linear_not_exponential_time() {
+    let f = Fixture::new("or_chain_linear");
+    let mut sql = "SELECT id FROM t WHERE ".to_string();
+    for i in 0..100 {
+        if i > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str(&format!("id = {i}"));
+    }
+    let start = std::time::Instant::now();
+    bind(&f, &sql).unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "100-term OR chain took {elapsed:?} -- exponential re-bind regression"
+    );
+    f.cleanup();
+}
+
+/// The fix must not change *correctness*: two different rigid types on
+/// either side of a shared-type unification (`BIGINT` vs. `INTEGER`,
+/// D21's "exact match only") must still be rejected, and a flexible
+/// literal must still be re-typed to conform to whichever rigid type is
+/// found, exactly as before the fix.
+#[test]
+fn shared_type_unification_still_rejects_mismatched_rigid_types() {
+    let f = Fixture::new("shared_type_still_correct");
+    // orders.id is BIGINT, t.id is INTEGER (test_support::Fixture's own
+    // documented, deliberate type mismatch for exactly this purpose).
+    let err = bind(&f, "SELECT 1 FROM t INNER JOIN orders ON orders.id = t.id").unwrap_err();
+    assert!(matches!(err, SqlError::TypeMismatch { .. }));
+    f.cleanup();
+}
+
+#[test]
+fn shared_type_unification_still_conforms_a_flexible_literal_to_a_rigid_column_type() {
+    let f = Fixture::new("shared_type_literal_conforms");
+    let BoundStatement::Select(s) = bind(&f, "SELECT 1 FROM orders WHERE orders.id = 5").unwrap()
+    else {
+        panic!()
+    };
+    let BoundExprKind::BinaryOp { right, .. } = &s.selection.as_ref().unwrap().kind else {
+        panic!()
+    };
+    // `orders.id` is BIGINT -- the literal `5` must have been re-bound
+    // to `Bigint`, not left at its own context-free `Integer` default.
+    assert_eq!(right.ty, Some(RelationalType::Bigint));
+    f.cleanup();
+}

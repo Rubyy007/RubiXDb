@@ -68,6 +68,14 @@ pub enum SqlError {
     /// `Display` text (never enriched with anything from this layer that
     /// could leak more).
     Catalog(String),
+    /// `PHASE_RELATIONAL_QUERY_PLANNER_ARCHITECTURE.md` (item 29): a
+    /// structural post-optimization plan-validation check failed (a
+    /// referenced table/column/index does not belong to the bound
+    /// statement's own scope, or an optimization rule produced an
+    /// internally inconsistent plan). This is a defensive, should-never-
+    /// fire check on this crate's own output, not a user-facing SQL
+    /// error class — reported the same safe way regardless.
+    PlanValidation { detail: String },
 }
 
 impl fmt::Display for SqlError {
@@ -87,6 +95,7 @@ impl fmt::Display for SqlError {
                 write!(f, "authorization denied: {detail}")
             }
             SqlError::Catalog(detail) => write!(f, "catalog error: {detail}"),
+            SqlError::PlanValidation { detail } => write!(f, "plan validation failed: {detail}"),
         }
     }
 }

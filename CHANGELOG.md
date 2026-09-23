@@ -6,6 +6,66 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 8 (rule-based query planner and optimizer) (2026-09-23)
+
+Adds a production-grade, rule-based query planner (`sql/src/plan/`, new
+module in the existing `rubixdb-sql` crate): `BoundStatement ->
+LogicalPlan -> (one fixed-order optimization pass) -> PhysicalPlan`,
+implementing D16/D17/D18. `PHASE_RELATIONAL_QUERY_PLANNER_ARCHITECTURE.md`
+is the full decision record; `PHASE_RELATIONAL_QUERY_PLANNER_
+INCREMENT8_RESULTS.md` has the certification matrix and measured
+benchmark numbers. No executor exists yet.
+
+#### Added
+
+- `sql/src/plan/{logical,optimize,access,physical,validate,explain,
+  expr_util,limits,metrics,mod}.rs`: `PRIMARY KEY` lookup detection
+  (composite-safe -- `a = ?` for `PRIMARY KEY(a, b)` never becomes a
+  partial point lookup); secondary-index selection respecting declared
+  leading-column order, `Ready`-only, and never selecting a `Primary`-
+  kind catalog index as an `IndexScan` (a real, inspected storage fact:
+  no physical entries are ever written for one); predicate pushdown
+  that is `LEFT JOIN`-safe by construction (never rewrites `BoundExpr`
+  logic, only relocates where it is evaluated, and only into a non-
+  null-extended scan); projection pruning (honestly reported as
+  metadata-only -- no partial-column-decode storage primitive exists
+  yet); conservative `LIMIT`/`ORDER BY` analysis (a bare ascending
+  index scan does *not* satisfy the SQL-standard `NULLS LAST` default
+  -- only an explicit `NULLS FIRST` does, matching the engine's own
+  physical, non-reversible ascending order); explicit `DISTINCT`;
+  `INNER`/`LEFT JOIN` via Nested Loop with mechanical Index Nested Loop
+  substitution; `UPDATE`/`DELETE` reusing `SELECT`'s own access-
+  planning algorithm verbatim; structural plan validation; a
+  deterministic `EXPLAIN` formatter; planner-specific resource limits
+  and bounded-cardinality metrics.
+- `sql/benches/query_planner_bench.rs`: plan-build latency across
+  statement shapes, catalog-resolution cost vs. catalog size (100-
+  10,000 tables), optimizer complexity vs. predicate count (1-120) and
+  join count (1-8) -- both confirmed linear.
+- 42 new tests: logical/physical separation, PK/index/range/residual
+  correctness, LEFT JOIN safety, NULL semantics, ordering analysis in
+  every direction, join algorithm selection, resource limits,
+  adversarial deep predicates, race-free concurrency, and a randomized
+  `proptest` differential test against an independent reference model.
+
+#### Fixed / Found
+
+- `sql/src/bind/expr.rs::bind_shared` (Increment 6, pre-dating this
+  increment) unconditionally re-bound every operand of a shared-type
+  unification a second time, including already-rigidly-typed subtrees
+  -- because it sits on `bind`'s own recursive path, this doubled the
+  work at every nesting level of a chain of binary operators,
+  `O(2^depth)` instead of `O(depth)`. A real, exploitable CPU-
+  exhaustion vector: a 20-term `WHERE ... OR ...` chain took ~4 seconds
+  and climbing, well within `SqlLimits`' own resource limits (the
+  existing depth guard bounds *shape*, not *work*). Found while writing
+  this increment's own adversarial planner test, not by inspection --
+  the same pattern as Increment 5's phantom-index-entry race and
+  Increment 6's flat-operator-chain stack overflow. Fixed: only a
+  flexible literal operand needs re-binding; a rigid expression's type
+  is merely re-checked, not re-walked. A 100-term chain now binds in
+  <1ms; D21's "no implicit coercion" correctness re-verified unchanged.
+
 ### Relational database: Increment 7 (Snapshot Isolation transaction engine) (2026-09-23)
 
 Adds a production-grade transaction engine implementing D10's already-

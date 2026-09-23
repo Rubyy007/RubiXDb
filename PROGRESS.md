@@ -3326,3 +3326,92 @@ planner, optimizer, executor, CLI, HTTP API, or frontend exists --
 this increment's own explicit stop condition. Write/Read/Compaction
 remain independently PRODUCTION READY, unaffected. Full account:
 `PHASE_RELATIONAL_TRANSACTION_INCREMENT7_RESULTS.md`.
+
+---
+
+## 2026-09-23 (final)
+
+**Implemented:** Increment 8 -- a production-grade, rule-based query
+planner and optimizer (`sql/src/plan/`, new module in the existing
+`rubixdb-sql` crate): `BoundStatement -> LogicalPlan -> (one fixed-order
+optimization pass) -> PhysicalPlan`, executing D16/D17/D18 exactly as
+already approved. `PRIMARY KEY` lookup detection is composite-safe (`a
+= ?` for `PRIMARY KEY(a, b)` correctly never becomes a point lookup
+unless `b` is also constrained -- directly, adversarially tested both
+ways). Secondary-index selection respects declared leading-column
+order, only ever considers `Ready` indexes, and -- a real, inspected
+storage fact, not a guess -- never selects a `Primary`-kind catalog
+index as an `IndexScan`, since `TableStore`'s own `maintained_indexes`
+filter means no physical entries are ever written for one; `PRIMARY
+KEY` access always routes through the dedicated `PkLookup` path
+instead. Every `PhysicalAccess` variant maps to a real, already-
+implemented storage primitive (`TableStore::get_row`, `IndexBuilder::
+index_lookup`/`index_range_scan`, `TableStore::scan_table`) -- nothing
+invented.
+
+Predicate pushdown never rewrites `BoundExpr` logic, only relocates
+where an unmodified subtree is evaluated -- three-valued logic is
+preserved automatically, and a `LEFT JOIN`'s nullable-side predicate is
+never pushed into its own scan (directly, adversarially tested: `WHERE
+orders.amount = 100` on a `LEFT JOIN`'s right side stays a `Filter`
+above the `Join`, never migrates into `orders`' own scan). `ORDER
+BY`/`Sort` elimination is conservative and exact-match only -- and,
+during this increment's own development, a wrong assumption ("ascending
+index scans satisfy a bare `ORDER BY`") was caught by a failing test:
+D5's own SQL-standard default for unspecified `NULLS` is `NULLS LAST`
+ascending, the *opposite* of the index's own physical `NULLS FIRST`
+encoding (no reverse-scan primitive exists anywhere in `LsmEngine`), so
+only an explicit `ORDER BY col NULLS FIRST` actually eliminates `Sort`
+-- both directions now directly tested. `UPDATE`/`DELETE` reuse
+`SELECT`'s own access-planning algorithm verbatim, one implementation
+never duplicated. `INNER`/`LEFT JOIN` via Nested Loop with mechanical
+Index Nested Loop substitution (detected via a correlated `BoundExpr::
+Column` reference to the outer side -- no new expression type
+invented); the full `ON` condition always still evaluated in full by a
+future executor regardless of what the inner access already consumed
+as a candidate-narrowing key.
+
+**A second real, pre-existing bug found and fixed** (the same "found by
+writing adversarial tests, not by inspection" pattern as Increments 5
+and 6): while writing this increment's own adversarial planner test,
+binding a mere 20-term `WHERE ... OR ...` chain was found to take ~4
+seconds and growing exponentially (~1.92x per added term) -- traced to
+`sql/src/bind/expr.rs::bind_shared` (Increment 6), whose second bind
+pass unconditionally re-bound every operand, including already-rigidly-
+typed subtrees, doubling the work at every nesting level of a left-deep
+chain (`O(2^depth)`, not `O(depth)`) -- a real, exploitable CPU-
+exhaustion vector reachable with an ordinary, resource-limit-compliant
+`WHERE` clause (well within `SqlLimits::max_expression_depth`, so the
+existing depth guard alone did not stop it). Fixed: only a flexible
+literal operand needs re-binding; a rigid expression's type is merely
+re-checked, not re-walked. Verified: a 100-term chain now binds in
+<1ms (previously would have taken ~10^17 seconds at the old growth
+rate); D21's "no implicit coercion" correctness re-verified unchanged.
+
+42 new tests across three files (`sql/src/plan_tests.rs`,
+`plan_reference_model.rs`, plus 3 regression tests in
+`bind_tests.rs`): logical/physical separation, PK/index/range/residual
+correctness, LEFT JOIN safety, NULL semantics, projection pruning
+(honestly reported as metadata-only -- no partial-column-decode
+storage primitive exists yet to attach a real optimization to), limit/
+sort analysis in every direction, DISTINCT, join algorithm selection,
+UPDATE/DELETE reuse, DDL/transaction-control pass-through, EXPLAIN
+determinism, resource limits, metrics, adversarial deep predicates,
+race-free concurrency, and a randomized differential property test
+against an independent reference model. Full regression: 537 `rubixdb`
++ 30 `rubixdb-api` + 143 `rubixdb-sql` tests, debug and release, all
+passing; `wal_tests`/`pathological_recovery_matrix`/`crash_consistency`
+unchanged; `src/manifest/`, `src/compaction/`, `src/sstable/`,
+`src/wal/`, `api/`, and `src/relational/txn.rs` completely untouched.
+
+`PHASE_RELATIONAL_QUERY_PLANNER_ARCHITECTURE.md` is the full decision
+record, `PHASE_RELATIONAL_QUERY_PLANNER_INCREMENT8_RESULTS.md` the
+certification matrix and measured `cargo bench --bench query_planner_
+bench` numbers.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** No executor, SQL
+execution, CLI, HTTP API, or frontend exists -- this increment's own
+explicit stop condition. Write/Read/Compaction, catalog, row storage,
+secondary indexes, the transaction engine, and the SQL parser/binder
+all remain independently PRODUCTION READY / PASS, unaffected. Full
+account: `PHASE_RELATIONAL_QUERY_PLANNER_INCREMENT8_RESULTS.md`.

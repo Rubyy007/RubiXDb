@@ -301,7 +301,38 @@ impl<'a> ExprBinder<'a> {
         });
         let ty = rigid_ty.or_else(|| first_pass.iter().find_map(|b| b.ty));
         match ty {
-            Some(ty) => exprs.iter().map(|e| self.bind(e, Some(ty))).collect(),
+            Some(ty) => {
+                // Only a flexible *literal* actually needs a second bind
+                // to conform to the now-known shared type -- a rigid
+                // expression's own type can never change on a second
+                // pass, so re-binding it again would be pure waste.
+                // Critically, "waste" compounds: `bind_shared` is called
+                // from `bind_binary`, which is on the path `bind` itself
+                // recurses through, so unconditionally re-binding *every*
+                // operand here made a deeply left-nested chain of binary
+                // operators (`a = 1 OR a = 2 OR ... OR a = N`) cost
+                // `O(2^N)` instead of `O(N)` (each level doubled the work
+                // of the level below it) -- a real, exploitable CPU-
+                // exhaustion vector for any adversarial predicate with a
+                // few dozen terms, found by `plan_tests::deeply_nested_
+                // or_predicate_within_sql_limits_does_not_overflow_the_
+                // planner`. A rigid expression still has its type
+                // re-verified against `ty` (preserving D21's "no
+                // implicit coercion, exact match only" semantics for two
+                // *different* rigid types, e.g. `orders.id = t.id` across
+                // a `BIGINT`/`INTEGER` mismatch) without paying to
+                // re-walk it.
+                let mut out = Vec::with_capacity(first_pass.len());
+                for (e, bound) in exprs.iter().zip(first_pass) {
+                    if matches!(bound.kind, BoundExprKind::Literal(_)) {
+                        out.push(self.bind(e, Some(ty))?);
+                    } else {
+                        check_assignable(bound.ty, ty)?;
+                        out.push(bound);
+                    }
+                }
+                Ok(out)
+            }
             None => Ok(first_pass),
         }
     }
