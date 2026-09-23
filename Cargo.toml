@@ -61,3 +61,7 @@ harness = false
 [[bench]]
 name = "secondary_index_bench"
 harness = false
+
+[[bench]]
+name = "transaction_bench"
+harness = false

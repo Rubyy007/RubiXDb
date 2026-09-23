@@ -398,7 +398,10 @@ fn check_value_matches_type(
     }
 }
 
-fn validate_row_shape(
+/// `pub(crate)`: reused by `relational::txn` (`Transaction::put_row`),
+/// so a transactional write is validated by the exact same rule an
+/// autocommit `put_row` already is — one implementation, never two.
+pub(crate) fn validate_row_shape(
     table: &TableRow,
     columns: &[ColumnRow],
     values: &[Option<RelationalValue>],
@@ -456,7 +459,10 @@ fn validate_row_shape(
 /// guaranteed non-`NULL` here because `validate_row_shape` (called by
 /// every public entry point before this) already rejected a `NULL`
 /// primary-key column.
-fn extract_pk_values(table: &TableRow, values: &[Option<RelationalValue>]) -> Vec<RelationalValue> {
+pub(crate) fn extract_pk_values(
+    table: &TableRow,
+    values: &[Option<RelationalValue>],
+) -> Vec<RelationalValue> {
     table
         .pk_ordinals
         .iter()
@@ -513,7 +519,12 @@ pub(crate) fn indexed_entry_key(
 /// pair is simply skipped — `write_batch`'s own last-op-wins overwrite
 /// would make it a no-op anyway, so skipping it is a pure write-
 /// amplification optimization, not a behavior change.
-fn index_maintenance_ops(
+/// `pub(crate)`: reused by `relational::txn::Transaction::commit`, which
+/// computes the identical table-row + index-delta `WriteOp` set for a
+/// transaction's buffered writes at commit time — one implementation,
+/// never a second, independently-maintained copy of D11's atomicity
+/// rule.
+pub(crate) fn index_maintenance_ops(
     table_id: u32,
     indexes: &[IndexRow],
     old: Option<&Row>,
@@ -552,7 +563,8 @@ fn index_maintenance_ops(
     Ok(ops)
 }
 
-fn build_put_op(
+/// `pub(crate)`: reused by `relational::txn::Transaction::commit`.
+pub(crate) fn build_put_op(
     table: &TableRow,
     encoded_pk: &[u8],
     columns: &[ColumnRow],

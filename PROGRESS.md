@@ -3261,3 +3261,68 @@ prose already committed to.
 **RELATIONAL DATABASE PRODUCTION READY = NO.** Write/Read/Compaction/
 catalog/row-storage/secondary-indexes remain independently certified,
 unaffected. Full account: `PHASE_RELATIONAL_SQL_INCREMENT6_RESULTS.md`.
+
+---
+
+## 2026-09-23 (later still)
+
+**Implemented:** Increment 7 -- a production-grade Snapshot Isolation
+transaction engine (`src/relational/txn.rs`, new): `TransactionManager`/
+`Transaction` executing D10 exactly as already approved. `BEGIN` pins
+one `LsmEngine::Snapshot`; reads resolve against a local write-set
+overlay first, the pinned snapshot second (read-your-own-writes);
+writes stay buffered until `COMMIT`, which re-validates every touched
+physical key's freshness (value comparison, `get_as_of` at snapshot vs.
+current -- the same check catches `PRIMARY KEY` conflicts with no
+special-casing), enforces `UNIQUE` for real for the first time (a
+physical existence scan reusing Increment 5's own index structure, with
+intra-transaction-duplicate and self-vacated-entry races both closed,
+and standard-SQL "`NULL` never conflicts with `NULL`" semantics), then
+applies the whole write-set -- table row and every affected index entry
+together -- through one `LsmEngine::write_batch` call. `ROLLBACK` is
+O(1): nothing was ever durable to undo. `commit(self)`/`rollback(self)`
+consume `self` by value, making "commit twice" a Rust compile error,
+not a runtime check.
+
+Commit's own critical section serializes on Increment 5's per-table
+`epoch_lock` (write side), acquired for every touched table in sorted
+order (deadlock-free across concurrent multi-table transactions) --
+reused, not duplicated. This is a **table-level**, not key-level, lock:
+measured directly (`txn_concurrent_commits_disjoint_keys`), commit
+throughput on one table stays flat (~260-290 commits/sec) from 1 to 32
+concurrent committing threads even on fully disjoint keys. Reported
+honestly as a deliberate tradeoff, not hidden.
+
+**Write skew is possible under Snapshot Isolation** -- documented and
+directly demonstrated (`write_skew_is_possible_under_snapshot_
+isolation`, the two-on-call-doctors scenario), never claimed fixed;
+this is Snapshot Isolation, not Serializable isolation.
+
+42 new tests: lifecycle, read-your-own-writes, snapshot consistency,
+conflict detection (same-key, `PRIMARY KEY` both orderings, `UNIQUE`
+both orderings, intra-transaction duplicates, self-vacated re-inserts,
+`NULL` semantics, multiple independent `UNIQUE` indexes), atomic
+table+index commit (verified via engine-seq-delta, RA.5's own
+technique), autocommit, write skew, five deterministic barrier-
+synchronized concurrency tests (never sleep-based), three resource-
+limit boundaries, snapshot/registry lifetime, real automatic-compaction
+interaction, two real-process-restart crash-recovery tests, metrics
+accounting, an authorization-boundary test, and two differential tests
+against an independent from-scratch Snapshot Isolation reference model
+-- a fixed scenario and a **randomized, interleaved `proptest`** across
+multiple simultaneously-open transaction slots. Full regression: 537
+`rubixdb` + 30 `rubixdb-api` + 98 `rubixdb-sql` tests, debug and
+release, all passing; `wal_tests`/`pathological_recovery_matrix`/
+`crash_consistency` unchanged; `src/manifest/`, `src/compaction/`,
+`src/sstable/`, `src/wal/`, `api/` completely untouched.
+
+`PHASE_RELATIONAL_TRANSACTION_ARCHITECTURE.md` is the full decision
+record, `PHASE_RELATIONAL_TRANSACTION_INCREMENT7_RESULTS.md` the
+certification matrix and measured `cargo bench --bench transaction_
+bench` numbers.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** No SQL parser execution,
+planner, optimizer, executor, CLI, HTTP API, or frontend exists --
+this increment's own explicit stop condition. Write/Read/Compaction
+remain independently PRODUCTION READY, unaffected. Full account:
+`PHASE_RELATIONAL_TRANSACTION_INCREMENT7_RESULTS.md`.

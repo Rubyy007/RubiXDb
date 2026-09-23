@@ -6,6 +6,63 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 7 (Snapshot Isolation transaction engine) (2026-09-23)
+
+Adds a production-grade transaction engine implementing D10's already-
+approved Snapshot Isolation model. `PHASE_RELATIONAL_TRANSACTION_
+ARCHITECTURE.md` is the full decision record; `PHASE_RELATIONAL_
+TRANSACTION_INCREMENT7_RESULTS.md` has the certification matrix and
+measured benchmark numbers. No SQL execution exists yet.
+
+#### Added
+
+- `src/relational/txn.rs` (new): `TransactionManager`/`Transaction` --
+  `BEGIN` pins one `LsmEngine::Snapshot`; reads resolve against a local
+  write-set overlay first, the pinned snapshot second (read-your-own-
+  writes); `COMMIT` re-validates every touched key's freshness (value
+  comparison, catching `PRIMARY KEY` conflicts with no special-casing),
+  enforces `UNIQUE` for real for the first time (a physical existence
+  scan reusing Increment 5's own index structure; intra-transaction-
+  duplicate and self-vacated-entry races both closed; standard-SQL
+  `NULL`-never-conflicts semantics), then applies the whole write-set
+  -- table row and every affected index entry together -- through one
+  `LsmEngine::write_batch` call. `ROLLBACK` is O(1). `commit(self)`/
+  `rollback(self)` consume `self` by value, making "commit twice" a
+  compile error.
+- Commit serializes on Increment 5's per-table `epoch_lock` (write
+  side), acquired for every touched table in sorted order -- reused,
+  not duplicated. Table-level, not key-level: measured directly, one
+  table's commit throughput does not scale past ~1 concurrent
+  committer even on fully disjoint keys -- reported honestly, not
+  hidden.
+- `TransactionManager::autocommit_put_row`/`autocommit_delete_row` --
+  the reusable BEGIN-op-COMMIT primitive a future SQL executor's
+  implicit transactions will use.
+- `benches/transaction_bench.rs`: `BEGIN` latency, four-read-path
+  overhead comparison, commit latency vs. write-set size (1-128),
+  commit latency vs. table size at a fixed write-set (confirms
+  conflict validation does not scan the table), catalog-resolution
+  cost vs. catalog size (100-10,000 tables, reusing `sql/`'s own
+  "no automatic caching" finding), concurrent-commit throughput
+  scaling (1-32 threads).
+- 42 new tests: lifecycle, read-your-own-writes, snapshot consistency,
+  conflict detection, `UNIQUE` enforcement (6 tests), atomic
+  table+index commit, autocommit, a direct write-skew demonstration,
+  five deterministic barrier-synchronized concurrency tests (never
+  sleep-based), resource-limit boundaries, snapshot/registry lifetime,
+  real automatic-compaction interaction, two real-process-restart
+  crash-recovery tests, metrics accounting, an authorization-boundary
+  test, and two differential tests -- a fixed scenario and a
+  randomized, interleaved `proptest` across multiple simultaneously-
+  open transaction slots -- against an independent, from-scratch
+  Snapshot Isolation reference model.
+
+#### Documented
+
+- **Write skew is possible under Snapshot Isolation** -- directly
+  demonstrated (the two-on-call-doctors scenario), never claimed
+  fixed; this is Snapshot Isolation, not Serializable isolation.
+
 ### Relational database: Increment 6 (SQL parser, internal AST, binder, authorization) (2026-09-23)
 
 Adds the SQL front-end foundation in a new `rubixdb-sql` workspace
