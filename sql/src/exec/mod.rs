@@ -11,6 +11,7 @@
 
 pub mod expr_eval;
 pub mod operators;
+pub mod write;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -60,6 +61,18 @@ impl RowContext {
             .find(|(tr, _)| *tr == table_ref)
             .and_then(|(_, row)| row.get(ordinal as usize))
             .and_then(|v| v.as_ref())
+    }
+
+    /// The full physical `Row` bound to `table_ref`, if any — `crate::
+    /// exec::write`'s own requirement: `UPDATE`'s new-row construction
+    /// needs every column of the old row (not just the ones an
+    /// assignment or predicate happens to reference), and `DELETE`
+    /// needs the full row to extract its `PRIMARY KEY` columns.
+    pub fn row_for(&self, table_ref: u32) -> Option<&Row> {
+        self.rows
+            .iter()
+            .find(|(tr, _)| *tr == table_ref)
+            .map(|(_, row)| row)
     }
 
     /// Combines this context with another (a `Join`'s own left/right row
@@ -162,6 +175,19 @@ pub struct ExecLimits {
     /// call that discards every row without yielding would otherwise
     /// never come back to a top-level check at all.
     pub deadline: Option<std::time::Duration>,
+    /// Item 47/48 (`crate::exec::write`): the hard cap on how many
+    /// primary keys an `UPDATE`/`DELETE`'s own target-row-finding pass
+    /// may collect before failing closed with a controlled
+    /// `ResourceLimit` error — checked *while collecting*, not only
+    /// once collection finishes, so a predicate matching millions of
+    /// rows can never build an unbounded in-memory `Vec` first and only
+    /// discover the problem afterward. Defaults to the same value as
+    /// `Transaction`'s own certified `TxnLimits::max_write_set_ops`
+    /// (D27) — the write-set this many target rows would produce is
+    /// exactly at that same certified boundary either way; this check
+    /// exists to fail with a clear, write-executor-attributed error
+    /// *before* reaching it, not to impose a materially different bound.
+    pub max_dml_target_rows: usize,
 }
 
 impl Default for ExecLimits {
@@ -171,6 +197,7 @@ impl Default for ExecLimits {
             max_materialized_rows: 1_000_000,
             max_index_scan_rows: 1_000_000,
             deadline: Some(std::time::Duration::from_secs(30)),
+            max_dml_target_rows: 10_000,
         }
     }
 }

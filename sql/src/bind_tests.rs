@@ -659,3 +659,66 @@ fn shared_type_unification_still_conforms_a_flexible_literal_to_a_rigid_column_t
     assert_eq!(right.ty, Some(RelationalType::Bigint));
     f.cleanup();
 }
+
+// -----------------------------------------------------------------
+// Regression: an omitted column with a declared `DEFAULT` must bind to
+// that default's own value, never to a `NULL` literal indistinguishable
+// from an explicit `NULL` -- found while building Increment 10's write
+// executor (`crate::bind::dml::bind_insert`'s own "an omitted column
+// with a declared DEFAULT..." comment has the full account). Before
+// this fix, `BoundInsert.rows` had no way to tell "the caller omitted
+// this column" apart from "the caller wrote NULL explicitly" once both
+// produced the identical `Literal(None)` -- a real correctness gap: any
+// DEFAULT-bearing column omitted from an INSERT column list would have
+// silently stored NULL instead of its declared default.
+// -----------------------------------------------------------------
+
+#[test]
+fn insert_omitted_column_with_default_binds_to_the_defaults_own_value() {
+    let f = Fixture::new("insert_default_substitution");
+    let default_bytes =
+        rubixdb::relational::value::encode_row(1, &[Some(RelationalValue::Integer(42))]);
+    f.catalog
+        .create_table(
+            f.ctx.default_schema_id,
+            "with_default",
+            &[
+                rubixdb::catalog::service::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: rubixdb::relational::value::TYPE_TAG_INTEGER,
+                    nullable: false,
+                    default_value: None,
+                    type_params: None,
+                },
+                rubixdb::catalog::service::ColumnDef {
+                    name: "score".to_string(),
+                    data_type: rubixdb::relational::value::TYPE_TAG_INTEGER,
+                    nullable: true,
+                    default_value: Some(default_bytes),
+                    type_params: None,
+                },
+            ],
+            &[0],
+        )
+        .unwrap();
+
+    // `score` omitted entirely -- must bind to the DEFAULT's own value.
+    let BoundStatement::Insert(ins) = bind(&f, "INSERT INTO with_default (id) VALUES (1)").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        ins.rows[0][1].kind,
+        BoundExprKind::Literal(Some(RelationalValue::Integer(42)))
+    );
+
+    // An *explicit* NULL on the same (nullable, defaulted) column must
+    // still bind to NULL, never silently upgraded to the default.
+    let BoundStatement::Insert(ins) =
+        bind(&f, "INSERT INTO with_default (id, score) VALUES (2, NULL)").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(ins.rows[0][1].kind, BoundExprKind::Literal(None));
+    f.cleanup();
+}

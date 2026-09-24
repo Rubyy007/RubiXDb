@@ -3498,3 +3498,94 @@ catalog, row storage, secondary indexes, the transaction engine, the
 SQL parser/binder, and the query planner all remain independently
 PRODUCTION READY / PASS, unaffected. Full account: `PHASE_RELATIONAL_
 QUERY_EXECUTOR_INCREMENT9_RESULTS.md`.
+
+## 2026-09-24 (later)
+
+**Implemented:** Increment 10 -- a production-grade write executor
+(`sql/src/exec/write.rs`, `sql/src/exec/write/metrics.rs`, new modules
+in the existing `rubixdb-sql` crate): `SQL write -> Parser -> AST ->
+Binder -> Plan -> Transaction -> Write Executor -> TableStore/
+IndexStore -> write_batch -> durable committed state`. `INSERT`,
+`UPDATE`, `DELETE`, and the DDL forms the current catalog/index
+architecture actually supports (`CREATE SCHEMA`/`TABLE`, `DROP TABLE`,
+`CREATE`/`DROP INDEX`) now really execute against real, persisted
+state -- never a demo, a wrapper, or a transaction bypass.
+
+`UPDATE`/`DELETE` target-row finding is a two-phase, bounded-memory
+design, forced as much by the borrow checker as by the "never an
+unbounded affected-row vector" requirement: Phase 1 drives Increment
+9's own certified read-access machinery (`PkLookup`/`IndexScan`/
+`SeqScan`, unmodified) to collect only matching rows' `PRIMARY KEY`
+values -- never full rows -- bounded by a new `ExecLimits::max_dml_
+target_rows`; Phase 2 mutates each row in a second pass, re-fetching
+fresh for `UPDATE` (never reusing what Phase 1 happened to see). DDL
+executes as its own atomic unit, deliberately outside the SQL-level
+`Transaction`/snapshot-isolation machinery entirely -- reapplying an
+Increment 7 decision rather than re-deciding it.
+
+Inspecting the binder before designing execution (never guessing)
+surfaced a real, pre-existing bug: an *omitted* `INSERT` column with a
+declared `DEFAULT` always bound to a plain `NULL` literal, structurally
+indistinguishable from an explicit `NULL` -- any `DEFAULT`-bearing
+column omitted from an `INSERT`'s column list would have silently
+stored `NULL` instead of its declared default. Fixed at bind time,
+where the ambiguity actually originates.
+
+**A second real bug, this one found by a differential test against an
+independent reference model, not by inspection**: `Transaction::
+put_row` is a generic upsert-at-key primitive with no notion of "this
+key must not already exist." `commit`'s own freshness/`UNIQUE`
+validation correctly rejects two *concurrently racing* `INSERT`s of the
+same `PRIMARY KEY`, but a plain, *later*, non-overlapping `INSERT`
+reusing a key an earlier, already-committed transaction used slipped
+through silently and overwrote the existing row -- both transactions'
+snapshots agreed, so nothing looked like a conflict. Fixed by having
+`execute_insert` check for an existing row via `Transaction::get_row`
+(the same snapshot-correct read every other statement already uses,
+entirely within the one transaction, never a second, independent
+conflict detector) immediately before each row's `put_row`, reported as
+the same `SqlError::Conflict` class a concurrent conflict already uses
+-- closing the *sequential* gap the existing commit-time freshness
+check structurally cannot see, without touching that check's own,
+still-sole authority over the concurrent case.
+
+42 new write-executor tests, 1 new binder regression test, plus a real,
+cross-process, OS-level crash test (`sql/tests/write_crash_
+consistency.rs`, reusing `rubixdb::wal::AbortPoint`/`FileWal::set_
+abort_hook` verbatim across 9 real abort points) proving a crash during
+`INSERT`'s own `write_batch` call can never leave a table row durable
+without its secondary-index entry, or the reverse -- item 30's own
+"HARD PRODUCTION GATE." Full regression: 542 `rubixdb` + 30
+`rubixdb-api` + 222 `rubixdb-sql` tests, debug and release, all passing;
+`wal_tests`/`pathological_recovery_matrix`/`crash_consistency`
+unchanged; every protected core-crate path (`src/wal/`, `src/manifest/`,
+`src/compaction/`, `src/sstable/`, `api/`, `src/relational/`,
+`src/catalog/`) completely untouched -- every change this increment is
+confined to `sql/`.
+
+`PHASE_RELATIONAL_WRITE_EXECUTOR_ARCHITECTURE.md` is the full decision
+record, `PHASE_RELATIONAL_WRITE_EXECUTOR_INCREMENT10_RESULTS.md` the
+certification matrix and measured `cargo bench --bench write_executor_
+bench` numbers -- including two honestly-reported unfavorable findings,
+not smoothed over: transaction commit latency grows clearly superlinear
+from a 16-row to a 128-row write-set (likely `validate_and_build_ops`'s
+own per-row freshness re-read, `O(write-set size)` by construction, not
+yet investigated further), and concurrent same-table write throughput
+does **not** scale with writer count at all in this configuration --
+flat at ~280-300 single-row `INSERT`s/sec whether 1 or 32 threads are
+writing, plausibly the per-table epoch write lock plus `GroupCommit`'s
+batching window interacting to serialize same-table commits, named as
+an open question rather than root-caused or silently tuned away.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** No CLI, HTTP SQL API, or
+frontend SQL console exists. `GROUP BY`/`HAVING`/aggregates/window
+functions/subqueries/CTEs/set operators remain entirely unbound at the
+binder. `RETURNING`/`UPSERT`/`ON CONFLICT` are not implemented (no
+bound grammar exists for either). `CHECK` constraints are not enforced
+(catalog-only metadata, no SQL binding path exists). `CREATE DATABASE`
+has no execution primitive and returns a controlled error. Write/Read/
+Compaction, catalog, row storage, secondary indexes, the transaction
+engine, the SQL parser/binder, the query planner, and the read-only
+query executor all remain independently PRODUCTION READY / PASS,
+unaffected. Full account: `PHASE_RELATIONAL_WRITE_EXECUTOR_
+INCREMENT10_RESULTS.md`.

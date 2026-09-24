@@ -98,10 +98,42 @@ pub fn bind_insert(
                         ),
                     });
                 }
-                *slot = Some(BoundExpr {
-                    kind: BoundExprKind::Literal(None),
-                    ty: Some(relational_type_of(column)?),
-                    nullable: true,
+                let ty = relational_type_of(column)?;
+                // An *omitted* column with a declared `DEFAULT` must bind
+                // to that default's own value here, at bind time -- not
+                // to a `NULL` literal indistinguishable from a caller
+                // explicitly writing `NULL` (standard SQL: `DEFAULT`
+                // applies only when the column is omitted; an explicit
+                // `NULL` on a nullable-with-a-default column, handled by
+                // the loop above this one, must still bind to `NULL`).
+                // `crate::bind::ddl::encode_default_literal`'s own doc
+                // comment already named this exact decode step as "any
+                // future executor['s]" job -- this is that job, done once
+                // here rather than repeated by every future statement
+                // kind that inserts a full row (`UPDATE` never needs
+                // this: an omitted column in `SET` simply is not
+                // reassigned at all, item 17/22 of the write-executor
+                // spec).
+                *slot = Some(match &column.default_value {
+                    Some(bytes) => {
+                        let (_, mut values) = rubixdb::relational::value::decode_row(bytes, &[ty])
+                            .map_err(|e| SqlError::TypeMismatch {
+                                detail: format!(
+                                    "column {:?} has a malformed DEFAULT: {e}",
+                                    column.name
+                                ),
+                            })?;
+                        BoundExpr {
+                            kind: BoundExprKind::Literal(values.remove(0)),
+                            ty: Some(ty),
+                            nullable: column.nullable,
+                        }
+                    }
+                    None => BoundExpr {
+                        kind: BoundExprKind::Literal(None),
+                        ty: Some(ty),
+                        nullable: true,
+                    },
                 });
             }
         }

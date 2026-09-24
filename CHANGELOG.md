@@ -6,6 +6,83 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 10 (production write executor) (2026-09-24)
+
+Adds a production-grade write executor (`sql/src/exec/write.rs`,
+`sql/src/exec/write/metrics.rs`, new modules in the existing
+`rubixdb-sql` crate): `SQL write -> Parser -> AST -> Binder -> Plan ->
+Transaction -> Write Executor -> TableStore/IndexStore -> write_batch ->
+durable committed state`. `INSERT`, `UPDATE`, `DELETE`, and the DDL
+forms the current catalog/index architecture actually supports
+(`CREATE SCHEMA`/`TABLE`, `DROP TABLE`, `CREATE`/`DROP INDEX`) now
+really execute -- no demo, no wrapper, no transaction bypass.
+`PHASE_RELATIONAL_WRITE_EXECUTOR_ARCHITECTURE.md` is the full decision
+record; `PHASE_RELATIONAL_WRITE_EXECUTOR_INCREMENT10_RESULTS.md` has the
+certification matrix and measured benchmark numbers.
+
+#### Added
+
+- `sql/src/exec/write.rs`: `execute_write`/`execute_write_autocommit`,
+  `execute_insert`/`execute_update`/`execute_delete`/`execute_ddl`. A
+  two-phase, bounded-memory design for `UPDATE`/`DELETE` target-row
+  finding -- reuses Increment 9's own certified read-access machinery
+  (`PkLookup`/`IndexScan`/`SeqScan`) to collect only matching rows'
+  `PRIMARY KEY` values (never full rows), bounded by a new `ExecLimits::
+  max_dml_target_rows`, then mutates each row in a second pass.
+- `sql/src/exec/write/metrics.rs`: `WriteMetrics`/`WriteMetricsSnapshot`
+  -- bounded-cardinality counters only (`insert_statements`/`rows_
+  inserted`/etc., `write_conflicts`, `dml_errors`/`ddl_errors`), no
+  table/schema/SQL-text/principal label ever accepted.
+- `sql/src/write_tests.rs`: 42 new tests -- see Results doc.
+- `sql/tests/write_crash_consistency.rs`: real, cross-process, OS-level
+  crash testing at the write executor's own commit boundary (item 30's
+  "HARD PRODUCTION GATE"), reusing `rubixdb::wal::{AbortPoint, FileWal::
+  set_abort_hook}` verbatim across 9 real abort points -- proves a crash
+  during `INSERT`'s own `write_batch` call can never leave a table row
+  durable without its secondary-index entry, or the reverse.
+- `sql/benches/write_executor_bench.rs`: `INSERT`/`UPDATE`/`DELETE`/DDL
+  latency, write amplification vs. index count (0/1/2/5/10), commit
+  latency vs. write-set size (1-128 rows), concurrent-writer throughput
+  (1/4/16/32 threads).
+- `RowContext::row_for` and `ExecLimits::max_dml_target_rows` (`sql/src/
+  exec/mod.rs`, additive).
+
+#### Fixed / Found
+
+- **Binder bug** (`sql/src/bind/dml.rs`): an *omitted* `INSERT` column
+  was always bound to a plain `NULL` literal, even when the column had a
+  declared `DEFAULT` -- structurally indistinguishable from an explicit
+  `NULL`, so any `DEFAULT`-bearing column omitted from an `INSERT`'s
+  column list would have silently stored `NULL` instead of its declared
+  default. Found by inspecting the binder before designing execution (a
+  breadcrumb in `encode_default_literal`'s own Increment-6 doc comment
+  named exactly this future decode step). Fixed at bind time; regression
+  test added.
+- **Real primary-key-uniqueness gap, found by differential testing**:
+  `Transaction::put_row` is a generic upsert-at-key primitive with no
+  notion of "this key must not already exist" -- `commit`'s own
+  freshness/`UNIQUE` validation catches a *concurrently racing* `INSERT`
+  of the same `PRIMARY KEY`, but not a plain, *later*, non-overlapping
+  `INSERT` reusing a key an earlier, already-committed transaction used
+  (both snapshots agree, so nothing looks like a conflict) -- the row
+  was silently overwritten instead of the `INSERT` failing. Found by
+  `write_tests::differential`'s own independent reference-model test,
+  not by inspection. Fixed: `execute_insert` now checks for an existing
+  row via `Transaction::get_row` (the same snapshot-correct read every
+  other statement already uses, entirely within the same transaction,
+  never a second detector) immediately before each row's `put_row`,
+  reported as the same `SqlError::Conflict` class a concurrent conflict
+  already uses. See `PHASE_RELATIONAL_WRITE_EXECUTOR_ARCHITECTURE.md`
+  §4b for the full argument that this closes a *sequential* gap the
+  existing commit-time freshness check structurally cannot see, without
+  weakening or duplicating that check's own, still-sole authority over
+  the concurrent case.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** No CLI, HTTP SQL API, or
+frontend SQL console exists; `GROUP BY`/`HAVING`/aggregates/window
+functions/subqueries/CTEs/set operators remain unbound at the binder.
+Full account: `PHASE_RELATIONAL_WRITE_EXECUTOR_INCREMENT10_RESULTS.md`.
+
 ### Relational database: Increment 9 (read-only query executor) (2026-09-24)
 
 Adds a production-grade query executor (`sql/src/exec/`, new module in

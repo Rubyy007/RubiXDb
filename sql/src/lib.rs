@@ -55,3 +55,6 @@ mod plan_reference_model;
 
 #[cfg(test)]
 mod exec_tests;
+
+#[cfg(test)]
+mod write_tests;
