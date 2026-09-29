@@ -4153,3 +4153,22 @@ Full results and explicit open items (cross-browser, sustained
 execute/clear memory cycling, GUI cancellation/network-failure
 timing, the true 100,000-row case) in
 `PHASE_RUBIXDB_GUI_PERFORMANCE.md`.
+
+## 2026-09-29 (Increment 13 hardening: real HTTP-disconnect cancellation)
+
+Closed query cancellation via real HTTP disconnect (Phase O) with
+`api/tests/api_cancellation.rs`: a real server, a real client that
+drops its connection mid-request (`tokio::time::timeout` shorter than
+the query's own real completion time, cancelling and dropping the
+underlying `reqwest` future -- an actual closed TCP connection, not a
+simulated signal), against a genuinely expensive `GROUP BY`/`HAVING`
+query made slow via real 24-way concurrent contention (reusing the
+tail-latency behavior already measured in
+`PHASE_RUBIXDB_PERFORMANCE_BASELINE.md` §7). The cancellation fired
+for real after 34.7ms in the recorded run. Decisive proof: the server
+answered a brand-new `/healthz` and a fresh `SELECT 1` immediately
+afterward (never blocked behind the cancelled or any other in-flight
+query), all 24 concurrent background queries eventually completed
+rather than hanging, and the underlying data was unaffected
+(read-only workload, `COUNT(*)` still exactly 3,000 afterward). Full
+regression clean.

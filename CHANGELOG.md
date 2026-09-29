@@ -6,6 +6,17 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- real HTTP-disconnect cancellation (2026-09-29)
+
+#### Added
+
+- `api/tests/api_cancellation.rs`: closes Phase O with a real server
+  and a real client dropping its connection mid-request against a
+  genuinely expensive query made slow via real 24-way concurrent
+  contention. Proves the server stays fully responsive to new requests
+  immediately after a disconnect, never wedges, and all concurrent
+  background queries eventually complete rather than hanging.
+
 ### Product: Increment 13 hardening -- real GUI/frontend performance (2026-09-29)
 
 Full results: `PHASE_RUBIXDB_GUI_PERFORMANCE.md`.
