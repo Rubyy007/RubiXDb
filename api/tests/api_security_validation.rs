@@ -100,6 +100,9 @@ fn base_config(data_dir: PathBuf) -> Config {
         sql_session_idle_timeout_secs: 300,
         sql_session_max_lifetime_secs: 1800,
         sql_statement_deadline_secs: 30,
+        instance_id: None,
+        instance_name: None,
+        frontend_dist: None,
     }
 }
 

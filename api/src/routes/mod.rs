@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod compaction;
 pub mod health;
+pub mod instance;
 pub mod kv;
 pub mod metrics_route;
 pub mod range;
@@ -17,6 +18,7 @@ use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::auth::auth_middleware;
 use crate::state::AppState;
@@ -123,10 +125,37 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let cors = cors_layer(&state.config);
     let mut router = Router::new()
         .route("/healthz", get(health::healthz))
+        .route("/v1/instance", get(instance::instance))
         .merge(protected)
         .layer(DefaultBodyLimit::max(limit));
     if let Some(cors) = cors {
         router = router.layer(cors);
+    }
+    // Only when `rubixdb gui` (or an explicit `RUBIXDB_FRONTEND_DIST`
+    // override) supplies a built frontend -- `PHASE_RUBIXDB_GUI_
+    // ARCHITECTURE.md` §3. A `.fallback_service` only ever runs for a
+    // request that matched none of the routes above, so this can never
+    // shadow `/v1/*`, `/healthz`, or `/readyz` -- exact-match API
+    // routes always win. Unmatched static-asset paths (`/assets/*.js`)
+    // are served from disk; any other unmatched GET (a client-side
+    // route like `/sql`) falls through `ServeDir`'s own `not_found_
+    // service` to `index.html`, the standard SPA-fallback shape, so a
+    // browser refresh on a deep link still works. The pre-existing
+    // standalone-API deployment (`frontend_dist: None`) gets exactly
+    // today's router, byte-for-byte -- this whole block is additive.
+    if let Some(dist) = &state.config.frontend_dist {
+        let index_html = dist.join("index.html");
+        // Plain `.fallback(...)`, not `.not_found_service(...)` --
+        // the latter forces every fallback response to HTTP 404
+        // regardless of whether the file was actually served (tower-
+        // http's own documented behavior), which would mean every
+        // client-side route (`/sql`, a refreshed deep link) loads
+        // with a 404 status. `.fallback` preserves `ServeFile`'s own
+        // real 200 for a successful read -- the standard SPA-
+        // fallback contract (a client-side route is a real,
+        // successful page load, not an error).
+        let serve_dir = ServeDir::new(dist).fallback(ServeFile::new(index_html));
+        router = router.fallback_service(serve_dir);
     }
     router.with_state(state)
 }

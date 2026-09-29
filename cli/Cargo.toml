@@ -16,9 +16,18 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 rustyline = "14"
 rpassword = "7"
-
-[dev-dependencies]
+# Only the `gui` subcommand (`src/gui.rs`) and instance-discovery in
+# `main.rs` use these -- the client role (`src/client.rs` and
+# everything it drives) remains a pure HTTP client of `POST /v1/sql`,
+# per `PHASE_RELATIONAL_CLI_ARCHITECTURE.md` §1: it never calls into
+# `rubixdb`/`rubixdb-sql` to execute SQL locally. The `gui` role's job
+# is exactly to host the one real server (reusing its library code
+# directly, never a second implementation) -- see
+# `PHASE_RUBIXDB_GUI_ARCHITECTURE.md` §1 for the distinction.
 rubixdb = { path = ".." }
 rubixdb-api = { path = "../api" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+rubixdb-instance = { path = "../instance" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+
+[dev-dependencies]
 axum = "0.7"

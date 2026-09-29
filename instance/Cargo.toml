@@ -1,0 +1,15 @@
+[package]
+name = "rubixdb-instance"
+version = "0.1.0"
+edition = "2021"
+description = "RubiXDB local instance manager -- discovery, OS-level ownership locking, and lifecycle for the single-user local product model"
+publish = false
+
+[dependencies]
+fs4 = { version = "1", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+
+[dev-dependencies]

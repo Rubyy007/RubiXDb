@@ -6,6 +6,101 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: GUI launcher and local instance manager (2026-09-29)
+
+Adds the local instance manager and `rubixdb gui` launcher assumed
+(but never actually built) by the Increment 13 hardening mission spec
+-- built as its own dedicated, real increment per explicit user
+direction rather than silently folded into a "certification" of
+nonexistent functionality. Full decision records:
+`PHASE_RUBIXDB_INSTANCE_ARCHITECTURE.md`,
+`PHASE_RUBIXDB_INSTANCE_SECURITY.md`,
+`PHASE_RUBIXDB_GUI_ARCHITECTURE.md`; certification evidence:
+`PHASE_RUBIXDB_GUI_INSTANCE_INCREMENT_RESULTS.md`.
+
+#### Added
+
+- `instance/` (new workspace member, `rubixdb-instance`): real OS-level
+  instance ownership via `fs4::FileExt` (`flock`/`LockFileEx`), never a
+  PID file -- the OS itself releases the lock the instant an owning
+  process exits or crashes, so there is no staleness heuristic
+  anywhere in this crate. Per-OS app-data directory resolution
+  (`%LOCALAPPDATA%`/`~/Library/Application Support`/`$XDG_DATA_HOME`);
+  instance names restricted to `[A-Za-z0-9_-]{1,64}`, the entire
+  path-traversal defense.
+- `instance::manifest`/`instance::credentials`: a persistent, non-secret
+  `instance.json` (`instance_id`, `name`, `api_port`,
+  `created_at_unix_secs`) and a generated 256-bit local admin API key
+  (`credentials.json`, mode `0600` on Unix), read directly by both
+  `gui` and `cli` -- no login prompt, no weakening of the existing
+  bearer-key auth model underneath.
+- `instance::port::bind_loopback`: hardcoded loopback-only binding,
+  bind-once (no probe-then-rebind TOCTOU), collision fallback to an
+  OS-assigned ephemeral port.
+- `instance::handshake`: real HTTP identity verification (`GET
+  /v1/instance`) and readiness polling (`GET /healthz`) -- never a
+  fixed sleep, never trusting a lock or a manifest alone.
+- `instance::browser`: dependency-free default-browser launch
+  (`cmd /C start`/`open`/`xdg-open`).
+- `instance::acquire`/`discover`/`list_instances`: the one algorithm
+  both `gui` and the CLI client use to find-or-create an instance,
+  including bounded, backoff-retried attach handling for the real
+  "two processes racing an unstarted instance" case.
+- `api/src/routes/instance.rs`: `GET /v1/instance` -- new, additive,
+  unauthenticated identity-handshake route.
+- `api/src/routes/mod.rs`: optional frontend static/SPA-fallback
+  serving via `tower_http::services::ServeDir`, gated by a new
+  `Config.frontend_dist: Option<PathBuf>` field (`None` by default --
+  every pre-existing deployment shape unchanged); mounted as a
+  `.fallback_service` so it can never shadow a real API route.
+- `api/src/config.rs`: three new additive `Option` fields
+  (`instance_id`, `instance_name`, `frontend_dist`).
+- `cli/src/gui.rs`, `cli/src/host.rs`: `rubixdb gui` -- finds/creates
+  the instance, hosts the real `rubixdb-api` server in-process on a
+  dedicated thread (reuses `rubixdb_api::{AppState, Config,
+  routes::build_router, server::serve}` directly, never a second SQL
+  engine), serves the real frontend build, opens the browser, blocks
+  on Ctrl+C/SIGTERM, shuts down gracefully. Presents "continue
+  existing / start new instance" when an already-running, handshake-
+  verified instance is found.
+- `cli/src/instance_cmd.rs`: `rubixdb instance list`/`status`.
+- `cli/src/frontend_dist.rs`: locates a built frontend (`RUBIXDB_
+  FRONTEND_DIST` override, then paths relative to the executable).
+- `cli/src/main.rs`: subcommand dispatch (`gui`/`instance`/`cli`,
+  default unchanged); the plain client role now auto-discovers (or, if
+  none exists yet, headlessly becomes the owner of) a local instance
+  when `RUBIXDB_API_URL` is unset, so `rubixdb` alone is a complete
+  first-run entry point -- `RUBIXDB_API_URL` remains a full, unchanged
+  explicit override.
+- `api/tests/api_instance_and_frontend.rs` (6 tests),
+  `cli/tests/gui_instance_integration.rs` (6 tests, real compiled
+  binary, real racing OS processes), 27 new unit tests in
+  `rubixdb-instance`.
+
+#### Fixed
+
+- `ServeDir::not_found_service` forces every fallback response to HTTP
+  404 regardless of whether a file was actually served -- switched to
+  plain `.fallback(...)`, which preserves the real 200 for a
+  successfully served file.
+- The embedded server's `std::net::TcpListener` was never set
+  non-blocking before being handed to
+  `tokio::net::TcpListener::from_std`, so the async runtime never
+  actually polled it for acceptance -- every request silently hung
+  until timeout despite the TCP handshake completing at the OS level.
+  Found via `netstat`/`curl` against a real running process.
+- A failed `EmbeddedServer::start()` could leave an orphaned server
+  thread/engine/listening socket running -- every post-spawn failure
+  path now signals shutdown and joins the thread before returning.
+- The plain CLI client's connection resolution trusted a stale,
+  unverified `instance.json` left behind by a since-exited process
+  (using the liveness-blind `discover()` as its primary path) instead
+  of verifying anyone was actually listening -- now routes
+  unconditionally through the handshake-verifying `acquire()`.
+- A lock-release-on-process-kill test used an unqualified libtest
+  filter name and silently never exercised the scenario it claimed to
+  cover.
+
 ### Relational database: Increment 12 (SQL API, CLI, and frontend SQL console) (2026-09-29)
 
 Exposes the already-certified SQL engine as a real product surface:

@@ -3800,3 +3800,90 @@ engine, the SQL parser/binder/planner/optimizer/executor (read + write
 PRODUCTION READY / PASS for the specific properties each has actually
 been tested against. Full account: `PHASE_RELATIONAL_SQL_API_
 INCREMENT12_RESULTS.md`.
+
+## 2026-09-29 (GUI + local instance manager)
+
+Increment 13's mission spec ("final production hardening") assumed a
+local instance manager and GUI launcher already existed,
+"implemented but not fully certified." A real audit of the repository
+(workspace members, `grep` for "gui"/"instance" across `api/`/`cli/`/
+`frontend/`, checking for the GUI/instance architecture docs the spec's
+own Phase 1 asked to be read first) found none of it existed at all --
+four workspace members, a direct-client `rubixdb` binary with no
+subcommands, none of `PHASE_RUBIXDB_PRODUCT_ARCHITECTURE.md`/
+`PHASE_RUBIXDB_LOCAL_INSTANCE_ARCHITECTURE.md`/`PHASE_RUBIXDB_LOCAL_
+SECURITY_ARCHITECTURE.md` on disk. Per explicit user direction, this
+was built as its own dedicated, real, production-grade increment
+rather than silently folded into "certifying" a product surface that
+was never built.
+
+Built: a new `rubixdb-instance` crate (real OS-level ownership via
+`fs4`'s `flock`/`LockFileEx`, never a PID file; per-OS app-data
+directory resolution with path-traversal-proof naming; a persistent
+manifest + a generated high-entropy local credential; loopback-only
+collision-safe port binding with no TOCTOU; a real HTTP identity
+handshake; a dependency-free cross-platform browser launcher); a new
+`rubixdb gui` subcommand that finds/creates the local instance, hosts
+the real `rubixdb-api` server in-process on a dedicated thread (no
+subprocess, no second SQL engine), serves the real production frontend
+build with SPA fallback, and opens the browser; `rubixdb instance
+list`/`status` for real introspection; the plain `rubixdb` client role
+gained automatic local-instance discovery so it is a complete first-run
+entry point on its own. Two small additive `rubixdb-api` changes: `GET
+/v1/instance` (new, unauthenticated) and optional frontend static/SPA
+serving gated by a new `Config.frontend_dist` field, `None` by default
+-- the pre-existing standalone-API deployment shape is byte-for-byte
+unchanged, verified by re-running the full pre-existing `api`/`cli`
+suites unmodified.
+
+Five real bugs found and fixed while building and testing this: (1) a
+`tower-http` `not_found_service` call forced every SPA-fallback
+response to HTTP 404 regardless of whether a file was actually served;
+(2) a lock-release-on-kill test used an unqualified libtest filter name
+and silently never ran the scenario it claimed to; (3) the embedded
+server's `TcpListener` was never set non-blocking before handing it to
+Tokio, so TCP handshakes completed at the OS level (visible in
+`netstat` as `ESTABLISHED`) while the async runtime never actually
+served a single request -- found via `netstat`/`curl` against a real
+running process, not guessed; (4) a failed `EmbeddedServer::start()`
+left an orphaned server thread/engine/socket running because the error
+paths never signaled shutdown; (5) the plain CLI client's connection
+resolution trusted a stale, unverified `instance.json` left behind by
+a since-exited process instead of checking liveness, found when a
+cross-process persistence test failed outright -- fixed by routing
+every connection through the same handshake-verifying `acquire()` path
+`rubixdb gui` uses, never the bare disk-read `discover()`.
+
+Real, process-level testing throughout: 27 unit tests in the new
+instance crate including a genuine kill-a-real-child-process lock-
+release test; 6 new API tests for the two additive routes; 6 new tests
+spawning the **actual compiled** `rubixdb` binary as real racing OS
+processes (two `-c` invocations racing an unstarted instance to one
+owner, two `gui` invocations racing with the loser correctly attaching
+instead of duplicating ownership, a `gui`-owned instance sharing real
+data with a separate CLI client, cross-process persistence); a manual
+end-to-end smoke test against a real `npm run build` frontend bundle
+confirming real index.html/asset/SPA-route/handshake responses. Full
+workspace regression: `fmt`/`clippy -D warnings` clean, `cargo check
+--workspace --all-targets --all-features` clean, `cargo test
+--workspace` all passing except the same pre-existing debug-mode
+`group_commit` throughput-threshold flake already documented in both
+prior increments' results docs, confirmed unrelated via `git diff
+--stat -- src/ sql/` reporting zero lines changed in either certified
+path this increment.
+
+Explicitly not claimed: a native desktop GUI (this is a lifecycle
+launcher in front of the existing, unchanged browser-based console);
+delete-object safety for database/schema/table/index (no such UI
+exists anywhere in this product yet); GUI/instance performance, load,
+or endurance measurement (deferred to the broader Increment 13
+product-hardening pass this increment's own scope explicitly excludes).
+Full account: `PHASE_RUBIXDB_INSTANCE_ARCHITECTURE.md`,
+`PHASE_RUBIXDB_INSTANCE_SECURITY.md`, `PHASE_RUBIXDB_GUI_ARCHITECTURE.
+md`, `PHASE_RUBIXDB_GUI_INSTANCE_INCREMENT_RESULTS.md`.
+
+Per the user's explicit instruction, this dedicated increment stops
+here -- no Router/Replication/Partitioning or other unrelated feature
+work follows automatically. Next: the remaining Increment 13 product-
+hardening gaps, now against the combined API + CLI + GUI + instance-
+management surface.

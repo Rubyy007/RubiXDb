@@ -8,6 +8,8 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use uuid::Uuid;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Reader,
@@ -71,6 +73,24 @@ pub struct Config {
     /// that crate's own standalone default, so this service's own
     /// operator-facing timeout knob is the single source of truth.
     pub sql_statement_deadline_secs: u64,
+    /// Set only when this process was started by `rubixdb gui`/`rubixdb
+    /// cli`'s own instance manager (`rubixdb-instance`) -- `None` for a
+    /// standalone `rubixdb-api` deployment (the pre-existing Increment
+    /// 12 shape, unchanged). Exposed read-only via `GET /v1/instance`
+    /// so an attaching process can verify, over real HTTP, that the
+    /// server holding the instance lock is genuinely the expected
+    /// instance before treating it as "the" running one --
+    /// `PHASE_RUBIXDB_INSTANCE_ARCHITECTURE.md` §6.
+    pub instance_id: Option<Uuid>,
+    pub instance_name: Option<String>,
+    /// The built frontend's static directory (`frontend/dist` after
+    /// `npm run build`). `None` (the pre-existing Increment 12 shape,
+    /// unchanged) means this process serves the API only -- exactly
+    /// today's standalone `rubixdb-api` deployment. Set only by
+    /// `rubixdb gui`'s in-process server startup
+    /// (`PHASE_RUBIXDB_GUI_ARCHITECTURE.md` §3), never required for
+    /// the API crate's own existing certified deployment shape.
+    pub frontend_dist: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -192,6 +212,14 @@ impl Config {
             sql_session_idle_timeout_secs: env_or("RUBIXDB_SQL_SESSION_IDLE_TIMEOUT_SECS", 300)?,
             sql_session_max_lifetime_secs: env_or("RUBIXDB_SQL_SESSION_MAX_LIFETIME_SECS", 1800)?,
             sql_statement_deadline_secs: env_or("RUBIXDB_SQL_STATEMENT_DEADLINE_SECS", 30)?,
+            instance_id: env_var("RUBIXDB_INSTANCE_ID")
+                .map(|raw| {
+                    Uuid::parse_str(&raw)
+                        .map_err(|e| ConfigError(format!("RUBIXDB_INSTANCE_ID invalid: {e}")))
+                })
+                .transpose()?,
+            instance_name: env_var("RUBIXDB_INSTANCE_NAME"),
+            frontend_dist: env_var("RUBIXDB_FRONTEND_DIST").map(PathBuf::from),
         })
     }
 }
