@@ -3973,3 +3973,48 @@ throughout. Still explicitly open: higher-concurrency load (32/64),
 sustained endurance, resource-trend tracking, HTTP/JSON fuzzing,
 expensive-query flood, GUI/frontend performance, and the final
 certification documents.
+
+## 2026-09-29 (Increment 13 hardening: real HTTP/JSON/SQL fuzzing and expensive-query-flood evidence)
+
+Closed the HTTP/JSON fuzzing gate (Phases K/L/M) with
+`api/tests/api_http_fuzz.rs` -- a real running server (real
+`TcpListener`, real `axum::serve`, real `reqwest` client, not the
+in-process router shortcut every other API test file uses), fed
+hundreds of malformed/adversarial requests across four real tests:
+malformed/truncated/random-byte JSON bodies, structurally-valid-but-
+semantically-wrong JSON (missing/null/wrong-typed fields, unknown
+fields, invalid parameter-type tags), invalid UTF-8 inside a JSON
+string field, and 40 random ASCII strings submitted as SQL through the
+real parser/binder/planner/executor pipeline; deep/large SQL
+expressions (2000-clause `AND` chains, 5000-deep nested parens, a 2MB
+string literal, a 100,000-character identifier, a 5000-column
+`SELECT`, a 50,000-element parameter array) through the same real
+pipeline; malformed/missing/garbage `Authorization` headers and a
+forged mismatched `Content-Length`; and repeated abrupt raw-TCP
+connection termination mid-request (a genuinely partial HTTP request,
+dropped without completing it, exercised directly via a raw socket
+rather than `reqwest`, which would otherwise hide the real behavior).
+Every case requires either a normal bounded HTTP response or an
+acceptable transport-level failure -- a timeout is treated as a hang
+and fails the test outright -- and the decisive final check in every
+test is that the server still answers a plain `/healthz` correctly
+afterward, proving nothing during the run took the process down.
+
+Went further than bare crash-safety for the explicitly expensive
+cases (Phase M's own "verify resource protections work," not just
+"don't crash"): the deep-parens, huge-literal, and 50,000-parameter
+cases assert the request is actively rejected by a real resource limit
+(never silently accepted), verified first by hand against a real
+running instance (2MB literal -> real `413`; 5000-deep parens -> real
+`413 RESOURCE_LIMIT` with the expected "nesting exceeds the configured
+recursion limit" detail) before being written into the automated,
+repeatable assertion.
+
+No new production dependency -- the randomized inputs come from a
+small hand-rolled xorshift64 PRNG in the test file itself, not `rand`.
+All 4 new tests pass; full `rubixdb-api` regression (91 tests total
+now) re-run clean.
+
+Still explicitly open: higher-concurrency load (32/64), sustained
+endurance, resource-trend tracking, GUI/frontend performance, and the
+final certification documents.

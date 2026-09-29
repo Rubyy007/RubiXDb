@@ -6,6 +6,20 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- real HTTP/JSON/SQL fuzzing (2026-09-29)
+
+#### Added
+
+- `api/tests/api_http_fuzz.rs`: real HTTP boundary fuzz/robustness
+  harness against a real running server (not the in-process router
+  shortcut) -- malformed/truncated JSON, semantically-wrong JSON,
+  invalid UTF-8, random-byte bodies, deep/large SQL expressions through
+  the real parser/binder/planner/executor pipeline, malformed
+  authorization/headers, and repeated abrupt raw-TCP connection
+  termination mid-request. Expensive/oversized cases (deep parens,
+  2MB literal, 50,000-element parameter array) assert active
+  rejection by a real resource limit, not just crash-safety.
+
 ### Product: Increment 13 hardening -- canonical port 302 and real crash-kill matrix (2026-09-29)
 
 #### Added
