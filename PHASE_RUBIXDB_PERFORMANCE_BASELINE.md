@@ -261,3 +261,46 @@ leak; this pass did not run long enough afterward to confirm the
 thread count eventually settles back toward the ~18-thread baseline,
 which is exactly the kind of question a longer endurance run
 (`PHASE_RUBIXDB_ENDURANCE.md`) is for for real.
+
+## 8. CLI performance (Phase AC), real timing against the release binary
+
+Real `rubixdb.exe` (release), attaching to an already-running local
+instance (no owner-startup cost in these numbers -- that is measured
+separately in `PHASE_RUBIXDB_GUI_INSTANCE_INCREMENT_RESULTS.md`).
+
+| Case | Real wall-clock time |
+|---|---|
+| Single `-c "SELECT 1"` (full process: startup + instance-attach handshake + query + exit) | 50-75ms across 10 runs |
+| `-f` script, 100 statements (single process, one session for the whole run) | 417-634ms across 3 clean runs (~4.2-6.3ms/statement) |
+| `-f` script, 1,000 statements | 3,930-5,188ms across 3 clean runs (~3.9-5.2ms/statement) |
+
+**Separating CLI/process overhead from server/HTTP cost**: the
+per-statement rate inside a script (~4-6ms) is close to this same
+release build's own measured single-client `INSERT` server-side
+latency (§4/§7: ~3.5ms p50 at concurrency=1) -- meaning the CLI's own
+per-statement overhead (splitting, dispatch, table rendering) adds
+roughly 0.5-2ms on top of real server latency, not a separate large
+cost center. The much larger, separate cost is one-time **process
+startup + instance-attach**: a bare `SELECT 1` (50-75ms) takes far
+longer than the same statement's own server-side latency alone
+(sub-millisecond, §4/§7's `pk_lookup`/trivial-literal numbers) --
+that gap is OS process creation, dynamic linking, and the real
+`acquire()`/handshake-retry path (`PHASE_RUBIXDB_INSTANCE_
+ARCHITECTURE.md` §7), not per-statement execution cost. This matters
+for script-mode workloads (fixed once per run, amortized across many
+statements) more than for single ad-hoc queries.
+
+## 9. Handle/thread stability under repeated real connect/disconnect and session cycles (Phase H)
+
+Server baseline (real release `rubixdb gui`, freshly started): 116
+handles, 14 threads. After 50 real, separate `rubixdb -c "SELECT 1"`
+process invocations (each a fresh OS process, fresh HTTP connection,
+full connect-query-disconnect cycle): 117 handles, 15 threads -- a
+change of +1/+1 across 50 full cycles, not a per-cycle accumulation.
+After a further 50 real session cycles (25 `BEGIN`/`INSERT`/`COMMIT`,
+25 `BEGIN`/`INSERT`/`ROLLBACK`, each its own process/session): still
+117 handles, 15 threads -- no change at all. Correctness verified in
+the same pass: the 25 committed transactions' rows are all present
+(`COUNT = 25`), the 25 rolled-back transactions' rows are all absent
+(`COUNT = 0`) -- exactly the required semantics, not merely "no
+crash."

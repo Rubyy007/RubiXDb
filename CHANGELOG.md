@@ -6,6 +6,18 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- CLI performance and handle/thread stability (2026-09-29)
+
+Real measurements against the release binary, no code changes.
+`PHASE_RUBIXDB_PERFORMANCE_BASELINE.md` §8-9: single-query CLI timing
+(50-75ms, dominated by process startup/instance-attach, not per-
+statement cost), 100/1,000-statement script timing (~4-6ms/statement,
+tracking real server latency closely), and 50+50 real connect/
+disconnect and session cycles showing the server's own handle/thread
+counts move by +1/+1 total across the first 50 cycles and not at all
+across the second 50, with committed/rolled-back correctness verified
+in the same pass.
+
 ### Product: Increment 13 hardening -- real sustained endurance run (2026-09-29)
 
 Full results: `PHASE_RUBIXDB_ENDURANCE.md`.

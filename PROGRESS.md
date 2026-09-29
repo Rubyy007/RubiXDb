@@ -4090,3 +4090,28 @@ ownership-traced proof, since no heap profiler was run.
 
 Explicitly still open: a materially longer duration run, GUI/frontend
 endurance, CLI endurance, and the final certification documents.
+
+## 2026-09-29 (Increment 13 hardening: CLI performance and handle/thread stability)
+
+Closed CLI performance (Phase AC) and handle/thread stability (Phase
+H) with real measurements against the release binary. CLI: a bare
+`-c "SELECT 1"` takes 50-75ms end to end (process startup + real
+instance-attach handshake dominates -- server-side latency for that
+statement is sub-millisecond), while script-mode per-statement cost
+(100-statement and 1,000-statement scripts, ~4-6ms/statement) tracks
+closely with the same release build's own measured single-client
+`INSERT` server latency, meaning the CLI itself adds only 0.5-2ms of
+overhead per statement on top of real server cost, not a separate
+large cost center.
+
+Handle/thread stability: 50 real, separate `rubixdb -c` process
+invocations (each a fresh connect-query-disconnect cycle) moved the
+server's own handle/thread counts by +1/+1 total, not per-cycle; a
+further 50 real `BEGIN`/`INSERT`/`COMMIT`-or-`ROLLBACK` session cycles
+produced zero further change. Correctness verified in the same pass:
+committed rows all present, rolled-back rows all absent.
+
+Full findings in `PHASE_RUBIXDB_PERFORMANCE_BASELINE.md` §8-9.
+Explicitly still open: a materially longer endurance duration, GUI/
+frontend performance and endurance, and the final certification
+documents.
