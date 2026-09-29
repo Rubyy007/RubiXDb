@@ -95,27 +95,35 @@ impl EmbeddedServer {
             // multi-tenant clients, where the limiter's job is
             // protecting the service from any *one* abusive principal
             // among many. A local instance has exactly one principal
-            // ("local") and no other tenant to protect against --
-            // found as a real bottleneck by `api/examples/sql_bench.rs`
-            // itself, whose own legitimate concurrent read benchmark
-            // (concurrency=4, 200 iterations) started getting real
-            // `429 RATE_LIMITED` responses. The limiter still has
-            // residual value even loopback-only (a compromised local
-            // process, or a browser page exploiting DNS-rebinding-
-            // style same-origin confusion against `127.0.0.1`, is a
-            // real attack class) so it is raised, not removed:
+            // ("local") and no other tenant to protect against.
+            //
+            // This was first raised to 2000rps/4000burst
+            // (`PHASE_RUBIXDB_PERFORMANCE_BASELINE.md` §2), which
+            // still proved too low once real throughput was actually
+            // measured at scale: `api/examples/sql_bench.rs`'s own
+            // extended load ladder (1600 iterations/level) showed
+            // legitimate single-client PK-lookup throughput alone
+            // sustaining 13,700+ req/s at concurrency=4 and 20,700+
+            // req/s at concurrency=16 -- both comfortably above the
+            // first-pass limit, which a per-principal token bucket
+            // with only a 4000-token burst cannot absorb for more than
+            // a fraction of a second of sustained load. Raised again,
+            // this time comfortably above the actual measured ceiling
+            // rather than a guess. The limiter still has residual
+            // value even loopback-only (a compromised local process,
+            // or a browser page exploiting DNS-rebinding-style same-
+            // origin confusion against `127.0.0.1`, is a real attack
+            // class) so it is raised again, not removed:
             // `RUBIXDB_LOCAL_RATE_LIMIT_RPS`/`_BURST` let an operator
-            // size it further; the new default is generous headroom
-            // over any plausible single-user workload while remaining
-            // a real, bounded ceiling.
+            // size it further.
             rate_limit_rps: std::env::var("RUBIXDB_LOCAL_RATE_LIMIT_RPS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2000.0),
+                .unwrap_or(100_000.0),
             rate_limit_burst: std::env::var("RUBIXDB_LOCAL_RATE_LIMIT_BURST")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(4000),
+                .unwrap_or(200_000),
             compaction_auto_trigger: true,
             compaction_trigger_count: 4,
             cors_allowed_origins: vec![],

@@ -6,6 +6,19 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- full concurrency ladder and real resource sampling (2026-09-29)
+
+#### Changed
+
+- `api/examples/sql_bench.rs`: extended to the full 1-64 concurrency
+  ladder (reads) / 1-32 (writes), 1,600 iterations/level for
+  statistically meaningful high-concurrency samples.
+- `cli/src/host.rs`: local rate limit raised again to
+  `rate_limit_rps=100_000.0`/`burst=200_000` -- the first raise
+  (2000/4000) was itself proven too low by this run's own real
+  measured throughput (up to 28,793 req/s for a single legitimate
+  client). See `PHASE_RUBIXDB_PERFORMANCE_BASELINE.md` §7.
+
 ### Product: Increment 13 hardening -- real HTTP/JSON/SQL fuzzing (2026-09-29)
 
 #### Added

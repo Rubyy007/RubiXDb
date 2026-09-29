@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 const READ_ROWS: i64 = 2000;
-const READ_ITERATIONS_PER_LEVEL: usize = 200;
-const WRITE_ITERATIONS_PER_LEVEL: usize = 100;
-const CONCURRENCY_LEVELS: &[usize] = &[1, 2, 4, 8, 16];
+const READ_ITERATIONS_PER_LEVEL: usize = 1600;
+const WRITE_ITERATIONS_PER_LEVEL: usize = 200;
+const CONCURRENCY_LEVELS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 struct Client {
     http: reqwest::Client,
@@ -250,7 +250,7 @@ async fn main() {
     // every request beyond concurrency=1 failed with a real (but
     // benchmark-induced, not product) primary-key conflict. Each level
     // now gets a clean table, matching the update/delete loops below.
-    let write_levels = [1usize, 2, 4, 8];
+    let write_levels = [1usize, 2, 4, 8, 16, 32];
     for &c in &write_levels {
         client.exec("DELETE FROM bench_rw").await.ok();
         let client = Arc::clone(&client);

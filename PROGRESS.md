@@ -4018,3 +4018,45 @@ now) re-run clean.
 Still explicitly open: higher-concurrency load (32/64), sustained
 endurance, resource-trend tracking, GUI/frontend performance, and the
 final certification documents.
+
+## 2026-09-29 (Increment 13 hardening: full 1-64 concurrency ladder + real resource sampling)
+
+Extended `api/examples/sql_bench.rs` to the full mission-required
+concurrency ladder (1, 2, 4, 8, 16, 32, 64 for reads; 1-32 for writes),
+raised read iterations to 1,600/level for statistically meaningful
+samples even at c=64, and ran it against a real release
+`rubixdb gui --no-browser` while sampling real RSS/handle/thread counts
+via `Get-Process` every ~1s throughout. Zero errors across the entire
+run (11,200 read + 3,600 write requests).
+
+Found the first rate-limit fix (2000rps/4000burst) was itself still
+too low, this time proven rather than guessed: real single-client
+PK-lookup throughput alone sustained 13,700-28,793 req/s across the
+ladder, comfortably exceeding a 4,000-token burst bucket. Raised again
+to 100,000rps/200,000burst, comfortably above the now-actually-
+measured ceiling.
+
+Real finding, explicitly not root-caused or silently resolved: PK
+lookup throughput keeps climbing cleanly through the whole ladder with
+p99 staying under 10ms even at c=64, but every other read workload
+(indexed lookup, range scan, count, `GROUP BY`) plateaus in throughput
+by c=8-16 and then its own p99/max latency degrades sharply past that
+point (range scan p99: 5.31ms at c=1 -> 637.62ms at c=64, a ~120x
+increase, while throughput barely moves) -- real evidence of
+contention specific to the non-PK read paths under high concurrency,
+recorded as an open follow-up rather than either ignored or
+"fixed" without the deeper engine-internal analysis this increment's
+own scope boundary doesn't yet justify.
+
+Resource trend: RSS climbed from a ~10.0MB idle baseline to a ~46.2MB
+peak under c=64 load and visibly came back down to ~24.7MB within ~2
+seconds of the load stopping (handles: 118 -> 406 -> 310 over the same
+window) -- the shape of bounded, load-proportional use, not monotonic
+growth, though this single run wasn't long enough to confirm thread
+count (18 -> 202 -> still 199 shortly after) settles all the way back;
+that's exactly what the next, longer endurance run is for.
+
+Full regression (fmt, clippy -D warnings, test across instance/cli/api)
+clean throughout. Still explicitly open: sustained multi-minute
+endurance, GUI/frontend performance, CLI performance/endurance, and
+the final certification documents.

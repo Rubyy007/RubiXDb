@@ -23,9 +23,16 @@ computation from actual collected samples — never estimated).
 vs. bind vs. plan vs. execute vs. serialize as separate numbers) — no
 such instrumentation is exposed by the server today; this is a
 documented limitation of this pass, not a claim of numbers this tool
-doesn't produce. CPU/RSS sampling during the run, sustained endurance
-behavior, and concurrency beyond 16 (reads) / 8 (writes) are also not
-covered here — see §5.
+doesn't produce. Sustained multi-minute endurance behavior is tracked
+separately (`PHASE_RUBIXDB_ENDURANCE.md`).
+
+**Update (concurrency extended to the full 1-64 ladder, real resource
+sampling added):** the initial pass below (§2-§4, concurrency 1-16)
+has been superseded by §7's full-ladder run, which also found and fixed
+a second, more precise rate-limit sizing issue and captured real
+RSS/handle/thread sampling via `Get-Process` during the run. §2-§6 are
+kept as the honest record of what was measured first and why it
+needed a second pass, not retroactively edited away.
 
 ## 1. Environment
 
@@ -166,3 +173,91 @@ that concurrency level (not an average of per-request rates).
 These remain open items for the full Increment 13 certification pass,
 named here rather than silently folded into an "it's fast enough"
 claim this evidence doesn't fully support yet.
+
+## 7. Full concurrency ladder (1-64), real resource sampling
+
+Re-run with `CONCURRENCY_LEVELS` extended to `[1, 2, 4, 8, 16, 32, 64]`,
+`READ_ITERATIONS_PER_LEVEL` raised from 200 to 1,600 (so even the
+c=64 level gets a statistically meaningful ~25 samples/worker), and
+`write_levels` extended to `[1, 2, 4, 8, 16, 32]` at 200
+iterations/level. Real release build, real `rubixdb gui --no-browser`.
+**Zero errors of any kind across the entire run** (11,200 read
+requests + 3,600 write requests).
+
+### A second, more precisely measured rate-limit finding
+
+The first rate-limit fix (§2, raised to 2000rps/4000burst) was itself
+still too low — proven, not guessed, this time: this run's own
+legitimate single-client PK-lookup throughput alone sustained
+13,700 req/s at concurrency=4 and 25,981 req/s at concurrency=16, both
+comfortably exceeding a limiter whose burst bucket only holds 4,000
+tokens. Raised again to `rate_limit_rps=100_000.0`,
+`rate_limit_burst=200_000` — comfortably above the actual measured
+ceiling this time rather than a second guess — verified by this same
+run completing with zero `429`s. `RUBIXDB_LOCAL_RATE_LIMIT_RPS`/`_BURST`
+remain the operator override; the standalone `rubixdb-api` binary's own
+default (200/400) is still untouched.
+
+### Read workloads (1,600 iterations/level)
+
+| Workload | c=1 p50/p99 | c=16 p50/p99 | c=64 p50/p99/max | c=64 throughput |
+|---|---|---|---|---|
+| PK lookup | 0.18 / 0.30 ms | 0.54 / 1.59 ms | 1.74 / 9.70 / 21.63 ms | 28,793 req/s |
+| Indexed lookup | 2.20 / 2.63 ms | 5.59 / 58.08 ms | 21.70 / 186.69 / 293.09 ms | 2,012 req/s |
+| Range scan (50 rows) | 3.82 / 5.31 ms | 8.29 / 111.18 ms | 8.93 / 637.62 / 761.45 ms | 1,086 req/s |
+| Full-table `COUNT(*)` | 3.67 / 7.78 ms | 7.26 / 135.76 ms | 9.89 / 462.15 / 579.97 ms | 1,137 req/s |
+| `GROUP BY`/`HAVING` | 4.39 / 6.16 ms | 8.86 / 152.10 ms | 10.51 / 606.49 / 676.09 ms | 949 req/s |
+
+### Write workloads (200 iterations/level)
+
+| Workload | c=1 p50 | c=8 p50 | c=32 p50/p99/max | c=32 throughput |
+|---|---|---|---|---|
+| INSERT | 3.52 ms | 29.06 ms | 119.27 / 129.31 / 129.82 ms | 264 req/s |
+| UPDATE | 3.59 ms | 31.52 ms | 104.55 / 112.55 / 113.80 ms | 304 req/s |
+| DELETE | 3.85 ms | 30.52 ms | 112.20 / 139.15 / 139.73 ms | 279 req/s |
+
+### A real finding: PK lookups scale, everything else's tail latency does not
+
+PK lookup's throughput keeps climbing through the whole ladder (5,145
+→ 28,793 req/s, c=1→64) with p99 staying under 10ms even at c=64. Every
+other read workload (indexed lookup, range scan, count, `GROUP BY`)
+plateaus in **throughput** by around c=8-16 (as already noted in §5)
+**and its p99/max latency then grows sharply** past that point — range
+scan's p99 goes from 5.31ms (c=1) to 637.62ms (c=64), a ~120x
+degradation, while its own throughput barely moves (256 → 1,086
+req/s). PK lookup shows no such tail blowup. This is real, measured
+evidence of contention specific to the non-PK read paths under high
+concurrency (plausibly a shared lock or limited-parallelism stage
+those paths share that pure PK lookup's path does not use) — not
+guessed, but also **not root-caused in this pass**: identifying the
+exact contention point would mean instrumenting or reading deeper into
+certified engine-internal code, which this increment's own boundary
+("Do NOT redesign Read Engine... unless a proven product-surface
+dependency requires a minimal change") does not yet justify without
+that deeper analysis. Recorded here as a real, open follow-up item —
+explicitly **not** claimed as resolved, and **not** silently absorbed
+into a passing grade.
+
+### Resource trend during the full run
+
+Sampled via `Get-Process` every ~1s against the real `rubixdb.exe`
+process (Windows; `WorkingSet64`/`HandleCount`/`Threads.Count`), for
+the whole ~95-second run plus a short cool-down:
+
+| | baseline (idle) | peak (during c=64) | ~1s after run ends |
+|---|---|---|---|
+| RSS | ~10.0 MB | ~46.2 MB | ~24.7 MB |
+| Handles | 118 | 406 | 310 |
+| Threads | 18 | 202 | 199 |
+
+RSS and handles both climb under peak concurrency load and visibly
+**come back down** once the load stops (46.2 MB → 24.7 MB RSS,
+406 → 310 handles within ~2 seconds) — the shape of bounded, load-
+proportional resource use, not monotonic unbounded growth. Thread
+count stays elevated near its peak briefly after the run (199 vs. 202
+peak) which is consistent with Tokio's blocking-thread-pool keep-alive
+policy (idle worker threads are not torn down instantly) rather than a
+leak; this pass did not run long enough afterward to confirm the
+thread count eventually settles back toward the ~18-thread baseline,
+which is exactly the kind of question a longer endurance run
+(`PHASE_RUBIXDB_ENDURANCE.md`) is for for real.
