@@ -89,8 +89,33 @@ impl EmbeddedServer {
             default_range_limit: 100,
             max_range_limit: 10_000,
             shutdown_drain_secs: 30,
-            rate_limit_rps: 200.0,
-            rate_limit_burst: 400,
+            // 200rps/400burst (`api/src/main.rs`'s own env-configured
+            // default) was sized for the standalone-deployment threat
+            // model: a shared server behind possibly-untrusted or
+            // multi-tenant clients, where the limiter's job is
+            // protecting the service from any *one* abusive principal
+            // among many. A local instance has exactly one principal
+            // ("local") and no other tenant to protect against --
+            // found as a real bottleneck by `api/examples/sql_bench.rs`
+            // itself, whose own legitimate concurrent read benchmark
+            // (concurrency=4, 200 iterations) started getting real
+            // `429 RATE_LIMITED` responses. The limiter still has
+            // residual value even loopback-only (a compromised local
+            // process, or a browser page exploiting DNS-rebinding-
+            // style same-origin confusion against `127.0.0.1`, is a
+            // real attack class) so it is raised, not removed:
+            // `RUBIXDB_LOCAL_RATE_LIMIT_RPS`/`_BURST` let an operator
+            // size it further; the new default is generous headroom
+            // over any plausible single-user workload while remaining
+            // a real, bounded ceiling.
+            rate_limit_rps: std::env::var("RUBIXDB_LOCAL_RATE_LIMIT_RPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000.0),
+            rate_limit_burst: std::env::var("RUBIXDB_LOCAL_RATE_LIMIT_BURST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4000),
             compaction_auto_trigger: true,
             compaction_trigger_count: 4,
             cors_allowed_origins: vec![],

@@ -6,6 +6,28 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- release build and performance baseline (2026-09-29)
+
+Full decision record and results: `PHASE_RUBIXDB_PERFORMANCE_BASELINE.md`.
+
+#### Added
+
+- `api/examples/sql_bench.rs`: a real, reusable end-to-end `POST
+  /v1/sql` latency/throughput benchmark tool -- real concurrent HTTP
+  clients, real percentile computation from actual samples, covering
+  PK lookup, indexed lookup, range scan, full-table count, `GROUP BY`/
+  `HAVING`, INSERT, UPDATE, DELETE at multiple concurrency levels.
+
+#### Fixed
+
+- `cli/src/host.rs`: the local embedded instance's rate limit inherited
+  the standalone API's multi-tenant-deployment default (200rps/burst
+  400) unexamined, which throttled a single legitimate local client
+  under realistic concurrent load -- raised to a documented, still-
+  bounded local default (2000rps/burst 4000), operator-overridable via
+  `RUBIXDB_LOCAL_RATE_LIMIT_RPS`/`_BURST`. The standalone
+  `rubixdb-api` binary's own env-configured default is unchanged.
+
 ### Product: GUI launcher and local instance manager (2026-09-29)
 
 Adds the local instance manager and `rubixdb gui` launcher assumed

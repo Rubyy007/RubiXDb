@@ -3887,3 +3887,44 @@ here -- no Router/Replication/Partitioning or other unrelated feature
 work follows automatically. Next: the remaining Increment 13 product-
 hardening gaps, now against the combined API + CLI + GUI + instance-
 management surface.
+
+## 2026-09-29 (Increment 13 hardening: release build + performance baseline)
+
+Began the Increment 13 product-hardening pass proper. Release build
+certification: `cargo build --workspace --release` and `cargo test
+--release --workspace` both clean except the same pre-existing
+`group_commit` debug/release-independent throughput-threshold flake
+already documented twice before (re-confirmed in isolation on a fully
+idle machine this time -- 11804 vs. a 15000 target, 64416 vs. an 80000
+target -- real, reproducible on this hardware, zero diff in the test
+file). A real end-to-end production-build smoke test (`rubixdb gui`
+serving a real `npm run build` frontend, `rubixdb -c` round-tripping
+real SQL, both via the actual compiled release binaries) passed.
+
+Built a new, reusable real benchmark tool
+(`api/examples/sql_bench.rs`) and used it to gather a real performance
+baseline (`PHASE_RUBIXDB_PERFORMANCE_BASELINE.md`) for PK lookup,
+indexed lookup, range scan, full-table count, `GROUP BY`/`HAVING`,
+INSERT, UPDATE, and DELETE at concurrency 1-16 (reads) / 1-8 (writes)
+against the real release server. Two real bugs found and fixed while
+gathering it: (1) the local embedded instance inherited the standalone
+API's multi-tenant-deployment rate limit (200rps/burst 400) verbatim,
+which throttled its own single legitimate local client under
+realistic concurrency -- raised to a documented, still-bounded local
+default (2000rps/burst 4000, operator-overridable) after a full
+decision record; (2) the benchmark's own INSERT workload never cleared
+its table between concurrency levels, causing a self-inflicted
+primary-key-collision storm at every level past the first. Real
+findings recorded from the corrected data: indexed lookups cost ~10x a
+PK lookup (confirmed via a real `EXPLAIN` that the planner correctly
+chose `IndexScan`, not a missing-index bug -- the expected cost of an
+index-entry-then-row-fetch, a certified Increment 5 characteristic);
+write throughput plateaus around 250-320 req/s regardless of
+concurrency while latency scales linearly with it, consistent with the
+certified single-path group-commit write architecture. Neither is a
+regression -- `git diff --stat -- src/` is empty for this work.
+
+Explicitly still open, named rather than assumed: concurrency beyond
+16/8, CPU/RSS sampling, sustained endurance, HTTP/JSON fuzzing, a
+crash-kill matrix, and GUI/frontend-side performance -- the rest of the
+Increment 13 hardening pass.
