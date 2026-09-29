@@ -4115,3 +4115,41 @@ Full findings in `PHASE_RUBIXDB_PERFORMANCE_BASELINE.md` §8-9.
 Explicitly still open: a materially longer endurance duration, GUI/
 frontend performance and endurance, and the final certification
 documents.
+
+## 2026-09-29 (Increment 13 hardening: real GUI/frontend performance)
+
+Closed GUI/frontend execute+render performance (Phases X/Y) with a new
+real Playwright suite (`frontend/playwright.gui.config.ts`,
+`frontend/e2e-gui/gui_performance.spec.ts`) against the actual product
+path -- the real compiled release `rubixdb.exe gui --no-browser`
+hosting both the API and the real `npm run build` frontend on one
+origin, a real Chromium browser, a real generated local credential.
+
+Page load: `connect()` 305-763ms wall-clock; real Navigation Timing
+API numbers `responseEnd` 18-34ms, `load` 48-131ms. The decisive
+finding: execute+render time for a real SELECT barely moves (105ms ->
+172ms) from a 100-row result to a 10,000-row result -- a 100x increase
+in result size produced roughly a 1.6x increase in perceived time,
+direct proof that Increment 12's pagination design (render only the
+current 200-row page) delivers what it was built for: rendered DOM row
+count stayed capped at 200 in every case, confirmed directly via
+`.table-wrap tbody tr` counts, never scaling with result size.
+Virtualization/incremental rendering were evaluated and not added,
+since this evidence shows no bottleneck they would fix.
+
+Seeding 10,000 rows for that last case took 140-177 real seconds --
+not the measured metric, but itself further real confirmation (at a
+different, larger scale) of the write-path-serialization finding
+already documented in `PHASE_RUBIXDB_PERFORMANCE_BASELINE.md`.
+
+A real config gap found and fixed along the way: the new
+`e2e-gui/` directory was initially picked up by `vitest` (only
+`e2e/` was excluded), causing every Playwright spec's `test.describe`
+to collide with Vitest's own test runner -- fixed by extending
+`vite.config.ts`'s `test.exclude`; full pre-existing unit suite
+(34 tests) re-confirmed passing afterward.
+
+Full results and explicit open items (cross-browser, sustained
+execute/clear memory cycling, GUI cancellation/network-failure
+timing, the true 100,000-row case) in
+`PHASE_RUBIXDB_GUI_PERFORMANCE.md`.

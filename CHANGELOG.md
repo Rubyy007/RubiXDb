@@ -6,6 +6,27 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- real GUI/frontend performance (2026-09-29)
+
+Full results: `PHASE_RUBIXDB_GUI_PERFORMANCE.md`.
+
+#### Added
+
+- `frontend/playwright.gui.config.ts`,
+  `frontend/e2e-gui/gui_performance.spec.ts`: real Playwright
+  performance suite against the actual `rubixdb gui`-hosted product
+  path (one origin, real release binary, real production frontend
+  build). Measures page-load timing and execute+render timing at
+  100/1,000/10,000-row result sizes, confirming pagination keeps
+  rendered DOM rows capped at 200 regardless of result size.
+
+#### Fixed
+
+- `frontend/vite.config.ts`: the new `e2e-gui/` directory was picked
+  up by `vitest` (only `e2e/` was excluded), causing every Playwright
+  `test.describe` to collide with Vitest's own runner -- added to
+  `test.exclude`.
+
 ### Product: Increment 13 hardening -- CLI performance and handle/thread stability (2026-09-29)
 
 Real measurements against the release binary, no code changes.

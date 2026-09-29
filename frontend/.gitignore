@@ -13,6 +13,7 @@ dist-ssr
 /blob-report/
 /playwright/.cache/
 .e2e-data
+.e2e-gui-data
 
 # editors
 .vscode/*
