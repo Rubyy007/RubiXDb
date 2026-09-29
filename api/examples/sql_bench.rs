@@ -10,7 +10,7 @@
 //! results of running this.
 //!
 //! USAGE:
-//!   RUBIXDB_BENCH_URL=http://127.0.0.1:8080 \
+//!   RUBIXDB_BENCH_URL=http://127.0.0.1:302 \
 //!   RUBIXDB_BENCH_KEY=<admin key> \
 //!   cargo run --release -p rubixdb-api --example sql_bench
 
@@ -128,7 +128,7 @@ where
 #[tokio::main]
 async fn main() {
     let base_url =
-        std::env::var("RUBIXDB_BENCH_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        std::env::var("RUBIXDB_BENCH_URL").unwrap_or_else(|_| "http://127.0.0.1:302".to_string());
     let api_key = std::env::var("RUBIXDB_BENCH_KEY").expect("RUBIXDB_BENCH_KEY must be set");
 
     let client = Arc::new(Client {

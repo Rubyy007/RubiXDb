@@ -6,7 +6,7 @@ import react from "@vitejs/plugin-react";
 // developed against a real backend without a CORS layer on the API
 // itself (RUBIXDB_API_PROXY_TARGET overrides the default for a
 // non-default port/host).
-const apiProxyTarget = process.env.RUBIXDB_API_PROXY_TARGET ?? "http://127.0.0.1:8080";
+const apiProxyTarget = process.env.RUBIXDB_API_PROXY_TARGET ?? "http://127.0.0.1:302";
 
 export default defineConfig({
   plugins: [react()],

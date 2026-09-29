@@ -311,6 +311,61 @@ fn instance_list_and_status_reflect_real_state() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Phase AG evidence: an unrelated process already holding the
+/// canonical port `127.0.0.1:302` must never be mistaken for a
+/// running rubiXDb instance. Port ownership and instance-lock
+/// ownership are entirely separate mechanisms (`PHASE_RUBIXDB_
+/// INSTANCE_ARCHITECTURE.md` §4/§5): `rubixdb gui` must still acquire
+/// the OS-level lock normally, fail to bind the occupied preferred
+/// port, fall back to a real ephemeral port, and a subsequent client
+/// must discover and use that *actual* port from the real manifest --
+/// never the hardcoded 302, and never by attaching to the unrelated
+/// process.
+#[test]
+fn port_collision_with_an_unrelated_process_falls_back_safely() {
+    // Best-effort: only meaningful when 302 is actually free to seize
+    // for this test in the first place.
+    let squatter = match std::net::TcpListener::bind("127.0.0.1:302") {
+        Ok(l) => l,
+        Err(_) => {
+            eprintln!("skipping: 127.0.0.1:302 is already in use on this machine");
+            return;
+        }
+    };
+
+    let root = fresh_root("port_collision");
+    let out = rubixdb_cmd(&root)
+        .arg("-c")
+        .arg("SELECT 1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("default").join("instance.json")).unwrap(),
+    )
+    .unwrap();
+    let actual_port = manifest["api_port"].as_u64().unwrap();
+    assert_ne!(
+        actual_port, 302,
+        "must not have bound the port an unrelated process already held"
+    );
+
+    // The squatter is still exactly what it was -- untouched, still
+    // ours, never treated as "the" rubiXDb instance.
+    drop(squatter);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 fn rubixdb_instance_dirs(root: &PathBuf) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root)
         .into_iter()

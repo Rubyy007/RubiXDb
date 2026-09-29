@@ -371,7 +371,7 @@ convention.
 
 **Startup** (deterministic, fails fast and loud on any error — never
 silently degrades): load configuration (env vars: `RUBIXDB_DATA_DIR`
-required, `RUBIXDB_LISTEN_ADDR` default `127.0.0.1:8080`, `RUBIXDB_
+required, `RUBIXDB_LISTEN_ADDR` default `127.0.0.1:302` (changed from `127.0.0.1:8080` in Increment 13 -- see `PHASE_RUBIXDB_PERFORMANCE_BASELINE.md`/certification docs for the rationale), `RUBIXDB_
 API_KEYS` required — format `name:role:key,name:role:key,...` —
 `RUBIXDB_MAX_VALUE_BYTES`, `RUBIXDB_MAX_RANGE_LIMIT`, rate-limit
 settings, all with sane defaults except the two `required` ones) →

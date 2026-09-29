@@ -172,7 +172,7 @@ impl Config {
     pub fn load_from_env() -> Result<Self, ConfigError> {
         let data_dir = env_var("RUBIXDB_DATA_DIR")
             .ok_or_else(|| ConfigError("RUBIXDB_DATA_DIR is required".to_string()))?;
-        let listen_addr: SocketAddr = env_or("RUBIXDB_LISTEN_ADDR", "127.0.0.1:8080".to_string())?
+        let listen_addr: SocketAddr = env_or("RUBIXDB_LISTEN_ADDR", "127.0.0.1:302".to_string())?
             .parse()
             .map_err(|e| ConfigError(format!("RUBIXDB_LISTEN_ADDR invalid: {e}")))?;
         let api_keys_raw = env_var("RUBIXDB_API_KEYS")
