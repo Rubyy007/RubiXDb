@@ -42,17 +42,44 @@ use operators::build_operator;
 #[derive(Clone, Debug, Default)]
 pub struct RowContext {
     rows: Vec<(u32, Row)>,
+    /// Set only by `AggregateOp` (Increment 11) on the tuple it emits per
+    /// group — the group's finalized aggregate results, positionally
+    /// indexed exactly as `BoundSelect::aggregates`/`BoundExprKind::
+    /// AggregateRef` addresses them. Empty for every row below an
+    /// `Aggregate` plan node (no query this crate plans ever evaluates
+    /// an `AggregateRef` there — `crate::bind::select`'s own binder never
+    /// produces one outside an aggregated statement's projection/
+    /// `HAVING`/`ORDER BY`).
+    aggregates: Vec<Option<RelationalValue>>,
 }
 
 impl RowContext {
     pub fn new() -> Self {
-        RowContext { rows: Vec::new() }
+        RowContext {
+            rows: Vec::new(),
+            aggregates: Vec::new(),
+        }
     }
 
     pub fn single(table_ref: u32, row: Row) -> Self {
         RowContext {
             rows: vec![(table_ref, row)],
+            aggregates: Vec::new(),
         }
+    }
+
+    /// `AggregateOp`'s own constructor for the tuple it emits per group —
+    /// `self`'s row bindings are kept unchanged (the group's
+    /// representative row, still resolvable by any `Column`/`group_by`-
+    /// matching expression above), `aggregates` is the group's finalized
+    /// per-aggregate results.
+    pub fn with_aggregates(mut self, aggregates: Vec<Option<RelationalValue>>) -> RowContext {
+        self.aggregates = aggregates;
+        self
+    }
+
+    pub fn get_aggregate(&self, index: usize) -> Option<&RelationalValue> {
+        self.aggregates.get(index).and_then(|v| v.as_ref())
     }
 
     pub fn get(&self, table_ref: u32, ordinal: u16) -> Option<&RelationalValue> {
@@ -81,7 +108,16 @@ impl RowContext {
     pub fn merged(&self, other: &RowContext) -> RowContext {
         let mut rows = self.rows.clone();
         rows.extend(other.rows.iter().cloned());
-        RowContext { rows }
+        // Neither side of a `Join` (the only caller) ever carries
+        // `aggregates` — `AggregateOp` always sits above every `Join` in
+        // any plan this crate builds — but this is written to be correct
+        // either way rather than silently dropping one side's values.
+        let aggregates = if !self.aggregates.is_empty() {
+            self.aggregates.clone()
+        } else {
+            other.aggregates.clone()
+        };
+        RowContext { rows, aggregates }
     }
 
     /// Item 29/30: the unmatched-inner-row case for `LEFT JOIN` — see
@@ -89,7 +125,10 @@ impl RowContext {
     pub fn with_null_extension(&self, table_ref: u32) -> RowContext {
         let mut rows = self.rows.clone();
         rows.push((table_ref, Vec::new()));
-        RowContext { rows }
+        RowContext {
+            rows,
+            aggregates: self.aggregates.clone(),
+        }
     }
 }
 
@@ -188,6 +227,31 @@ pub struct ExecLimits {
     /// exists to fail with a clear, write-executor-attributed error
     /// *before* reaching it, not to impose a materially different bound.
     pub max_dml_target_rows: usize,
+    /// Item 30/73/74 (`AggregateOp`): the hard cap on distinct `GROUP BY`
+    /// groups one query's hash-aggregation state may hold before failing
+    /// closed. Checked *before* a new group is inserted, never after —
+    /// the same discipline `max_materialized_rows` already applies to
+    /// `Distinct`'s seen-value set, which this defaults to matching
+    /// exactly (a group's own state is a structurally similar "one entry
+    /// per distinct key" resource shape; no independent constant is
+    /// invented for it).
+    pub max_group_count: usize,
+    /// Item 30/34/59/73: the hard cap on total estimated bytes
+    /// (`GroupingKey::estimated_bytes` + `AggregateState::estimated_
+    /// bytes`, summed across every live group) one query's aggregation
+    /// state may occupy. `max_group_count` alone bounds group *count*,
+    /// but a `TEXT`/`BLOB` grouping key or `MIN`/`MAX` state can each be
+    /// arbitrarily large per group — this is the independent byte-level
+    /// bound item 30 requires when a pure count-based limit is not
+    /// itself sufficient. 256 MiB is a defensible, documented, non-
+    /// arbitrary production default: two orders of magnitude below the
+    /// crate's smallest process-level assumption (a multi-GB host), and
+    /// the same order of magnitude as `max_materialized_rows`'s own
+    /// worst-case `Tuple` buffer for a wide row shape — chosen and
+    /// recorded here (`PHASE_RELATIONAL_AGGREGATION_ARCHITECTURE.md`)
+    /// per item 30's own "choose a defensible bound and document it"
+    /// instruction, since no existing limit already covers this shape.
+    pub max_aggregate_state_bytes: usize,
 }
 
 impl Default for ExecLimits {
@@ -198,6 +262,8 @@ impl Default for ExecLimits {
             max_index_scan_rows: 1_000_000,
             deadline: Some(std::time::Duration::from_secs(30)),
             max_dml_target_rows: 10_000,
+            max_group_count: 1_000_000,
+            max_aggregate_state_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -243,6 +309,26 @@ pub struct ExecMetrics {
     index_scans: AtomicU64,
     joins: AtomicU64,
     execution_time_ms_total: AtomicU64,
+    /// Item 71/72: incremented once per newly-created `GROUP BY` group
+    /// (never per input row — a group already seen on a later row is not
+    /// double-counted).
+    groups_created: AtomicU64,
+    /// Item 71/72: the final group count actually emitted as result
+    /// rows, one query's own `AggregateOp::materialize` call at a time —
+    /// always equal to `groups_created` for that same query (kept as a
+    /// separate counter, not derived, so a divergence would itself be
+    /// observable evidence of a bug rather than something the metric
+    /// shape could hide).
+    groups_emitted: AtomicU64,
+    /// Item 71/72: input rows `AggregateOp` consumed — distinct from
+    /// `rows_scanned` (which counts raw storage-layer fetches below any
+    /// `WHERE` filtering) and from `groups_emitted` (never conflated with
+    /// either).
+    aggregate_rows_processed: AtomicU64,
+    /// Item 71: incremented once per `SqlError::ResourceLimit` an
+    /// aggregation-specific check (`max_group_count`/`max_aggregate_
+    /// state_bytes`) actually raised.
+    aggregate_resource_limit_hits: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -262,6 +348,10 @@ pub struct ExecMetricsSnapshot {
     pub index_scans: u64,
     pub joins: u64,
     pub execution_time_ms_total: u64,
+    pub groups_created: u64,
+    pub groups_emitted: u64,
+    pub aggregate_rows_processed: u64,
+    pub aggregate_resource_limit_hits: u64,
 }
 
 impl ExecMetrics {
@@ -298,6 +388,20 @@ impl ExecMetrics {
     pub fn record_join(&self) {
         self.joins.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_group_created(&self) {
+        self.groups_created.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_groups_emitted(&self, n: u64) {
+        self.groups_emitted.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_aggregate_rows_processed(&self, n: u64) {
+        self.aggregate_rows_processed
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_aggregate_resource_limit_hit(&self) {
+        self.aggregate_resource_limit_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
 
     pub fn snapshot(&self) -> ExecMetricsSnapshot {
         ExecMetricsSnapshot {
@@ -316,6 +420,12 @@ impl ExecMetrics {
             index_scans: self.index_scans.load(Ordering::Relaxed),
             joins: self.joins.load(Ordering::Relaxed),
             execution_time_ms_total: self.execution_time_ms_total.load(Ordering::Relaxed),
+            groups_created: self.groups_created.load(Ordering::Relaxed),
+            groups_emitted: self.groups_emitted.load(Ordering::Relaxed),
+            aggregate_rows_processed: self.aggregate_rows_processed.load(Ordering::Relaxed),
+            aggregate_resource_limit_hits: self
+                .aggregate_resource_limit_hits
+                .load(Ordering::Relaxed),
         }
     }
 }

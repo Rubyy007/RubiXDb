@@ -44,7 +44,7 @@ impl<'a> DepthGuard<'a> {
 pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Statement> {
     let dg = DepthGuard { limits };
     match stmt {
-        sp::Statement::Query(q) => Ok(Statement::Select(convert_query(q, &dg, 0)?)),
+        sp::Statement::Query(q) => Ok(Statement::Select(Box::new(convert_query(q, &dg, 0)?))),
         sp::Statement::Insert(insert) => Ok(Statement::Insert(convert_insert(insert, &dg)?)),
         sp::Statement::Update(update) => Ok(Statement::Update(convert_update(update, &dg)?)),
         sp::Statement::Delete(delete) => Ok(Statement::Delete(convert_delete(delete, &dg)?)),
@@ -249,26 +249,37 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || select.having.is_some()
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
         || select.exclude.is_some()
     {
         return Err(unsupported(
-            "SELECT with TOP/INTO/LATERAL/PREWHERE/CONNECT BY/CLUSTER BY/DISTRIBUTE BY/SORT BY/HAVING/WINDOW/QUALIFY/value-table-mode/EXCLUDE",
+            "SELECT with TOP/INTO/LATERAL/PREWHERE/CONNECT BY/CLUSTER BY/DISTRIBUTE BY/SORT BY/WINDOW/QUALIFY/value-table-mode/EXCLUDE",
         ));
     }
-    match &select.group_by {
+    let group_by = match &select.group_by {
         sp::GroupByExpr::All(_) => return Err(unsupported("GROUP BY ALL")),
         sp::GroupByExpr::Expressions(exprs, modifiers) => {
-            if !exprs.is_empty() || !modifiers.is_empty() {
+            if !modifiers.is_empty() {
                 return Err(unsupported(
-                    "GROUP BY (aggregation binding is out of this increment's scope)",
+                    "GROUP BY with modifiers (ROLLUP/CUBE/GROUPING SETS)",
                 ));
             }
+            if exprs.len() > dg.limits.max_columns {
+                return Err(SqlError::ResourceLimit {
+                    detail: format!(
+                        "GROUP BY clause exceeds max_columns ({})",
+                        dg.limits.max_columns
+                    ),
+                });
+            }
+            exprs
+                .iter()
+                .map(|e| convert_expr(e, dg, depth + 1))
+                .collect::<Result<Vec<_>>>()?
         }
-    }
+    };
 
     let distinct = match &select.distinct {
         None | Some(sp::Distinct::All) => false,
@@ -294,6 +305,12 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
 
     let selection = select
         .selection
+        .as_ref()
+        .map(|e| convert_expr(e, dg, depth + 1))
+        .transpose()?;
+
+    let having = select
+        .having
         .as_ref()
         .map(|e| convert_expr(e, dg, depth + 1))
         .transpose()?;
@@ -340,6 +357,8 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
         projection,
         from,
         selection,
+        group_by,
+        having,
         order_by,
         limit,
         offset,
@@ -1006,6 +1025,77 @@ fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<E
     if !matches!(f.parameters, sp::FunctionArguments::None) {
         return Err(unsupported("function call with a parametric argument list"));
     }
+
+    let name = convert_object_name(&f.name, dg.limits)?;
+    if name.0.len() == 1 {
+        if let Some(agg_func) = crate::aggregate::AggregateFunc::lookup(&name.0[0].value) {
+            match &f.args {
+                sp::FunctionArguments::None => {
+                    return Err(SqlError::TypeMismatch {
+                        detail: format!(
+                            "aggregate function {} requires an argument",
+                            agg_func.name()
+                        ),
+                    });
+                }
+                sp::FunctionArguments::Subquery(_) => {
+                    return Err(unsupported("function call with a bare subquery argument"));
+                }
+                sp::FunctionArguments::List(list) => {
+                    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                        return Err(unsupported(
+                            "aggregate function with DISTINCT or clauses inside the argument list",
+                        ));
+                    }
+                    if list.args.is_empty() {
+                        return Err(SqlError::TypeMismatch {
+                            detail: format!(
+                                "aggregate function {} requires an argument",
+                                agg_func.name()
+                            ),
+                        });
+                    }
+                    if list.args.len() > 1 {
+                        return Err(SqlError::TypeMismatch {
+                            detail: format!(
+                                "aggregate function {} requires exactly 1 argument, found {}",
+                                agg_func.name(),
+                                list.args.len()
+                            ),
+                        });
+                    }
+                    return match &list.args[0] {
+                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
+                            if agg_func == crate::aggregate::AggregateFunc::Count {
+                                Ok(Expr::Aggregate {
+                                    func: agg_func,
+                                    arg: crate::aggregate::AggregateArg::Wildcard,
+                                })
+                            } else {
+                                Err(SqlError::TypeMismatch {
+                                    detail: format!(
+                                        "aggregate function {} does not support wildcard argument (*)",
+                                        agg_func.name()
+                                    ),
+                                })
+                            }
+                        }
+                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                            let arg_expr = convert_expr(e, dg, depth + 1)?;
+                            Ok(Expr::Aggregate {
+                                func: agg_func,
+                                arg: crate::aggregate::AggregateArg::Expr(Box::new(arg_expr)),
+                            })
+                        }
+                        _ => Err(unsupported(
+                            "named or qualified wildcard function arguments",
+                        )),
+                    };
+                }
+            }
+        }
+    }
+
     let args = match &f.args {
         sp::FunctionArguments::None => Vec::new(),
         sp::FunctionArguments::List(list) => {
@@ -1033,10 +1123,7 @@ fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<E
             return Err(unsupported("function call with a bare subquery argument"))
         }
     };
-    Ok(Expr::Function {
-        name: convert_object_name(&f.name, dg.limits)?,
-        args,
-    })
+    Ok(Expr::Function { name, args })
 }
 
 // ---------------------------------------------------------------------

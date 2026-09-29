@@ -10,8 +10,9 @@ use std::ops::Bound;
 
 use rubixdb::relational::{RelationalValue, Row};
 
+use crate::aggregate::{AggregateArg, AggregateState, GroupingKey};
 use crate::ast::JoinKind;
-use crate::bound::{BoundExpr, BoundOrderByItem, BoundSelectItem, NullsOrder};
+use crate::bound::{BoundAggregateExpr, BoundExpr, BoundOrderByItem, BoundSelectItem, NullsOrder};
 use crate::error::{Result, SqlError};
 use crate::exec::expr_eval::{eval, eval_predicate};
 use crate::exec::{ExecCtx, RowContext, Tuple};
@@ -73,6 +74,15 @@ pub fn build_operator<'a>(
             input: build_operator(input, outer, ec)?,
             seen: Vec::new(),
         })),
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Ok(Box::new(AggregateOp::build(
+            build_operator(input, outer, ec)?,
+            group_by.clone(),
+            aggregates.clone(),
+        ))),
         PhysicalPlan::Sort { input, items } => Ok(Box::new(SortOp::build(
             build_operator(input, outer, ec)?,
             items.clone(),
@@ -408,6 +418,165 @@ impl<'a> Operator<'a> for DistinctOp<'a> {
             ec.metrics.record_distinct_rows(1);
             return Ok(Some(tuple));
         }
+    }
+}
+
+// =======================================================================
+// Aggregate — Increment 11 (`PHASE_RELATIONAL_AGGREGATION_ARCHITECTURE.
+// md`): hash aggregation over `crate::aggregate::GroupingKey`'s own
+// canonical, collision-free grouping representation (never a lossy
+// debug-string key). A blocking operator, exactly like `Sort`/`Distinct`
+// above (the same reason: correctness requires seeing every input row
+// before any group's aggregate state is final) — never an unbounded
+// materialization of raw input *rows*, though: only one `RowContext`
+// (the group's first-seen representative row, item 12's own
+// "streaming... discard the input row once it has contributed to
+// aggregate state") plus a small, fixed-shape `Vec<AggregateState>` is
+// retained per distinct group, bounded by `ExecLimits::max_group_count`/
+// `max_aggregate_state_bytes` (item 30/73), checked *before* inserting a
+// new group or growing a state past the byte bound — never after.
+// =======================================================================
+
+struct AggregateOp<'a> {
+    input: Box<dyn Operator<'a> + 'a>,
+    group_by: Vec<BoundExpr>,
+    aggregates: Vec<BoundAggregateExpr>,
+    output: Option<std::vec::IntoIter<Tuple>>,
+}
+
+impl<'a> AggregateOp<'a> {
+    fn build(
+        input: Box<dyn Operator<'a> + 'a>,
+        group_by: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregateExpr>,
+    ) -> Self {
+        AggregateOp {
+            input,
+            group_by,
+            aggregates,
+            output: None,
+        }
+    }
+
+    fn initial_states(&self) -> Result<Vec<AggregateState>> {
+        self.aggregates
+            .iter()
+            .map(|agg| {
+                let is_wildcard = matches!(agg.arg, AggregateArg::Wildcard);
+                let input_ty = match &agg.arg {
+                    AggregateArg::Wildcard => None,
+                    AggregateArg::Expr(e) => e.ty,
+                };
+                AggregateState::initial(agg.func, is_wildcard, input_ty)
+            })
+            .collect()
+    }
+
+    fn materialize(&mut self, ec: &ExecCtx<'a>) -> Result<()> {
+        use std::collections::HashMap;
+
+        // item 61: emission order must be a deterministic function of
+        // input scan order, never raw `HashMap` iteration order — the
+        // map here only ever answers "have I seen this key," an index
+        // into the insertion-ordered `groups` vector actually iterated
+        // below.
+        let mut index_of: HashMap<GroupingKey, usize> = HashMap::new();
+        let mut groups: Vec<(RowContext, Vec<AggregateState>)> = Vec::new();
+        let mut estimated_bytes: usize = 0usize;
+        let mut rows_processed: u64 = 0;
+
+        while let Some(tuple) = self.input.next(ec)? {
+            ec.check()?;
+            rows_processed += 1;
+
+            let key_values: Vec<Option<RelationalValue>> = self
+                .group_by
+                .iter()
+                .map(|g| eval(g, &tuple.ctx, ec))
+                .collect::<Result<_>>()?;
+            let key = GroupingKey::from_values(&key_values);
+
+            let idx = match index_of.get(&key) {
+                Some(&i) => i,
+                None => {
+                    // item 30/74: checked *before* the new group is
+                    // created, never after — a query that would exceed
+                    // the bound fails closed on the row that discovers
+                    // it, with every prior group's state simply dropped
+                    // (item 66: never a partial aggregate result).
+                    if groups.len() >= ec.limits.max_group_count {
+                        ec.metrics.record_aggregate_resource_limit_hit();
+                        return Err(SqlError::ResourceLimit {
+                            detail: format!(
+                                "GROUP BY produced more than max_group_count ({}) groups",
+                                ec.limits.max_group_count
+                            ),
+                        });
+                    }
+                    estimated_bytes = estimated_bytes.saturating_add(key.estimated_bytes());
+                    groups.push((tuple.ctx.clone(), self.initial_states()?));
+                    let new_idx = groups.len() - 1;
+                    index_of.insert(key, new_idx);
+                    ec.metrics.record_group_created();
+                    new_idx
+                }
+            };
+
+            let (_, states) = &mut groups[idx];
+            for (agg, state) in self.aggregates.iter().zip(states.iter_mut()) {
+                let val = match &agg.arg {
+                    AggregateArg::Wildcard => None,
+                    AggregateArg::Expr(e) => eval(e, &tuple.ctx, ec)?,
+                };
+                let before = state.estimated_bytes();
+                state.update(val.as_ref())?;
+                let after = state.estimated_bytes();
+                estimated_bytes = estimated_bytes.saturating_sub(before).saturating_add(after);
+            }
+            if estimated_bytes > ec.limits.max_aggregate_state_bytes {
+                ec.metrics.record_aggregate_resource_limit_hit();
+                return Err(SqlError::ResourceLimit {
+                    detail: format!(
+                        "aggregate state exceeded max_aggregate_state_bytes ({})",
+                        ec.limits.max_aggregate_state_bytes
+                    ),
+                });
+            }
+        }
+
+        // item 11/44: an aggregate query with no `GROUP BY` clause
+        // always produces exactly one result row, even over zero
+        // qualifying input rows (every aggregate's own documented
+        // empty-input contract — `COUNT` is `0`, the rest are `NULL`).
+        if self.group_by.is_empty() && groups.is_empty() {
+            groups.push((RowContext::new(), self.initial_states()?));
+        }
+
+        ec.metrics.record_aggregate_rows_processed(rows_processed);
+        ec.metrics.record_groups_emitted(groups.len() as u64);
+
+        let out: Vec<Tuple> = groups
+            .into_iter()
+            .map(|(ctx, states)| {
+                let values: Vec<Option<RelationalValue>> =
+                    states.into_iter().map(AggregateState::finalize).collect();
+                Tuple {
+                    ctx: ctx.with_aggregates(values),
+                    projected: Vec::new(),
+                }
+            })
+            .collect();
+        self.output = Some(out.into_iter());
+        Ok(())
+    }
+}
+
+impl<'a> Operator<'a> for AggregateOp<'a> {
+    fn next(&mut self, ec: &ExecCtx<'a>) -> Result<Option<Tuple>> {
+        if self.output.is_none() {
+            self.materialize(ec)?;
+        }
+        Ok(self.output.as_mut().expect("materialized above").next())
     }
 }
 
@@ -754,6 +923,7 @@ fn right_side_table_refs(plan: &PhysicalPlan) -> Vec<u32> {
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Projection { input, .. }
             | PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Aggregate { input, .. }
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Limit { input, .. } => walk(input, out),
         }

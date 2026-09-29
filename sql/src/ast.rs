@@ -168,6 +168,11 @@ pub enum Expr {
         name: ObjectName,
         args: Vec<Expr>,
     },
+    /// An aggregate function call (Increment 11) — COUNT, SUM, AVG, MIN, MAX.
+    Aggregate {
+        func: crate::aggregate::AggregateFunc,
+        arg: crate::aggregate::AggregateArg<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -226,6 +231,8 @@ pub struct Select {
     pub projection: Vec<SelectItem>,
     pub from: Option<FromClause>,
     pub selection: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
@@ -353,7 +360,7 @@ pub struct Explain {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     /// `SELECT` — PARSED, BOUND. NOT EXECUTABLE YET (no executor).
-    Select(Select),
+    Select(Box<Select>),
     /// `INSERT` — PARSED, BOUND. NOT EXECUTABLE YET (bound form carries
     /// everything a future executor needs to perform the real
     /// `TableStore`/index write without reparsing, item 26 — but this

@@ -192,6 +192,10 @@ pub fn eval(expr: &BoundExpr, ctx: &RowContext, ec: &ExecCtx) -> Result<Option<R
             ec,
         ),
         BoundExprKind::Function { name, args } => eval_function(name, args, ctx, ec),
+        BoundExprKind::Aggregate(_) => Err(SqlError::UnsupportedExecution {
+            detail: "an aggregate expression reached execution unresolved (internal binder invariant violation: expected AggregateRef after bind-time extraction)".to_string(),
+        }),
+        BoundExprKind::AggregateRef(idx) => Ok(ctx.get_aggregate(*idx).cloned()),
     }
 }
 

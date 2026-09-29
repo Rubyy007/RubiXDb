@@ -3589,3 +3589,98 @@ engine, the SQL parser/binder, the query planner, and the read-only
 query executor all remain independently PRODUCTION READY / PASS,
 unaffected. Full account: `PHASE_RELATIONAL_WRITE_EXECUTOR_
 INCREMENT10_RESULTS.md`.
+
+## 2026-09-29
+
+**Implemented:** Increment 11 -- production `GROUP BY`/`HAVING`/
+aggregate execution (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), threaded
+through the full existing pipeline end to end: parser -> internal AST ->
+binder -> logical plan -> rule optimizer -> physical plan -> executor ->
+transaction/read context -> real relational storage. No second query
+engine, no client-side aggregation.
+
+The working tree already held an uncommitted, **non-compiling** partial
+pass at aggregate binding from an earlier session (`sql/src/
+aggregate.rs`'s contract/state/grouping-key types, `Expr::Aggregate`/
+`BoundExprKind::Aggregate`/`AggregateRef`, aggregate-call binding in
+`bind/expr.rs`, real `GROUP BY`/`HAVING` AST conversion in
+`convert.rs`) -- inspected in full before writing anything, per the
+"no guessing" rule. Found and fixed one real bug in it
+(`AggregateState::merge`'s `Max` arm wrote through an unbound
+identifier -- a compile error, so this code had never actually run)
+plus two type mismatches and two missing re-exports. What did not yet
+exist, and is this increment's own work: `GROUP BY` binding itself,
+select-list group-compatibility validation (item 17's core rule -- a
+column not in `GROUP BY` and not inside an aggregate call is rejected,
+never silently selected from an arbitrary row of its group), aggregate-
+call extraction into `BoundSelect`'s own shared, deduplicated,
+positionally-indexed `aggregates` list (`BoundExprKind::Aggregate` nodes
+rewritten to `AggregateRef(idx)`), the `Aggregate` logical/physical plan
+node (wired through every one of the ~15 previously-exhaustive `match`
+sites this newly-added enum variant touched across the planner/
+executor/`EXPLAIN`), the `AggregateOp` executor itself, resource limits,
+metrics, and all testing/benchmarking/documentation.
+
+Two design decisions worth naming: `HAVING` is represented as an
+ordinary `Filter` node placed directly above `Aggregate` -- no second
+boolean-logic model, and it makes "`HAVING` evaluates once per group,
+never once per input row" a structural fact (`AggregateOp`'s own
+`next()` is the only thing a `HAVING` `Filter` can ever pull from) 
+rather than something a counter has to separately prove. And
+`AggregateOp` retains only one representative input row per group
+(discarding every other row immediately after it contributes to
+aggregate state, per item 12's "streaming" requirement) plus a small
+`Vec<AggregateState>` -- provably sufficient because the binder's own
+group-compatibility validation guarantees every legal non-aggregate
+expression above `Aggregate` is constant within a group, so any member
+row answers it identically.
+
+Correctness was proven by an independent reference aggregation engine
+(`sql/src/aggregate_reference_model.rs`, item 51/52 -- never calls the
+planner/executor/storage), compared against the real pipeline across a
+7-scenario fixed matrix (empty input, duplicates, `NULL` grouping,
+mixed-`NULL` values, negative/zero values), a 2,000-distinct-group
+high-cardinality case, and 64 `proptest`-generated random tables -- all
+matched exactly. 48 new tests total (21 binder, 18 executor, 3
+differential/property), plus a new `sql/benches/aggregation_bench.rs`
+covering per-function cost, `GROUP BY` cardinality (10/1,000/10,000
+groups), composite keys, `HAVING` overhead, `GROUP BY` + `ORDER BY` +
+`LIMIT`, and rows/sec scaling (1,000-100,000 rows) -- reported honestly,
+including two unexplained findings rather than smoothed over: most
+single-aggregate queries measured faster than a plain full-table scan
+at the same row count (confounded by result-row-count difference, not
+per-row aggregate cost, named as such) and 10-group `GROUP BY` measured
+slower than 1,000/10,000-group `GROUP BY` at the same row count
+(unexplained, not investigated further this increment).
+
+Full regression: 542 `rubixdb` + 270 `rubixdb-sql` tests, debug,
+all passing (two unrelated `tests/group_commit/*` WAL throughput-
+threshold tests failed on this run -- `src/wal/group_commit.rs` was not
+touched, plausibly a debug-build/host-load artifact against a release-
+build target, flagged rather than silently ignored). `cargo fmt`/
+`clippy -D warnings` clean. `git diff --stat -- src/` shows exactly one
+line changed outside `sql/` (a `pub use` re-export addition in
+`src/relational/mod.rs`, no storage semantics touched).
+
+`PHASE_RELATIONAL_AGGREGATION_ARCHITECTURE.md` is the full decision
+record; `PHASE_RELATIONAL_AGGREGATION_INCREMENT11_RESULTS.md` the
+certification matrix and measured `cargo bench --bench aggregation_
+bench` numbers.
+
+One pre-existing, documented, *unchanged* limitation surfaced by this
+increment's own transaction test rather than newly introduced by it:
+aggregation over a `SeqScan`/`IndexScan` input does not exhibit read-
+your-own-writes, because those access paths have always read via
+`TableStore::scan_table_rows_as_of(snapshot_seq)` directly rather than
+`Transaction::get_row`'s write-set-overlay path -- only `PkLookup` has
+ever had that property, in any query, aggregated or not.
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** Subqueries, CTEs, set
+operators, window functions, `ROLLUP`/`CUBE`/`GROUPING SETS`,
+`COUNT(DISTINCT ...)`, and every product layer (CLI, HTTP SQL API,
+frontend SQL console) remain outside this increment's scope, per its
+own stop condition. Write/Read/Compaction, catalog, row storage,
+secondary indexes, the transaction engine, the SQL parser/binder, the
+query planner, and the query executor (read-only + write) all remain
+independently PRODUCTION READY / PASS, unaffected. Full account:
+`PHASE_RELATIONAL_AGGREGATION_INCREMENT11_RESULTS.md`.

@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "write_executor_bench"
 harness = false
+
+[[bench]]
+name = "aggregation_bench"
+harness = false

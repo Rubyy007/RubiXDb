@@ -23,7 +23,7 @@ pub use error::{RelationalError, Result};
 pub use index::{IndexBuilder, IndexStatsSnapshot};
 pub use table_store::{Row, TableStore, MAX_ROW_VALUE_BYTES};
 pub use txn::{Transaction, TransactionManager, TxnLimits, TxnMetricsSnapshot, TxnState};
-pub use value::{RelationalType, RelationalValue};
+pub use value::{validate_decimal, RelationalType, RelationalValue, MAX_DECIMAL_PRECISION};
 
 #[cfg(test)]
 mod tests;

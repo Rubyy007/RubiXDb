@@ -11,7 +11,9 @@ use std::collections::BTreeSet;
 use rubixdb::catalog::CatalogService;
 
 use crate::ast::JoinKind;
-use crate::bound::{BoundExpr, BoundExprKind, BoundOrderByItem, BoundSelectItem, NullsOrder};
+use crate::bound::{
+    BoundAggregateExpr, BoundExpr, BoundExprKind, BoundOrderByItem, BoundSelectItem, NullsOrder,
+};
 use crate::error::Result;
 use crate::plan::access::{plan_table_access, IndexAccessMode, PhysicalAccess};
 use crate::plan::expr_util::{and_all, referenced_table_refs};
@@ -54,6 +56,16 @@ pub enum PhysicalPlan {
     },
     Distinct {
         input: Box<PhysicalPlan>,
+    },
+    /// `GROUP BY`/aggregate execution — a direct, unmodified carry-over
+    /// of `LogicalPlan::Aggregate` (no physical access-path decision
+    /// applies to it, unlike `Scan`; item 28/29 chose hash aggregation,
+    /// entirely an executor-side runtime data-structure choice, not a
+    /// plan-shape one).
+    Aggregate {
+        input: Box<PhysicalPlan>,
+        group_by: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregateExpr>,
     },
     /// Retained whenever the input's own access path does not
     /// provably already produce this order (item 15). Never removed by
@@ -165,6 +177,18 @@ pub fn build_physical_plan(
         LogicalPlan::Distinct { input } => Ok(PhysicalPlan::Distinct {
             input: Box::new(build_physical_plan(input, catalog, metrics)?),
         }),
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            metrics.record_aggregate_plan();
+            Ok(PhysicalPlan::Aggregate {
+                input: Box::new(build_physical_plan(input, catalog, metrics)?),
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+            })
+        }
         LogicalPlan::Sort { input, items } => {
             metrics.record_sort_node();
 
@@ -243,6 +267,7 @@ fn collect_table_refs(plan: &LogicalPlan) -> BTreeSet<u32> {
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Projection { input, .. }
             | LogicalPlan::Distinct { input }
+            | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. } => walk(input, out),
         }

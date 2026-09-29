@@ -7,7 +7,7 @@ use rubixdb::relational::{RelationalType, RelationalValue};
 
 use crate::ast::{self, BinaryOp, Expr, Literal, UnaryOp};
 use crate::bind::scope::Scope;
-use crate::bound::{BoundExpr, BoundExprKind, ColumnRef};
+use crate::bound::{BoundAggregateExpr, BoundExpr, BoundExprKind, ColumnRef};
 use crate::error::{Result, SqlError};
 use crate::functions::{self, ReturnType};
 use crate::limits::SqlLimits;
@@ -34,6 +34,7 @@ pub struct ExprBinder<'a> {
     pub scope: Option<&'a Scope>,
     pub limits: &'a SqlLimits,
     pub max_parameter: u32,
+    pub allow_aggregate: bool,
 }
 
 impl<'a> ExprBinder<'a> {
@@ -42,7 +43,13 @@ impl<'a> ExprBinder<'a> {
             scope,
             limits,
             max_parameter: 0,
+            allow_aggregate: false,
         }
+    }
+
+    pub fn with_aggregate(mut self, allow: bool) -> Self {
+        self.allow_aggregate = allow;
+        self
     }
 
     pub fn bind(&mut self, expr: &Expr, expected: Option<RelationalType>) -> Result<BoundExpr> {
@@ -135,6 +142,74 @@ impl<'a> ExprBinder<'a> {
                 else_result,
             } => self.bind_case(operand.as_deref(), branches, else_result.as_deref()),
             Expr::Function { name, args } => self.bind_function(name, args),
+            Expr::Aggregate { func, arg } => {
+                if !self.allow_aggregate {
+                    return Err(SqlError::TypeMismatch {
+                        detail: "aggregate functions are not allowed in this context".to_string(),
+                    });
+                }
+                self.bind_aggregate(*func, arg, expected)
+            }
+        }
+    }
+
+    fn bind_aggregate(
+        &mut self,
+        func: crate::aggregate::AggregateFunc,
+        arg: &crate::aggregate::AggregateArg<Box<Expr>>,
+        expected: Option<RelationalType>,
+    ) -> Result<BoundExpr> {
+        match arg {
+            crate::aggregate::AggregateArg::Wildcard => {
+                crate::aggregate::AggregateContract::check_argument_type(func, true, None)?;
+                let (ty, nullable) =
+                    crate::aggregate::AggregateContract::derive_return_type(func, true, None)?;
+                check_assignable(Some(ty), expected.unwrap_or(ty))?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Aggregate(BoundAggregateExpr {
+                        func,
+                        arg: crate::aggregate::AggregateArg::Wildcard,
+                    }),
+                    ty: Some(ty),
+                    nullable,
+                })
+            }
+            crate::aggregate::AggregateArg::Expr(inner) => {
+                let prev_allow = self.allow_aggregate;
+                self.allow_aggregate = false;
+                let bound_inner = self.bind(inner, None);
+                self.allow_aggregate = prev_allow;
+                let bound_inner = match bound_inner {
+                    Err(SqlError::TypeMismatch { detail })
+                        if detail == "aggregate functions are not allowed in this context" =>
+                    {
+                        return Err(SqlError::TypeMismatch {
+                            detail: "aggregate function calls cannot be nested".to_string(),
+                        });
+                    }
+                    other => other?,
+                };
+
+                crate::aggregate::AggregateContract::check_argument_type(
+                    func,
+                    false,
+                    bound_inner.ty,
+                )?;
+                let (ty, nullable) = crate::aggregate::AggregateContract::derive_return_type(
+                    func,
+                    false,
+                    bound_inner.ty,
+                )?;
+                check_assignable(Some(ty), expected.unwrap_or(ty))?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Aggregate(BoundAggregateExpr {
+                        func,
+                        arg: crate::aggregate::AggregateArg::Expr(Box::new(bound_inner)),
+                    }),
+                    ty: Some(ty),
+                    nullable,
+                })
+            }
         }
     }
 

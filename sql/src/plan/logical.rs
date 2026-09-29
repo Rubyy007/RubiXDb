@@ -6,25 +6,12 @@
 //! (`BoundTableRef`) or an already-typed `BoundExpr`.
 
 use crate::ast::JoinKind;
-use crate::bound::{BoundExpr, BoundOrderByItem, BoundSelect, BoundSelectItem, BoundTableRef};
+use crate::bound::{
+    BoundAggregateExpr, BoundExpr, BoundOrderByItem, BoundSelect, BoundSelectItem, BoundTableRef,
+};
 use crate::error::{Result, SqlError};
 use crate::plan::limits::PlannerLimits;
 
-/// `Aggregate`/`GroupBy` are deliberately **not** represented here,
-/// despite `PHASE_RELATIONAL_DATABASE_ARCHITECTURE.md` §11 listing
-/// `Aggregate` among the v1 logical operators: `GROUP BY`/`HAVING`/
-/// aggregate functions are still rejected at bind time (verified this
-/// increment, unchanged since Increment 6 —
-/// `sql/src/convert.rs::convert_select`'s own `GroupByExpr::Expressions`
-/// arm still returns `Unsupported`), so no `BoundSelect` this crate can
-/// ever produce contains aggregation. Item 48's own instruction
-/// ("leave them unsupported... do not expand scope simply because the
-/// planner could theoretically represent them") is followed literally:
-/// adding dead variants no code path can construct would be exactly
-/// that unrequested scope expansion, and would need `#[allow(dead_
-/// code)]` to avoid a clippy failure — a sign the variants do not
-/// belong yet. Revisit when a future increment's binder actually
-/// produces bound aggregation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     /// A `FROM`-less `SELECT` (`SELECT 1 + 1`) — the SQL-standard
@@ -62,6 +49,22 @@ pub enum LogicalPlan {
     },
     Distinct {
         input: Box<LogicalPlan>,
+    },
+    /// `GROUP BY`/aggregate functions (Increment 11,
+    /// `PHASE_RELATIONAL_AGGREGATION_ARCHITECTURE.md`). Sits between
+    /// `WHERE`'s `Filter` and the final `Projection` — evaluation-order-
+    /// correct (`WHERE` filters input rows *before* grouping; `HAVING`
+    /// filters *groups*, so it is represented as an ordinary `Filter`
+    /// wrapped directly around this node, reusing the same three-valued-
+    /// logic `Filter` semantics rather than inventing a second one, item
+    /// 21). `group_by` empty (no `GROUP BY` clause) with a non-empty
+    /// `aggregates` means "the whole input is one implicit group" (item
+    /// 11/44's "a single aggregate result row, even over zero qualifying
+    /// rows").
+    Aggregate {
+        input: Box<LogicalPlan>,
+        group_by: Vec<BoundExpr>,
+        aggregates: Vec<BoundAggregateExpr>,
     },
     Sort {
         input: Box<LogicalPlan>,
@@ -125,6 +128,31 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
         };
     }
 
+    // item 16: the same three conditions `crate::bind::select` uses to
+    // decide `is_aggregated` — kept independently re-derivable here
+    // (rather than carried as a redundant flag) so this function's own
+    // output is provably a pure function of `BoundSelect`'s real fields.
+    let is_aggregated =
+        !select.group_by.is_empty() || select.having.is_some() || !select.aggregates.is_empty();
+    if is_aggregated {
+        plan = LogicalPlan::Aggregate {
+            input: Box::new(plan),
+            group_by: select.group_by.clone(),
+            aggregates: select.aggregates.clone(),
+        };
+        // HAVING = an ordinary Filter directly above Aggregate — item 20/
+        // 21: reuses Filter's own three-valued-logic semantics verbatim,
+        // never a second boolean model, and its placement (above, never
+        // pushed below, Aggregate) is exactly what makes it evaluate
+        // once per *group* rather than once per input row.
+        if let Some(having) = &select.having {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: having.clone(),
+            };
+        }
+    }
+
     plan = LogicalPlan::Projection {
         input: Box::new(plan),
         items: select.projection.clone(),
@@ -164,6 +192,7 @@ pub fn node_count(plan: &LogicalPlan) -> usize {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Distinct { input }
+        | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => 1 + node_count(input),
     }

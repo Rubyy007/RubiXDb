@@ -26,6 +26,25 @@ fn bind_with_auth(f: &Fixture, sql: &str, auth: &AuthContext) -> crate::Result<B
     bind_statement(&f.catalog, &f.ctx, auth, &metrics, &limits, &stmt)
 }
 
+/// Runs the full parse → bind pipeline, propagating either stage's own
+/// error rather than panicking on a parse-stage failure (`bind`'s own
+/// helper deliberately panics there, since every other test in this file
+/// wants parsing itself to always succeed) — for cases this increment
+/// rejects as early as AST conversion (`crate::convert`), not binding.
+fn parse_then_bind(f: &Fixture, sql: &str) -> crate::Result<BoundStatement> {
+    let limits = SqlLimits::default();
+    let stmt = parse_statement(sql, &limits)?;
+    let metrics = SqlMetrics::default();
+    bind_statement(
+        &f.catalog,
+        &f.ctx,
+        &AuthContext::admin("test-principal"),
+        &metrics,
+        &limits,
+        &stmt,
+    )
+}
+
 // -----------------------------------------------------------------
 // SELECT: column resolution, wildcard, type resolution
 // -----------------------------------------------------------------
@@ -720,5 +739,326 @@ fn insert_omitted_column_with_default_binds_to_the_defaults_own_value() {
         panic!()
     };
     assert_eq!(ins.rows[0][1].kind, BoundExprKind::Literal(None));
+    f.cleanup();
+}
+
+// -----------------------------------------------------------------
+// Increment 11: GROUP BY / HAVING / aggregate binding
+// -----------------------------------------------------------------
+
+#[test]
+fn group_by_binds_and_aggregate_calls_are_extracted_to_a_shared_indexed_list() {
+    let f = Fixture::new("agg_bind_basic");
+    let BoundStatement::Select(s) =
+        bind(&f, "SELECT name, COUNT(*), SUM(id) FROM t GROUP BY name").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(s.group_by.len(), 1);
+    assert!(matches!(s.group_by[0].kind, BoundExprKind::Column(_)));
+    assert_eq!(s.aggregates.len(), 2, "COUNT(*) and SUM(id)");
+    assert_eq!(s.aggregates[0].func, crate::aggregate::AggregateFunc::Count);
+    assert!(matches!(
+        s.aggregates[0].arg,
+        crate::aggregate::AggregateArg::Wildcard
+    ));
+    assert_eq!(s.aggregates[1].func, crate::aggregate::AggregateFunc::Sum);
+
+    // Projection items 1/2 must now be AggregateRef(0)/AggregateRef(1),
+    // never a raw Aggregate node (item 25's own "the bound tree never
+    // carries an unextracted Aggregate node into the plan").
+    assert_eq!(s.projection.len(), 3);
+    assert_eq!(s.projection[1].expr.kind, BoundExprKind::AggregateRef(0));
+    assert_eq!(s.projection[2].expr.kind, BoundExprKind::AggregateRef(1));
+    f.cleanup();
+}
+
+#[test]
+fn identical_aggregate_calls_are_deduplicated_to_one_shared_index() {
+    let f = Fixture::new("agg_bind_dedup");
+    let BoundStatement::Select(s) = bind(&f, "SELECT COUNT(*), COUNT(*) + 1 FROM t").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        s.aggregates.len(),
+        1,
+        "two syntactically identical COUNT(*) calls must share one aggregate slot"
+    );
+    assert_eq!(s.projection[0].expr.kind, BoundExprKind::AggregateRef(0));
+    f.cleanup();
+}
+
+#[test]
+fn count_star_and_count_expr_are_distinguished() {
+    let f = Fixture::new("agg_bind_count_kinds");
+    let BoundStatement::Select(s) = bind(&f, "SELECT COUNT(*), COUNT(name) FROM t").unwrap() else {
+        panic!()
+    };
+    assert_eq!(s.aggregates.len(), 2);
+    assert!(matches!(
+        s.aggregates[0].arg,
+        crate::aggregate::AggregateArg::Wildcard
+    ));
+    assert!(matches!(
+        s.aggregates[1].arg,
+        crate::aggregate::AggregateArg::Expr(_)
+    ));
+    f.cleanup();
+}
+
+#[test]
+fn aggregate_without_group_by_is_a_single_implicit_group() {
+    let f = Fixture::new("agg_bind_implicit_group");
+    let BoundStatement::Select(s) = bind(&f, "SELECT COUNT(*) FROM t").unwrap() else {
+        panic!()
+    };
+    assert!(s.group_by.is_empty());
+    assert_eq!(s.aggregates.len(), 1);
+    f.cleanup();
+}
+
+#[test]
+fn having_binds_aggregate_calls_and_is_boolean_typed() {
+    let f = Fixture::new("agg_bind_having");
+    let BoundStatement::Select(s) = bind(
+        &f,
+        "SELECT name, COUNT(*) FROM t GROUP BY name HAVING COUNT(*) > 1",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(s.having.as_ref().unwrap().ty, Some(RelationalType::Boolean));
+    // HAVING's own COUNT(*) must share the same aggregate slot as the
+    // projection's COUNT(*) (item 25's dedup, applied across clauses).
+    assert_eq!(s.aggregates.len(), 1);
+    f.cleanup();
+}
+
+#[test]
+fn order_by_may_reference_an_aggregate_result_once_aggregated() {
+    let f = Fixture::new("agg_bind_order_by_agg");
+    let BoundStatement::Select(s) = bind(
+        &f,
+        "SELECT name, COUNT(*) FROM t GROUP BY name ORDER BY COUNT(*)",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(s.aggregates.len(), 1);
+    assert_eq!(
+        s.order_by[0].expr.kind,
+        BoundExprKind::AggregateRef(0),
+        "ORDER BY's own COUNT(*) must reuse the projection's aggregate slot"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn ungrouped_column_in_an_aggregated_select_list_is_rejected() {
+    let f = Fixture::new("agg_bind_ungrouped_rejected");
+    let err = bind(&f, "SELECT name, active, COUNT(*) FROM t GROUP BY name").unwrap_err();
+    assert!(
+        matches!(err, SqlError::TypeMismatch { .. }),
+        "`active` is neither grouped nor aggregated -- must be rejected, never silently selected from an arbitrary row of the group, got {err:?}"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn ungrouped_column_with_no_group_by_at_all_is_rejected() {
+    let f = Fixture::new("agg_bind_ungrouped_no_group_by");
+    let err = bind(&f, "SELECT name, COUNT(*) FROM t").unwrap_err();
+    assert!(matches!(err, SqlError::TypeMismatch { .. }));
+    f.cleanup();
+}
+
+#[test]
+fn group_by_expression_itself_may_be_selected_directly() {
+    // The whole GROUP BY expression, not just a bare column, is group-
+    // compatible when it exactly matches (item 17's "functionally
+    // dependent" allowance via exact structural match).
+    let f = Fixture::new("agg_bind_group_expr_selected");
+    let BoundStatement::Select(s) =
+        bind(&f, "SELECT active, COUNT(*) FROM t GROUP BY active").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(s.projection.len(), 2);
+    f.cleanup();
+}
+
+#[test]
+fn group_by_without_any_aggregate_is_supported() {
+    let f = Fixture::new("agg_bind_group_by_no_agg");
+    let BoundStatement::Select(s) = bind(&f, "SELECT name FROM t GROUP BY name").unwrap() else {
+        panic!()
+    };
+    assert!(s.aggregates.is_empty());
+    assert_eq!(s.group_by.len(), 1);
+    f.cleanup();
+}
+
+#[test]
+fn composite_group_by_binds_every_expression() {
+    let f = Fixture::new("agg_bind_composite_group_by");
+    let BoundStatement::Select(s) = bind(
+        &f,
+        "SELECT name, active, COUNT(*) FROM t GROUP BY name, active",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(s.group_by.len(), 2);
+    f.cleanup();
+}
+
+#[test]
+fn aggregate_in_where_is_rejected() {
+    let f = Fixture::new("agg_bind_where_rejected");
+    let err = bind(&f, "SELECT id FROM t WHERE COUNT(*) > 1").unwrap_err();
+    assert!(
+        matches!(err, SqlError::TypeMismatch { .. }),
+        "item 19: aggregate expressions are never legal in WHERE, got {err:?}"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn nested_aggregate_is_rejected() {
+    let f = Fixture::new("agg_bind_nested_rejected");
+    let err = bind(&f, "SELECT SUM(COUNT(*)) FROM t").unwrap_err();
+    assert!(
+        matches!(err, SqlError::TypeMismatch { .. }),
+        "item 18: aggregate-inside-aggregate must be rejected deterministically, got {err:?}"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn unknown_function_name_is_rejected_not_treated_as_an_aggregate() {
+    let f = Fixture::new("agg_bind_unknown_function");
+    let err = bind(&f, "SELECT MEDIAN(id) FROM t").unwrap_err();
+    assert!(matches!(
+        err,
+        SqlError::UnknownObject {
+            kind: "function",
+            ..
+        }
+    ));
+    f.cleanup();
+}
+
+#[test]
+fn sum_of_text_column_is_a_type_mismatch() {
+    let f = Fixture::new("agg_bind_sum_text");
+    let err = bind(&f, "SELECT SUM(name) FROM t").unwrap_err();
+    assert!(matches!(err, SqlError::TypeMismatch { .. }));
+    f.cleanup();
+}
+
+#[test]
+fn count_star_does_not_support_other_wildcards_and_min_max_reject_wildcard() {
+    let f = Fixture::new("agg_bind_wildcard_rules");
+    assert!(matches!(
+        parse_then_bind(&f, "SELECT SUM(*) FROM t").unwrap_err(),
+        SqlError::TypeMismatch { .. }
+    ));
+    assert!(matches!(
+        parse_then_bind(&f, "SELECT MIN(*) FROM t").unwrap_err(),
+        SqlError::TypeMismatch { .. }
+    ));
+    f.cleanup();
+}
+
+#[test]
+fn avg_of_decimal_is_a_controlled_unsupported_error() {
+    let f = Fixture::new("agg_bind_avg_decimal");
+    f.catalog
+        .create_table(
+            f.ctx.default_schema_id,
+            "priced",
+            &[
+                rubixdb::catalog::service::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: rubixdb::relational::value::TYPE_TAG_INTEGER,
+                    nullable: false,
+                    default_value: None,
+                    type_params: None,
+                },
+                rubixdb::catalog::service::ColumnDef {
+                    name: "price".to_string(),
+                    data_type: rubixdb::relational::value::TYPE_TAG_DECIMAL,
+                    nullable: true,
+                    default_value: None,
+                    type_params: Some(vec![10, 2]),
+                },
+            ],
+            &[0],
+        )
+        .unwrap();
+    let err = bind(&f, "SELECT AVG(price) FROM priced").unwrap_err();
+    assert!(
+        matches!(err, SqlError::Unsupported { .. }),
+        "AVG(DECIMAL) must be a controlled, documented unsupported error, never a silently wrong rescale, got {err:?}"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn min_max_and_sum_and_avg_on_orders_amount_resolve_expected_types() {
+    let f = Fixture::new("agg_bind_numeric_types");
+    let BoundStatement::Select(s) = bind(
+        &f,
+        "SELECT MIN(amount), MAX(amount), SUM(amount), AVG(amount), COUNT(amount) FROM orders",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(s.projection[0].expr.ty, Some(RelationalType::Integer)); // MIN preserves input type
+    assert_eq!(s.projection[1].expr.ty, Some(RelationalType::Integer)); // MAX preserves input type
+    assert_eq!(s.projection[2].expr.ty, Some(RelationalType::Bigint)); // SUM(INTEGER) -> BIGINT
+    assert_eq!(s.projection[3].expr.ty, Some(RelationalType::Double)); // AVG(INTEGER) -> DOUBLE
+    assert_eq!(s.projection[4].expr.ty, Some(RelationalType::Bigint)); // COUNT -> BIGINT
+    assert!(!s.projection[4].expr.nullable, "COUNT is never NULL");
+    assert!(
+        s.projection[2].expr.nullable,
+        "SUM over zero/all-NULL input is NULL"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn group_by_all_and_rollup_remain_explicitly_unsupported() {
+    let f = Fixture::new("agg_bind_rollup_unsupported");
+    assert!(matches!(
+        parse_then_bind(&f, "SELECT id FROM t GROUP BY ALL").unwrap_err(),
+        SqlError::Unsupported { .. }
+    ));
+    assert!(matches!(
+        parse_then_bind(&f, "SELECT id, COUNT(*) FROM t GROUP BY ROLLUP(id)").unwrap_err(),
+        SqlError::Unsupported { .. }
+    ));
+    f.cleanup();
+}
+
+#[test]
+fn count_distinct_remains_explicitly_unsupported() {
+    let f = Fixture::new("agg_bind_count_distinct_unsupported");
+    let err = parse_then_bind(&f, "SELECT COUNT(DISTINCT name) FROM t").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported { .. }));
+    f.cleanup();
+}
+
+#[test]
+fn authorization_denial_on_an_aggregated_query_is_the_same_unknown_object_shape() {
+    // item 48: aggregation must not bypass binder authorization -- a
+    // principal without SELECT on `t` gets the identical existence-
+    // hiding error shape whether or not the query aggregates.
+    let f = Fixture::new("agg_bind_auth");
+    let no_access = AuthContext::none("no-access-principal");
+    let err =
+        bind_with_auth(&f, "SELECT name, COUNT(*) FROM t GROUP BY name", &no_access).unwrap_err();
+    assert!(matches!(err, SqlError::UnknownObject { .. }));
     f.cleanup();
 }

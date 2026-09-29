@@ -123,6 +123,30 @@ fn write_physical(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "Distinct");
             write_physical(input, depth + 1, out);
         }
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            let group_s: Vec<String> = group_by.iter().map(fmt_expr).collect();
+            let agg_s: Vec<String> = aggregates
+                .iter()
+                .map(|a| {
+                    let arg = match &a.arg {
+                        crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
+                        crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
+                    };
+                    format!("{}({})", a.func.name(), arg)
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "Aggregate group_by=[{}] aggregates=[{}]",
+                group_s.join(", "),
+                agg_s.join(", ")
+            );
+            write_physical(input, depth + 1, out);
+        }
         PhysicalPlan::Sort { input, items } => {
             let parts: Vec<String> = items
                 .iter()
@@ -316,5 +340,13 @@ fn fmt_expr(expr: &BoundExpr) -> String {
                 args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
             )
         }
+        BoundExprKind::Aggregate(agg) => {
+            let arg = match &agg.arg {
+                crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
+                crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
+            };
+            format!("{}({})", agg.func.name(), arg)
+        }
+        BoundExprKind::AggregateRef(idx) => format!("agg[{idx}]"),
     }
 }

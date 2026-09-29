@@ -6,6 +6,72 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 11 (production GROUP BY / HAVING / aggregation) (2026-09-29)
+
+Adds production `GROUP BY`/`HAVING`/aggregate execution (`COUNT`, `SUM`,
+`AVG`, `MIN`, `MAX`) to the existing `rubixdb-sql` crate, threaded
+through the full pipeline: parser -> internal AST -> binder -> logical
+plan -> rule optimizer -> physical plan -> executor -> transaction/read
+context -> real relational storage. `PHASE_RELATIONAL_AGGREGATION_
+ARCHITECTURE.md` is the full decision record; `PHASE_RELATIONAL_
+AGGREGATION_INCREMENT11_RESULTS.md` has the certification matrix and
+measured benchmark numbers.
+
+#### Added
+
+- `sql/src/bind/select.rs`: `GROUP BY` binding, select-list/`HAVING`/
+  `ORDER BY` group-compatibility validation (`validate_group_compat`),
+  aggregate-call extraction into `BoundSelect::aggregates` (a shared,
+  deduplicated, positionally-indexed list -- `extract_aggregates`
+  rewrites every bound `Aggregate(...)` node to `AggregateRef(idx)`).
+- `crate::plan::logical::LogicalPlan::Aggregate` / `crate::plan::
+  physical::PhysicalPlan::Aggregate` (new plan-node variants). `HAVING`
+  is represented as an ordinary `Filter` node placed directly above
+  `Aggregate` -- reuses existing three-valued-logic `Filter` semantics
+  verbatim, never a second boolean model.
+- `crate::exec::operators::AggregateOp` -- hash aggregation over
+  `crate::aggregate::GroupingKey`'s canonical, collision-free grouping
+  representation; retains one representative input row plus a small
+  `Vec<AggregateState>` per group (never full per-row materialization);
+  insertion-ordered emission (never raw `HashMap`-iteration order, for
+  plan determinism).
+- `RowContext::aggregates`/`with_aggregates`/`get_aggregate`;
+  `BoundExprKind::AggregateRef` evaluation in `crate::exec::expr_eval`.
+- `ExecLimits::max_group_count`/`max_aggregate_state_bytes` (checked
+  before the corresponding growth, mirroring `Distinct`'s existing
+  `max_materialized_rows` check); `ExecMetrics::groups_created`/
+  `groups_emitted`/`aggregate_rows_processed`/`aggregate_resource_
+  limit_hits`; `PlannerMetrics::aggregate_plans`.
+- `sql/src/aggregate_reference_model.rs`: an independent reference
+  aggregation engine (never calls the planner/executor/storage),
+  compared against the real pipeline via a 7-scenario fixed matrix, a
+  2,000-group high-cardinality case, and 64 `proptest`-generated random
+  tables -- all matched exactly.
+- `sql/benches/aggregation_bench.rs`: per-function cost, `GROUP BY`
+  cardinality (10/1,000/10,000 groups), composite keys, `HAVING`
+  overhead, `GROUP BY` + `ORDER BY` + `LIMIT`, rows/sec scaling.
+- 48 new tests: 21 in `sql/src/bind_tests.rs`, 18 in `sql/src/
+  exec_tests.rs`, 3 in `aggregate_reference_model.rs` -- see Results doc.
+- `rubixdb::relational::{validate_decimal, MAX_DECIMAL_PRECISION}`
+  re-exported from the crate root (`src/relational/mod.rs`, additive;
+  the only change outside `sql/` this increment made).
+
+#### Fixed
+
+- `sql/src/aggregate.rs::AggregateState::merge`'s `Max` arm wrote
+  through an unbound `max` identifier instead of its own matched `m1`
+  binding -- inherited from an earlier, uncommitted, never-compiling
+  session; found and fixed while inspecting the existing partial pass
+  before writing anything new (the crate did not compile at all at the
+  start of this increment).
+- `sql/src/parse_tests.rs::unsupported_grammar_is_a_typed_error_not_a_
+  panic`: its `"SELECT id FROM t GROUP BY id"`/`"... HAVING ..."` cases
+  asserted `GROUP BY`/`HAVING` were unsupported grammar -- exactly the
+  feature this increment adds. Replaced with the `GROUP BY`-adjacent
+  forms that remain genuinely unsupported (`GROUP BY ALL`, `GROUP BY
+  ROLLUP(...)`), keeping the test's own stated premise true rather than
+  asserting something this increment made false.
+
 ### Relational database: Increment 10 (production write executor) (2026-09-24)
 
 Adds a production-grade write executor (`sql/src/exec/write.rs`,

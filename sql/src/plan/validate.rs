@@ -83,6 +83,7 @@ fn validate_physical(plan: &PhysicalPlan, catalog: &CatalogService) -> Result<()
         PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Projection { input, .. }
         | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Aggregate { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::Limit { input, .. } => validate_physical(input, catalog),
     }
@@ -138,6 +139,21 @@ fn collect_parameters_physical(plan: &PhysicalPlan, out: &mut BTreeSet<u32>) {
             collect_parameters_physical(input, out);
         }
         PhysicalPlan::Distinct { input } => collect_parameters_physical(input, out),
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            for g in group_by {
+                collect_parameters_expr(g, out);
+            }
+            for a in aggregates {
+                if let crate::aggregate::AggregateArg::Expr(e) = &a.arg {
+                    collect_parameters_expr(e, out);
+                }
+            }
+            collect_parameters_physical(input, out);
+        }
         PhysicalPlan::Sort { input, items } => {
             for item in items {
                 collect_parameters_expr(&item.expr, out);
@@ -250,5 +266,11 @@ fn collect_parameters_expr(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
                 collect_parameters_expr(arg, out);
             }
         }
+        BoundExprKind::Aggregate(agg) => {
+            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+                collect_parameters_expr(e, out);
+            }
+        }
+        BoundExprKind::AggregateRef(_) => {}
     }
 }

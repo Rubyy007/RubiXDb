@@ -263,9 +263,17 @@ fn truncated_sql_is_a_controlled_error() {
 
 #[test]
 fn unsupported_grammar_is_a_typed_error_not_a_panic() {
+    // "SELECT ... GROUP BY id" / "... HAVING ..." are no longer here:
+    // Increment 11 added real GROUP BY/HAVING support
+    // (`PHASE_RELATIONAL_AGGREGATION_ARCHITECTURE.md`) — the two forms
+    // below are the GROUP BY-adjacent grammar that remains genuinely
+    // unsupported (`crate::convert::convert_query`'s own `GroupByExpr::
+    // All`/non-empty-`modifiers` rejections), so this test still proves
+    // "unsupported grammar is a typed error, never a panic" without
+    // asserting something this increment made false.
     let cases = [
-        "SELECT id FROM t GROUP BY id",
-        "SELECT id FROM t HAVING id > 1",
+        "SELECT id FROM t GROUP BY ALL",
+        "SELECT id FROM t GROUP BY ROLLUP(id)",
         "SELECT * FROM t, orders",
         "WITH x AS (SELECT 1) SELECT * FROM x",
         "SELECT id FROM t UNION SELECT id FROM orders",

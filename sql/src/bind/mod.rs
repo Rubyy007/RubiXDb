@@ -52,9 +52,9 @@ fn bind_statement_inner(
     stmt: &ast::Statement,
 ) -> Result<BoundStatement> {
     Ok(match stmt {
-        ast::Statement::Select(s) => {
-            BoundStatement::Select(select::bind_select(catalog, ctx, auth, metrics, limits, s)?)
-        }
+        ast::Statement::Select(s) => BoundStatement::Select(Box::new(select::bind_select(
+            catalog, ctx, auth, metrics, limits, s,
+        )?)),
         ast::Statement::Insert(s) => {
             BoundStatement::Insert(dml::bind_insert(catalog, ctx, auth, metrics, limits, s)?)
         }

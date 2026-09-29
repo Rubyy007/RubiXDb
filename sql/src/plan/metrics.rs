@@ -22,6 +22,7 @@ pub struct PlannerMetrics {
     sort_nodes: AtomicU64,
     sort_nodes_eliminated: AtomicU64,
     plan_resource_limit_hits: AtomicU64,
+    aggregate_plans: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub struct PlannerMetricsSnapshot {
     pub sort_nodes: u64,
     pub sort_nodes_eliminated: u64,
     pub plan_resource_limit_hits: u64,
+    pub aggregate_plans: u64,
 }
 
 impl PlannerMetrics {
@@ -86,6 +88,9 @@ impl PlannerMetrics {
         self.plan_resource_limit_hits
             .fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_aggregate_plan(&self) {
+        self.aggregate_plans.fetch_add(1, Ordering::Relaxed);
+    }
 
     pub fn snapshot(&self) -> PlannerMetricsSnapshot {
         PlannerMetricsSnapshot {
@@ -103,6 +108,7 @@ impl PlannerMetrics {
             sort_nodes: self.sort_nodes.load(Ordering::Relaxed),
             sort_nodes_eliminated: self.sort_nodes_eliminated.load(Ordering::Relaxed),
             plan_resource_limit_hits: self.plan_resource_limit_hits.load(Ordering::Relaxed),
+            aggregate_plans: self.aggregate_plans.load(Ordering::Relaxed),
         }
     }
 }

@@ -5,6 +5,7 @@
 //! the core `rubixdb` engine crate (D14) — `rubixdb` is a dependency of
 //! *this* crate, never the reverse.
 
+pub mod aggregate;
 pub mod ast;
 pub mod auth;
 pub mod bind;
@@ -58,3 +59,6 @@ mod exec_tests;
 
 #[cfg(test)]
 mod write_tests;
+
+#[cfg(test)]
+mod aggregate_reference_model;

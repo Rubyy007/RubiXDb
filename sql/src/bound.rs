@@ -97,6 +97,18 @@ pub enum BoundExprKind {
         name: &'static str,
         args: Vec<BoundExpr>,
     },
+    /// An aggregate expression before plan generation.
+    Aggregate(BoundAggregateExpr),
+    /// A reference to the output of an Aggregate plan operator (0-based index into aggregates).
+    AggregateRef(usize),
+}
+
+pub type BoundAggregateArg = crate::aggregate::AggregateArg<Box<BoundExpr>>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundAggregateExpr {
+    pub func: crate::aggregate::AggregateFunc,
+    pub arg: BoundAggregateArg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +151,15 @@ pub struct BoundSelect {
     pub from: Vec<BoundFromItem>,
     pub projection: Vec<BoundSelectItem>,
     pub selection: Option<BoundExpr>,
+    pub group_by: Vec<BoundExpr>,
+    /// Every distinct aggregate function call collected out of
+    /// `projection`/`having`/`order_by` during binding — those trees now
+    /// reference this list positionally via `BoundExprKind::AggregateRef`
+    /// rather than embedding `BoundExprKind::Aggregate` directly (Increment
+    /// 11: one shared index namespace for the future `Aggregate` plan
+    /// node's own output columns).
+    pub aggregates: Vec<BoundAggregateExpr>,
+    pub having: Option<BoundExpr>,
     pub order_by: Vec<BoundOrderByItem>,
     pub limit: Option<BoundExpr>,
     pub offset: Option<BoundExpr>,
@@ -255,7 +276,7 @@ pub struct BoundCreateDatabase {
 /// stops there — nothing in this crate executes any of them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundStatement {
-    Select(BoundSelect),
+    Select(Box<BoundSelect>),
     Insert(BoundInsert),
     Update(BoundUpdate),
     Delete(BoundDelete),

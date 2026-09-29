@@ -131,6 +131,22 @@ fn pushdown_predicates(
         LogicalPlan::Distinct { input } => Ok(LogicalPlan::Distinct {
             input: Box::new(pushdown_predicates(*input, limits, metrics)?),
         }),
+        // item 26: never pushed *through* — a HAVING conjunct above this
+        // node references group/aggregate output, not raw table columns,
+        // and a WHERE conjunct already stopped at (or below) the Filter
+        // that sits below this node in `build_logical_plan`'s own
+        // evaluation-order construction; this arm only recurses into the
+        // aggregate's own input so pushdown still reaches the scan below
+        // WHERE.
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Ok(LogicalPlan::Aggregate {
+            input: Box::new(pushdown_predicates(*input, limits, metrics)?),
+            group_by,
+            aggregates,
+        }),
         LogicalPlan::Sort { input, items } => Ok(LogicalPlan::Sort {
             input: Box::new(pushdown_predicates(*input, limits, metrics)?),
             items,
@@ -229,6 +245,21 @@ fn collect_required_columns(plan: &LogicalPlan, acc: &mut HashMap<u32, BTreeSet<
             collect_required_columns(input, acc);
         }
         LogicalPlan::Distinct { input } => collect_required_columns(input, acc),
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            for g in group_by {
+                note(g, acc);
+            }
+            for a in aggregates {
+                if let crate::aggregate::AggregateArg::Expr(e) = &a.arg {
+                    note(e, acc);
+                }
+            }
+            collect_required_columns(input, acc);
+        }
         LogicalPlan::Sort { input, items } => {
             for item in items {
                 note(&item.expr, acc);
@@ -280,6 +311,15 @@ fn annotate_required_columns(
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(annotate_required_columns(*input, required)),
+        },
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalPlan::Aggregate {
+            input: Box::new(annotate_required_columns(*input, required)),
+            group_by,
+            aggregates,
         },
         LogicalPlan::Sort { input, items } => LogicalPlan::Sort {
             input: Box::new(annotate_required_columns(*input, required)),
@@ -349,6 +389,15 @@ fn mark_pushable_limits(plan: LogicalPlan, metrics: &PlannerMetrics) -> LogicalP
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(mark_pushable_limits(*input, metrics)),
+        },
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalPlan::Aggregate {
+            input: Box::new(mark_pushable_limits(*input, metrics)),
+            group_by,
+            aggregates,
         },
         LogicalPlan::Sort { input, items } => LogicalPlan::Sort {
             input: Box::new(mark_pushable_limits(*input, metrics)),

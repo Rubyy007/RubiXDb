@@ -121,6 +121,12 @@ fn collect_table_refs(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
                 collect_table_refs(arg, out);
             }
         }
+        BoundExprKind::Aggregate(agg) => {
+            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+                collect_table_refs(e, out);
+            }
+        }
+        BoundExprKind::AggregateRef(_) => {}
     }
 }
 
@@ -188,6 +194,12 @@ fn collect_ordinals(expr: &BoundExpr, table_ref: u32, out: &mut BTreeSet<u16>) {
                 collect_ordinals(arg, table_ref, out);
             }
         }
+        BoundExprKind::Aggregate(agg) => {
+            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+                collect_ordinals(e, table_ref, out);
+            }
+        }
+        BoundExprKind::AggregateRef(_) => {}
     }
 }
 
