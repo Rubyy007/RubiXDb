@@ -6,6 +6,27 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- final certification matrix (2026-09-29)
+
+Full record: `PHASE_RUBIXDB_INCREMENT13_CERTIFICATION.md`
+(consolidated with `PHASE_RUBIXDB_INCREMENT13_PERFORMANCE.md`,
+`_SECURITY.md`, `_RELIABILITY.md`).
+
+#### Added
+
+- Four final consolidation documents covering every gate this
+  Increment 13 continuation closed, cross-referencing rather than
+  duplicating the detailed evidence documents already produced this
+  session. Every gate is reported `PASS` (with `NON-BLOCKING
+  LIMITATION` where scope-limited), `NOT APPLICABLE`, or `NOT DONE
+  THIS PASS` -- never a converted or assumed `PASS`.
+
+**Final production decision: RUBIXDB PRODUCT SURFACE = NOT PRODUCTION
+READY**, with eleven explicitly named, genuinely unexecuted items as
+the exact blockers -- a materially stronger evidence-backed position
+than existed before this continuation began, but not a certification
+claim these documents make.
+
 ### Product: Increment 13 hardening -- real HTTP-disconnect cancellation (2026-09-29)
 
 #### Added

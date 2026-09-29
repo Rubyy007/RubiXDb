@@ -4172,3 +4172,40 @@ query), all 24 concurrent background queries eventually completed
 rather than hanging, and the underlying data was unaffected
 (read-only workload, `COUNT(*)` still exactly 3,000 afterward). Full
 regression clean.
+
+## 2026-09-29 (Increment 13 hardening: final certification matrix)
+
+Consolidated every real gate this Increment 13 continuation closed
+into four final documents: `PHASE_RUBIXDB_INCREMENT13_PERFORMANCE.md`,
+`PHASE_RUBIXDB_INCREMENT13_SECURITY.md`,
+`PHASE_RUBIXDB_INCREMENT13_RELIABILITY.md`,
+`PHASE_RUBIXDB_INCREMENT13_CERTIFICATION.md`. Each summarizes and
+cross-references the detailed evidence documents already produced
+(`PHASE_RUBIXDB_PERFORMANCE_BASELINE.md`, `PHASE_RUBIXDB_ENDURANCE.md`,
+`PHASE_RUBIXDB_GUI_PERFORMANCE.md`, `PHASE_RUBIXDB_INSTANCE_SECURITY.
+md`, plus the real test files themselves) rather than duplicating raw
+data.
+
+The certification matrix lists every gate from the mission's own Phase
+BJ status list with a real result: `PASS` where real evidence exists
+(with `NON-BLOCKING LIMITATION` annotations naming exactly what was
+and was not covered within an otherwise-real pass), `NOT APPLICABLE`
+for delete-safety (no such UI exists in this product), and `NOT DONE
+THIS PASS` -- stated as such, never converted to `PASS` -- for eleven
+genuinely unexecuted items: dedicated query-starvation testing, CLI
+endurance beyond the handle-stability check already run, GUI
+endurance/browser-memory cycling, `CREATE INDEX` mid-backfill crash
+testing, commit-acknowledgment-loss as its own scenario, a formal
+dependency-advisory scan, simultaneous sustained load across two
+instances at once, heap-level ownership tracing for RSS growth, a
+materially longer (multi-hour+) endurance duration, cross-browser GUI
+timing, and the true 100,000-row GUI case.
+
+**Final production decision: RUBIXDB PRODUCT SURFACE = NOT PRODUCTION
+READY**, with the exact blockers being the eleven named `NOT DONE`
+items -- not vague, not hidden. This is a materially stronger,
+evidence-backed position than existed before this continuation began
+(zero GUI/instance-manager code, zero fuzzing, zero crash-kill matrix,
+zero endurance evidence, zero measured performance numbers of any
+kind), but it is not a `PRODUCTION READY` claim, and none of these four
+documents makes one.
