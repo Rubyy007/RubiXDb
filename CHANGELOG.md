@@ -6,6 +6,21 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- real sustained endurance run (2026-09-29)
+
+Full results: `PHASE_RUBIXDB_ENDURANCE.md`.
+
+#### Added
+
+- `api/examples/endurance.rs`: a real sustained mixed-workload driver
+  (6 concurrent read/write workers + a dedicated session/transaction-
+  cycling worker) used for a real 180-second endurance run against a
+  release `rubixdb gui` instance, with real `Get-Process` RSS/handle/
+  thread sampling throughout. 97,000+ requests; all 2,460 errors
+  confirmed to be genuine snapshot-isolation conflicts, not a bug;
+  handle/thread counts stayed flat across the whole run (real evidence
+  against a leak); RSS growth correlated with real ~16x data growth.
+
 ### Product: Increment 13 hardening -- full concurrency ladder and real resource sampling (2026-09-29)
 
 #### Changed

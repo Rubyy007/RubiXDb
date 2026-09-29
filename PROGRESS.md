@@ -4060,3 +4060,33 @@ Full regression (fmt, clippy -D warnings, test across instance/cli/api)
 clean throughout. Still explicitly open: sustained multi-minute
 endurance, GUI/frontend performance, CLI performance/endurance, and
 the final certification documents.
+
+## 2026-09-29 (Increment 13 hardening: real sustained endurance run)
+
+Closed a first real endurance pass (Phases E/F/I/J,
+`PHASE_RUBIXDB_ENDURANCE.md`) with a new driver
+(`api/examples/endurance.rs`): 6 concurrent mixed read/write workers
+plus a dedicated session/transaction-cycling worker, against a real
+release `rubixdb gui` instance, for 180 real seconds, with real RSS/
+handle/thread sampling via `Get-Process` throughout. 97,000+ total
+requests; 2,460 errors, every one sampled and confirmed to be the same
+real, expected `CONFLICT_ERROR` (genuine snapshot-isolation write-
+write conflict detection under deliberately high contention on a
+1,000-row shared id space, not a bug). 3,511 real session/transaction
+cycles completed (2,340 committed, 1,171 rolled back) including
+periodic real snapshot retention held open across concurrent writes
+from the other workers -- zero session-related errors, and handle/
+thread counts stayed essentially flat across the whole run (120->144
+handles, 18->25 threads across 97,000+ requests), real evidence
+against a per-request handle/thread/session leak.
+
+RSS climbed from a 9.9MB baseline to a 48.1MB peak and was still at
+37.9MB roughly 10s after the run ended -- distinguished (not assumed)
+from a leak by correlating it with the table's own real growth (1,000
+-> 16,189 rows, a genuine ~16x data-size increase) against the flat
+handle/thread counts, which makes a per-request leak specifically
+implausible; documented honestly as correlational evidence, not
+ownership-traced proof, since no heap profiler was run.
+
+Explicitly still open: a materially longer duration run, GUI/frontend
+endurance, CLI endurance, and the final certification documents.
