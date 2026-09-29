@@ -1,0 +1,24 @@
+[package]
+name = "rubixdb-cli"
+version = "0.1.0"
+edition = "2021"
+description = "RubiXDB CLI -- a thin HTTP client of POST /v1/sql, never a second SQL engine"
+publish = false
+
+[[bin]]
+name = "rubixdb"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+rustyline = "14"
+rpassword = "7"
+
+[dev-dependencies]
+rubixdb = { path = ".." }
+rubixdb-api = { path = "../api" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+axum = "0.7"

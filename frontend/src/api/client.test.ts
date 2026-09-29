@@ -89,4 +89,46 @@ describe("ApiClient", () => {
     expect(url).toContain("limit=5");
     expect(url).toContain("as_of_seq=42");
   });
+
+  it("sql() posts to /v1/sql with the sql text and session_id", async () => {
+    mockFetchOnce(200, { session_id: "abc-123", result: { kind: "begin" } });
+    const client = new ApiClient(session, () => {});
+    const res = await client.sql({ sql: "BEGIN", session_id: null });
+    const call = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [url, init] = call;
+    expect(url).toBe("http://localhost:8080/v1/sql");
+    expect(JSON.parse(init.body)).toEqual({ sql: "BEGIN", session_id: null });
+    expect(res.session_id).toBe("abc-123");
+  });
+
+  it("sql() forwards an AbortSignal for cancellation", async () => {
+    mockFetchOnce(200, { session_id: null, result: { kind: "rows", columns: [], rows: [], row_count: 0 } });
+    const client = new ApiClient(session, () => {});
+    const controller = new AbortController();
+    await client.sql({ sql: "SELECT 1" }, controller.signal);
+    const call = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [, init] = call;
+    expect(init.signal).toBe(controller.signal);
+  });
+
+  it("catalog methods hit the expected read-only endpoints", async () => {
+    mockFetchOnce(200, []);
+    const client = new ApiClient(session, () => {});
+    await client.listDatabases();
+    expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(
+      "http://localhost:8080/v1/catalog/databases",
+    );
+
+    mockFetchOnce(200, []);
+    await client.listTables();
+    expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(
+      "http://localhost:8080/v1/catalog/tables",
+    );
+
+    mockFetchOnce(200, { table_id: 1, name: "users", columns: [] });
+    await client.describeTable("users");
+    expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(
+      "http://localhost:8080/v1/catalog/tables/users",
+    );
+  });
 });

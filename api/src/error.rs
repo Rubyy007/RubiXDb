@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rubixdb::EngineError;
+use rubixdb_sql::SqlError;
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -20,11 +21,44 @@ pub enum ApiError {
     Forbidden,
     RateLimited,
     Engine(EngineError),
+    /// `PHASE_RELATIONAL_SQL_API_ARCHITECTURE.md` §4 (item 16): every
+    /// `rubixdb_sql::SqlError` this crate's own parse/bind/plan/execute
+    /// pipeline can return, mapped to a stable HTTP status/code — never
+    /// re-derived or re-classified by this crate's own logic (the SQL
+    /// crate's own error taxonomy is the single source of truth for
+    /// *why* a statement failed; this mapping only ever chooses the
+    /// HTTP-facing shell around it).
+    Sql(SqlError),
+    /// A `session_id` the request supplied does not resolve to a live
+    /// session this principal owns (unknown, expired, or belongs to a
+    /// different principal) — deliberately the same one outcome for
+    /// all three (item 74's own existence-hiding requirement, applied
+    /// to sessions the same way `SqlError::UnknownObject` already
+    /// applies it to catalog objects).
+    SqlSessionNotFound,
+    /// item 24: a principal already holds `max_sessions_per_principal`
+    /// open transactions.
+    SqlTooManySessions,
+    /// The SQL statement's own wall-clock execution budget elapsed —
+    /// surfaced distinctly from `SqlError::DeadlineExceeded` because it
+    /// can also fire from this crate's own outer HTTP-level timeout
+    /// race (`routes::sql`'s cancellation-on-drop guard), not only from
+    /// the executor's internal check.
+    SqlDeadlineExceeded,
 }
 
 impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         ApiError::Engine(e)
+    }
+}
+
+impl From<SqlError> for ApiError {
+    fn from(e: SqlError) -> Self {
+        match e {
+            SqlError::DeadlineExceeded => ApiError::SqlDeadlineExceeded,
+            other => ApiError::Sql(other),
+        }
     }
 }
 
@@ -150,7 +184,146 @@ impl ApiError {
                 "invalid argument".to_string(),
                 Some(detail.clone()),
             ),
+            ApiError::Sql(sql_err) => sql_error_parts(sql_err),
+            ApiError::SqlSessionNotFound => (
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                "the given session_id does not resolve to an active session".to_string(),
+                None,
+            ),
+            ApiError::SqlTooManySessions => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOO_MANY_SESSIONS",
+                "this principal already holds the maximum number of open SQL sessions".to_string(),
+                None,
+            ),
+            ApiError::SqlDeadlineExceeded => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "TIMEOUT",
+                "the SQL statement exceeded its execution deadline".to_string(),
+                None,
+            ),
         }
+    }
+}
+
+/// item 16: stable, machine-readable codes distinguishing `parse_error`/
+/// `bind_error`/`authorization_error`/`conflict_error`/`resource_limit`/
+/// `timeout`/`cancelled`/`unsupported`/`storage_error` — every `SqlError`
+/// variant maps to exactly one of these, never a generic catch-all that
+/// would force a client to parse the English `message` text (item 16's
+/// own explicit prohibition). Never forwards a filesystem path, physical
+/// ID, WAL detail, stack trace, or SQL parameter *value* — every `detail`
+/// forwarded here is itself already one of `SqlError`'s own pre-
+/// sanitized `String` fields (that crate's own `error.rs` doc comment:
+/// "never carries filesystem paths... credentials, or the caller's SQL/
+/// parameter values").
+fn sql_error_parts(e: &SqlError) -> (StatusCode, &'static str, String, Option<String>) {
+    match e {
+        SqlError::Parse { detail } => (
+            StatusCode::BAD_REQUEST,
+            "PARSE_ERROR",
+            "the SQL text could not be parsed".to_string(),
+            Some(detail.clone()),
+        ),
+        SqlError::ResourceLimit { detail } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RESOURCE_LIMIT",
+            "a SQL resource limit was exceeded".to_string(),
+            Some(detail.clone()),
+        ),
+        SqlError::Unsupported { detail } | SqlError::UnsupportedExecution { detail } => (
+            StatusCode::BAD_REQUEST,
+            "UNSUPPORTED",
+            "this SQL feature is not supported".to_string(),
+            Some(detail.clone()),
+        ),
+        SqlError::InvalidIdentifier { detail }
+        | SqlError::AmbiguousColumn { detail }
+        | SqlError::TypeMismatch { detail } => (
+            StatusCode::BAD_REQUEST,
+            "BIND_ERROR",
+            "the statement failed to bind".to_string(),
+            Some(detail.clone()),
+        ),
+        SqlError::InvalidParameter { detail } => (
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "invalid parameter".to_string(),
+            Some(detail.clone()),
+        ),
+        // item 17: the same status/code/message shape regardless of
+        // whether the object genuinely does not exist or exists but
+        // this principal cannot see it -- `SqlError::UnknownObject`
+        // itself already collapsed that distinction one layer down; this
+        // mapping must not reintroduce it (e.g. by echoing `kind` in a
+        // way that would let a client binary-search object existence).
+        SqlError::UnknownObject { .. } => (
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "the referenced object was not found".to_string(),
+            None,
+        ),
+        SqlError::AuthorizationDenied { detail } => (
+            StatusCode::FORBIDDEN,
+            "AUTHORIZATION_ERROR",
+            "not authorized to perform this action".to_string(),
+            Some(detail.clone()),
+        ),
+        SqlError::Catalog(detail) => {
+            tracing::error!(detail, "sql catalog error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORAGE_ERROR",
+                "a catalog error occurred".to_string(),
+                None,
+            )
+        }
+        SqlError::PlanValidation { detail } => {
+            tracing::error!(
+                detail,
+                "sql plan validation failed (should-never-fire defensive check)"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "an internal planning error occurred".to_string(),
+                None,
+            )
+        }
+        SqlError::Storage(detail) => {
+            tracing::error!(detail, "sql storage error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORAGE_ERROR",
+                "a storage error occurred".to_string(),
+                None,
+            )
+        }
+        SqlError::ExecutionParameter { detail } => (
+            StatusCode::BAD_REQUEST,
+            "EXECUTION_ERROR",
+            "a runtime execution error occurred".to_string(),
+            Some(detail.clone()),
+        ),
+        SqlError::Cancelled => (
+            StatusCode::from_u16(499).expect("499 is a valid HTTP status code value"),
+            "CANCELLED",
+            "the request was cancelled".to_string(),
+            None,
+        ),
+        SqlError::DeadlineExceeded => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "TIMEOUT",
+            "the SQL statement exceeded its execution deadline".to_string(),
+            None,
+        ),
+        SqlError::Conflict { detail } => (
+            StatusCode::CONFLICT,
+            "CONFLICT_ERROR",
+            "a transaction conflict occurred".to_string(),
+            Some(detail.clone()),
+        ),
     }
 }
 

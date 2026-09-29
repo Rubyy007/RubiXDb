@@ -154,6 +154,102 @@ export interface MetricsBody {
   service: ServiceMetricsBody;
 }
 
+// -----------------------------------------------------------------
+// SQL console (`POST /v1/sql`, `/v1/catalog/*`) --
+// `PHASE_RELATIONAL_FRONTEND_SQL_ARCHITECTURE.md`. Mirrors the API's
+// own wire contract exactly (`api/src/routes/sql.rs`,
+// `api/src/sql_params.rs`) -- typed values are kept intact end to end
+// (item 96), never collapsed to a plain string before this layer.
+// -----------------------------------------------------------------
+
+/** One typed SQL value, on the wire -- the exact tagged shape
+ * `api/src/sql_params.rs::SqlValueJson`/`SqlParam` serializes. 64-bit-
+ * or-wider numeric types travel as strings to avoid `JSON.parse`'s
+ * silent `Number` precision loss beyond 2^53 (that module's own doc
+ * comment has the full reasoning) -- this type follows the same rule
+ * on the way back into a request. */
+export type SqlValue =
+  | { type: "null" }
+  | { type: "boolean"; value: boolean }
+  | { type: "integer"; value: number }
+  | { type: "bigint"; value: string }
+  | { type: "real"; value: number }
+  | { type: "double"; value: number }
+  | { type: "decimal"; unscaled: string; scale: number }
+  | { type: "text"; value: string }
+  | { type: "blob"; value_b64: string }
+  | { type: "date"; value: string }
+  | { type: "time"; value: string }
+  | { type: "timestamp"; value: string };
+
+export interface SqlColumnMeta {
+  name: string;
+  type: string | null;
+  nullable: boolean;
+}
+
+export type SqlResultBody =
+  | { kind: "rows"; columns: SqlColumnMeta[]; rows: SqlValue[][]; row_count: number }
+  | { kind: "write"; statement: string; rows_affected: number }
+  | { kind: "ddl" }
+  | { kind: "explain"; plan_text: string }
+  | { kind: "begin" }
+  | { kind: "commit" }
+  | { kind: "rollback" };
+
+export interface SqlResponseBody {
+  session_id: string | null;
+  result: SqlResultBody;
+}
+
+export interface SqlRequestBody {
+  sql: string;
+  params?: SqlValue[];
+  session_id?: string | null;
+}
+
+export interface DatabaseInfo {
+  database_id: number;
+  name: string;
+}
+
+export interface SchemaInfo {
+  schema_id: number;
+  database_id: number;
+  name: string;
+}
+
+export interface TableInfo {
+  table_id: number;
+  schema_id: number;
+  name: string;
+}
+
+export interface ColumnInfo {
+  ordinal: number;
+  name: string;
+  data_type: string;
+  nullable: boolean;
+  primary_key: boolean;
+}
+
+export interface TableDescription {
+  table_id: number;
+  name: string;
+  columns: ColumnInfo[];
+}
+
+export interface IndexInfo {
+  index_id: number;
+  table_id: number;
+  table_name: string | null;
+  name: string;
+  kind: string;
+  unique: boolean;
+  state: string;
+  columns: string[];
+}
+
 export interface ApiErrorBody {
   error: {
     code: string;

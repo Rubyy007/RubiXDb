@@ -3684,3 +3684,119 @@ secondary indexes, the transaction engine, the SQL parser/binder, the
 query planner, and the query executor (read-only + write) all remain
 independently PRODUCTION READY / PASS, unaffected. Full account:
 `PHASE_RELATIONAL_AGGREGATION_INCREMENT11_RESULTS.md`.
+
+## 2026-09-29 (later)
+
+**Implemented:** Increment 12 -- exposes the already-certified SQL
+engine as a real product: `POST /v1/sql` (the one SQL execution path),
+a PostgreSQL-style CLI (`rubixdb-cli`, new workspace member), and a
+frontend SQL console, all three terminating at the identical HTTP
+handler -- no second parser/binder/planner/executor anywhere.
+
+`rubixdb-api` had zero dependency on `rubixdb-sql` at the start (KV-only
+API over `LsmEngine` directly) -- inspected in full before writing
+anything, per the "no guessing" rule. Added: `AppState.engine` changed
+from bare `LsmEngine` to `Arc<LsmEngine>` (additive; every existing call
+site unaffected, verified by grep first); a `TableStore`/`IndexBuilder`/
+`TransactionManager`/`CatalogService` alongside the existing engine
+handle; a session/transaction registry (`api/src/sql_session.rs`) whose
+own core design decision -- sessions exist *only* while an explicit
+transaction is open, everything else runs fully stateless autocommit --
+keeps the common case free of any new bookkeeping at all; typed
+request-parameter/response-value JSON encoding (`bigint`/`decimal`/
+`time`/`timestamp` as wire-safe strings, never a lossy JSON number);
+`/v1/sql`'s own `Reader`-minimum role gate (a documented, justified
+exception to the existing method-based default, since one `POST`
+endpoint can carry either a read or a write depending on the SQL text)
+deferring the real per-statement decision entirely to `rubixdb_sql::
+auth::is_authorized` -- one authorization boundary, never a competing
+one; read-only `/v1/catalog/*` metadata routes, added only after
+confirming by inspection that `system.*` catalog objects have no SQL
+`SELECT` path at all (`crate::bind::scope::resolve_table` only ever
+resolves *user* tables); cancellation wired through a `spawn_blocking`
+boundary plus a drop-triggered `CancellationToken` cancel and a deadline
+backstop, reusing `rubixdb_sql::exec::CancellationToken`/`ExecLimits::
+deadline` verbatim -- both already built for exactly this integration.
+
+Found and fixed a real regression during this work, the way item 115/
+116 requires: eagerly bootstrapping the catalog in `AppState::new`
+injected `system.databases`/`system.schemas` rows into the *same flat
+keyspace* `/v1/kv`/`/v1/range` already scan (there is no separate
+catalog storage area), breaking two pre-existing, certified KV
+integration tests and silently falsifying `/v1/metadata`'s own "no
+tables, no schema, no SQL" claim for every deployment. Fixed by making
+catalog bootstrap lazy -- deferred to the first actual SQL/catalog
+request, cached thereafter -- so a pure-KV deployment's keyspace is
+byte-for-byte unaffected by this increment's existence.
+
+The CLI (`rubixdb-cli`, binary `rubixdb`) is a genuinely thin HTTP
+client -- no dependency on `rubixdb`/`rubixdb-sql` at all, verified by
+its own `Cargo.toml`. Implements the locked `\l \ls \lt \d \di \du
+\conninfo \c \help \q` command contract against real `/v1/catalog/*`
+data (never a hardcoded example), a real interactive REPL (`rustyline`),
+and real `-c`/`-f` script mode sharing one server session across every
+statement in a run. `session_id` tracking is ordinary client-side state,
+never a second transaction implementation -- the CLI only ever forwards
+whatever the server's own response says and renders it. A real deadlock
+was found and fixed in the CLI's own test harness (`#[tokio::test]`'s
+single-threaded default runtime competing with a blocking subprocess
+call for one thread -- diagnosed via `Get-Process` finding two hung
+`rubixdb.exe` instances and a locked test binary, fixed by switching to
+a multi-threaded runtime), the exact kind of finding item 113 asks to
+be proven and fixed rather than silently worked around.
+
+The frontend SQL console is one new page integrated into the existing
+React console (every other screen unchanged, verified by re-running the
+full pre-existing Playwright suite alongside 3 new real-browser E2E
+tests, 21/21 passing together). Typed values render through one shared
+formatting rule (mirroring the CLI's own `render.rs`), adversarial row
+content renders as inert React text nodes (never `dangerouslySetInner
+HTML`, verified against real XSS payloads both at the component level
+and through a real browser), and the Cancel button performs a real
+`AbortController`/`fetch` abort the server observes as a dropped
+connection, not a UI-only "hide the spinner." A real browser E2E run
+surfaced two apparent test failures that turned out to be genuine test-
+authoring mistakes, not application bugs (the app's own correct
+singular "Result (1 row)" text; a `GROUP BY` count that was actually
+correct once an earlier `DELETE` in the same test sequence was properly
+accounted for) -- both traced to their real cause via the failing
+test's own captured page snapshot before either being dismissed or
+acted on incorrectly.
+
+84 new tests total, all passing against real components (no mocked
+engine/server for primary certification): 40 in `rubixdb-api` (15 unit
++ 25 integration, including a genuine concurrent-transaction test
+spawning 12 simultaneous independent sessions via `tokio::spawn` on a
+multi-threaded runtime with zero cross-contamination), 25 in
+`rubixdb-cli` (15 unit + 10 against the real compiled binary and a real
+running server), 19 in the frontend (16 Vitest + 3 real Playwright
+browser E2E). Full regression: 542 `rubixdb` + 96 `rubixdb-api` + 25
+`rubixdb-cli` tests passing; `cargo fmt`/`clippy -D warnings` clean
+across the whole workspace; `git diff --stat -- src/ sql/` empty --
+zero lines changed in either the certified engine or the certified SQL
+crate, confirmed not assumed. The same `tests/group_commit/*` debug-
+build throughput/latency threshold failures already documented as pre-
+existing in both prior increments' own results docs recurred here too,
+with different specific numbers again, always in a file with zero diff
+this increment.
+
+Explicitly not measured this increment, flagged rather than silently
+claimed: performance/load testing (no p50/p95/p99/throughput numbers
+captured for the API, CLI, or frontend), sustained endurance runs,
+memory/handle/thread stability over many session cycles, a dedicated
+HTTP/JSON fuzzing sweep, and an HTTP-surface-specific crash-consistency
+test (the existing write-executor crash test's own certification is
+inherited unchanged, since this increment's SQL layer adds no new
+durability mechanism of its own).
+
+**RELATIONAL DATABASE PRODUCTION READY = NO.** Additional SQL language
+surface (subqueries, CTEs, set operators, window functions) remains
+outside every increment's scope so far, and this increment's own
+explicitly unmeasured items above are real, named gaps. Write/Read/
+Compaction, catalog, row storage, secondary indexes, the transaction
+engine, the SQL parser/binder/planner/optimizer/executor (read + write
++ aggregation), and -- as of this increment -- the product surface
+(API/CLI/frontend) built on top of them, all remain independently
+PRODUCTION READY / PASS for the specific properties each has actually
+been tested against. Full account: `PHASE_RELATIONAL_SQL_API_
+INCREMENT12_RESULTS.md`.

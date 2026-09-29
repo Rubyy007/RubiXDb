@@ -59,10 +59,49 @@ fn extract_bearer(req: &Request) -> Option<&str> {
 
 /// Minimum role a request's HTTP method requires — `GET`/`HEAD` read
 /// the database, everything else mutates it or its snapshot registry.
+///
+/// `POST /v1/sql` is a deliberate exception (item 14 of `PHASE_
+/// RELATIONAL_SQL_API_ARCHITECTURE.md`'s own governing directive: "the
+/// API must not implement its own competing table/column/index
+/// authorization rules"): unlike every other route, one JSON body sent
+/// as `POST` can carry a read-only `SELECT`/`EXPLAIN` (a `Reader`-
+/// appropriate operation) or a mutating `INSERT`/`UPDATE`/`DELETE`/DDL —
+/// the HTTP method alone cannot distinguish them the way it can for
+/// every other route's fixed, single-purpose semantics. Gating the
+/// whole endpoint at `Admin` would make an ordinary reader-role `SELECT`
+/// through SQL strictly *more* restricted than the identical read via
+/// `GET /v1/kv`, for no security reason; gating it at `Reader` and
+/// deferring the real per-statement decision to `rubixdb_sql::bind`'s
+/// own already-certified authorization model (`crate::routes::sql`'s
+/// `AuthContext` mapping, immediately below) is the one-authorization-
+/// boundary design the whole increment requires. A `Reader` who submits
+/// `INSERT`/`UPDATE`/`DELETE`/DDL genuinely does then reach that check
+/// and is correctly denied there — verified in `api/tests/api_
+/// integration.rs`'s own SQL authorization matrix, never merely
+/// asserted here.
 fn required_role(req: &Request) -> Role {
+    if req.uri().path() == "/v1/sql" {
+        return Role::Reader;
+    }
     match *req.method() {
         axum::http::Method::GET | axum::http::Method::HEAD => Role::Reader,
         _ => Role::Admin,
+    }
+}
+
+/// The **only** place an API-layer `Role` is translated into a SQL-
+/// layer `rubixdb_sql::auth::AuthContext` — item 14's own "D25's v1
+/// default-privilege mapping" doc comment in `sql/src/auth.rs` names
+/// this exact mapping as the wiring a future consumer would supply;
+/// this is that consumer. `Role::Admin` -> `DefaultAccess::Admin`
+/// (every privilege on every object), `Role::Reader` -> `DefaultAccess::
+/// Reader` (`SELECT` on every object, plus whatever `system.grants` rows
+/// exist for this principal by name) — never a third, API-invented
+/// access tier.
+pub fn to_sql_auth_context(principal: &Principal) -> rubixdb_sql::auth::AuthContext {
+    match principal.role {
+        Role::Admin => rubixdb_sql::auth::AuthContext::admin(principal.name.clone()),
+        Role::Reader => rubixdb_sql::auth::AuthContext::reader(principal.name.clone()),
     }
 }
 

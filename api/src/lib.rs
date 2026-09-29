@@ -18,6 +18,9 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod routes;
 pub mod server;
+pub mod sql_metrics;
+pub mod sql_params;
+pub mod sql_session;
 pub mod state;
 
 pub use config::Config;

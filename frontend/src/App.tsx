@@ -9,6 +9,7 @@ import { SnapshotsPage } from "./pages/SnapshotsPage";
 import { CompactionPage } from "./pages/CompactionPage";
 import { HealthPage } from "./pages/HealthPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { SqlConsolePage } from "./pages/SqlConsolePage";
 
 function RequireSession({ children }: { children: ReactElement }) {
   const { session } = useSession();
@@ -28,6 +29,7 @@ export function App() {
         }
       >
         <Route path="/" element={<DashboardPage />} />
+        <Route path="/sql" element={<SqlConsolePage />} />
         <Route path="/explorer" element={<ExplorerPage />} />
         <Route path="/snapshots" element={<SnapshotsPage />} />
         <Route path="/compaction" element={<CompactionPage />} />

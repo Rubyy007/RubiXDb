@@ -86,33 +86,39 @@ mod tests {
             compaction_auto_trigger: false,
             compaction_trigger_count: 4,
             cors_allowed_origins: vec![],
+            sql_max_sessions_per_principal: 50,
+            sql_session_idle_timeout_secs: 300,
+            sql_session_max_lifetime_secs: 1800,
+            sql_statement_deadline_secs: 30,
         }
     }
 
-    fn open_test_engine(dir: &std::path::Path) -> rubixdb::lsm::LsmEngine {
+    fn open_test_engine(dir: &std::path::Path) -> std::sync::Arc<rubixdb::lsm::LsmEngine> {
         use rubixdb::execution::batch_coordinator::BatchCoordinatorConfig;
         use rubixdb::lsm::LsmConfig;
         use rubixdb::wal::{SyncMode, WalConfig};
-        rubixdb::lsm::LsmEngine::open(
-            dir,
-            WalConfig {
-                sync_mode: SyncMode::GroupCommit {
-                    max_wait: Duration::from_millis(5),
-                    max_batch_bytes: 256 * 1024,
+        std::sync::Arc::new(
+            rubixdb::lsm::LsmEngine::open(
+                dir,
+                WalConfig {
+                    sync_mode: SyncMode::GroupCommit {
+                        max_wait: Duration::from_millis(5),
+                        max_batch_bytes: 256 * 1024,
+                    },
+                    ..WalConfig::default()
                 },
-                ..WalConfig::default()
-            },
-            BatchCoordinatorConfig {
-                queue_capacity: 64,
-                max_queued_bytes: 16 * 1024 * 1024,
-                submission_timeout: Duration::from_secs(2),
-                shutdown_drain_bound: Duration::from_secs(10),
-                await_retry_budget: Duration::from_secs(5),
-                max_drain_per_batch: 4096,
-            },
-            LsmConfig::default(),
+                BatchCoordinatorConfig {
+                    queue_capacity: 64,
+                    max_queued_bytes: 16 * 1024 * 1024,
+                    submission_timeout: Duration::from_secs(2),
+                    shutdown_drain_bound: Duration::from_secs(10),
+                    await_retry_budget: Duration::from_secs(5),
+                    max_drain_per_batch: 4096,
+                },
+                LsmConfig::default(),
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     /// Real, end-to-end: start the server, trigger shutdown

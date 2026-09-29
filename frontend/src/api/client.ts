@@ -2,15 +2,22 @@ import type {
   ApiErrorBody,
   CompactionMetricsBody,
   CompactionStatusBody,
+  DatabaseInfo,
   ExistsResponse,
   GetResponse,
+  IndexInfo,
   MetadataBody,
   MetricsBody,
   RangeResponse,
   ReadyBody,
+  SchemaInfo,
   SeqResponse,
   SnapshotBody,
+  SqlRequestBody,
+  SqlResponseBody,
   StatusBody,
+  TableDescription,
+  TableInfo,
   WhoAmIBody,
 } from "./types";
 import { ApiRequestError } from "./types";
@@ -39,6 +46,7 @@ export class ApiClient {
     method: string,
     path: string,
     body?: unknown,
+    signal?: AbortSignal,
   ): Promise<T> {
     const response = await fetch(`${this.session.baseUrl}${path}`, {
       method,
@@ -47,6 +55,7 @@ export class ApiClient {
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal,
     });
 
     if (response.status === 401) {
@@ -151,5 +160,36 @@ export class ApiClient {
 
   releaseSnapshot(id: string) {
     return this.request<void>("DELETE", `/v1/snapshots/${encodeURIComponent(id)}`);
+  }
+
+  /** `POST /v1/sql` -- item 42/48: the *only* SQL execution path this
+   * frontend ever calls (never a second parser/binder/planner/executor
+   * -- item 42). `signal` wires the Cancel button through to a real
+   * `fetch` abort, which the server observes as a dropped connection
+   * and reacts to via its own `CancellationToken` (`PHASE_RELATIONAL_
+   * SQL_API_ARCHITECTURE.md` §5) -- never merely a UI-side "stop
+   * showing the spinner" while the query keeps running server-side. */
+  sql(req: SqlRequestBody, signal?: AbortSignal) {
+    return this.request<SqlResponseBody>("POST", "/v1/sql", req, signal);
+  }
+
+  listDatabases() {
+    return this.request<DatabaseInfo[]>("GET", "/v1/catalog/databases");
+  }
+
+  listSchemas() {
+    return this.request<SchemaInfo[]>("GET", "/v1/catalog/schemas");
+  }
+
+  listTables() {
+    return this.request<TableInfo[]>("GET", "/v1/catalog/tables");
+  }
+
+  describeTable(name: string) {
+    return this.request<TableDescription>("GET", `/v1/catalog/tables/${encodeURIComponent(name)}`);
+  }
+
+  listIndexes() {
+    return this.request<IndexInfo[]>("GET", "/v1/catalog/indexes");
   }
 }

@@ -1,9 +1,11 @@
+pub mod catalog;
 pub mod compaction;
 pub mod health;
 pub mod kv;
 pub mod metrics_route;
 pub mod range;
 pub mod snapshots;
+pub mod sql;
 pub mod status;
 
 use std::sync::Arc;
@@ -101,6 +103,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/compaction/status", get(compaction::status))
         .route("/v1/compaction/metrics", get(compaction::metrics))
         .route("/v1/metrics", get(metrics_route::metrics))
+        .route("/v1/sql", post(sql::sql))
+        .route("/v1/catalog/databases", get(catalog::databases))
+        .route("/v1/catalog/schemas", get(catalog::schemas))
+        .route("/v1/catalog/tables", get(catalog::tables))
+        .route("/v1/catalog/tables/:name", get(catalog::describe_table))
+        .route("/v1/catalog/indexes", get(catalog::indexes))
+        .route("/v1/catalog/authz", get(catalog::authz))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,

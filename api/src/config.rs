@@ -56,6 +56,21 @@ pub struct Config {
     /// wildcarded (`*`) regardless of configuration, since credentials
     /// (the `Authorization` header) are in play.
     pub cors_allowed_origins: Vec<String>,
+    /// `PHASE_RELATIONAL_SQL_API_ARCHITECTURE.md` §3 — item 24: bounds
+    /// on the SQL session registry (sessions exist only while an
+    /// explicit transaction is open). `sql_max_sessions_per_principal`
+    /// bounds fan-out from one credential; `sql_session_idle_timeout_
+    /// secs`/`sql_session_max_lifetime_secs` bound how long an
+    /// abandoned transaction may keep pinning a snapshot.
+    pub sql_max_sessions_per_principal: usize,
+    pub sql_session_idle_timeout_secs: u64,
+    pub sql_session_max_lifetime_secs: u64,
+    /// Wall-clock budget for one SQL statement's execution —
+    /// `rubixdb_sql::exec::ExecLimits::deadline` (item 12), propagated
+    /// from HTTP request handling into the executor rather than left at
+    /// that crate's own standalone default, so this service's own
+    /// operator-facing timeout knob is the single source of truth.
+    pub sql_statement_deadline_secs: u64,
 }
 
 #[derive(Debug)]
@@ -173,6 +188,10 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            sql_max_sessions_per_principal: env_or("RUBIXDB_SQL_MAX_SESSIONS_PER_PRINCIPAL", 50)?,
+            sql_session_idle_timeout_secs: env_or("RUBIXDB_SQL_SESSION_IDLE_TIMEOUT_SECS", 300)?,
+            sql_session_max_lifetime_secs: env_or("RUBIXDB_SQL_SESSION_MAX_LIFETIME_SECS", 1800)?,
+            sql_statement_deadline_secs: env_or("RUBIXDB_SQL_STATEMENT_DEADLINE_SECS", 30)?,
         })
     }
 }

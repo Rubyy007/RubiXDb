@@ -6,6 +6,88 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Relational database: Increment 12 (SQL API, CLI, and frontend SQL console) (2026-09-29)
+
+Exposes the already-certified SQL engine as a real product surface:
+`POST /v1/sql` (the one SQL execution path), a PostgreSQL-style CLI
+(`rubixdb-cli`, new workspace member), and a frontend SQL console --
+API, CLI, and frontend all terminate at the identical HTTP handler,
+never a second parser/binder/planner/executor. `PHASE_RELATIONAL_SQL_
+API_ARCHITECTURE.md`, `PHASE_RELATIONAL_CLI_ARCHITECTURE.md`, and
+`PHASE_RELATIONAL_FRONTEND_SQL_ARCHITECTURE.md` are the full decision
+records; `PHASE_RELATIONAL_SQL_API_INCREMENT12_RESULTS.md` has the
+certification matrix.
+
+#### Added
+
+- `api/src/routes/sql.rs`: `POST /v1/sql` -- parse/bind/plan/execute
+  wired verbatim into `rubixdb-sql`, typed request parameters and
+  response values (`api/src/sql_params.rs`; `bigint`/`decimal`/`time`/
+  `timestamp` travel as wire-safe strings, never a lossy JSON number),
+  execution run inside `tokio::task::spawn_blocking` with a drop-
+  triggered `CancellationToken` cancel and a deadline backstop above
+  `rubixdb_sql::exec::ExecLimits::deadline`'s own internal check.
+- `api/src/sql_session.rs`: the SQL transaction/session registry --
+  sessions exist only while an explicit transaction is open (`BEGIN`
+  .. `COMMIT`/`ROLLBACK`), everything else runs fully stateless
+  autocommit; per-principal session cap, idle timeout, max lifetime, a
+  background reaper.
+- `api/src/routes/catalog.rs`: read-only `GET /v1/catalog/{databases,
+  schemas,tables,tables/:name,indexes,authz}` -- added only after
+  confirming `system.*` catalog objects have no SQL `SELECT` path at
+  all; reuses the identical `rubixdb_sql::auth::is_authorized` check
+  per row, never a second authorization system.
+- `api/src/auth.rs`: `/v1/sql`'s own `Reader`-minimum role gate (a
+  documented exception to the existing method-based default) and
+  `to_sql_auth_context`, the one API-role -> SQL-`AuthContext` mapping.
+- `api/src/error.rs`: every `SqlError` variant mapped to a stable HTTP
+  status/machine-readable code (`PARSE_ERROR`/`BIND_ERROR`/
+  `AUTHORIZATION_ERROR`/`CONFLICT_ERROR`/`RESOURCE_LIMIT`/`TIMEOUT`/
+  `CANCELLED`/`UNSUPPORTED`/`STORAGE_ERROR`/...).
+- `api/src/sql_metrics.rs`: bounded SQL-endpoint metrics, folded into
+  the existing `GET /v1/metrics`.
+- `rubixdb-cli` (new workspace member, binary `rubixdb`): a thin HTTP
+  client of `POST /v1/sql` -- no dependency on `rubixdb`/`rubixdb-sql`
+  at all. The locked `\l \ls \lt \d \di \du \conninfo \c \help \q`
+  command contract against real backend metadata, a real interactive
+  REPL (`rustyline`), real `-c`/`-f` script mode sharing one server
+  session per run, quote-aware (lexical only, never semantic)
+  statement-boundary splitting, adversarial-content-safe terminal
+  rendering (ANSI escape sequences sanitized).
+- `frontend/src/pages/SqlConsolePage.tsx` (new `/sql` route/nav item):
+  SQL editor, Execute/Cancel/Clear, typed paginated result grid,
+  transaction/session indicator, query history. Cancel performs a real
+  `AbortController`/`fetch` abort the server observes as a dropped
+  connection. Every result cell renders as a React text node -- no
+  `dangerouslySetInnerHTML` anywhere.
+- 84 new tests: 40 in `rubixdb-api` (including a real concurrent-
+  transaction test, 12 simultaneous sessions via `tokio::spawn`, zero
+  cross-contamination), 25 in `rubixdb-cli` (against the real compiled
+  binary and a real running server), 19 in the frontend (16 Vitest + 3
+  real Playwright browser E2E) -- see Results doc.
+- `AppState.engine` changed from bare `LsmEngine` to `Arc<LsmEngine>`
+  (additive; every existing call site unaffected, verified by grep
+  before the change).
+
+#### Fixed
+
+- **Real regression, found before writing any new tests**: eagerly
+  bootstrapping the catalog in `AppState::new` injected `system.
+  databases`/`system.schemas` rows into the *same flat keyspace* `/v1/
+  kv`/`/v1/range` already scan (there is no separate catalog storage
+  area), breaking two pre-existing, certified KV integration tests and
+  silently falsifying `/v1/metadata`'s own "no tables, no schema, no
+  SQL" claim for every deployment. Fixed by making catalog bootstrap
+  lazy (`SqlContext::bind_context()`, first call only, cached
+  thereafter) -- a pure-KV deployment's keyspace is now byte-for-byte
+  unaffected by this increment's existence.
+- **Real deadlock in the CLI's own test harness**: `#[tokio::test]`'s
+  default single-threaded runtime competed with a blocking `Command::
+  output()` subprocess call for its one available thread, hanging the
+  spawned real-server task forever. Diagnosed via `Get-Process` (two
+  hung `rubixdb.exe` instances, a locked test binary), fixed by
+  switching the affected tests to a multi-threaded runtime.
+
 ### Relational database: Increment 11 (production GROUP BY / HAVING / aggregation) (2026-09-29)
 
 Adds production `GROUP BY`/`HAVING`/aggregate execution (`COUNT`, `SUM`,

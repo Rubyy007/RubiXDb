@@ -85,6 +85,10 @@ fn test_config(data_dir: PathBuf) -> Config {
         compaction_auto_trigger: false,
         compaction_trigger_count: 4,
         cors_allowed_origins: vec!["http://localhost:5173".to_string()],
+        sql_max_sessions_per_principal: 50,
+        sql_session_idle_timeout_secs: 300,
+        sql_session_max_lifetime_secs: 1800,
+        sql_statement_deadline_secs: 30,
     }
 }
 
@@ -93,7 +97,8 @@ fn test_config(data_dir: PathBuf) -> Config {
 /// post-restart app against the same directory.
 fn build_app(dir: &Path) -> (Arc<AppState>, Router) {
     let lsm_config = LsmConfig::default();
-    let engine = LsmEngine::open(dir, wal_config(), pool_config(), lsm_config.clone()).unwrap();
+    let engine =
+        Arc::new(LsmEngine::open(dir, wal_config(), pool_config(), lsm_config.clone()).unwrap());
     let state = Arc::new(AppState::new(
         engine,
         lsm_config,

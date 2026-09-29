@@ -65,7 +65,7 @@ async fn main() {
         pool_config(),
         lsm_config.clone(),
     ) {
-        Ok(e) => e,
+        Ok(e) => Arc::new(e),
         Err(e) => {
             // Deterministic, fail-loud startup -- the service must
             // never begin serving against a half-open engine.

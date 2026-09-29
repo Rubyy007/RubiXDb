@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "api", "sql"]
+members = [".", "api", "sql", "cli"]
 
 [package]
 name = "rubixdb"

@@ -150,3 +150,58 @@ export function useRangeMutation() {
     mutationFn: (query: RangeQuery) => client!.range(query),
   });
 }
+
+// -----------------------------------------------------------------
+// SQL console catalog metadata -- read-only, cacheable exactly like
+// every other status/metadata query above. The SQL *execution* call
+// itself (`POST /v1/sql`) is deliberately *not* a react-query mutation
+// -- it carries stateful session-id tracking and cancellation the
+// generic mutation shape does not fit well, so `SqlConsolePage` calls
+// `ApiClient.sql` directly instead (`PHASE_RELATIONAL_FRONTEND_SQL_
+// ARCHITECTURE.md` §2).
+// -----------------------------------------------------------------
+
+export function useDatabasesQuery() {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["sql", "databases"],
+    queryFn: () => client!.listDatabases(),
+    enabled: client !== null,
+  });
+}
+
+export function useSchemasQuery() {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["sql", "schemas"],
+    queryFn: () => client!.listSchemas(),
+    enabled: client !== null,
+  });
+}
+
+export function useTablesQuery() {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["sql", "tables"],
+    queryFn: () => client!.listTables(),
+    enabled: client !== null,
+  });
+}
+
+export function useIndexesQuery() {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["sql", "indexes"],
+    queryFn: () => client!.listIndexes(),
+    enabled: client !== null,
+  });
+}
+
+/** Invalidates the catalog-metadata queries above -- called after any
+ * SQL statement that might have changed the schema (DDL) or after any
+ * statement at all, kept simple (this console is a human operator's
+ * tool, the same "invalidate broadly, simply" tradeoff `invalidateKv
+ * Queries` above already documents). */
+export function invalidateCatalogQueries(queryClient: ReturnType<typeof useQueryClient>) {
+  queryClient.invalidateQueries({ queryKey: ["sql"] });
+}

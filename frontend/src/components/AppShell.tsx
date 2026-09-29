@@ -7,6 +7,7 @@ import { Button } from "./Button";
 
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", icon: "▣" },
+  { to: "/sql", label: "SQL Console", icon: "⌨" },
   { to: "/explorer", label: "Data Explorer", icon: "⌕" },
   { to: "/snapshots", label: "Snapshots", icon: "⧉" },
   { to: "/compaction", label: "Compaction", icon: "⚙" },
