@@ -6,6 +6,26 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 13 hardening -- canonical port 302 and real crash-kill matrix (2026-09-29)
+
+#### Added
+
+- `instance::port::DEFAULT_API_PORT` changed to `302` (from `8080`),
+  per explicit user direction, accepted as a Windows-only product
+  constraint (privileged-port restriction on Linux/macOS). Propagated
+  to the standalone API's own default, the benchmark tool, and the
+  frontend dev-proxy; `bind_loopback` now logs a clear diagnostic on a
+  `PermissionDenied` bind failure specifically. Two new tests
+  (`default_port_is_302_decimal_not_octal`,
+  `port_collision_with_an_unrelated_process_falls_back_safely`).
+- `cli/tests/crash_recovery_integration.rs`: four real crash-kill
+  tests using the actual compiled binary and real `Child::kill()` --
+  committed-write survival, uncommitted-transaction non-survival,
+  committed-DDL-and-index survival, and no-torn-writes under a kill
+  during sustained concurrent write load -- all exercised through the
+  real product entry point (CLI -> HTTP -> embedded server -> engine),
+  not the raw engine test harness.
+
 ### Product: Increment 13 hardening -- release build and performance baseline (2026-09-29)
 
 Full decision record and results: `PHASE_RUBIXDB_PERFORMANCE_BASELINE.md`.

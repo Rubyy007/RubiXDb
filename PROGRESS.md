@@ -3928,3 +3928,48 @@ Explicitly still open, named rather than assumed: concurrency beyond
 16/8, CPU/RSS sampling, sustained endurance, HTTP/JSON fuzzing, a
 crash-kill matrix, and GUI/frontend-side performance -- the rest of the
 Increment 13 hardening pass.
+
+## 2026-09-29 (Increment 13 hardening: canonical port 302, real crash-kill matrix)
+
+Per explicit user direction (after flagging that ports below 1024 are
+OS-privileged on Linux/macOS, confirmed acceptable for a Windows-only
+product target), changed the canonical default port from 8080 to 302
+everywhere it appears (`instance::port::DEFAULT_API_PORT`, the
+standalone API's own env-configured default, the benchmark tool, the
+frontend dev-proxy, one still-accurate historical doc reference).
+`bind_loopback` now logs a clear diagnostic specifically on a
+`PermissionDenied` bind failure rather than silently falling back, so
+the privileged-port gap stays visible on a non-Windows host. Verified
+end-to-end on the real Windows target: `rubixdb gui` binds
+`127.0.0.1:302` and serves real traffic without elevation. Two new
+real tests pin the literal value and prove port ownership is correctly
+independent from instance-lock ownership (a real unrelated process
+squatting on 302 never gets mistaken for a running instance -- the
+real owner still acquires the lock normally and falls back to a real
+ephemeral port).
+
+Closed the crash-kill matrix gate (Increment 13 Phases Q-W) with four
+real tests (`cli/tests/crash_recovery_integration.rs`): the actual
+compiled `rubixdb` binary, real `Child::kill()` (an ungraceful
+`TerminateProcess`/`SIGKILL`, no destructors, no graceful-shutdown
+handler), then a real restart and query through the real product
+path -- not the raw engine test harness. Proved: a committed write
+survives a real kill; an uncommitted (`BEGIN`, no `COMMIT`) write never
+becomes visible after a real kill, through the real HTTP/session path;
+committed DDL (schema + table + index together) survives a real kill
+with the catalog and index both recovering correctly; and, under
+sustained concurrent write load killed at an unpredictable moment, the
+recovered table contains no torn/partial rows -- every surviving row's
+value matches its id exactly (12/60 attempted rows survived in one
+real run, each internally consistent). The core engine's own
+crash-consistency certification (`tests/crash_consistency.rs`) is
+unchanged -- these are new because nothing before this increment had
+proven the same durability guarantees hold when exercised through the
+actual product entry point (CLI -> HTTP -> embedded server -> engine)
+rather than the engine directly.
+
+Full instance/cli/api regression (fmt, clippy -D warnings, test) clean
+throughout. Still explicitly open: higher-concurrency load (32/64),
+sustained endurance, resource-trend tracking, HTTP/JSON fuzzing,
+expensive-query flood, GUI/frontend performance, and the final
+certification documents.
