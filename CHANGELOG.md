@@ -6,6 +6,68 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 15 -- PK range scan fix (2026-09-30)
+
+Full record: `PHASE_RUBIXDB_INCREMENT15_PK_RANGE_ARCHITECTURE.md`,
+`_PERFORMANCE.md`, `_RESULTS.md`. Closes
+`PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_RANGE_SCAN_ADR.md`'s "NON-PK
+READ PERFORMANCE = FAIL" finding.
+
+#### Fixed
+
+- A primary-key range predicate (`WHERE id >= x AND id < y`) fell back
+  to a full `SeqScan` regardless of range width, with cost growing
+  with total table size (measured up to ~300x a comparable single-row
+  PK lookup, and up to 828ms at 105,907 rows for a <=50-row range).
+  Added `PhysicalAccess::PkRangeScan` (`sql/src/plan/access.rs`) and
+  `TableStore::scan_table_pk_range_rows_as_of`
+  (`src/relational/table_store.rs`), reusing the certified `LsmEngine::
+  range_scan` primitive and the existing `index_key::index_scan_range`
+  prefix/successor byte-range logic verbatim (no certified engine code
+  changed). `UPDATE`/`DELETE`/`JOIN`/aggregation inherit the fix
+  automatically through the shared executor machinery. Measured: p50
+  latency flat at 0.09-0.31ms from 1,000-100,000 rows vs. the old
+  path's 3.9ms-337.6ms for the identical query on identical data (up
+  to ~1,099x at 100,000 rows).
+
+#### Added
+
+- Multi-column composite-PK-prefix correctness tests (the mission's
+  named correctness landmine: a partial PK equality must return every
+  row sharing the prefix, never one arbitrary match), MVCC snapshot
+  and tombstone/reinsert correctness tests, table-isolation tests,
+  JOIN/aggregation/UPDATE/DELETE regression tests, and an extended
+  independent differential/property-testing reference model
+  (`sql/src/plan_reference_model.rs`).
+
+### Product: Increment 14 hardening -- blockers 1-12 (2026-09-30)
+
+Query starvation, CLI endurance, GUI endurance/browser memory,
+`CREATE INDEX` mid-backfill crash safety, commit-ack-loss, a real
+`cargo-audit` dependency scan, simultaneous multi-instance sustained
+load, heap-level ownership tracing (`dhat`), cross-browser GUI timing,
+the true 100,000-row GUI case, and delete safety -- each with its own
+`PHASE_RUBIXDB_INCREMENT14_BLOCKER*.md` evidence document. The
+remaining item from Increment 13's eleven, long-duration endurance, is
+Blocker 9 (below), still in progress.
+
+#### Fixed
+
+- An accidentally-committed `dhat-heap.json` profiler dump (572KB) was
+  untracked and gitignored.
+
+### Product: Blocker 9 -- chained long-duration endurance (2026-09-30, in progress)
+
+New `api/examples/long_endurance.rs` (persistence-aware, resumes
+across a process restart instead of resetting state; adds a real
+`JOIN` to the operation mix) and `scripts/run_long_endurance_
+segment.ps1` (orchestrates one segment against the real product
+startup flow). A pre-flight smoke test caught and fixed a driver bug
+(a heartbeat task overshooting its configured deadline by up to 300s).
+Segment 1 of 3 (~115 minutes, fresh seed) completed cleanly and
+directly surfaced the Increment 15 finding above; segment 2
+(continuing on the same data) is running.
+
 ### Product: Increment 13 hardening -- final certification matrix (2026-09-29)
 
 Full record: `PHASE_RUBIXDB_INCREMENT13_CERTIFICATION.md`

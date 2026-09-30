@@ -504,6 +504,51 @@ fn delete_multiplicity_matches_exactly_the_predicate() {
 }
 
 #[test]
+fn update_over_a_pk_range_never_under_or_over_updates() {
+    // Increment 15 regression: UPDATE's target-row planning shares
+    // `crate::plan::access::plan_table_access` with SELECT, so a PK
+    // range predicate must now plan as `PkRangeScan` there too --
+    // verified by exact row count, not just "some rows changed."
+    let f = WriteFixture::new("update_pk_range");
+    for i in 0..10 {
+        f.write(&format!(
+            "INSERT INTO t (id, name, active) VALUES ({i}, 'x', TRUE)"
+        ));
+    }
+    let r = f.write("UPDATE t SET active = FALSE WHERE id >= 3 AND id < 7");
+    assert_eq!(r.rows_affected, 4, "must update exactly ids 3,4,5,6");
+    let still_active = f.select("SELECT id FROM t WHERE active = TRUE");
+    assert_eq!(still_active.rows.len(), 6);
+    let now_inactive = f.select("SELECT id FROM t WHERE active = FALSE");
+    assert_eq!(now_inactive.rows.len(), 4);
+    f.cleanup();
+}
+
+#[test]
+fn delete_over_a_pk_range_never_under_or_over_deletes() {
+    let f = WriteFixture::new("delete_pk_range");
+    for i in 0..10 {
+        f.write(&format!(
+            "INSERT INTO t (id, name, active) VALUES ({i}, 'x', TRUE)"
+        ));
+    }
+    let r = f.write("DELETE FROM t WHERE id >= 3 AND id < 7");
+    assert_eq!(r.rows_affected, 4, "must delete exactly ids 3,4,5,6");
+    let mut remaining: Vec<i64> = f
+        .select("SELECT id FROM t")
+        .rows
+        .iter()
+        .map(|row| match row[0] {
+            Some(rubixdb::relational::RelationalValue::Integer(n)) => n as i64,
+            _ => panic!(),
+        })
+        .collect();
+    remaining.sort();
+    assert_eq!(remaining, vec![0, 1, 2, 7, 8, 9]);
+    f.cleanup();
+}
+
+#[test]
 fn delete_zero_matches_reports_zero_and_changes_nothing() {
     let f = WriteFixture::new("delete_zero");
     f.write("INSERT INTO t (id, name, active) VALUES (1, 'a', TRUE)");

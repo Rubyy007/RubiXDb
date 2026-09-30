@@ -405,5 +405,17 @@ fn order_satisfied_by_access(
             Ok(true)
         }
         PhysicalAccess::SeqScan { .. } => Ok(false),
+        // Conservative, matching `SeqScan`'s own treatment just above
+        // (never Sort-eliminating) even though a `PkRangeScan`'s
+        // underlying `range_scan` does return rows in PK order (same
+        // guarantee `TableStore::scan_table`'s own doc comment states
+        // for the whole-table case): claiming order satisfaction here
+        // is a pure optimization with zero correctness upside worth
+        // the risk of an unproven edge case (residual-filter
+        // interaction, a future prefix-bound shape) silently dropping
+        // a needed `Sort`. A future increment can revisit this once
+        // deliberately scoped and tested on its own, mirroring exactly
+        // how `IndexScan`'s own elimination rule above was built.
+        PhysicalAccess::PkRangeScan { .. } => Ok(false),
     }
 }

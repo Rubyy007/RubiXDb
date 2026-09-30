@@ -29,6 +29,47 @@ enum RefAccess {
     PkLookup,
     IndexScan(u32),
     SeqScan,
+    /// Increment 15 (`PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_RANGE_
+    /// SCAN_ADR.md`): a PK range too narrow for `PkLookup` (not every
+    /// PK ordinal has an equality conjunct) but wide enough to form a
+    /// leading-column prefix range.
+    PkRangeScan,
+}
+
+/// Independently scores a PK-range candidate, mirroring `reference_
+/// choose`'s own secondary-index scoring shape (prefix of leading
+/// equality ordinals, plus one more for a range on the very next
+/// ordinal) but never calling into `crate::plan::access` — this is a
+/// from-scratch re-derivation, the same discipline this whole module
+/// already applies to `IndexScan`/`PkLookup`. Returns `None` when no
+/// PK ordinal has a usable predicate, or when every PK ordinal already
+/// has equality (that case is `PkLookup`, handled by the caller
+/// before this is ever consulted).
+fn pk_range_score(
+    pk_ordinals: &[u16],
+    equalities: &BTreeSet<u16>,
+    ranges: &BTreeSet<u16>,
+) -> usize {
+    if pk_ordinals.is_empty() {
+        return 0;
+    }
+    let mut prefix_len = 0usize;
+    for &ord in pk_ordinals {
+        if equalities.contains(&ord) {
+            prefix_len += 1;
+        } else {
+            break;
+        }
+    }
+    if prefix_len == pk_ordinals.len() {
+        return 0; // full equality is PkLookup, not this path
+    }
+    let next = pk_ordinals[prefix_len];
+    let has_range = ranges.contains(&next);
+    if prefix_len == 0 && !has_range {
+        return 0;
+    }
+    prefix_len + usize::from(has_range)
 }
 
 /// Independently re-implemented (not shared code with `crate::plan::
@@ -47,7 +88,16 @@ fn reference_choose(
     if !pk_ordinals.is_empty() && pk_ordinals.iter().all(|o| equalities.contains(o)) {
         return RefAccess::PkLookup;
     }
-    let mut best: Option<(u32, usize)> = None;
+    // Increment 15: PK-range is seeded first, so it wins ties against
+    // a secondary index of equal score -- the same deterministic
+    // tie-break `candidate_pk_range_access`'s caller in `crate::plan::
+    // access` applies (PK-range is seeded into `best` before the
+    // secondary-index loop there too).
+    let mut best: Option<(RefAccess, usize)> = None;
+    let pk_score = pk_range_score(pk_ordinals, equalities, ranges);
+    if pk_score > 0 {
+        best = Some((RefAccess::PkRangeScan, pk_score));
+    }
     for (id, cols) in indexes {
         let mut k = 0usize;
         for &c in cols {
@@ -71,13 +121,13 @@ fn reference_choose(
         if score == 0 {
             continue;
         }
-        match best {
-            Some((_, best_score)) if best_score >= score => {}
-            _ => best = Some((*id, score)),
+        match &best {
+            Some((_, best_score)) if *best_score >= score => {}
+            _ => best = Some((RefAccess::IndexScan(*id), score)),
         }
     }
     match best {
-        Some((id, _)) => RefAccess::IndexScan(id),
+        Some((access, _)) => access,
         None => RefAccess::SeqScan,
     }
 }
@@ -101,6 +151,7 @@ fn classify(plan: &Plan) -> RefAccess {
         PhysicalAccess::PkLookup { .. } => RefAccess::PkLookup,
         PhysicalAccess::IndexScan { index_id, .. } => RefAccess::IndexScan(*index_id),
         PhysicalAccess::SeqScan { .. } => RefAccess::SeqScan,
+        PhysicalAccess::PkRangeScan { .. } => RefAccess::PkRangeScan,
     }
 }
 
@@ -155,6 +206,10 @@ fn matches_reference_model_across_a_fixed_scenario_matrix() {
         ("SELECT id FROM t WHERE name >= 'a'", &[], &[1]),
         ("SELECT id FROM t WHERE active = TRUE", &[], &[]),
         ("SELECT id FROM t WHERE id = 1 AND name = 'a'", &[0, 1], &[]),
+        // Increment 15: a PK range (not a full-PK equality) must
+        // predict PkRangeScan, not SeqScan.
+        ("SELECT id FROM t WHERE id >= 1 AND id < 5", &[], &[0]),
+        ("SELECT id FROM t WHERE id > 1", &[], &[0]),
     ];
 
     for (sql, eq_ords, range_ords) in scenarios {
@@ -177,14 +232,19 @@ proptest! {
     #[test]
     fn matches_reference_model_for_randomized_predicate_and_index_shapes(
         id_eq in any::<bool>(),
+        id_range in any::<bool>(),
         name_eq in any::<bool>(),
         name_range in any::<bool>(),
         active_eq in any::<bool>(),
         with_name_index in any::<bool>(),
     ) {
         // `name_eq`/`name_range` are mutually exclusive predicate shapes
-        // on the same column in one generated statement.
+        // on the same column in one generated statement; likewise
+        // `id_eq`/`id_range` (Increment 15: exercises `PkRangeScan`
+        // against the reference model too, not just secondary-index
+        // range predicates).
         let name_range = name_range && !name_eq;
+        let id_range = id_range && !id_eq;
 
         let f = Fixture::new("plan_diff_property");
         let catalog = Arc::new(CatalogService::new(Arc::clone(&f.engine)));
@@ -206,6 +266,9 @@ proptest! {
         if id_eq {
             conjuncts.push("id = 1".to_string());
             equalities.insert(0u16);
+        } else if id_range {
+            conjuncts.push("id >= 1".to_string());
+            ranges.insert(0u16);
         }
         if name_eq {
             conjuncts.push("name = 'a'".to_string());

@@ -109,7 +109,12 @@ impl OpStat {
             "{name:<16} count={count:<10} errors={errors:<8} avg_ms={avg_ms:>9.3} max_ms={max_ms:>10.3}"
         );
         if errors > 0 {
-            for sample in self.error_samples.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            for sample in self
+                .error_samples
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+            {
                 println!("  sample error: {sample}");
             }
         }
@@ -131,7 +136,12 @@ struct Counters {
     transaction_errors: AtomicU64,
 }
 
-async fn timed(client: &Client, sql: &str, session_id: Option<&str>, stat: &OpStat) -> Result<Value, String> {
+async fn timed(
+    client: &Client,
+    sql: &str,
+    session_id: Option<&str>,
+    stat: &OpStat,
+) -> Result<Value, String> {
     let start = Instant::now();
     let result = client.exec(sql, session_id).await;
     stat.record(start.elapsed(), &result);
@@ -183,7 +193,9 @@ async fn main() {
         for g in 0..10 {
             client
                 .exec(
-                    &format!("INSERT INTO long_endurance_grp (grp, label) VALUES ('g{g}', 'label-{g}')"),
+                    &format!(
+                        "INSERT INTO long_endurance_grp (grp, label) VALUES ('g{g}', 'label-{g}')"
+                    ),
                     None,
                 )
                 .await
@@ -194,7 +206,10 @@ async fn main() {
         // correctness check at the end has no *expected* mismatches
         // to explain away.
         client
-            .exec("INSERT INTO long_endurance_grp (grp, label) VALUES ('session', 'session-label')", None)
+            .exec(
+                "INSERT INTO long_endurance_grp (grp, label) VALUES ('session', 'session-label')",
+                None,
+            )
             .await
             .expect("seed session grp row");
         client
@@ -226,7 +241,10 @@ async fn main() {
         println!("fresh: seeded 1000 rows + grp table + index");
     } else {
         let existing = client
-            .exec("SELECT COUNT(*) AS n, MAX(id) AS m FROM long_endurance_t", None)
+            .exec(
+                "SELECT COUNT(*) AS n, MAX(id) AS m FROM long_endurance_t",
+                None,
+            )
             .await
             .expect("continuing segment must find the prior segment's table");
         println!("continuing: existing state = {existing}");

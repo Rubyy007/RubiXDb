@@ -627,7 +627,8 @@ fn access_table_ref(access: &PhysicalAccess) -> u32 {
     match access {
         PhysicalAccess::PkLookup { table_ref, .. }
         | PhysicalAccess::IndexScan { table_ref, .. }
-        | PhysicalAccess::SeqScan { table_ref, .. } => *table_ref,
+        | PhysicalAccess::SeqScan { table_ref, .. }
+        | PhysicalAccess::PkRangeScan { table_ref, .. } => *table_ref,
     }
 }
 

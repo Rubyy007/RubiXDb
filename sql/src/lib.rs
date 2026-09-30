@@ -62,3 +62,6 @@ mod write_tests;
 
 #[cfg(test)]
 mod aggregate_reference_model;
+
+#[cfg(test)]
+mod pk_range_benchmark;

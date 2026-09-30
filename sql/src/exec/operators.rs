@@ -252,6 +252,45 @@ impl<'a> AccessOp<'a> {
                     outer: outer.clone(),
                 })
             }
+            PhysicalAccess::PkRangeScan {
+                table_ref,
+                start,
+                end,
+                residual,
+                ..
+            } => {
+                let table_ref = *table_ref;
+                let as_of = ec.txn.snapshot_seq();
+                match (
+                    resolve_pk_bound(start, outer, ec)?,
+                    resolve_pk_bound(end, outer, ec)?,
+                ) {
+                    (Some(start), Some(end)) => {
+                        ec.metrics.record_pk_range_scan();
+                        let iter = ec.table_store.scan_table_pk_range_rows_as_of(
+                            access.table_id(),
+                            start,
+                            end,
+                            as_of,
+                        )?;
+                        ec.metrics.record_table_fetch();
+                        Ok(AccessOp {
+                            table_ref,
+                            residual: residual.clone(),
+                            source: AccessSource::Lazy(Box::new(iter)),
+                            outer: outer.clone(),
+                        })
+                    }
+                    // A NULL bound endpoint can never match (item 62,
+                    // same rule `PkLookup`/`IndexScan` already apply).
+                    _ => Ok(AccessOp {
+                        table_ref,
+                        residual: residual.clone(),
+                        source: AccessSource::Vec(Vec::new().into_iter()),
+                        outer: outer.clone(),
+                    }),
+                }
+            }
         }
     }
 
@@ -328,6 +367,23 @@ fn resolve_bound(
             .map(|v| Bound::Included(v.into_iter().map(Some).collect())),
         Bound::Excluded(exprs) => resolve_values(exprs, outer, ec)?
             .map(|v| Bound::Excluded(v.into_iter().map(Some).collect())),
+    })
+}
+
+/// `PkRangeScan`'s own bound resolver -- unlike `resolve_bound` above,
+/// primary-key values are never `Option`-wrapped (D5: PK columns are
+/// never `NULL`), so this produces a plain `Bound<Vec<RelationalValue>>`
+/// directly, matching `TableStore::scan_table_pk_range_rows_as_of`'s
+/// (and `relational::key::encode_composite_key`'s) own signature.
+fn resolve_pk_bound(
+    bound: &Bound<Vec<BoundExpr>>,
+    outer: &RowContext,
+    ec: &ExecCtx,
+) -> Result<Option<Bound<Vec<RelationalValue>>>> {
+    Ok(match bound {
+        Bound::Unbounded => Some(Bound::Unbounded),
+        Bound::Included(exprs) => resolve_values(exprs, outer, ec)?.map(Bound::Included),
+        Bound::Excluded(exprs) => resolve_values(exprs, outer, ec)?.map(Bound::Excluded),
     })
 }
 
@@ -936,6 +992,7 @@ fn access_table_ref(access: &PhysicalAccess) -> u32 {
     match access {
         PhysicalAccess::PkLookup { table_ref, .. }
         | PhysicalAccess::IndexScan { table_ref, .. }
-        | PhysicalAccess::SeqScan { table_ref, .. } => *table_ref,
+        | PhysicalAccess::SeqScan { table_ref, .. }
+        | PhysicalAccess::PkRangeScan { table_ref, .. } => *table_ref,
     }
 }

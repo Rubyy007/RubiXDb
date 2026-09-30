@@ -307,6 +307,7 @@ pub struct ExecMetrics {
     pk_lookups: AtomicU64,
     seq_scans: AtomicU64,
     index_scans: AtomicU64,
+    pk_range_scans: AtomicU64,
     joins: AtomicU64,
     execution_time_ms_total: AtomicU64,
     /// Item 71/72: incremented once per newly-created `GROUP BY` group
@@ -346,6 +347,7 @@ pub struct ExecMetricsSnapshot {
     pub pk_lookups: u64,
     pub seq_scans: u64,
     pub index_scans: u64,
+    pub pk_range_scans: u64,
     pub joins: u64,
     pub execution_time_ms_total: u64,
     pub groups_created: u64,
@@ -385,6 +387,9 @@ impl ExecMetrics {
     pub fn record_index_scan(&self) {
         self.index_scans.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_pk_range_scan(&self) {
+        self.pk_range_scans.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn record_join(&self) {
         self.joins.fetch_add(1, Ordering::Relaxed);
     }
@@ -418,6 +423,7 @@ impl ExecMetrics {
             pk_lookups: self.pk_lookups.load(Ordering::Relaxed),
             seq_scans: self.seq_scans.load(Ordering::Relaxed),
             index_scans: self.index_scans.load(Ordering::Relaxed),
+            pk_range_scans: self.pk_range_scans.load(Ordering::Relaxed),
             joins: self.joins.load(Ordering::Relaxed),
             execution_time_ms_total: self.execution_time_ms_total.load(Ordering::Relaxed),
             groups_created: self.groups_created.load(Ordering::Relaxed),

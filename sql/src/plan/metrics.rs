@@ -14,6 +14,7 @@ pub struct PlannerMetrics {
     seq_scans_selected: AtomicU64,
     index_scans_selected: AtomicU64,
     pk_lookups_selected: AtomicU64,
+    pk_range_scans_selected: AtomicU64,
     predicate_pushdowns: AtomicU64,
     projection_prunes: AtomicU64,
     limit_pushdowns: AtomicU64,
@@ -33,6 +34,7 @@ pub struct PlannerMetricsSnapshot {
     pub seq_scans_selected: u64,
     pub index_scans_selected: u64,
     pub pk_lookups_selected: u64,
+    pub pk_range_scans_selected: u64,
     pub predicate_pushdowns: u64,
     pub projection_prunes: u64,
     pub limit_pushdowns: u64,
@@ -62,6 +64,9 @@ impl PlannerMetrics {
     }
     pub fn record_pk_lookup(&self) {
         self.pk_lookups_selected.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_pk_range_scan(&self) {
+        self.pk_range_scans_selected.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_predicate_pushdown(&self) {
         self.predicate_pushdowns.fetch_add(1, Ordering::Relaxed);
@@ -100,6 +105,7 @@ impl PlannerMetrics {
             seq_scans_selected: self.seq_scans_selected.load(Ordering::Relaxed),
             index_scans_selected: self.index_scans_selected.load(Ordering::Relaxed),
             pk_lookups_selected: self.pk_lookups_selected.load(Ordering::Relaxed),
+            pk_range_scans_selected: self.pk_range_scans_selected.load(Ordering::Relaxed),
             predicate_pushdowns: self.predicate_pushdowns.load(Ordering::Relaxed),
             projection_prunes: self.projection_prunes.load(Ordering::Relaxed),
             limit_pushdowns: self.limit_pushdowns.load(Ordering::Relaxed),

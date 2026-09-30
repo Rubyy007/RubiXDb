@@ -266,6 +266,287 @@ fn index_narrowed_residual_predicate_is_still_evaluated() {
 }
 
 // -----------------------------------------------------------------
+// PK range scan (Increment 15, `PHASE_RUBIXDB_INCREMENT14_BLOCKER9_
+// PK_RANGE_SCAN_ADR.md` / `PHASE_RUBIXDB_INCREMENT15_PK_RANGE_
+// ARCHITECTURE.md`) -- correctness of the new bounded access path.
+// -----------------------------------------------------------------
+
+#[test]
+fn pk_range_scan_returns_exactly_the_matching_rows_via_the_right_access_path() {
+    let f = ExecFixture::new("pk_range_exact");
+    let t = f.table_id("t");
+    for i in 0..30 {
+        f.store.put_row(t, &row(i, "x", true)).unwrap();
+    }
+
+    let metrics = ExecMetrics::default();
+    let plan = f.plan("SELECT id FROM t WHERE id >= 10 AND id < 15");
+    let result = execute_autocommit(
+        &plan,
+        &f.txm,
+        &f.store,
+        &f.builder,
+        &[],
+        &ExecLimits::default(),
+        &metrics,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    let mut ids: Vec<i32> = result
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Some(RelationalValue::Integer(n)) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![10, 11, 12, 13, 14]);
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.pk_range_scans, 1);
+    assert_eq!(
+        snap.seq_scans, 0,
+        "a bounded PK range predicate must never fall back to a table scan"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn pk_range_scan_respects_inclusive_and_exclusive_bounds_at_domain_edges() {
+    let f = ExecFixture::new("pk_range_bounds");
+    let t = f.table_id("t");
+    for i in 0..10 {
+        f.store.put_row(t, &row(i, "x", true)).unwrap();
+    }
+
+    let cases: &[(&str, &[i32])] = &[
+        ("SELECT id FROM t WHERE id >= 3 AND id < 7", &[3, 4, 5, 6]),
+        ("SELECT id FROM t WHERE id > 3 AND id <= 7", &[4, 5, 6, 7]),
+        ("SELECT id FROM t WHERE id >= 0 AND id < 1", &[0]),
+        // An empty range must return zero rows, not error and not the
+        // whole table.
+        ("SELECT id FROM t WHERE id >= 5 AND id < 5", &[]),
+        // Range touching the very start/end of the PK domain.
+        ("SELECT id FROM t WHERE id < 1", &[0]),
+        ("SELECT id FROM t WHERE id >= 9", &[9]),
+        // The full-table-equivalent range, expressed as a range.
+        (
+            "SELECT id FROM t WHERE id >= 0 AND id < 10",
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        ),
+    ];
+    for (sql, expected) in cases {
+        let result = f.run(sql);
+        let mut ids: Vec<i32> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Some(RelationalValue::Integer(n)) => n,
+                _ => panic!(),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, *expected, "mismatch for {sql:?}");
+    }
+    f.cleanup();
+}
+
+#[test]
+fn pk_range_scan_never_returns_an_adjacent_tables_rows() {
+    // PK RANGE TABLE ISOLATION: two tables whose PK domains overlap
+    // exactly (both 0..20) -- a range query against one must never
+    // observe the other's physical rows, proven by actual overlapping
+    // data, not merely by inspecting the byte-range construction.
+    let f = ExecFixture::new("pk_range_isolation");
+    f.f.catalog
+        .create_table(
+            f.f.ctx.default_schema_id,
+            "u",
+            &[
+                rubixdb::catalog::service::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: rubixdb::relational::value::TYPE_TAG_INTEGER,
+                    nullable: false,
+                    default_value: None,
+                    type_params: None,
+                },
+                rubixdb::catalog::service::ColumnDef {
+                    name: "marker".to_string(),
+                    data_type: rubixdb::relational::value::TYPE_TAG_TEXT,
+                    nullable: false,
+                    default_value: None,
+                    type_params: None,
+                },
+            ],
+            &[0],
+        )
+        .unwrap();
+    let t = f.table_id("t");
+    let u = f.table_id("u");
+    for i in 0..20 {
+        f.store.put_row(t, &row(i, "t-row", true)).unwrap();
+        f.store
+            .put_row(
+                u,
+                &[int(i), Some(RelationalValue::Text("u-row".to_string()))],
+            )
+            .unwrap();
+    }
+
+    let result = f.run("SELECT name FROM t WHERE id >= 0 AND id < 20");
+    assert_eq!(result.rows.len(), 20);
+    assert!(
+        result.rows.iter().all(|r| r[0] == text("t-row")),
+        "must contain only table t's own rows, never table u's"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn pk_range_scan_residual_predicate_is_still_evaluated() {
+    let f = ExecFixture::new("pk_range_residual");
+    let t = f.table_id("t");
+    for i in 0..10 {
+        f.store.put_row(t, &row(i, "x", i % 2 == 0)).unwrap();
+    }
+    let result = f.run("SELECT id FROM t WHERE id >= 2 AND id < 8 AND active = TRUE");
+    let mut ids: Vec<i32> = result
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Some(RelationalValue::Integer(n)) => n,
+            _ => panic!(),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![2, 4, 6],
+        "the non-PK residual predicate must still apply"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn pk_range_scan_on_composite_primary_key_prefix_returns_every_matching_row() {
+    // The exact correctness landmine the mission called out: a partial
+    // composite-PK prefix bound (`a = 1`, PK is `(a, b)`) must return
+    // *every* row with `a = 1` regardless of `b`, never just the first
+    // one a naive truncated-key bound would happen to hit.
+    let f = ExecFixture::new("pk_range_composite");
+    let table_id =
+        f.f.catalog
+            .create_table(
+                f.f.ctx.default_schema_id,
+                "composite3",
+                &[
+                    rubixdb::catalog::service::ColumnDef {
+                        name: "a".to_string(),
+                        data_type: rubixdb::relational::value::TYPE_TAG_INTEGER,
+                        nullable: false,
+                        default_value: None,
+                        type_params: None,
+                    },
+                    rubixdb::catalog::service::ColumnDef {
+                        name: "b".to_string(),
+                        data_type: rubixdb::relational::value::TYPE_TAG_INTEGER,
+                        nullable: false,
+                        default_value: None,
+                        type_params: None,
+                    },
+                ],
+                &[0, 1],
+            )
+            .unwrap();
+    for (a, b) in [(1, 1), (1, 2), (1, 3), (2, 1), (0, 9)] {
+        f.store.put_row(table_id, &[int(a), int(b)]).unwrap();
+    }
+
+    let result = f.run("SELECT a, b FROM composite3 WHERE a = 1");
+    let mut pairs: Vec<(i32, i32)> = result
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Some(RelationalValue::Integer(a)), Some(RelationalValue::Integer(b))) => (*a, *b),
+            _ => panic!(),
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![(1, 1), (1, 2), (1, 3)],
+        "every row with a=1 must come back regardless of b"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn pk_range_scan_respects_transaction_snapshot_isolation() {
+    let f = ExecFixture::new("pk_range_snapshot");
+    let t = f.table_id("t");
+    for i in 0..5 {
+        f.store.put_row(t, &row(i, "x", true)).unwrap();
+    }
+
+    let snapshot_txn = f.txm.begin().unwrap();
+    // A later, independently-committed write inside the same PK range
+    // must not become visible to a snapshot already taken before it.
+    f.store.put_row(t, &row(3_000, "late", true)).unwrap();
+
+    let seen = f.run_in_txn(
+        "SELECT id FROM t WHERE id >= 0 AND id < 10000",
+        &snapshot_txn,
+    );
+    assert_eq!(
+        seen.rows.len(),
+        5,
+        "PkRangeScan must honor the transaction's own pinned snapshot, not read-committed"
+    );
+    drop(snapshot_txn);
+
+    let after = f.run("SELECT id FROM t WHERE id >= 0 AND id < 10000");
+    assert_eq!(
+        after.rows.len(),
+        6,
+        "a fresh read must see the committed write"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn pk_range_scan_reflects_delete_then_reinsert_not_a_stale_or_duplicate_version() {
+    let f = ExecFixture::new("pk_range_tombstone");
+    let t = f.table_id("t");
+    f.store.put_row(t, &row(1, "v1", true)).unwrap();
+    f.store.put_row(t, &row(2, "keep", true)).unwrap();
+    f.store
+        .delete_row(t, &[RelationalValue::Integer(1)])
+        .unwrap();
+    f.store.put_row(t, &row(1, "v2", false)).unwrap();
+
+    let result = f.run("SELECT id, name FROM t WHERE id >= 0 AND id < 10");
+    let mut rows: Vec<(i32, String)> = result
+        .rows
+        .iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Some(RelationalValue::Integer(id)), Some(RelationalValue::Text(name))) => {
+                (*id, name.clone())
+            }
+            _ => panic!(),
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![(1, "v2".to_string()), (2, "keep".to_string())],
+        "must see exactly one, current version per key -- never the deleted v1, never both"
+    );
+    f.cleanup();
+}
+
+// -----------------------------------------------------------------
 // Filter three-valued logic (items 16/62)
 // -----------------------------------------------------------------
 
@@ -526,6 +807,45 @@ fn inner_join_emits_exact_multiplicity() {
         result.rows.len(),
         3,
         "one outer row matching three inner rows must emit exactly three joined rows"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn inner_join_with_a_pk_range_on_the_outer_side_still_emits_exact_multiplicity() {
+    // Increment 15 regression: a PK range on the JOIN's outer side
+    // (`t.id >= 1 AND t.id < 2`, matching the same single row as the
+    // equality test above) must integrate with the join executor
+    // exactly like `PkLookup`/`SeqScan` already do -- never
+    // globalizing the bound across rows it shouldn't, never dropping
+    // or duplicating matches.
+    let f = ExecFixture::new("inner_join_pk_range");
+    let t = f.table_id("t");
+    let orders = f.table_id("orders");
+    f.store.put_row(t, &row(1, "alice", true)).unwrap();
+    f.store.put_row(t, &row(2, "bob", true)).unwrap();
+    for (order_id, customer, t_id) in [(1i64, "o1", 1), (2, "o2", 1), (3, "o3", 2)] {
+        f.store
+            .put_row(
+                orders,
+                &[
+                    Some(RelationalValue::Bigint(order_id)),
+                    text(customer),
+                    int(10),
+                    int(t_id),
+                ],
+            )
+            .unwrap();
+    }
+
+    let result = f.run(
+        "SELECT orders.customer FROM t INNER JOIN orders ON orders.t_id = t.id \
+         WHERE t.id >= 1 AND t.id < 2",
+    );
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "the PK range must match only t.id=1, joined to exactly its two orders"
     );
     f.cleanup();
 }
@@ -1393,6 +1713,40 @@ fn composite_group_by_produces_one_group_per_distinct_pair() {
         ],
         "3 distinct (name, active) pairs -- composite grouping must not collide"
     );
+    f.cleanup();
+}
+
+#[test]
+fn aggregation_over_a_pk_range_matches_the_same_query_expressed_as_seq_scan_plus_filter() {
+    // Increment 15 regression: COUNT/SUM/GROUP BY/HAVING must see
+    // exactly the same input rows whether the underlying access is a
+    // `PkRangeScan` (id >= 2 AND id < 8) or a logically equivalent
+    // `SeqScan` + residual filter (id >= 2 AND id < 8 expressed via a
+    // predicate shape the planner cannot recognize as a PK range,
+    // forcing SeqScan) -- a real cross-check, not just "some number
+    // came back."
+    let f = ExecFixture::new("agg_pk_range");
+    let t = f.table_id("t");
+    for i in 0..10 {
+        f.store
+            .put_row(t, &row(i, if i % 2 == 0 { "even" } else { "odd" }, true))
+            .unwrap();
+    }
+
+    let range_result =
+        f.run("SELECT name, COUNT(*), SUM(id) FROM t WHERE id >= 2 AND id < 8 GROUP BY name");
+    // `id + 0` defeats PK-range recognition (not a plain column
+    // reference), forcing SeqScan for the same logical row set.
+    let seq_scan_result = f.run(
+        "SELECT name, COUNT(*), SUM(id) FROM t WHERE id + 0 >= 2 AND id + 0 < 8 GROUP BY name",
+    );
+
+    let normalize = |mut r: crate::exec::QueryResult| {
+        r.rows
+            .sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        r.rows
+    };
+    assert_eq!(normalize(range_result), normalize(seq_scan_result));
     f.cleanup();
 }
 

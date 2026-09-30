@@ -151,6 +151,122 @@ fn partial_composite_pk_equality_never_becomes_a_point_lookup() {
     f.cleanup();
 }
 
+/// Increment 15 (`PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_RANGE_SCAN_
+/// ADR.md`): the exact query the ADR's own reproduction used
+/// (`WHERE id >= x AND id < y` on a single-column PK) must now select
+/// `PkRangeScan`, not `SeqScan` -- with the bound's inclusive/exclusive
+/// shape preserved exactly as written.
+#[test]
+fn pk_range_on_single_column_primary_key_builds_pk_range_scan() {
+    let f = Fixture::new("pk_range_single");
+    let p = plan(&f, "SELECT id FROM t WHERE id >= 1 AND id < 5");
+    let access = only_access(query_physical(&p));
+    match access {
+        PhysicalAccess::PkRangeScan { start, end, .. } => {
+            assert!(matches!(start, Bound::Included(_)));
+            assert!(matches!(end, Bound::Excluded(_)));
+        }
+        other => panic!("expected PkRangeScan, got {other:?}"),
+    }
+    f.cleanup();
+}
+
+/// A one-sided PK range (`>` only, no upper bound) must still become
+/// `PkRangeScan` with `Bound::Unbounded` on the missing side -- never
+/// silently fall back to `SeqScan` just because only one side of the
+/// range is constrained.
+#[test]
+fn pk_range_with_only_a_lower_bound_leaves_the_upper_bound_unbounded() {
+    let f = Fixture::new("pk_range_one_sided");
+    let p = plan(&f, "SELECT id FROM t WHERE id > 1");
+    let access = only_access(query_physical(&p));
+    match access {
+        PhysicalAccess::PkRangeScan { start, end, .. } => {
+            assert!(matches!(start, Bound::Excluded(_)));
+            assert!(matches!(end, Bound::Unbounded));
+        }
+        other => panic!("expected PkRangeScan, got {other:?}"),
+    }
+    f.cleanup();
+}
+
+/// The multi-column-PK case the ADR explicitly calls out as mandatory
+/// (`PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_RANGE_SCAN_ADR.md` never
+/// covered this table shape): a partial composite-PK equality
+/// (`WHERE a = 1`, PK is `(a, b)`) must become a `PkRangeScan` whose
+/// bound is a *prefix* (only `a`'s value, `b` left unconstrained) --
+/// never a `PkLookup` (that requires every PK ordinal) and never a
+/// `SeqScan` (that would silently give up the narrowing this whole
+/// increment exists to add). This is the exact "unsafe assumption" the
+/// mission warned about if done wrong: the bound must capture *every*
+/// row with `a = 1` regardless of `b`, not just one arbitrary row.
+#[test]
+fn partial_composite_pk_equality_becomes_a_prefix_pk_range_scan() {
+    let f = Fixture::new("composite_pk_range_prefix");
+    let catalog = &f.catalog;
+    catalog
+        .create_table(
+            f.ctx.default_schema_id,
+            "composite2",
+            &[
+                ColumnDef {
+                    name: "a".to_string(),
+                    data_type: TYPE_TAG_INTEGER,
+                    nullable: false,
+                    default_value: None,
+                    type_params: None,
+                },
+                ColumnDef {
+                    name: "b".to_string(),
+                    data_type: TYPE_TAG_INTEGER,
+                    nullable: false,
+                    default_value: None,
+                    type_params: None,
+                },
+            ],
+            &[0, 1],
+        )
+        .unwrap();
+
+    let p = plan(&f, "SELECT a FROM composite2 WHERE a = 1");
+    let access = only_access(query_physical(&p));
+    match access {
+        PhysicalAccess::PkRangeScan { start, end, .. } => {
+            match start {
+                Bound::Included(v) => assert_eq!(v.len(), 1, "bound must be a 1-column prefix"),
+                other => panic!("expected Included prefix start, got {other:?}"),
+            }
+            match end {
+                Bound::Included(v) => assert_eq!(v.len(), 1),
+                other => panic!("expected Included prefix end, got {other:?}"),
+            }
+        }
+        other => panic!("expected PkRangeScan, got {other:?}"),
+    }
+
+    // Both columns range-bounded: `a = 1 AND b >= 2 AND b < 9` must
+    // extend the prefix with a range on the very next PK column.
+    let p2 = plan(
+        &f,
+        "SELECT a FROM composite2 WHERE a = 1 AND b >= 2 AND b < 9",
+    );
+    let access2 = only_access(query_physical(&p2));
+    match access2 {
+        PhysicalAccess::PkRangeScan { start, end, .. } => {
+            match start {
+                Bound::Included(v) => assert_eq!(v.len(), 2, "start must cover (a, b)"),
+                other => panic!("expected Included (a,b) start, got {other:?}"),
+            }
+            match end {
+                Bound::Excluded(v) => assert_eq!(v.len(), 2, "end must cover (a, b)"),
+                other => panic!("expected Excluded (a,b) end, got {other:?}"),
+            }
+        }
+        other => panic!("expected PkRangeScan, got {other:?}"),
+    }
+    f.cleanup();
+}
+
 #[test]
 fn pk_lookup_preserves_parameter_reference_unevaluated() {
     let f = Fixture::new("pk_param");
@@ -357,6 +473,7 @@ fn access_predicate_is_none_or_join_key_only(access: &PhysicalAccess) -> bool {
         PhysicalAccess::SeqScan { predicate, .. } => predicate.as_ref().map(|e| format!("{e:?}")),
         PhysicalAccess::IndexScan { residual, .. } => residual.as_ref().map(|e| format!("{e:?}")),
         PhysicalAccess::PkLookup { residual, .. } => residual.as_ref().map(|e| format!("{e:?}")),
+        PhysicalAccess::PkRangeScan { residual, .. } => residual.as_ref().map(|e| format!("{e:?}")),
     };
     match residual_text {
         None => true,
@@ -745,10 +862,14 @@ fn metrics_record_plan_shape_choices() {
     let b2 = bound(&f, "SELECT id FROM t WHERE active = TRUE");
     build_plan(&b2, &f.catalog, &limits, &metrics).unwrap();
 
+    let b3 = bound(&f, "SELECT id FROM t WHERE id >= 1 AND id < 5");
+    build_plan(&b3, &f.catalog, &limits, &metrics).unwrap();
+
     let snap = metrics.snapshot();
-    assert_eq!(snap.plans_built, 2);
+    assert_eq!(snap.plans_built, 3);
     assert_eq!(snap.pk_lookups_selected, 1);
     assert_eq!(snap.seq_scans_selected, 1);
+    assert_eq!(snap.pk_range_scans_selected, 1);
     f.cleanup();
 }
 

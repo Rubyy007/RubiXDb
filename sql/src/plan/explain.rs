@@ -233,6 +233,21 @@ fn write_access(access: &PhysicalAccess, out: &mut String) {
             let _ = write!(out, "SeqScan table_id={table_id} table_ref=t{table_ref}");
             write_residual(predicate, out);
         }
+        PhysicalAccess::PkRangeScan {
+            table_id,
+            table_ref,
+            start,
+            end,
+            residual,
+        } => {
+            let _ = write!(
+                out,
+                "PkRangeScan table_id={table_id} table_ref=t{table_ref} start={} end={}",
+                fmt_bound(start),
+                fmt_bound(end)
+            );
+            write_residual(residual, out);
+        }
     }
     out.push('\n');
 }

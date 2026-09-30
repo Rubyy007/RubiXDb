@@ -96,6 +96,31 @@ pub enum PhysicalAccess {
         table_ref: u32,
         predicate: Option<BoundExpr>,
     },
+    /// A bounded scan of the table's own primary-key-ordered physical
+    /// row range (Increment 15, `PHASE_RUBIXDB_INCREMENT14_BLOCKER9_
+    /// PK_RANGE_SCAN_ADR.md`) — chosen when a PK comparison (not a full
+    /// PK equality, which stays `PkLookup`) forms a safe leading-column
+    /// prefix range, exactly mirroring `IndexScan`'s own `Range` mode
+    /// but over the table's own row key rather than a secondary index's
+    /// entries. `relational::table_store::TableStore::
+    /// scan_table_pk_range_rows_as_of` is the one storage primitive
+    /// this maps to; it physically narrows the certified `LsmEngine::
+    /// range_scan` bound instead of scanning the whole table and
+    /// filtering afterward.
+    PkRangeScan {
+        table_id: u32,
+        /// See `PkLookup::table_ref`'s own doc comment.
+        table_ref: u32,
+        /// One `BoundExpr` per leading PK-ordinal position consumed by
+        /// this bound (may be a strict prefix of the full PK, mirroring
+        /// `IndexAccessMode::Range`'s own "trailing columns
+        /// unconstrained within that bound" contract).
+        start: Bound<Vec<BoundExpr>>,
+        end: Bound<Vec<BoundExpr>>,
+        /// Every remaining conjunct not consumed by the range bound
+        /// itself — never dropped (same rule as `PkLookup`/`IndexScan`).
+        residual: Option<BoundExpr>,
+    },
 }
 
 impl PhysicalAccess {
@@ -103,7 +128,8 @@ impl PhysicalAccess {
         match self {
             PhysicalAccess::PkLookup { table_id, .. }
             | PhysicalAccess::IndexScan { table_id, .. }
-            | PhysicalAccess::SeqScan { table_id, .. } => *table_id,
+            | PhysicalAccess::SeqScan { table_id, .. }
+            | PhysicalAccess::PkRangeScan { table_id, .. } => *table_id,
         }
     }
 }
@@ -174,10 +200,35 @@ pub fn plan_table_access(
         });
     }
 
+    // --- Increment 15 (`PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_RANGE_
+    // SCAN_ADR.md`): a PK comparison that does not cover every PK
+    // ordinal with equality (the `PkLookup` case above) may still form
+    // a safe leading-column range over the table's own row key, using
+    // exactly the same leading-column-prefix algorithm already proven
+    // correct for secondary indexes -- `candidate_pk_range_access`
+    // deliberately duplicates that algorithm's shape rather than
+    // sharing code with `candidate_index_access` (see its own doc
+    // comment), so this change carries zero risk of altering the
+    // already-certified secondary-index selection path. Seeded into
+    // `best` first so it competes with secondary indexes on the same
+    // "most consumed conjuncts wins" rule below.
+    let mut best: Option<(usize, PhysicalAccess, Vec<bool>)> = None;
+    if !table.pk_ordinals.is_empty() {
+        if let Some((access, consumed_count, consumed)) = candidate_pk_range_access(
+            table_id,
+            table_ref,
+            &table.pk_ordinals,
+            &parts,
+            &equality_by_ordinal,
+            &comparisons,
+        ) {
+            best = Some((consumed_count, access, consumed));
+        }
+    }
+
     // --- item 8/9: secondary index selection, leading-column match,
     // `Ready` state only, never `Primary` (see module doc comment). ---
     let indexes = catalog.list_indexes(table_id)?;
-    let mut best: Option<(usize, PhysicalAccess, Vec<bool>)> = None;
     for index in &indexes {
         if index.state != rubixdb::catalog::schema::IndexState::Ready
             || index.kind == IndexKind::Primary
@@ -211,7 +262,6 @@ pub fn plan_table_access(
 
     if let Some((_, access, consumed)) = best {
         let residual = residual_of(&parts, &consumed);
-        metrics.record_index_scan();
         return Ok(match access {
             PhysicalAccess::IndexScan {
                 table_id,
@@ -220,14 +270,33 @@ pub fn plan_table_access(
                 index_name,
                 mode,
                 ..
-            } => PhysicalAccess::IndexScan {
+            } => {
+                metrics.record_index_scan();
+                PhysicalAccess::IndexScan {
+                    table_id,
+                    table_ref,
+                    index_id,
+                    index_name,
+                    mode,
+                    residual,
+                }
+            }
+            PhysicalAccess::PkRangeScan {
                 table_id,
                 table_ref,
-                index_id,
-                index_name,
-                mode,
-                residual,
-            },
+                start,
+                end,
+                ..
+            } => {
+                metrics.record_pk_range_scan();
+                PhysicalAccess::PkRangeScan {
+                    table_id,
+                    table_ref,
+                    start,
+                    end,
+                    residual,
+                }
+            }
             other => other,
         });
     }
@@ -374,6 +443,125 @@ fn candidate_index_access(
             index_id,
             index_name: index_name.to_string(),
             mode: IndexAccessMode::Range { start, end },
+            residual: None,
+        },
+        count,
+        consumed,
+    ))
+}
+
+/// Builds a `PkRangeScan` from the table's own `pk_ordinals` using the
+/// identical leading-column-prefix-then-range algorithm as `candidate_
+/// index_access` above (Increment 15,
+/// `PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_RANGE_SCAN_ADR.md`) —
+/// deliberately a **separate, non-shared** function rather than a
+/// refactor of `candidate_index_access` into common code: this table
+/// is reached whenever `PkLookup`'s full-equality check above already
+/// failed (so at least one PK ordinal lacks an equality conjunct), and
+/// keeping the two functions textually independent means this new path
+/// carries zero risk of changing `candidate_index_access`'s already-
+/// certified behavior for secondary indexes, at the cost of ~40 lines
+/// of duplication (an explicit, accepted trade-off, not an oversight —
+/// see `PHASE_RUBIXDB_INCREMENT15_PK_RANGE_ARCHITECTURE.md` §3).
+///
+/// Returns `None` whenever no PK ordinal has a usable predicate at all
+/// (the caller then falls through to `SeqScan`, exactly as before this
+/// increment — this function only ever *adds* a new access path, never
+/// removes or narrows an existing one).
+fn candidate_pk_range_access(
+    table_id: u32,
+    table_ref: u32,
+    pk_ordinals: &[u16],
+    parts: &[BoundExpr],
+    equality_by_ordinal: &std::collections::HashMap<u16, (usize, &BoundExpr)>,
+    comparisons: &[(u16, crate::ast::BinaryOp, &BoundExpr, usize)],
+) -> Option<(PhysicalAccess, usize, Vec<bool>)> {
+    use crate::ast::BinaryOp;
+
+    let mut consumed = vec![false; parts.len()];
+    let mut prefix: Vec<BoundExpr> = Vec::new();
+    let mut prefix_len = 0usize;
+    for &ord in pk_ordinals {
+        match equality_by_ordinal.get(&ord) {
+            Some((idx, expr)) => {
+                prefix.push((*expr).clone());
+                consumed[*idx] = true;
+                prefix_len += 1;
+            }
+            None => break,
+        }
+    }
+
+    // Every PK ordinal matched by equality is handled by `PkLookup`
+    // above, before this function is ever called -- reaching
+    // `prefix_len == pk_ordinals.len()` here would mean this function
+    // was called when `PkLookup` should have fired instead. Guard it
+    // anyway (defensive, not load-bearing): never produce a redundant
+    // access path.
+    if prefix_len == pk_ordinals.len() {
+        return None;
+    }
+
+    let mut lower: Option<(bool, &BoundExpr, usize)> = None;
+    let mut upper: Option<(bool, &BoundExpr, usize)> = None;
+    if let Some(&next_ord) = pk_ordinals.get(prefix_len) {
+        for &(ord, op, expr, idx) in comparisons {
+            if ord != next_ord {
+                continue;
+            }
+            match op {
+                BinaryOp::Gt => lower = Some((false, expr, idx)),
+                BinaryOp::GtEq => lower = Some((true, expr, idx)),
+                BinaryOp::Lt => upper = Some((false, expr, idx)),
+                BinaryOp::LtEq => upper = Some((true, expr, idx)),
+                _ => {}
+            }
+        }
+    }
+
+    if prefix_len == 0 && lower.is_none() && upper.is_none() {
+        return None;
+    }
+
+    let start = match lower {
+        Some((inclusive, expr, idx)) => {
+            consumed[idx] = true;
+            let mut v = prefix.clone();
+            v.push(expr.clone());
+            if inclusive {
+                Bound::Included(v)
+            } else {
+                Bound::Excluded(v)
+            }
+        }
+        None if prefix_len > 0 => Bound::Included(prefix.clone()),
+        None => Bound::Unbounded,
+    };
+    let end = match upper {
+        Some((inclusive, expr, idx)) => {
+            consumed[idx] = true;
+            let mut v = prefix.clone();
+            v.push(expr.clone());
+            if inclusive {
+                Bound::Included(v)
+            } else {
+                Bound::Excluded(v)
+            }
+        }
+        None if prefix_len > 0 => Bound::Included(prefix.clone()),
+        None => Bound::Unbounded,
+    };
+
+    let count = consumed.iter().filter(|c| **c).count();
+    if count == 0 {
+        return None;
+    }
+    Some((
+        PhysicalAccess::PkRangeScan {
+            table_id,
+            table_ref,
+            start,
+            end,
             residual: None,
         },
         count,

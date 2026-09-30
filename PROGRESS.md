@@ -4209,3 +4209,115 @@ evidence-backed position than existed before this continuation began
 zero endurance evidence, zero measured performance numbers of any
 kind), but it is not a `PRODUCTION READY` claim, and none of these four
 documents makes one.
+
+## 2026-09-30 (Increment 14 hardening: blockers 1-8, 10-12 closed)
+
+Ten of the Increment 13 continuation's eleven named `NOT DONE THIS
+PASS` items closed with real evidence: query starvation (Blocker 1),
+CLI endurance (Blocker 2), GUI endurance/browser memory (Blocker 3),
+`CREATE INDEX` mid-backfill crash safety (Blocker 4), commit-ack-loss
+(Blocker 5), a real `cargo-audit` dependency scan (Blocker 6),
+simultaneous multi-instance sustained load (Blocker 7), heap-level
+ownership tracing via `dhat` (Blocker 8), cross-browser GUI timing
+across real Chromium/Firefox/WebKit (Blocker 10), and the true
+100,000-row GUI case (Blocker 11) -- plus an extra delete-safety gate
+(Blocker 12) beyond the original eleven. Each has its own
+`PHASE_RUBIXDB_INCREMENT14_BLOCKER*.md` evidence document. The eleventh
+item, long-duration (multi-hour) endurance, remained open going into
+the next session (see below).
+
+Housekeeping found and fixed at the start of the next session: a
+generated `dhat-heap.json` profiler dump (572KB) had been accidentally
+committed alongside Blocker 8's work -- untracked and gitignored.
+
+## 2026-09-30 (Blocker 9: chained long-duration endurance, in progress)
+
+Built `api/examples/long_endurance.rs` (a persistence-aware variant of
+the Increment 13 180s `endurance.rs` driver that can resume across a
+process restart instead of resetting state, and adds a real `JOIN` to
+the operation mix) and `scripts/run_long_endurance_segment.ps1`
+(orchestrates one segment: real `rubixdb gui --no-browser`, resource
+monitor, workload, final `/v1/status`/`/v1/metrics` capture, hard
+process stop). A 20s smoke test caught a real driver bug (a heartbeat
+task that overshot its configured deadline by up to 300s per tick)
+before committing to the real run -- fixed and reverified.
+
+Per explicit instruction: three ~115-minute segments (~6900s workload
+each, chained on the *same* persistent instance/data, never reset
+between segments, hard-stop between segments doubling as a real
+crash-recovery exercise). Segment 1 (fresh seed) completed cleanly:
+6912s actual, 0 hangs, table grew 1,000 -> 105,907 rows, `CONFLICT_
+ERROR` counts matched the already-documented expected snapshot-
+isolation contention pattern, correctness/orphan checks clean. Segment
+1's own results directly led to the Increment 15 finding below.
+Segment 2 (continuing) launched immediately after; segment 3 to
+follow. Final resource-trend/certification write-up deferred until all
+three segments complete.
+
+## 2026-09-30 (Increment 15: PK range scan fix, closing the Blocker 9 ADR)
+
+Segment 1's own data exposed a genuine production-critical finding,
+documented on the spot as `PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_
+RANGE_SCAN_ADR.md`: a bounded PK-range query (`WHERE id >= x AND id <
+y`, at most 50 rows) cost ~300x a comparable single-row PK lookup and
+grew with total table size (up to 828ms at 105,907 rows) because the
+certified planner had no access path for a PK range -- only full-PK
+equality (`PkLookup`) or secondary-index access (`IndexScan`) avoided
+`SeqScan`'s full-table materialize-then-filter.
+
+Investigated the actual storage/relational layer before writing any
+code (per the Increment 15 mandate's own "do not guess" rule): the
+certified `LsmEngine::range_scan` primitive already supports an
+arbitrary byte-range, already lazy, already snapshot-aware -- no
+engine change needed. `src/relational/index_key.rs`'s own module doc
+comment already documented `index_id = 0` as "reserved for the table's
+own row key," meaning its existing, already-tested `index_scan_range`
+prefix/successor byte-range logic could be reused verbatim for PK
+ranges rather than reimplemented.
+
+Implemented a new `PhysicalAccess::PkRangeScan` (`sql/src/plan/
+access.rs`), planned via a new, deliberately non-shared `candidate_pk_
+range_access` function (kept separate from the certified secondary-
+index selection code specifically to guarantee zero risk to it -- see
+`PHASE_RUBIXDB_INCREMENT15_PK_RANGE_ARCHITECTURE.md` §3.2), backed by
+a new `TableStore::scan_table_pk_range_rows_as_of` that narrows the
+certified engine call's byte range via the reused `index_scan_range`
+helper. `UPDATE`/`DELETE`/`JOIN`/aggregation inherited the fix
+automatically through the executor machinery Increment 9 already
+certified for the other access paths -- no separate implementation.
+
+Measured (real, in-process, release build, same build for "before" and
+"after" via a same-query-different-expression differential technique --
+`PHASE_RUBIXDB_INCREMENT15_PK_RANGE_PERFORMANCE.md`): p50 latency for
+a 50-row PK range stays 0.09-0.31ms from 1,000 to 100,000 rows (flat),
+versus the old `SeqScan` path's 3.9ms-337.6ms for the identical query
+on identical data -- a ~1,099x improvement at 100,000 rows. Cost tracks
+range width (0.11ms @ 1 row -> 35ms @ 10,000 rows) and is insensitive
+to range position within the PK domain, both confirming a genuine
+seek-based access path rather than a disguised scan.
+
+New tests: exact multi-column-PK-prefix correctness (the mission's
+named landmine -- a partial composite-PK equality bound must return
+every row sharing the prefix, not one arbitrary match), MVCC snapshot
+isolation, tombstone/reinsert correctness, table isolation, JOIN and
+aggregation regression, UPDATE/DELETE exact-target-count regression,
+and an extended independent differential/property-testing reference
+model (`plan_reference_model.rs`) -- full list in
+`PHASE_RUBIXDB_INCREMENT15_PK_RANGE_RESULTS.md` §1-2. Every pre-
+existing test in `rubixdb-sql` (287 total after these additions),
+`rubixdb` (542), and `rubixdb-api` (45 unit + 40 HTTP/SQL integration)
+passes with unmodified expectations. Protected-engine audit clean
+(`src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`: zero
+diff).
+
+One pre-existing, unrelated `cargo clippy --workspace -D warnings`
+failure remains, in two Blocker 4/7 test files from before this
+session (`cli/tests/multi_instance_sustained_load.rs`, `cli/tests/
+index_backfill_crash_integration.rs`) -- flagged, not silently fixed
+outside this increment's own mandate; see `PHASE_RUBIXDB_INCREMENT15_
+PK_RANGE_RESULTS.md` §4.
+
+**The Increment 14 ADR's "NON-PK READ PERFORMANCE = FAIL" finding is
+now closed.** Blocker 9's remaining two endurance segments continue in
+parallel; final consolidated Increment 14+15 certification is deferred
+until they complete.

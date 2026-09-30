@@ -12,7 +12,7 @@ use crate::catalog::schema::{ColumnRow, IndexKind, IndexRow, IndexState, TableRo
 use crate::catalog::CatalogService;
 use crate::lsm::{LsmEngine, WriteOp};
 use crate::relational::error::{RelationalError, Result};
-use crate::relational::index_key::{encode_indexed_columns, index_entry_key};
+use crate::relational::index_key::{encode_indexed_columns, index_entry_key, index_scan_range};
 use crate::relational::key::{
     decode_composite_key, encode_composite_key, table_row_key, table_row_range,
 };
@@ -343,6 +343,61 @@ impl TableStore {
         Ok(self
             .engine
             .range_scan(as_bound_ref(&start), as_bound_ref(&end), as_of_seq)
+            .map(move |entry| {
+                let (key, value) = entry?;
+                decode_table_row_entry(&table, &columns, &key, &value)
+            }))
+    }
+
+    /// Increment 15 (`PHASE_RUBIXDB_INCREMENT14_BLOCKER9_PK_RANGE_SCAN_
+    /// ADR.md`, `PHASE_RUBIXDB_INCREMENT15_PK_RANGE_ARCHITECTURE.md`):
+    /// a genuinely bounded, lazy PK-range scan -- the same certified
+    /// `LsmEngine::range_scan` primitive `scan_table_rows_as_of` already
+    /// wraps, but narrowed to the physical byte range implied by
+    /// `start`/`end` instead of the whole table.
+    ///
+    /// Reuses `relational::index_key::index_scan_range` verbatim with
+    /// `index_id = 0` -- that module's own doc comment already
+    /// documents `index_id = 0` as "reserved for the table's own row
+    /// key," and `index_entry_range(table_id, 0)` is bit-for-bit
+    /// identical to `table_row_range(table_id)` (both are `0x01 ||
+    /// table_id BE || 0x00000000 BE` as the start, next-slot as the
+    /// end) -- so the exact same already-tested prefix/successor byte-
+    /// range logic that makes a secondary index's `Range` mode correct
+    /// for a partial (prefix) bound is reused here without
+    /// modification, not reimplemented. `start`/`end` may be a strict
+    /// prefix of the full PK tuple (mirrors `IndexAccessMode::Range`'s
+    /// own "trailing columns unconstrained within that bound"
+    /// contract) -- safe because `encode_composite_key`'s per-column
+    /// encoding is fixed-width or self-delimiting (escape-terminated
+    /// TEXT/BLOB), so a shorter prefix's bytes are always a genuine
+    /// byte-string prefix of any longer key extending it, never an
+    /// ambiguous collision.
+    pub fn scan_table_pk_range_rows_as_of(
+        &self,
+        table_id: u32,
+        start: Bound<Vec<RelationalValue>>,
+        end: Bound<Vec<RelationalValue>>,
+        as_of_seq: u64,
+    ) -> Result<impl Iterator<Item = Result<(Vec<RelationalValue>, Row)>> + '_> {
+        let (table, columns) = self.resolve_table(table_id)?;
+        let encode_bound = |b: Bound<Vec<RelationalValue>>| -> Result<Bound<Vec<u8>>> {
+            Ok(match b {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(values) => Bound::Included(encode_composite_key(&values)?),
+                Bound::Excluded(values) => Bound::Excluded(encode_composite_key(&values)?),
+            })
+        };
+        let start_bytes = encode_bound(start)?;
+        let end_bytes = encode_bound(end)?;
+        let (phys_start, phys_end) = index_scan_range(table_id, 0, start_bytes, end_bytes);
+        Ok(self
+            .engine
+            .range_scan(
+                as_bound_ref(&phys_start),
+                as_bound_ref(&phys_end),
+                as_of_seq,
+            )
             .map(move |entry| {
                 let (key, value) = entry?;
                 decode_table_row_entry(&table, &columns, &key, &value)

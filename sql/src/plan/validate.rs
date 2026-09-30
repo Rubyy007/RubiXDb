@@ -56,6 +56,7 @@ fn access_predicate(access: &PhysicalAccess) -> Option<&BoundExpr> {
         PhysicalAccess::PkLookup { residual, .. } => residual.as_ref(),
         PhysicalAccess::IndexScan { residual, .. } => residual.as_ref(),
         PhysicalAccess::SeqScan { predicate, .. } => predicate.as_ref(),
+        PhysicalAccess::PkRangeScan { residual, .. } => residual.as_ref(),
     }
 }
 
@@ -206,6 +207,21 @@ fn collect_parameters_access(access: &PhysicalAccess, out: &mut BTreeSet<u32>) {
         }
         PhysicalAccess::SeqScan { predicate, .. } => {
             collect_parameters_expr_opt(predicate.as_ref(), out)
+        }
+        PhysicalAccess::PkRangeScan {
+            start,
+            end,
+            residual,
+            ..
+        } => {
+            for bound in [start, end] {
+                if let std::ops::Bound::Included(v) | std::ops::Bound::Excluded(v) = bound {
+                    for e in v {
+                        collect_parameters_expr(e, out);
+                    }
+                }
+            }
+            collect_parameters_expr_opt(residual.as_ref(), out);
         }
     }
 }
