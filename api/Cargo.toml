@@ -24,3 +24,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Increment 14, Blocker 8 (heap/ownership memory analysis) --
+# `heaptrack`/`valgrind`/`massif` do not exist on Windows; `dhat` is
+# the standard Rust-native equivalent (a real, source-attributed heap
+# profiler, not a correlational RSS guess), used only by the
+# `heap_ownership_profile` example below, never linked into any
+# production binary.
+dhat = "0.3"
