@@ -30,6 +30,42 @@ pub struct OwnedInstance {
     pub dir: std::path::PathBuf,
 }
 
+/// Increment 14, Blocker 4 — `CREATE INDEX` mid-backfill crash. A real
+/// gap found by inspection, not guessed: `IndexBuilder::recover_
+/// incomplete_builds`/`recover_incomplete_drops` (`PHASE_RELATIONAL_
+/// INDEX_BACKFILL_ADR.md` §8) already implement the certified
+/// "restart, not resume" crash-recovery protocol and are already
+/// unit-tested (`src/relational/index_tests.rs`) -- but before this
+/// increment, neither was ever called from any real product entry
+/// point (`grep -rn "recover_incomplete_builds\|recover_incomplete_
+/// drops"` outside that engine crate and its own tests had zero
+/// matches). A real process kill mid-`CREATE INDEX` backfill therefore
+/// left the index permanently stuck `Building` across restarts in the
+/// actual product, even though the engine-level primitive to fix it
+/// already existed. This wires that existing, already-certified
+/// primitive into the real startup path -- no engine change, no new
+/// recovery logic, just the missing call site.
+fn recover_incomplete_index_operations(state: &AppState) {
+    match state.sql.index_builder.recover_incomplete_builds() {
+        Ok(recovered) if !recovered.is_empty() => {
+            eprintln!(
+                "rubixdb: recovered incomplete CREATE INDEX backfill(s) from a prior crash: {recovered:?}"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("rubixdb: index build recovery failed at startup: {e}"),
+    }
+    match state.sql.index_builder.recover_incomplete_drops() {
+        Ok(recovered) if !recovered.is_empty() => {
+            eprintln!(
+                "rubixdb: recovered incomplete DROP INDEX sweep(s) from a prior crash: {recovered:?}"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("rubixdb: index drop recovery failed at startup: {e}"),
+    }
+}
+
 pub struct EmbeddedServer {
     pub base_url: String,
     // Held for process lifetime -- dropping releases the OS lock.
@@ -179,6 +215,7 @@ impl EmbeddedServer {
                             }
                         };
                         let state = Arc::new(AppState::new(engine.clone(), lsm_config, config));
+                        recover_incomplete_index_operations(&state);
                         let router = build_router(state.clone());
                         // `tokio::net::TcpListener::from_std` requires
                         // the socket already be non-blocking -- a std

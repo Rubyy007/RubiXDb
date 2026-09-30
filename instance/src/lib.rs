@@ -210,6 +210,70 @@ pub fn discover(
     }
 }
 
+#[derive(Debug)]
+pub enum RemoveError {
+    /// No manifest exists for this name -- nothing to delete. Reported
+    /// distinctly from `Io` so a caller (the CLI) can print "no such
+    /// instance" rather than a generic I/O failure.
+    NotFound,
+    /// The instance's OS-level lock is currently held by a live
+    /// process -- deletion is refused rather than deleting storage out
+    /// from under a running server (item "delete safety": the backend
+    /// must remain authoritative, and a live instance's own directory
+    /// is never removed while anything holds it open).
+    StillRunning,
+    Io(std::io::Error),
+    InvalidName(String),
+}
+
+impl std::fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveError::NotFound => write!(f, "no such instance"),
+            RemoveError::StillRunning => {
+                write!(f, "instance is currently running; stop it before deleting it")
+            }
+            RemoveError::Io(e) => write!(f, "instance removal I/O error: {e}"),
+            RemoveError::InvalidName(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for RemoveError {}
+
+/// Permanently deletes one local instance's entire on-disk directory
+/// (data, manifest, credentials, lock file) -- `PHASE_RUBIXDB_
+/// INSTANCE_ARCHITECTURE.md`'s own DATABASE/INSTANCE delete-safety
+/// gate (Increment 14, Blocker 12). Never called with the name of the
+/// instance the calling process itself is currently hosting (the CLI
+/// caller's own responsibility to check first, since this process
+/// could not have the lock free in that case anyway) -- this function
+/// only ever proves *some* process doesn't hold the lock, via the same
+/// real OS-level primitive `acquire`/`InstanceLock` already use, never
+/// a staleness heuristic or a PID check.
+///
+/// Refuses (rather than force-breaking the lock) when the instance is
+/// currently running -- this is the same "never force-break a held
+/// lock" discipline `AcquireOutcome::LockedButUnverifiable` already
+/// establishes, applied to deletion.
+pub fn remove_instance(name: &str) -> Result<(), RemoveError> {
+    let dir = paths::instance_dir(name).map_err(RemoveError::InvalidName)?;
+    if InstanceManifest::load(&dir).map_err(RemoveError::Io)?.is_none() {
+        return Err(RemoveError::NotFound);
+    }
+    match InstanceLock::try_acquire(&dir) {
+        Ok(lock) => {
+            // Close the lock file handle before removing the directory
+            // that contains it -- Windows refuses to delete a file
+            // still open elsewhere in the same process.
+            drop(lock);
+            std::fs::remove_dir_all(&dir).map_err(RemoveError::Io)?;
+            Ok(())
+        }
+        Err(LockAcquireError::AlreadyLocked) => Err(RemoveError::StillRunning),
+        Err(LockAcquireError::Io(e)) => Err(RemoveError::Io(e)),
+    }
+}
+
 /// Lists every instance name that has at least a manifest on disk --
 /// used by `rubixdb instance list` and by the GUI's "start new
 /// instance" flow to avoid colliding with an existing name.
@@ -357,6 +421,60 @@ mod tests {
                 _ => panic!("expected both Owned"),
             };
             assert_ne!(a_port, b_port);
+        });
+    }
+
+    #[test]
+    fn remove_instance_rejects_unknown_name() {
+        with_isolated_root(|_root| {
+            assert!(matches!(
+                remove_instance("nope"),
+                Err(RemoveError::NotFound)
+            ));
+        });
+    }
+
+    #[test]
+    fn remove_instance_refuses_while_lock_is_held() {
+        with_isolated_root(|_root| {
+            let owned = acquire("busy").unwrap();
+            let lock = match owned {
+                AcquireOutcome::Owned { lock, .. } => lock,
+                _ => panic!("expected Owned"),
+            };
+            assert!(matches!(
+                remove_instance("busy"),
+                Err(RemoveError::StillRunning)
+            ));
+            drop(lock);
+        });
+    }
+
+    #[test]
+    fn remove_instance_deletes_the_directory_once_unlocked() {
+        with_isolated_root(|_root| {
+            let owned = acquire("removable").unwrap();
+            let dir = match &owned {
+                AcquireOutcome::Owned { dir, .. } => dir.clone(),
+                _ => panic!("expected Owned"),
+            };
+            drop(owned);
+            assert!(dir.exists());
+            remove_instance("removable").unwrap();
+            assert!(!dir.exists(), "instance directory must actually be gone");
+            assert!(discover("removable").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn remove_instance_never_touches_a_different_instance() {
+        with_isolated_root(|_root| {
+            let a = acquire("keep-me").unwrap();
+            let b = acquire("delete-me").unwrap();
+            drop(b);
+            remove_instance("delete-me").unwrap();
+            assert!(discover("keep-me").unwrap().is_some(), "unrelated instance must survive");
+            drop(a);
         });
     }
 

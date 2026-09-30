@@ -25,7 +25,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, Path, State};
 use axum::Json;
 use rubixdb::catalog::schema::{ObjectKind, Privilege};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::{to_sql_auth_context, Principal};
 use crate::error::ApiError;
@@ -381,6 +381,213 @@ pub async fn authz(
             })
             .collect(),
     }))
+}
+
+// =======================================================================
+// Delete safety — Increment 14, Blocker 12. Every route below requires
+// the caller to supply the object's *current* identity (name, plus its
+// parent's current name where applicable) in the request body; the
+// handler re-reads that identity fresh from the live catalog and
+// rejects on any mismatch (wrong/partial/empty confirmation, or a
+// stale UI that cached a since-deleted object's id — a fresh `get_*`
+// against that id simply returns `NotFound`, which this handler never
+// converts into a delete). This is the same authorization boundary
+// (`Privilege::Ddl`, `is_authorized`) every SQL DDL statement already
+// uses, and calls the exact same catalog/index-builder primitives
+// `DROP TABLE`/`DROP INDEX` already execute (`sql/src/exec/write.rs`)
+// — no new SQL grammar, no direct filesystem/index-file manipulation.
+// =======================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmName {
+    pub confirm_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmTable {
+    pub schema_name: String,
+    pub table_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmIndex {
+    pub schema_name: String,
+    pub table_name: String,
+    pub index_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteResult {
+    pub deleted: bool,
+}
+
+fn confirmation_mismatch() -> ApiError {
+    ApiError::Validation(
+        "confirmation does not match the object's current name -- refused".to_string(),
+    )
+}
+
+/// `DELETE /v1/catalog/schemas/:schema_id` — exact-name confirmation.
+/// Reuses `CatalogService::drop_schema` verbatim (already rejects a
+/// non-empty schema rather than inventing `CASCADE`).
+pub async fn delete_schema(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Path(schema_id): Path<u32>,
+    Json(body): Json<ConfirmName>,
+) -> Result<Json<DeleteResult>, ApiError> {
+    let bind_context = state.sql.bind_context()?;
+    let schema = state
+        .sql
+        .catalog
+        .get_schema(schema_id)
+        .map_err(rubixdb_sql::SqlError::from)?
+        .ok_or_else(not_found)?;
+
+    let auth_ctx = to_sql_auth_context(&principal);
+    let authorized = rubixdb_sql::auth::is_authorized(
+        &state.sql.catalog,
+        &auth_ctx,
+        Privilege::Ddl,
+        &[
+            (ObjectKind::Schema, schema_id),
+            (ObjectKind::Database, bind_context.database_id),
+        ],
+    )?;
+    if !authorized {
+        return Err(not_found());
+    }
+
+    if body.confirm_name.is_empty() || body.confirm_name != schema.name {
+        return Err(confirmation_mismatch());
+    }
+
+    state
+        .sql
+        .catalog
+        .drop_schema(schema_id)
+        .map_err(rubixdb_sql::SqlError::from)?;
+    Ok(Json(DeleteResult { deleted: true }))
+}
+
+/// `DELETE /v1/catalog/tables/:table_id` — confirmation must name both
+/// the table's current schema and its current table name (item: "table
+/// delete requires explicit confirmation showing schema.table", never
+/// the application name). Calls `CatalogService::drop_table` — the
+/// identical primitive `DROP TABLE` already executes.
+pub async fn delete_table(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Path(table_id): Path<u32>,
+    Json(body): Json<ConfirmTable>,
+) -> Result<Json<DeleteResult>, ApiError> {
+    let bind_context = state.sql.bind_context()?;
+    let table = state
+        .sql
+        .catalog
+        .get_table(table_id)
+        .map_err(rubixdb_sql::SqlError::from)?
+        .ok_or_else(not_found)?;
+    let schema = state
+        .sql
+        .catalog
+        .get_schema(table.schema_id)
+        .map_err(rubixdb_sql::SqlError::from)?
+        .ok_or_else(not_found)?;
+
+    let auth_ctx = to_sql_auth_context(&principal);
+    let authorized = rubixdb_sql::auth::is_authorized(
+        &state.sql.catalog,
+        &auth_ctx,
+        Privilege::Ddl,
+        &[
+            (ObjectKind::Table, table_id),
+            (ObjectKind::Schema, table.schema_id),
+            (ObjectKind::Database, bind_context.database_id),
+        ],
+    )?;
+    if !authorized {
+        return Err(not_found());
+    }
+
+    if body.schema_name.is_empty()
+        || body.table_name.is_empty()
+        || body.schema_name != schema.name
+        || body.table_name != table.name
+    {
+        return Err(confirmation_mismatch());
+    }
+
+    state
+        .sql
+        .catalog
+        .drop_table(table_id)
+        .map_err(rubixdb_sql::SqlError::from)?;
+    Ok(Json(DeleteResult { deleted: true }))
+}
+
+/// `DELETE /v1/catalog/indexes/:index_id` — confirmation must name the
+/// index's current schema, table, and index name. Calls `IndexBuilder::
+/// drop_index_online` — the identical certified online-drop protocol
+/// `DROP INDEX` already executes (never `CatalogService::drop_index`
+/// directly, which would skip the physical entry sweep).
+pub async fn delete_index(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Path(index_id): Path<u32>,
+    Json(body): Json<ConfirmIndex>,
+) -> Result<Json<DeleteResult>, ApiError> {
+    let bind_context = state.sql.bind_context()?;
+    let index = state
+        .sql
+        .catalog
+        .get_index(index_id)
+        .map_err(rubixdb_sql::SqlError::from)?
+        .ok_or_else(not_found)?;
+    let table = state
+        .sql
+        .catalog
+        .get_table(index.table_id)
+        .map_err(rubixdb_sql::SqlError::from)?
+        .ok_or_else(not_found)?;
+    let schema = state
+        .sql
+        .catalog
+        .get_schema(table.schema_id)
+        .map_err(rubixdb_sql::SqlError::from)?
+        .ok_or_else(not_found)?;
+
+    let auth_ctx = to_sql_auth_context(&principal);
+    let authorized = rubixdb_sql::auth::is_authorized(
+        &state.sql.catalog,
+        &auth_ctx,
+        Privilege::Ddl,
+        &[
+            (ObjectKind::Table, table.table_id),
+            (ObjectKind::Schema, table.schema_id),
+            (ObjectKind::Database, bind_context.database_id),
+        ],
+    )?;
+    if !authorized {
+        return Err(not_found());
+    }
+
+    if body.schema_name.is_empty()
+        || body.table_name.is_empty()
+        || body.index_name.is_empty()
+        || body.schema_name != schema.name
+        || body.table_name != table.name
+        || body.index_name != index.name
+    {
+        return Err(confirmation_mismatch());
+    }
+
+    state
+        .sql
+        .index_builder
+        .drop_index_online(index_id)
+        .map_err(rubixdb_sql::SqlError::from)?;
+    Ok(Json(DeleteResult { deleted: true }))
 }
 
 fn not_found() -> ApiError {

@@ -77,6 +77,7 @@ async fn main() {
 
     let shutdown_drain = Duration::from_secs(config.shutdown_drain_secs);
     let state = Arc::new(AppState::new(engine, lsm_config, config));
+    recover_incomplete_index_operations(&state);
     let listen_addr = state.config.listen_addr;
     let router = build_router(state.clone());
 
@@ -104,6 +105,34 @@ async fn main() {
     tracing::info!("draining complete, shutting down engine");
     let report = state.engine.shutdown();
     tracing::info!(?report.pool_state, fully_drained = report.fully_drained, "engine shutdown complete");
+}
+
+/// Increment 14, Blocker 4 — see the identical function's doc comment
+/// in `cli/src/host.rs` for the full "why": this standalone binary is
+/// a second, separately-real product entry point that opens its own
+/// `AppState`, so it needs the same startup call to the existing,
+/// already-certified `IndexBuilder` recovery primitives.
+fn recover_incomplete_index_operations(state: &rubixdb_api::AppState) {
+    match state.sql.index_builder.recover_incomplete_builds() {
+        Ok(recovered) if !recovered.is_empty() => {
+            tracing::warn!(
+                index_ids = ?recovered,
+                "recovered incomplete CREATE INDEX backfill(s) from a prior crash"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "index build recovery failed at startup"),
+    }
+    match state.sql.index_builder.recover_incomplete_drops() {
+        Ok(recovered) if !recovered.is_empty() => {
+            tracing::warn!(
+                index_ids = ?recovered,
+                "recovered incomplete DROP INDEX sweep(s) from a prior crash"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "index drop recovery failed at startup"),
+    }
 }
 
 async fn shutdown_signal() {

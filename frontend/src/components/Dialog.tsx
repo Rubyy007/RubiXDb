@@ -10,6 +10,11 @@ interface DialogProps {
   confirmVariant?: "primary" | "danger";
   onClose: () => void;
   busy?: boolean;
+  /** Disables the confirm button without hiding it -- used by
+   * type-to-confirm destructive flows (Increment 14, Blocker 12) so
+   * the required exact-match text is visible before it's satisfied,
+   * rather than the button only appearing once already correct. */
+  confirmDisabled?: boolean;
 }
 
 /** Built on the native <dialog> element specifically for its built-in
@@ -27,6 +32,7 @@ export function Dialog({
   confirmVariant = "primary",
   onClose,
   busy,
+  confirmDisabled,
 }: DialogProps) {
   const ref = useRef<HTMLDialogElement>(null);
 
@@ -70,7 +76,11 @@ export function Dialog({
           Cancel
         </Button>
         {confirmLabel && onConfirm && (
-          <Button variant={confirmVariant} onClick={onConfirm} disabled={busy}>
+          <Button
+            variant={confirmVariant}
+            onClick={onConfirm}
+            disabled={busy || confirmDisabled}
+          >
             {busy ? "Working…" : confirmLabel}
           </Button>
         )}

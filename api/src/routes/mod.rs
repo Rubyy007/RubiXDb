@@ -108,9 +108,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/sql", post(sql::sql))
         .route("/v1/catalog/databases", get(catalog::databases))
         .route("/v1/catalog/schemas", get(catalog::schemas))
+        .route(
+            "/v1/catalog/schemas/:schema_id",
+            axum::routing::delete(catalog::delete_schema),
+        )
         .route("/v1/catalog/tables", get(catalog::tables))
         .route("/v1/catalog/tables/:name", get(catalog::describe_table))
+        .route(
+            "/v1/catalog/tables/by-id/:table_id",
+            axum::routing::delete(catalog::delete_table),
+        )
         .route("/v1/catalog/indexes", get(catalog::indexes))
+        .route(
+            "/v1/catalog/indexes/:index_id",
+            axum::routing::delete(catalog::delete_index),
+        )
         .route("/v1/catalog/authz", get(catalog::authz))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

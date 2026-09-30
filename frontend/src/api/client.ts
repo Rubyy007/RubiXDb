@@ -192,4 +192,33 @@ export class ApiClient {
   listIndexes() {
     return this.request<IndexInfo[]>("GET", "/v1/catalog/indexes");
   }
+
+  /** Increment 14, Blocker 12 — delete safety. Each call carries the
+   * object's *current* identity as the confirmation body; the server
+   * re-checks it against the live catalog (never trusts this client's
+   * possibly-stale cached name) and rejects on any mismatch, exactly
+   * like `DROP TABLE`/`DROP INDEX` already do for SQL. */
+  deleteSchema(schemaId: number, confirmName: string) {
+    return this.request<{ deleted: boolean }>(
+      "DELETE",
+      `/v1/catalog/schemas/${schemaId}`,
+      { confirm_name: confirmName },
+    );
+  }
+
+  deleteTable(tableId: number, schemaName: string, tableName: string) {
+    return this.request<{ deleted: boolean }>(
+      "DELETE",
+      `/v1/catalog/tables/by-id/${tableId}`,
+      { schema_name: schemaName, table_name: tableName },
+    );
+  }
+
+  deleteIndex(indexId: number, schemaName: string, tableName: string, indexName: string) {
+    return this.request<{ deleted: boolean }>(
+      "DELETE",
+      `/v1/catalog/indexes/${indexId}`,
+      { schema_name: schemaName, table_name: tableName, index_name: indexName },
+    );
+  }
 }

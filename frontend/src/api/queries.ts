@@ -205,3 +205,51 @@ export function useIndexesQuery() {
 export function invalidateCatalogQueries(queryClient: ReturnType<typeof useQueryClient>) {
   queryClient.invalidateQueries({ queryKey: ["sql"] });
 }
+
+// -----------------------------------------------------------------
+// Delete safety (Increment 14, Blocker 12) -- Data Explorer's Objects
+// tab. Every mutation below invalidates the catalog listing queries
+// on success, so a stale row can never keep showing after this
+// client's own delete succeeds; a *different* client's stale cached
+// row is instead caught server-side (`api_delete_safety.rs`'s own
+// stale-UI tests) when this client tries to act on it.
+// -----------------------------------------------------------------
+
+export function useDeleteSchemaMutation() {
+  const client = useApiClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ schemaId, confirmName }: { schemaId: number; confirmName: string }) =>
+      client!.deleteSchema(schemaId, confirmName),
+    onSuccess: () => invalidateCatalogQueries(queryClient),
+  });
+}
+
+export function useDeleteTableMutation() {
+  const client = useApiClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      tableId,
+      schemaName,
+      tableName,
+    }: { tableId: number; schemaName: string; tableName: string }) =>
+      client!.deleteTable(tableId, schemaName, tableName),
+    onSuccess: () => invalidateCatalogQueries(queryClient),
+  });
+}
+
+export function useDeleteIndexMutation() {
+  const client = useApiClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      indexId,
+      schemaName,
+      tableName,
+      indexName,
+    }: { indexId: number; schemaName: string; tableName: string; indexName: string }) =>
+      client!.deleteIndex(indexId, schemaName, tableName, indexName),
+    onSuccess: () => invalidateCatalogQueries(queryClient),
+  });
+}
