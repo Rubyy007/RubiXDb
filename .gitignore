@@ -366,3 +366,6 @@ FodyWeavers.xsd
 **/*.rs.bk
 *.pdb
 temp/
+
+# dhat heap-profiler output (generated per-run, not source)
+dhat-heap.json
