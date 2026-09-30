@@ -38,6 +38,7 @@ fn rubixdb_cmd(root: &PathBuf, instance_name: &str) -> Command {
 }
 
 struct Instance {
+    #[allow(dead_code)]
     name: &'static str,
     child: std::process::Child,
     base_url: String,
@@ -58,8 +59,16 @@ fn read_manifest_and_credentials(root: &PathBuf, name: &str) -> Option<(u16, Str
 }
 
 fn start_instance(root: &PathBuf, name: &'static str) -> Instance {
+    // `rubixdb gui` selects a named instance via the `--instance NAME`
+    // flag (`cli/src/gui.rs`), not `RUBIXDB_INSTANCE_NAME` (that env
+    // var is only read by the plain client role in `main.rs` --
+    // verified by inspecting `gui.rs` after an initial version of this
+    // test used the env var and silently got two processes racing for
+    // the same "default" instance instead of two independent ones).
     let child = rubixdb_cmd(root, name)
         .arg("gui")
+        .arg("--instance")
+        .arg(name)
         .arg("--no-browser")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -85,9 +94,21 @@ fn start_instance(root: &PathBuf, name: &'static str) -> Instance {
                 }
             }
         }
-        assert!(Instant::now() < deadline, "instance {name} never became ready");
+        if Instant::now() >= deadline {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("instance {name} never became ready");
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap()
 }
 
 async fn exec_sql(client: &reqwest::Client, base_url: &str, admin_key: &str, sql: &str) -> Result<Value, String> {
@@ -164,7 +185,7 @@ async fn run_phase(
         let key = r_key.to_string();
         let label = r_label.to_string();
         handles.push(tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = http_client();
             while Instant::now() < stop_at {
                 let start = Instant::now();
                 match exec_sql(&client, &url, &key, &format!("SELECT COUNT(*) FROM {label}_t")).await {
@@ -188,7 +209,7 @@ async fn run_phase(
         let table = write_table.to_string();
         let counter = write_id_counter.clone();
         handles.push(tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = http_client();
             while Instant::now() < stop_at {
                 let id = counter.fetch_add(1, Ordering::Relaxed);
                 match exec_sql(
@@ -238,7 +259,7 @@ async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_co
     println!("instance A: {} pid={}", a.base_url, a.child.id());
     println!("instance B: {} pid={}", b.base_url, b.child.id());
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     exec_sql(&client, &a.base_url, &a.admin_key, "CREATE TABLE instA_t (id INTEGER PRIMARY KEY, v TEXT)")
         .await
         .unwrap();
@@ -322,7 +343,7 @@ async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_co
 
     // Lock/credential crossover: instance A's admin key must not
     // authenticate against instance B's server.
-    let cross_auth = reqwest::Client::new()
+    let cross_auth = http_client()
         .post(format!("{}/v1/sql", b.base_url))
         .bearer_auth(&a.admin_key)
         .json(&json!({ "sql": "SELECT 1", "params": [] }))
@@ -339,7 +360,7 @@ async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_co
     // no knowledge of that session_id at all.
     let begin_a = exec_sql(&client, &a.base_url, &a.admin_key, "BEGIN").await.unwrap();
     let session_id = begin_a["session_id"].as_str().unwrap().to_string();
-    let commit_attempt_on_b = reqwest::Client::new()
+    let commit_attempt_on_b = http_client()
         .post(format!("{}/v1/sql", b.base_url))
         .bearer_auth(&b.admin_key)
         .json(&json!({ "sql": "COMMIT", "params": [], "session_id": session_id }))

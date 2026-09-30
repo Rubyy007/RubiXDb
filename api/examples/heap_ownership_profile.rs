@@ -195,8 +195,15 @@ async fn main() {
     // isolates is whether the *API/session/query layer above the
     // engine* released its own transient buffers, which it should,
     // regardless of engine-level physical reclamation timing.
-    call(&router, "DELETE FROM heap_t WHERE val >= 0", None).await;
-    checkpoint("6: after bulk DELETE", &baseline);
+    // A real, discovered production limit while building this profile:
+    // `max_dml_target_rows` (10,000) rejects a single DML statement
+    // whose target set is larger than that -- our ~21,000 remaining
+    // rows must be deleted in bounded batches, exactly like a real
+    // client would have to.
+    for lo in (0..21_000i64).step_by(9_000) {
+        call(&router, &format!("DELETE FROM heap_t WHERE id >= {lo} AND id < {}", lo + 9_000), None).await;
+    }
+    checkpoint("6: after bulk DELETE (batched)", &baseline);
 
     println!("\ndhat-heap.json written on exit -- open at https://nnethercote.github.io/dh_view/dh_view.html for full call-site attribution of bytes still live at process end.");
 }
