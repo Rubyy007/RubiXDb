@@ -369,3 +369,8 @@ temp/
 
 # dhat heap-profiler output (generated per-run, not source)
 dhat-heap.json
+
+# Blocker 9 long-duration endurance: persistent instance data dir and
+# per-segment logs/monitor CSVs -- generated evidence, not source.
+/.long-endurance-data/
+/scratch/long_endurance/
