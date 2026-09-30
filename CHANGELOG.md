@@ -56,7 +56,10 @@ Blocker 9 (below), still in progress.
 - An accidentally-committed `dhat-heap.json` profiler dump (572KB) was
   untracked and gitignored.
 
-### Product: Blocker 9 -- chained long-duration endurance (2026-09-30, in progress)
+### Product: Blocker 9 -- chained long-duration endurance (2026-10-01, complete)
+
+Full record: `PHASE_RUBIXDB_INCREMENT14_BLOCKER9_LONG_DURATION_
+ENDURANCE.md`.
 
 New `api/examples/long_endurance.rs` (persistence-aware, resumes
 across a process restart instead of resetting state; adds a real
@@ -64,9 +67,20 @@ across a process restart instead of resetting state; adds a real
 segment.ps1` (orchestrates one segment against the real product
 startup flow). A pre-flight smoke test caught and fixed a driver bug
 (a heartbeat task overshooting its configured deadline by up to 300s).
-Segment 1 of 3 (~115 minutes, fresh seed) completed cleanly and
-directly surfaced the Increment 15 finding above; segment 2
-(continuing on the same data) is running.
+
+Three ~115-minute segments (~5.76 cumulative hours) chained on the
+same persistent instance/data (never reset, hard-stopped and restarted
+between segments as a real crash-recovery exercise); table grew 1,000
+-> 205,987 rows; resources stayed fully bounded throughout with
+automatic compaction observed consolidating SSTables mid-run. Segment
+1's own data surfaced the Increment 15 finding above; segment 2
+(continuing, pre-fix binary) hit real 504 timeout failures as the
+table grew further; segment 3 (continuing, rebuilt with the Increment
+15 fix) showed `range_select`/`join` improve ~193x/~231x with zero
+errors on the same growing dataset. Verdict: **PASS**, with the
+pre-fix segments' real failures kept in the record and one distinct,
+still-open item (`indexed_select` secondary-index cost growing with
+table size, out of Increment 15's scope) named rather than hidden.
 
 ### Product: Increment 13 hardening -- final certification matrix (2026-09-29)
 

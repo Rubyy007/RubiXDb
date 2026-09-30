@@ -4230,7 +4230,10 @@ Housekeeping found and fixed at the start of the next session: a
 generated `dhat-heap.json` profiler dump (572KB) had been accidentally
 committed alongside Blocker 8's work -- untracked and gitignored.
 
-## 2026-09-30 (Blocker 9: chained long-duration endurance, in progress)
+## 2026-10-01 (Blocker 9: chained long-duration endurance -- complete)
+
+Full record: `PHASE_RUBIXDB_INCREMENT14_BLOCKER9_LONG_DURATION_
+ENDURANCE.md`.
 
 Built `api/examples/long_endurance.rs` (a persistence-aware variant of
 the Increment 13 180s `endurance.rs` driver that can resume across a
@@ -4242,17 +4245,37 @@ process stop). A 20s smoke test caught a real driver bug (a heartbeat
 task that overshot its configured deadline by up to 300s per tick)
 before committing to the real run -- fixed and reverified.
 
-Per explicit instruction: three ~115-minute segments (~6900s workload
-each, chained on the *same* persistent instance/data, never reset
-between segments, hard-stop between segments doubling as a real
-crash-recovery exercise). Segment 1 (fresh seed) completed cleanly:
-6912s actual, 0 hangs, table grew 1,000 -> 105,907 rows, `CONFLICT_
-ERROR` counts matched the already-documented expected snapshot-
-isolation contention pattern, correctness/orphan checks clean. Segment
-1's own results directly led to the Increment 15 finding below.
-Segment 2 (continuing) launched immediately after; segment 3 to
-follow. Final resource-trend/certification write-up deferred until all
-three segments complete.
+Three ~115-minute segments (~6912s workload each, ~5.76 cumulative
+hours), chained on the *same* persistent instance/data, never reset
+between segments, hard-stopped and restarted between segments (doubling
+as a real crash-recovery exercise -- instance identity, data, and
+correctness all verified intact across both restarts). Table grew
+1,000 -> 105,907 (segment 1) -> 156,205 (segment 2) -> 205,987
+(segment 3) rows. Resources stayed fully bounded throughout (RSS
+sawtoothing ~17-76MB, threads/handles stable, zero storage-pressure
+events, automatic compaction observed actually consolidating SSTables
+mid-run) -- no resource-growth problem at any point.
+
+**Segment 1's own data directly surfaced the Increment 15 finding
+below** (real `indexed_select`/`range_select`/`join` latency degrading
+with table growth). Segment 2 continued running the *pre-fix* binary
+(already launched before the finding was investigated) and got
+dramatically worse as the table grew further -- real `504 TIMEOUT`
+failures on `indexed_select` (5) and `range_select` (1), max latencies
+up to 32.7 seconds. After Increment 15 landed, the release binaries
+were rebuilt and **segment 3 ran the post-fix build**, continuing on
+the same growing dataset (156,205 -> 205,987 rows): `range_select`
+improved avg 459.96ms -> 2.38ms (~193x) and `join` avg 456.9ms ->
+1.98ms (~231x), both with zero errors, despite the table growing a
+further 32%. `indexed_select` (a secondary-index path Increment 15
+never touched, and was never meant to fix) kept degrading across all
+three segments as expected -- flagged as a distinct, still-open
+"INDEX READ PERFORMANCE AT SCALE" item for a future increment, not
+folded into this one's PASS.
+
+**Blocker 9 verdict: PASS**, on the strength of the post-fix (segment
+3) evidence, with the pre-fix segments' real failures kept in the
+record rather than discarded.
 
 ## 2026-09-30 (Increment 15: PK range scan fix, closing the Blocker 9 ADR)
 
