@@ -66,7 +66,11 @@ fn start_owner_and_wait_ready(root: &PathBuf) -> std::process::Child {
         .unwrap();
     let mut ready = false;
     for _ in 0..150 {
-        let status = rubixdb_cmd(root).arg("instance").arg("status").output().unwrap();
+        let status = rubixdb_cmd(root)
+            .arg("instance")
+            .arg("status")
+            .output()
+            .unwrap();
         if String::from_utf8_lossy(&status.stdout).contains("status:      running") {
             ready = true;
             break;
@@ -82,7 +86,11 @@ fn kill_and_wait_for_lock_release(mut child: std::process::Child, root: &PathBuf
     child.wait().ok();
     let mut released = false;
     for _ in 0..100 {
-        let status = rubixdb_cmd(root).arg("instance").arg("status").output().unwrap();
+        let status = rubixdb_cmd(root)
+            .arg("instance")
+            .arg("status")
+            .output()
+            .unwrap();
         if !String::from_utf8_lossy(&status.stdout).contains("status:      running") {
             released = true;
             break;
@@ -131,7 +139,11 @@ fn five_hundred_real_cli_invocations_show_no_monotonic_resource_growth() {
         seed_sql.push_str(&format!("({i},'row-{i}')"));
     }
     let seeded = run_c(&root, &seed_sql);
-    assert!(seeded.status.success(), "stderr={}", String::from_utf8_lossy(&seeded.stderr));
+    assert!(
+        seeded.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
 
     let mut samples: Vec<(usize, u64, u64, u64)> = Vec::new();
     let mut unexpected_failures: Vec<String> = Vec::new();
@@ -177,14 +189,18 @@ fn five_hundred_real_cli_invocations_show_no_monotonic_resource_growth() {
                 // or crash the process.
                 let out = run_c(&root, "SELEC THIS IS NOT VALID SQL");
                 if out.status.success() {
-                    unexpected_failures.push(format!("iter {i} invalid SQL unexpectedly succeeded: {out:?}"));
+                    unexpected_failures.push(format!(
+                        "iter {i} invalid SQL unexpectedly succeeded: {out:?}"
+                    ));
                 }
             }
             4 => {
                 // Invalid meta-command -- same expectation.
                 let out = run_c(&root, "\\this_meta_command_does_not_exist");
                 if out.status.success() {
-                    unexpected_failures.push(format!("iter {i} invalid meta-command unexpectedly succeeded: {out:?}"));
+                    unexpected_failures.push(format!(
+                        "iter {i} invalid meta-command unexpectedly succeeded: {out:?}"
+                    ));
                 }
             }
             5 => {
@@ -254,7 +270,10 @@ fn five_hundred_real_cli_invocations_show_no_monotonic_resource_growth() {
     // BASELINE.md`'s own 97,000-request API evidence already
     // established for the HTTP layer; this is the same property
     // proven again through the actual CLI client entry point.
-    assert!(samples.len() >= 4, "not enough samples collected to judge a trend");
+    assert!(
+        samples.len() >= 4,
+        "not enough samples collected to judge a trend"
+    );
     let mid = samples.len() / 2;
     let (front, back) = samples.split_at(mid);
     let avg = |xs: &[(usize, u64, u64, u64)], f: fn(&(usize, u64, u64, u64)) -> u64| -> f64 {

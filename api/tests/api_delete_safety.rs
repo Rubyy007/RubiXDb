@@ -193,7 +193,12 @@ async fn index_id_by_name(router: &Router, key: &str, name: &str) -> u32 {
 async fn table_delete_wrong_confirmation_is_rejected_and_table_survives() {
     let dir = temp_dir("table_wrong");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE victims (id INTEGER PRIMARY KEY)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE victims (id INTEGER PRIMARY KEY)",
+    )
+    .await;
     let table_id = table_id_by_name(&router, ADMIN_KEY, "victims").await;
 
     let (status, body) = delete_req(
@@ -203,7 +208,11 @@ async fn table_delete_wrong_confirmation_is_rejected_and_table_survives() {
         json!({ "schema_name": "public", "table_name": "not_victims" }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "wrong table name must be rejected: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "wrong table name must be rejected: {body}"
+    );
 
     let names: Vec<String> = get_json(&router, ADMIN_KEY, "/v1/catalog/tables")
         .await
@@ -212,14 +221,22 @@ async fn table_delete_wrong_confirmation_is_rejected_and_table_survives() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(names.contains(&"victims".to_string()), "table must survive a rejected delete");
+    assert!(
+        names.contains(&"victims".to_string()),
+        "table must survive a rejected delete"
+    );
 }
 
 #[tokio::test]
 async fn table_delete_partial_confirmation_is_rejected() {
     let dir = temp_dir("table_partial");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE partial_t (id INTEGER PRIMARY KEY)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE partial_t (id INTEGER PRIMARY KEY)",
+    )
+    .await;
     let table_id = table_id_by_name(&router, ADMIN_KEY, "partial_t").await;
 
     // Correct schema, but a prefix of the real table name -- must not
@@ -238,7 +255,12 @@ async fn table_delete_partial_confirmation_is_rejected() {
 async fn table_delete_empty_confirmation_is_rejected() {
     let dir = temp_dir("table_empty");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE empty_t (id INTEGER PRIMARY KEY)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE empty_t (id INTEGER PRIMARY KEY)",
+    )
+    .await;
     let table_id = table_id_by_name(&router, ADMIN_KEY, "empty_t").await;
 
     let (status, _) = delete_req(
@@ -255,7 +277,12 @@ async fn table_delete_empty_confirmation_is_rejected() {
 async fn table_delete_exact_confirmation_succeeds_and_is_durable() {
     let dir = temp_dir("table_exact");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE gone_t (id INTEGER PRIMARY KEY)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE gone_t (id INTEGER PRIMARY KEY)",
+    )
+    .await;
     let table_id = table_id_by_name(&router, ADMIN_KEY, "gone_t").await;
 
     let (status, body) = delete_req(
@@ -275,7 +302,10 @@ async fn table_delete_exact_confirmation_succeeds_and_is_durable() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(!names.contains(&"gone_t".to_string()), "table must actually be gone");
+    assert!(
+        !names.contains(&"gone_t".to_string()),
+        "table must actually be gone"
+    );
 }
 
 /// Stale-UI / concurrent-deletion: "client A" cached `table_id`, but
@@ -289,8 +319,18 @@ async fn table_delete_exact_confirmation_succeeds_and_is_durable() {
 async fn stale_ui_delete_of_an_already_deleted_table_is_safely_rejected() {
     let dir = temp_dir("table_stale");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE stale_t (id INTEGER PRIMARY KEY)").await;
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE other_t (id INTEGER PRIMARY KEY)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE stale_t (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE other_t (id INTEGER PRIMARY KEY)",
+    )
+    .await;
     let stale_id = table_id_by_name(&router, ADMIN_KEY, "stale_t").await;
     let other_id = table_id_by_name(&router, ADMIN_KEY, "other_t").await;
 
@@ -313,7 +353,11 @@ async fn stale_ui_delete_of_an_already_deleted_table_is_safely_rejected() {
         json!({ "schema_name": "public", "table_name": "stale_t" }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "already-deleted object must 404, not fabricate success: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "already-deleted object must 404, not fabricate success: {body}"
+    );
 
     // The unrelated table must be completely untouched.
     let names: Vec<String> = get_json(&router, ADMIN_KEY, "/v1/catalog/tables")
@@ -323,7 +367,10 @@ async fn stale_ui_delete_of_an_already_deleted_table_is_safely_rejected() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(names.contains(&"other_t".to_string()), "unrelated table must survive");
+    assert!(
+        names.contains(&"other_t".to_string()),
+        "unrelated table must survive"
+    );
     let _ = other_id;
 }
 
@@ -331,7 +378,12 @@ async fn stale_ui_delete_of_an_already_deleted_table_is_safely_rejected() {
 async fn reader_role_cannot_delete_a_table() {
     let dir = temp_dir("table_reader");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE ro_t (id INTEGER PRIMARY KEY)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE ro_t (id INTEGER PRIMARY KEY)",
+    )
+    .await;
     let table_id = table_id_by_name(&router, ADMIN_KEY, "ro_t").await;
 
     let (status, _) = delete_req(
@@ -353,7 +405,10 @@ async fn reader_role_cannot_delete_a_table() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(names.contains(&"ro_t".to_string()), "table must survive a rejected reader delete");
+    assert!(
+        names.contains(&"ro_t".to_string()),
+        "table must survive a rejected reader delete"
+    );
 }
 
 // =======================================================================
@@ -417,7 +472,12 @@ async fn schema_delete_refuses_when_schema_still_has_tables() {
     // drop -- it deliberately targets the schema that already has
     // tables via bootstrap, `public`, rather than `busy_schema`.
     let public_id = schema_id_by_name(&router, ADMIN_KEY, "public").await;
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE dependency_t (id INTEGER PRIMARY KEY)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE dependency_t (id INTEGER PRIMARY KEY)",
+    )
+    .await;
 
     let (status, body) = delete_req(
         &router,
@@ -426,7 +486,10 @@ async fn schema_delete_refuses_when_schema_still_has_tables() {
         json!({ "confirm_name": "public" }),
     )
     .await;
-    assert!(!status.is_success(), "must refuse to drop a non-empty schema: {body}");
+    assert!(
+        !status.is_success(),
+        "must refuse to drop a non-empty schema: {body}"
+    );
     let _ = schema_id;
 }
 
@@ -438,7 +501,12 @@ async fn schema_delete_refuses_when_schema_still_has_tables() {
 async fn index_delete_wrong_confirmation_is_rejected() {
     let dir = temp_dir("index_wrong");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE idx_t (id INTEGER PRIMARY KEY, grp TEXT)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE idx_t (id INTEGER PRIMARY KEY, grp TEXT)",
+    )
+    .await;
     sql_req(&router, ADMIN_KEY, "CREATE INDEX idx_grp ON idx_t (grp)").await;
     let index_id = index_id_by_name(&router, ADMIN_KEY, "idx_grp").await;
 
@@ -456,8 +524,18 @@ async fn index_delete_wrong_confirmation_is_rejected() {
 async fn index_delete_exact_confirmation_succeeds_and_query_correctness_holds() {
     let dir = temp_dir("index_exact");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE idx_t2 (id INTEGER PRIMARY KEY, grp TEXT)").await;
-    sql_req(&router, ADMIN_KEY, "INSERT INTO idx_t2 (id, grp) VALUES (1, 'a'), (2, 'b')").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE idx_t2 (id INTEGER PRIMARY KEY, grp TEXT)",
+    )
+    .await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "INSERT INTO idx_t2 (id, grp) VALUES (1, 'a'), (2, 'b')",
+    )
+    .await;
     sql_req(&router, ADMIN_KEY, "CREATE INDEX idx_grp2 ON idx_t2 (grp)").await;
     let index_id = index_id_by_name(&router, ADMIN_KEY, "idx_grp2").await;
 
@@ -489,14 +567,32 @@ async fn index_delete_exact_confirmation_succeeds_and_query_correctness_holds() 
 async fn stale_ui_delete_of_an_already_deleted_index_is_safely_rejected() {
     let dir = temp_dir("index_stale");
     let (_state, router) = build_app(&dir);
-    sql_req(&router, ADMIN_KEY, "CREATE TABLE idx_t3 (id INTEGER PRIMARY KEY, grp TEXT)").await;
+    sql_req(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE idx_t3 (id INTEGER PRIMARY KEY, grp TEXT)",
+    )
+    .await;
     sql_req(&router, ADMIN_KEY, "CREATE INDEX idx_grp3 ON idx_t3 (grp)").await;
     let index_id = index_id_by_name(&router, ADMIN_KEY, "idx_grp3").await;
 
-    let confirm = json!({ "schema_name": "public", "table_name": "idx_t3", "index_name": "idx_grp3" });
-    let (status1, _) = delete_req(&router, ADMIN_KEY, &format!("/v1/catalog/indexes/{index_id}"), confirm.clone()).await;
+    let confirm =
+        json!({ "schema_name": "public", "table_name": "idx_t3", "index_name": "idx_grp3" });
+    let (status1, _) = delete_req(
+        &router,
+        ADMIN_KEY,
+        &format!("/v1/catalog/indexes/{index_id}"),
+        confirm.clone(),
+    )
+    .await;
     assert_eq!(status1, StatusCode::OK);
 
-    let (status2, body2) = delete_req(&router, ADMIN_KEY, &format!("/v1/catalog/indexes/{index_id}"), confirm).await;
+    let (status2, body2) = delete_req(
+        &router,
+        ADMIN_KEY,
+        &format!("/v1/catalog/indexes/{index_id}"),
+        confirm,
+    )
+    .await;
     assert_eq!(status2, StatusCode::NOT_FOUND, "{body2}");
 }

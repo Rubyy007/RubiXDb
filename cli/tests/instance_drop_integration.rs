@@ -66,7 +66,10 @@ fn drop_with_partial_confirmation_is_refused() {
     run_c(&root, "SELECT 1");
 
     let out = run_instance(&root, &["drop", "default", "--confirm", "defau"]);
-    assert!(!out.status.success(), "partial confirmation must be refused");
+    assert!(
+        !out.status.success(),
+        "partial confirmation must be refused"
+    );
     assert!(root.join("default").join("instance.json").is_file());
     std::fs::remove_dir_all(&root).ok();
 }
@@ -88,7 +91,10 @@ fn drop_with_no_confirmation_flag_is_refused() {
     run_c(&root, "SELECT 1");
 
     let out = run_instance(&root, &["drop", "default"]);
-    assert!(!out.status.success(), "a missing --confirm flag must be refused");
+    assert!(
+        !out.status.success(),
+        "a missing --confirm flag must be refused"
+    );
     assert!(root.join("default").join("instance.json").is_file());
     std::fs::remove_dir_all(&root).ok();
 }
@@ -98,7 +104,10 @@ fn drop_of_unknown_instance_name_is_refused() {
     let root = fresh_root("unknown_name");
     std::fs::create_dir_all(&root).unwrap();
 
-    let out = run_instance(&root, &["drop", "never-existed", "--confirm", "never-existed"]);
+    let out = run_instance(
+        &root,
+        &["drop", "never-existed", "--confirm", "never-existed"],
+    );
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no such instance"), "stderr={stderr}");
@@ -113,7 +122,11 @@ fn drop_of_unknown_instance_name_is_refused() {
 fn drop_with_exact_confirmation_permanently_deletes_a_stopped_instance() {
     let root = fresh_root("exact_confirm");
     let created = run_c(&root, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
-    assert!(created.status.success(), "stderr={}", String::from_utf8_lossy(&created.stderr));
+    assert!(
+        created.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&created.stderr)
+    );
     assert!(root.join("default").join("instance.json").is_file());
 
     let out = run_instance(&root, &["drop", "default", "--confirm", "default"]);
@@ -130,7 +143,10 @@ fn drop_with_exact_confirmation_permanently_deletes_a_stopped_instance() {
 
     let listed = run_instance(&root, &["list"]);
     let stdout = String::from_utf8_lossy(&listed.stdout);
-    assert!(!stdout.contains("default"), "deleted instance must not appear in `instance list`: {stdout}");
+    assert!(
+        !stdout.contains("default"),
+        "deleted instance must not appear in `instance list`: {stdout}"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -194,7 +210,11 @@ fn drop_never_touches_a_different_instance() {
         .stderr(Stdio::piped())
         .output()
         .unwrap();
-    assert!(second.status.success(), "stderr={}", String::from_utf8_lossy(&second.stderr));
+    assert!(
+        second.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     assert!(root.join("second").join("instance.json").is_file());
 
     let out = run_instance(&root, &["drop", "default", "--confirm", "default"]);

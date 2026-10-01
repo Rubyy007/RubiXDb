@@ -46,7 +46,10 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 const ADMIN_KEY: &str = "heap-profile-admin-key-0123456789";
 
 fn temp_dir() -> PathBuf {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let path = std::env::temp_dir().join(format!("rubixdb_heap_profile_{nanos}"));
     std::fs::create_dir_all(&path).unwrap();
     path
@@ -56,7 +59,11 @@ fn test_config(data_dir: PathBuf) -> Config {
     Config {
         data_dir,
         listen_addr: "127.0.0.1:0".parse().unwrap(),
-        api_keys: vec![ApiKeyConfig { name: "admin".into(), role: Role::Admin, key: ADMIN_KEY.into() }],
+        api_keys: vec![ApiKeyConfig {
+            name: "admin".into(),
+            role: Role::Admin,
+            key: ADMIN_KEY.into(),
+        }],
         max_value_bytes: 1024 * 1024,
         max_key_bytes: 4096,
         default_range_limit: 100,
@@ -78,10 +85,23 @@ fn test_config(data_dir: PathBuf) -> Config {
 }
 
 fn wal_config() -> WalConfig {
-    WalConfig { sync_mode: SyncMode::GroupCommit { max_wait: Duration::from_millis(5), max_batch_bytes: 256 * 1024 }, ..WalConfig::default() }
+    WalConfig {
+        sync_mode: SyncMode::GroupCommit {
+            max_wait: Duration::from_millis(5),
+            max_batch_bytes: 256 * 1024,
+        },
+        ..WalConfig::default()
+    }
 }
 fn pool_config() -> BatchCoordinatorConfig {
-    BatchCoordinatorConfig { queue_capacity: 4096, max_queued_bytes: 64 * 1024 * 1024, submission_timeout: Duration::from_secs(10), shutdown_drain_bound: Duration::from_secs(30), await_retry_budget: Duration::from_secs(10), max_drain_per_batch: 65536 }
+    BatchCoordinatorConfig {
+        queue_capacity: 4096,
+        max_queued_bytes: 64 * 1024 * 1024,
+        submission_timeout: Duration::from_secs(10),
+        shutdown_drain_bound: Duration::from_secs(30),
+        await_retry_budget: Duration::from_secs(10),
+        max_drain_per_batch: 65536,
+    }
 }
 
 async fn call(router: &Router, sql: &str, session_id: Option<&str>) -> Value {
@@ -127,14 +147,20 @@ async fn main() {
     let dir = temp_dir();
     println!("data_dir = {}", dir.display());
     let lsm_config = LsmConfig::default();
-    let engine = Arc::new(LsmEngine::open(&dir, wal_config(), pool_config(), lsm_config.clone()).unwrap());
+    let engine =
+        Arc::new(LsmEngine::open(&dir, wal_config(), pool_config(), lsm_config.clone()).unwrap());
     let state = Arc::new(AppState::new(engine, lsm_config, test_config(dir.clone())));
     let router = build_router(state);
 
     let baseline = dhat::HeapStats::get();
     checkpoint("0: process baseline", &baseline);
 
-    call(&router, "CREATE TABLE heap_t (id INTEGER PRIMARY KEY, v TEXT, val INTEGER)", None).await;
+    call(
+        &router,
+        "CREATE TABLE heap_t (id INTEGER PRIMARY KEY, v TEXT, val INTEGER)",
+        None,
+    )
+    .await;
     checkpoint("1: after bootstrap+CREATE TABLE", &baseline);
 
     // Phase A: real, controlled DATA GROWTH -- 20,000 rows via batched
@@ -164,17 +190,30 @@ async fn main() {
     // populated table (result/row buffers should not accumulate
     // between independent, completed requests).
     for i in 0..2_000 {
-        call(&router, &format!("SELECT id, v, val FROM heap_t WHERE id = {}", i % 20_000), None).await;
+        call(
+            &router,
+            &format!("SELECT id, v, val FROM heap_t WHERE id = {}", i % 20_000),
+            None,
+        )
+        .await;
     }
     checkpoint("3: after 2,000 SELECTs (query buffers)", &baseline);
 
     // Phase C: METADATA CHURN -- 500 real CREATE TABLE + DROP TABLE
     // cycles (catalog-only growth/shrink, isolated from row data).
     for i in 0..500 {
-        call(&router, &format!("CREATE TABLE churn_{i} (id INTEGER PRIMARY KEY)"), None).await;
+        call(
+            &router,
+            &format!("CREATE TABLE churn_{i} (id INTEGER PRIMARY KEY)"),
+            None,
+        )
+        .await;
         call(&router, &format!("DROP TABLE churn_{i}"), None).await;
     }
-    checkpoint("4: after 500 CREATE+DROP TABLE cycles (metadata)", &baseline);
+    checkpoint(
+        "4: after 500 CREATE+DROP TABLE cycles (metadata)",
+        &baseline,
+    );
 
     // Phase D: SESSION/TRANSACTION CHURN -- 1,000 real BEGIN/COMMIT
     // cycles (session-registry state, isolated from data/query/
@@ -182,10 +221,22 @@ async fn main() {
     for i in 0..1_000 {
         let begin = call(&router, "BEGIN", None).await;
         let session_id = begin["session_id"].as_str().unwrap().to_string();
-        call(&router, &format!("INSERT INTO heap_t (id, v, val) VALUES ({}, 'txn', {})", 100_000 + i, i), Some(&session_id)).await;
+        call(
+            &router,
+            &format!(
+                "INSERT INTO heap_t (id, v, val) VALUES ({}, 'txn', {})",
+                100_000 + i,
+                i
+            ),
+            Some(&session_id),
+        )
+        .await;
         call(&router, "COMMIT", Some(&session_id)).await;
     }
-    checkpoint("5: after 1,000 BEGIN/INSERT/COMMIT cycles (sessions/txns)", &baseline);
+    checkpoint(
+        "5: after 1,000 BEGIN/INSERT/COMMIT cycles (sessions/txns)",
+        &baseline,
+    );
 
     // Phase E: DELETE all data back out -- if phase 2's growth was
     // purely data-proportional (not a leak elsewhere), curr_bytes
@@ -201,7 +252,15 @@ async fn main() {
     // rows must be deleted in bounded batches, exactly like a real
     // client would have to.
     for lo in (0..21_000i64).step_by(9_000) {
-        call(&router, &format!("DELETE FROM heap_t WHERE id >= {lo} AND id < {}", lo + 9_000), None).await;
+        call(
+            &router,
+            &format!(
+                "DELETE FROM heap_t WHERE id >= {lo} AND id < {}",
+                lo + 9_000
+            ),
+            None,
+        )
+        .await;
     }
     checkpoint("6: after bulk DELETE (batched)", &baseline);
 

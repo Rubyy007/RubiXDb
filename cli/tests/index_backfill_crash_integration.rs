@@ -16,7 +16,7 @@
 //! `AppState::new`, before serving. This test proves the fix with a
 //! real kill, not just that the engine-level primitive exists.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +33,7 @@ fn fresh_root(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rubixdb_idx_crash_it_{tag}_{nanos}"))
 }
 
-fn rubixdb_cmd(root: &PathBuf) -> Command {
+fn rubixdb_cmd(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rubixdb"));
     cmd.env("RUBIXDB_INSTANCES_ROOT", root);
     cmd.env_remove("RUBIXDB_API_URL");
@@ -47,12 +47,13 @@ struct RunningOwner {
     admin_key: String,
 }
 
-fn read_manifest_and_credentials(root: &PathBuf) -> (u16, String) {
+fn read_manifest_and_credentials(root: &Path) -> (u16, String) {
     let manifest_path = root.join("default").join("instance.json");
     let creds_path = root.join("default").join("credentials.json");
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
-    let creds: Value = serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+    let creds: Value =
+        serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
     let port = manifest["api_port"].as_u64().unwrap() as u16;
     let admin_key = creds["admin_key"].as_str().unwrap().to_string();
     (port, admin_key)
@@ -61,7 +62,7 @@ fn read_manifest_and_credentials(root: &PathBuf) -> (u16, String) {
 /// Starts `rubixdb gui --no-browser` as the real owning process and
 /// waits for a real, verified `/healthz` response before returning --
 /// never a fixed sleep.
-fn start_owner_and_wait_ready(root: &PathBuf) -> RunningOwner {
+fn start_owner_and_wait_ready(root: &Path) -> RunningOwner {
     let child = rubixdb_cmd(root)
         .arg("gui")
         .arg("--no-browser")
@@ -102,7 +103,12 @@ fn start_owner_and_wait_ready(root: &PathBuf) -> RunningOwner {
     }
 }
 
-fn exec_sql(client: &reqwest::blocking::Client, base_url: &str, admin_key: &str, sql: &str) -> Value {
+fn exec_sql(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    admin_key: &str,
+    sql: &str,
+) -> Value {
     let resp = client
         .post(format!("{base_url}/v1/sql"))
         .bearer_auth(admin_key)
@@ -230,7 +236,10 @@ fn create_index_killed_mid_backfill_recovers_correctly_on_restart() {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(saw_building, "never observed the index in 'building' state -- backfill did not start in time");
+    assert!(
+        saw_building,
+        "never observed the index in 'building' state -- backfill did not start in time"
+    );
 
     // Kill NOW, for real, while backfill is genuinely in progress.
     let mut child = owner.child;
@@ -287,7 +296,10 @@ fn create_index_killed_mid_backfill_recovers_correctly_on_restart() {
     );
     let rows = count["result"]["rows"].as_array().unwrap();
     let total: i64 = extract_int(&rows[0][0]);
-    assert_eq!(total, ROW_COUNT, "table row count must be exactly what was seeded, no torn writes");
+    assert_eq!(
+        total, ROW_COUNT,
+        "table row count must be exactly what was seeded, no torn writes"
+    );
 
     let mut restarted = restarted;
     let _ = restarted.child.kill();

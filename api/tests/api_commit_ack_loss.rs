@@ -114,7 +114,11 @@ async fn exec_sql(addr: std::net::SocketAddr, body: Value) -> Value {
         .send()
         .await
         .unwrap();
-    assert!(resp.status().is_success(), "setup/verification call failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "setup/verification call failed: {}",
+        resp.status()
+    );
     resp.json().await.unwrap()
 }
 
@@ -164,7 +168,9 @@ fn send_request_and_abandon_connection_without_reading_response(
     );
     stream.write_all(request.as_bytes()).expect("write headers");
     stream.write_all(&body_bytes).expect("write body");
-    stream.flush().expect("flush -- every byte handed to the OS/peer");
+    stream
+        .flush()
+        .expect("flush -- every byte handed to the OS/peer");
     // `flush()` only guarantees the bytes reached this side's own OS
     // send buffer, not that the peer has actually read and processed
     // them yet -- an immediate `drop()` risks a TCP RST racing ahead of
@@ -185,7 +191,11 @@ fn send_request_and_abandon_connection_without_reading_response(
 async fn commit_durably_succeeds_even_when_the_client_never_reads_the_response() {
     let addr = spawn_real_server().await;
 
-    exec_sql(addr, json!({ "sql": "DROP TABLE IF EXISTS ack_loss_t", "params": [] })).await;
+    exec_sql(
+        addr,
+        json!({ "sql": "DROP TABLE IF EXISTS ack_loss_t", "params": [] }),
+    )
+    .await;
     exec_sql(
         addr,
         json!({ "sql": "CREATE TABLE ack_loss_t (id INTEGER PRIMARY KEY, v TEXT)", "params": [] }),
@@ -229,7 +239,10 @@ async fn commit_durably_succeeds_even_when_the_client_never_reads_the_response()
         verify["result"]["row_count"], 1,
         "the server must have durably committed even though the client never read the COMMIT response: {verify}"
     );
-    assert_eq!(verify["result"]["rows"][0][0]["value"], "committed-but-unacked");
+    assert_eq!(
+        verify["result"]["rows"][0][0]["value"],
+        "committed-but-unacked"
+    );
 
     // Safe retry semantics, documented not invented: a naive client
     // that assumes "no response means retry the same request" and
@@ -238,7 +251,11 @@ async fn commit_durably_succeeds_even_when_the_client_never_reads_the_response()
     // first, successful commit) -- never a silent no-op success that
     // would misrepresent what actually happened, and never a second
     // real side effect.
-    let retry = exec_sql_allow_error(addr, json!({ "sql": "COMMIT", "params": [], "session_id": session_id })).await;
+    let retry = exec_sql_allow_error(
+        addr,
+        json!({ "sql": "COMMIT", "params": [], "session_id": session_id }),
+    )
+    .await;
     assert_eq!(
         retry["error"]["code"], "SESSION_NOT_FOUND",
         "retrying COMMIT on an already-consumed session_id must be a clear, safe rejection, not fabricated idempotency: {retry}"

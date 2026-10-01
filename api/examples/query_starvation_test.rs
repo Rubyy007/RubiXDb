@@ -129,7 +129,12 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-async fn exec_sql(client: &reqwest::Client, base_url: &str, admin_key: &str, sql: &str) -> Result<u16, String> {
+async fn exec_sql(
+    client: &reqwest::Client,
+    base_url: &str,
+    admin_key: &str,
+    sql: &str,
+) -> Result<u16, String> {
     let resp = client
         .post(format!("{base_url}/v1/sql"))
         .bearer_auth(admin_key)
@@ -147,9 +152,14 @@ async fn exec_sql(client: &reqwest::Client, base_url: &str, admin_key: &str, sql
 
 async fn seed(server: &Server) {
     let client = reqwest::Client::new();
-    exec_sql(&client, &server.base_url, &server.admin_key, "DROP TABLE IF EXISTS starve_big")
-        .await
-        .ok();
+    exec_sql(
+        &client,
+        &server.base_url,
+        &server.admin_key,
+        "DROP TABLE IF EXISTS starve_big",
+    )
+    .await
+    .ok();
     exec_sql(
         &client,
         &server.base_url,
@@ -184,7 +194,9 @@ async fn seed(server: &Server) {
             println!("  seeded {inserted}/{ROW_COUNT}");
         }
     }
-    println!("seeded {ROW_COUNT} rows into starve_big (no secondary index -- forces sequential scan)");
+    println!(
+        "seeded {ROW_COUNT} rows into starve_big (no secondary index -- forces sequential scan)"
+    );
 }
 
 #[derive(Default)]
@@ -208,7 +220,13 @@ fn report_line(label: &str, s: &Samples) {
     );
 }
 
-async fn cheap_worker(base_url: String, admin_key: String, stop_at: Instant, samples: Arc<Samples>, seed: u64) {
+async fn cheap_worker(
+    base_url: String,
+    admin_key: String,
+    stop_at: Instant,
+    samples: Arc<Samples>,
+    seed: u64,
+) {
     let client = reqwest::Client::new();
     let mut rng: u64 = 0x9E3779B97F4A7C15 ^ seed;
     let mut next = move || {
@@ -240,7 +258,12 @@ async fn cheap_worker(base_url: String, admin_key: String, stop_at: Instant, sam
     }
 }
 
-async fn control_plane_worker(base_url: String, admin_key: String, stop_at: Instant, samples: Arc<Samples>) {
+async fn control_plane_worker(
+    base_url: String,
+    admin_key: String,
+    stop_at: Instant,
+    samples: Arc<Samples>,
+) {
     let client = reqwest::Client::new();
     let endpoints = [
         ("GET", "/healthz", false),
@@ -395,7 +418,11 @@ async fn main() {
     println!("phase_secs={phase_secs} per phase, levels={LEVELS:?}, row_count={ROW_COUNT}");
 
     let server = spawn_server(18097).await;
-    println!("server pid={} data_dir={}", server.child.id(), server.data_dir.display());
+    println!(
+        "server pid={} data_dir={}",
+        server.child.id(),
+        server.data_dir.display()
+    );
 
     let seed_start = Instant::now();
     seed(&server).await;
@@ -403,8 +430,22 @@ async fn main() {
 
     for &level in LEVELS.iter() {
         println!("\n=== concurrency level: {level} cheap workers ===");
-        run_phase(&server, &format!("BASELINE (no expensive query), N={level}"), level, false, phase_secs).await;
-        run_phase(&server, &format!("LOADED (1 expensive query running), N={level}"), level, true, phase_secs).await;
+        run_phase(
+            &server,
+            &format!("BASELINE (no expensive query), N={level}"),
+            level,
+            false,
+            phase_secs,
+        )
+        .await;
+        run_phase(
+            &server,
+            &format!("LOADED (1 expensive query running), N={level}"),
+            level,
+            true,
+            phase_secs,
+        )
+        .await;
     }
 
     println!("\n=== query starvation test complete ===");

@@ -8,7 +8,7 @@
 //! transaction/lock/port crossover between the two, not just that both
 //! stayed alive.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ fn fresh_root(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rubixdb_multi_inst_{tag}_{nanos}"))
 }
 
-fn rubixdb_cmd(root: &PathBuf, instance_name: &str) -> Command {
+fn rubixdb_cmd(root: &Path, instance_name: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rubixdb"));
     cmd.env("RUBIXDB_INSTANCES_ROOT", root);
     cmd.env("RUBIXDB_INSTANCE_NAME", instance_name);
@@ -45,20 +45,25 @@ struct Instance {
     admin_key: String,
 }
 
-fn read_manifest_and_credentials(root: &PathBuf, name: &str) -> Option<(u16, String)> {
+fn read_manifest_and_credentials(root: &Path, name: &str) -> Option<(u16, String)> {
     let manifest_path = root.join(name).join("instance.json");
     let creds_path = root.join(name).join("credentials.json");
     if !manifest_path.is_file() || !creds_path.is_file() {
         return None;
     }
-    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).ok()?).ok()?;
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).ok()?).ok()?;
     let creds: Value = serde_json::from_str(&std::fs::read_to_string(&creds_path).ok()?).ok()?;
     let port = manifest["api_port"].as_u64()? as u16;
     let admin_key = creds["admin_key"].as_str()?.to_string();
     Some((port, admin_key))
 }
 
-fn start_instance(root: &PathBuf, name: &'static str) -> Instance {
+// `clippy::zombie_processes` cannot see that the spawned child is moved into
+// the returned `Instance`, whose owner `kill()`s and `wait()`s it (see the
+// end of the test); the only other path kills and waits explicitly below.
+#[allow(clippy::zombie_processes)]
+fn start_instance(root: &Path, name: &'static str) -> Instance {
     // `rubixdb gui` selects a named instance via the `--instance NAME`
     // flag (`cli/src/gui.rs`), not `RUBIXDB_INSTANCE_NAME` (that env
     // var is only read by the plain client role in `main.rs` --
@@ -83,7 +88,10 @@ fn start_instance(root: &PathBuf, name: &'static str) -> Instance {
                 .timeout(Duration::from_millis(500))
                 .build()
                 .unwrap();
-            if let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/healthz")).send() {
+            if let Ok(resp) = client
+                .get(format!("http://127.0.0.1:{port}/healthz"))
+                .send()
+            {
                 if resp.status().is_success() {
                     return Instance {
                         name,
@@ -111,7 +119,12 @@ fn http_client() -> reqwest::Client {
         .unwrap()
 }
 
-async fn exec_sql(client: &reqwest::Client, base_url: &str, admin_key: &str, sql: &str) -> Result<Value, String> {
+async fn exec_sql(
+    client: &reqwest::Client,
+    base_url: &str,
+    admin_key: &str,
+    sql: &str,
+) -> Result<Value, String> {
     let resp = client
         .post(format!("{base_url}/v1/sql"))
         .bearer_auth(admin_key)
@@ -188,10 +201,21 @@ async fn run_phase(
             let client = http_client();
             while Instant::now() < stop_at {
                 let start = Instant::now();
-                match exec_sql(&client, &url, &key, &format!("SELECT COUNT(*) FROM {label}_t")).await {
+                match exec_sql(
+                    &client,
+                    &url,
+                    &key,
+                    &format!("SELECT COUNT(*) FROM {label}_t"),
+                )
+                .await
+                {
                     Ok(_) => {
                         stats.read_ok.fetch_add(1, Ordering::Relaxed);
-                        stats.read_latency_us.lock().unwrap().push(start.elapsed().as_micros() as u64);
+                        stats
+                            .read_latency_us
+                            .lock()
+                            .unwrap()
+                            .push(start.elapsed().as_micros() as u64);
                     }
                     Err(_) => {
                         stats.read_err.fetch_add(1, Ordering::Relaxed);
@@ -260,17 +284,41 @@ async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_co
     println!("instance B: {} pid={}", b.base_url, b.child.id());
 
     let client = http_client();
-    exec_sql(&client, &a.base_url, &a.admin_key, "CREATE TABLE instA_t (id INTEGER PRIMARY KEY, v TEXT)")
-        .await
-        .unwrap();
-    exec_sql(&client, &b.base_url, &b.admin_key, "CREATE TABLE instB_t (id INTEGER PRIMARY KEY, v TEXT)")
-        .await
-        .unwrap();
+    exec_sql(
+        &client,
+        &a.base_url,
+        &a.admin_key,
+        "CREATE TABLE instA_t (id INTEGER PRIMARY KEY, v TEXT)",
+    )
+    .await
+    .unwrap();
+    exec_sql(
+        &client,
+        &b.base_url,
+        &b.admin_key,
+        "CREATE TABLE instB_t (id INTEGER PRIMARY KEY, v TEXT)",
+    )
+    .await
+    .unwrap();
     // Seed a few rows so read-heavy workers have something real to
     // read from the start.
     for i in 0..20 {
-        exec_sql(&client, &a.base_url, &a.admin_key, &format!("INSERT INTO instA_t (id, v) VALUES ({i}, 'seed')")).await.unwrap();
-        exec_sql(&client, &b.base_url, &b.admin_key, &format!("INSERT INTO instB_t (id, v) VALUES ({i}, 'seed')")).await.unwrap();
+        exec_sql(
+            &client,
+            &a.base_url,
+            &a.admin_key,
+            &format!("INSERT INTO instA_t (id, v) VALUES ({i}, 'seed')"),
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &client,
+            &b.base_url,
+            &b.admin_key,
+            &format!("INSERT INTO instB_t (id, v) VALUES ({i}, 'seed')"),
+        )
+        .await
+        .unwrap();
     }
 
     let (rss_a0, h_a0, t_a0) = sample_process_metrics(a.child.id()).unwrap_or((0, 0, 0));
@@ -322,10 +370,26 @@ async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_co
     println!("resource A: rss {rss_a0}->{rss_a1}->{rss_a2} kb, handles {h_a0}->{h_a1}->{h_a2}, threads {t_a0}->{t_a1}->{t_a2}");
     println!("resource B: rss {rss_b0}->{rss_b1}->{rss_b2} kb, handles {h_b0}->{h_b1}->{h_b2}, threads {t_b0}->{t_b1}->{t_b2}");
 
-    assert_eq!(a_read1.read_err.load(Ordering::Relaxed), 0, "instance A reads must have zero errors under simultaneous cross-instance load");
-    assert_eq!(a_write1.write_err.load(Ordering::Relaxed), 0, "instance B writes must have zero errors in phase 1");
-    assert_eq!(b_read2.read_err.load(Ordering::Relaxed), 0, "instance B reads must have zero errors in phase 2");
-    assert_eq!(b_write2.write_err.load(Ordering::Relaxed), 0, "instance A writes must have zero errors in phase 2");
+    assert_eq!(
+        a_read1.read_err.load(Ordering::Relaxed),
+        0,
+        "instance A reads must have zero errors under simultaneous cross-instance load"
+    );
+    assert_eq!(
+        a_write1.write_err.load(Ordering::Relaxed),
+        0,
+        "instance B writes must have zero errors in phase 1"
+    );
+    assert_eq!(
+        b_read2.read_err.load(Ordering::Relaxed),
+        0,
+        "instance B reads must have zero errors in phase 2"
+    );
+    assert_eq!(
+        b_write2.write_err.load(Ordering::Relaxed),
+        0,
+        "instance A writes must have zero errors in phase 2"
+    );
 
     // --- Crossover verification ---
 
@@ -334,12 +398,36 @@ async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_co
 
     // Catalog/data crossover: instance A must never see instance B's
     // table, and vice versa.
-    let a_tables = exec_sql(&client, &a.base_url, &a.admin_key, "SELECT COUNT(*) FROM instA_t").await;
+    let a_tables = exec_sql(
+        &client,
+        &a.base_url,
+        &a.admin_key,
+        "SELECT COUNT(*) FROM instA_t",
+    )
+    .await;
     assert!(a_tables.is_ok(), "instance A must see its own table");
-    let a_sees_b = exec_sql(&client, &a.base_url, &a.admin_key, "SELECT COUNT(*) FROM instB_t").await;
-    assert!(a_sees_b.is_err(), "instance A must NOT see instance B's table -- zero catalog crossover");
-    let b_sees_a = exec_sql(&client, &b.base_url, &b.admin_key, "SELECT COUNT(*) FROM instA_t").await;
-    assert!(b_sees_a.is_err(), "instance B must NOT see instance A's table -- zero catalog crossover");
+    let a_sees_b = exec_sql(
+        &client,
+        &a.base_url,
+        &a.admin_key,
+        "SELECT COUNT(*) FROM instB_t",
+    )
+    .await;
+    assert!(
+        a_sees_b.is_err(),
+        "instance A must NOT see instance B's table -- zero catalog crossover"
+    );
+    let b_sees_a = exec_sql(
+        &client,
+        &b.base_url,
+        &b.admin_key,
+        "SELECT COUNT(*) FROM instA_t",
+    )
+    .await;
+    assert!(
+        b_sees_a.is_err(),
+        "instance B must NOT see instance A's table -- zero catalog crossover"
+    );
 
     // Lock/credential crossover: instance A's admin key must not
     // authenticate against instance B's server.
@@ -358,7 +446,9 @@ async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_co
 
     // Transaction crossover: begin a transaction on A, confirm B has
     // no knowledge of that session_id at all.
-    let begin_a = exec_sql(&client, &a.base_url, &a.admin_key, "BEGIN").await.unwrap();
+    let begin_a = exec_sql(&client, &a.base_url, &a.admin_key, "BEGIN")
+        .await
+        .unwrap();
     let session_id = begin_a["session_id"].as_str().unwrap().to_string();
     let commit_attempt_on_b = http_client()
         .post(format!("{}/v1/sql", b.base_url))

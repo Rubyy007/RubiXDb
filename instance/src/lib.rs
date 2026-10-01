@@ -231,7 +231,10 @@ impl std::fmt::Display for RemoveError {
         match self {
             RemoveError::NotFound => write!(f, "no such instance"),
             RemoveError::StillRunning => {
-                write!(f, "instance is currently running; stop it before deleting it")
+                write!(
+                    f,
+                    "instance is currently running; stop it before deleting it"
+                )
             }
             RemoveError::Io(e) => write!(f, "instance removal I/O error: {e}"),
             RemoveError::InvalidName(e) => write!(f, "{e}"),
@@ -257,7 +260,10 @@ impl std::error::Error for RemoveError {}
 /// establishes, applied to deletion.
 pub fn remove_instance(name: &str) -> Result<(), RemoveError> {
     let dir = paths::instance_dir(name).map_err(RemoveError::InvalidName)?;
-    if InstanceManifest::load(&dir).map_err(RemoveError::Io)?.is_none() {
+    if InstanceManifest::load(&dir)
+        .map_err(RemoveError::Io)?
+        .is_none()
+    {
         return Err(RemoveError::NotFound);
     }
     match InstanceLock::try_acquire(&dir) {
@@ -473,7 +479,10 @@ mod tests {
             let b = acquire("delete-me").unwrap();
             drop(b);
             remove_instance("delete-me").unwrap();
-            assert!(discover("keep-me").unwrap().is_some(), "unrelated instance must survive");
+            assert!(
+                discover("keep-me").unwrap().is_some(),
+                "unrelated instance must survive"
+            );
             drop(a);
         });
     }
