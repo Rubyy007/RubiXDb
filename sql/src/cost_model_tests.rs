@@ -16,9 +16,10 @@ use rubixdb::relational::RelationalValue;
 use crate::exec::cost::AccessPathMode;
 use crate::index_read_differential_tests::{rows_of, Diff, Mrow, Rng};
 
-const MODES: [AccessPathMode; 3] = [
+const MODES: [AccessPathMode; 4] = [
     AccessPathMode::Auto,
     AccessPathMode::ForceIndex,
+    AccessPathMode::ForcePkRange,
     AccessPathMode::ForceSeq,
 ];
 
@@ -116,6 +117,30 @@ fn shapes(rng: &mut Rng, groups: u64) -> Vec<Shape> {
     out.push((
         format!("SELECT * FROM dt WHERE id >= {idl} AND id < {idh}"),
         Box::new(move |r| r.0 >= idl && r.0 < idh),
+    ));
+    // Increment 18: every combination where a PK range and one or more
+    // secondary indexes can each satisfy part of the predicate.
+    out.push((
+        format!("SELECT * FROM dt WHERE id >= {idl} AND id < {idh} AND a = {v}"),
+        Box::new(move |r| r.0 >= idl && r.0 < idh && r.1 == Some(v)),
+    ));
+    let s4 = format!("s{}", rng.below(5));
+    let s5 = s4.clone();
+    out.push((
+        format!("SELECT * FROM dt WHERE id >= {idl} AND a >= {lo} AND a < {hi} AND b = '{s4}'"),
+        Box::new(move |r| {
+            r.0 >= idl
+                && r.1.is_some_and(|a| a >= lo && a < hi)
+                && r.2.as_deref() == Some(s5.as_str())
+        }),
+    ));
+    out.push((
+        format!("SELECT * FROM dt WHERE id < {idh} AND c = {k} AND a = {v}"),
+        Box::new(move |r| r.0 < idh && r.3 == k && r.1 == Some(v)),
+    ));
+    out.push((
+        format!("SELECT * FROM dt WHERE id >= {idl} AND id < {idh} AND a <= {lo}"),
+        Box::new(move |r| r.0 >= idl && r.0 < idh && r.1.is_some_and(|a| a <= lo)),
     ));
     out.push((
         format!("SELECT * FROM dt WHERE id = {idl}"),
@@ -482,3 +507,126 @@ fn statistics_registry_is_bounded() {
 
 #[allow(dead_code)]
 fn _types(_: RelationalType) {}
+
+// ---------------------------------------------------------------------
+// Increment 18: unified access-path selection (PK range vs secondary index)
+// ---------------------------------------------------------------------
+
+fn run_auto(d: &Diff, sql: &str) -> (usize, crate::exec::ExecMetricsSnapshot) {
+    let t = d.txm.begin().unwrap();
+    let (r, m) = d.select_in_metrics(sql, &t);
+    (r.rows.len(), m)
+}
+
+/// The Increment 18 baseline problem, as a deterministic decision test: a
+/// wide PK range plus a highly selective secondary predicate must execute
+/// through the index (the planner's structural choice is the PK range,
+/// which would walk the whole range); a narrow PK range plus an
+/// unselective secondary predicate must stay on the PK range.
+#[test]
+fn pk_range_and_secondary_index_are_priced_by_exact_row_counts() {
+    let d = Diff::with_memtable("access_unified", 4 * 1024 * 1024);
+    let mut rng = Rng(21);
+    // ids 0..4000; `a` has 2 groups (~half the rows each); one row gets a
+    // unique `a` so a selective index predicate exists.
+    let _ = load(&d, &mut rng, 4_000, 2);
+    d.write("UPDATE dt SET a = 777 WHERE id = 3100");
+    analyze(&d);
+
+    // wide PK range (3,000 rows) + selective index (1 row): index wins.
+    d.mode.set(AccessPathMode::Auto);
+    let (n, m) = run_auto(
+        &d,
+        "SELECT * FROM dt WHERE id >= 500 AND id < 3500 AND a = 777",
+    );
+    assert_eq!(n, 1);
+    assert_eq!(
+        m.pk_range_scans, 1,
+        "the planner's structural choice is the PK range"
+    );
+    assert_eq!(
+        m.access_path_switches, 1,
+        "...but execution must switch to the index"
+    );
+    assert!(
+        m.index_rows_examined <= 2,
+        "index path examined {} rows",
+        m.index_rows_examined
+    );
+
+    // narrow PK range (20 rows) + unselective index (~2,000 rows): PK stays.
+    let (_, m) = run_auto(
+        &d,
+        "SELECT * FROM dt WHERE id >= 100 AND id < 120 AND a = 1",
+    );
+    assert_eq!(
+        m.access_path_switches, 0,
+        "a 20-row PK range beats a 2,000-entry index"
+    );
+
+    // PK range far narrower than the index match: stays on the PK range even
+    // though both are sargable and the index is not unselective.
+    let (_, m) = run_auto(
+        &d,
+        "SELECT * FROM dt WHERE id >= 100 AND id < 130 AND a = 0",
+    );
+    assert_eq!(m.access_path_switches, 0);
+    d.f.cleanup();
+}
+
+/// Two secondary indexes can each serve the predicate; the more selective
+/// one must run (the planner's first-seen tie-break would pick `ia`).
+#[test]
+fn the_more_selective_of_two_secondary_indexes_is_chosen() {
+    let d = Diff::with_memtable("access_two_idx", 4 * 1024 * 1024);
+    let mut rng = Rng(5);
+    // `a`: 2 groups (unselective, ~2,000 rows); `b`: s0..s4 (~800 rows).
+    // Make one (a, b) combination rare through a dedicated value.
+    let mut model = load(&d, &mut rng, 4_000, 2);
+    d.write("UPDATE dt SET b = 'rare' WHERE id = 1234");
+    model.get_mut(&1234).unwrap().2 = Some("rare".to_string());
+    analyze(&d);
+    let (n, m) = run_auto(&d, "SELECT * FROM dt WHERE a >= 0 AND b = 'rare'");
+    let expected = model
+        .values()
+        .filter(|r| r.1.is_some_and(|a| a >= 0) && r.2.as_deref() == Some("rare"))
+        .count();
+    assert_eq!(n, expected, "result must equal the independent model");
+    // `ia` is the planner's first-seen candidate; the executor must examine
+    // far fewer than the ~2,000 entries `ia` would produce.
+    assert!(
+        m.index_rows_examined < 50,
+        "should have used the selective index, examined {}",
+        m.index_rows_examined
+    );
+    d.f.cleanup();
+}
+
+/// An access whose Sort was eliminated relies on one index's order; no
+/// alternative may replace it.
+#[test]
+fn ordered_scans_never_switch_candidates() {
+    let d = Diff::with_memtable("access_ordered", 4 * 1024 * 1024);
+    let mut rng = Rng(8);
+    let _ = load(&d, &mut rng, 1_500, 2);
+    analyze(&d);
+    let t = d.txm.begin().unwrap();
+    let (r, m) = d.select_in_metrics(
+        "SELECT id, a FROM dt WHERE a >= 0 AND id >= 0 AND id < 1400 ORDER BY a NULLS FIRST",
+        &t,
+    );
+    assert_eq!(m.access_path_switches, 0);
+    let a_vals: Vec<Option<i32>> = r
+        .rows
+        .iter()
+        .map(|row| match &row[1] {
+            Some(RelationalValue::Integer(v)) => Some(*v),
+            None => None,
+            o => panic!("{o:?}"),
+        })
+        .collect();
+    let mut sorted = a_vals.clone();
+    sorted.sort();
+    assert_eq!(a_vals, sorted, "ORDER BY order must hold");
+    d.f.cleanup();
+}

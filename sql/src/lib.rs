@@ -80,3 +80,9 @@ mod cost_model_tests;
 
 #[cfg(test)]
 mod inc17_overhead_bench;
+
+#[cfg(test)]
+mod txn_scan_tests;
+
+#[cfg(test)]
+mod materialization_tests;

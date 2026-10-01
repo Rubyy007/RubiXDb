@@ -8,17 +8,16 @@
 
 use std::ops::Bound;
 
-use rubixdb::relational::index::{IndexProbe, IndexScanSpec};
-use rubixdb::relational::{RelationalValue, Row};
+use rubixdb::relational::RelationalValue;
 
 use crate::aggregate::{AggregateArg, AggregateState, GroupingKey};
 use crate::ast::JoinKind;
 use crate::bound::{BoundAggregateExpr, BoundExpr, BoundOrderByItem, BoundSelectItem, NullsOrder};
 use crate::error::{Result, SqlError};
-use crate::exec::cost::{self, AccessPathMode};
+use crate::exec::access_op::AccessOp;
 use crate::exec::expr_eval::{eval, eval_predicate};
 use crate::exec::{ExecCtx, RowContext, Tuple};
-use crate::plan::access::{IndexAccessMode, IndexFallback, PhysicalAccess};
+use crate::plan::access::PhysicalAccess;
 use crate::plan::physical::{JoinAlgorithm, PhysicalPlan};
 
 /// The one interface every executable operator implements — item 6:
@@ -126,475 +125,8 @@ impl<'a> Operator<'a> for EmptyRelationOp {
 }
 
 // =======================================================================
-// Access — `PkLookup` / `IndexScan` / `SeqScan` (items 10/11/12/13/14/15).
+// Access -- see `exec/access_op.rs` (Increment 18 moved `AccessOp` there).
 // =======================================================================
-
-enum AccessSource<'a> {
-    /// `PkLookup`: at most one row, already fetched.
-    Single(Option<Row>),
-    /// `IndexScan`: `IndexBuilder`'s own eager `Vec` result (item 12/13;
-    /// see `ExecLimits::max_index_scan_rows`'s own doc comment for why
-    /// this is bounded rather than lazy).
-    Vec(std::vec::IntoIter<(Vec<RelationalValue>, Row)>),
-    /// `SeqScan`: genuinely lazy, row-at-a-time (item 10 — never
-    /// materializes the whole table).
-    Lazy(Box<dyn Iterator<Item = rubixdb::relational::Result<(Vec<RelationalValue>, Row)>> + 'a>),
-}
-
-struct AccessOp<'a> {
-    table_ref: u32,
-    residual: Option<BoundExpr>,
-    source: AccessSource<'a>,
-    /// The outer context this access was built against — merged with
-    /// every fetched row before evaluating `residual`, since a
-    /// correlated residual (rare, but structurally possible) may still
-    /// reference the outer side.
-    outer: RowContext,
-    /// Cost-model observation of a lazy table scan (statistics only).
-    obs: Option<ScanObs>,
-}
-
-impl<'a> AccessOp<'a> {
-    fn build(access: &PhysicalAccess, outer: &RowContext, ec: &ExecCtx<'a>) -> Result<Self> {
-        match access {
-            PhysicalAccess::PkLookup {
-                table_ref,
-                key_values,
-                residual,
-                ..
-            } => {
-                let table_ref = *table_ref;
-                let resolved = resolve_values(key_values, outer, ec)?;
-                let row = match resolved {
-                    None => None, // a NULL key component can never match (item 62)
-                    Some(values) => {
-                        ec.metrics.record_pk_lookup();
-                        let row = ec.txn.get_row(access.table_id(), &values)?;
-                        if row.is_some() {
-                            ec.metrics.record_table_fetch();
-                        }
-                        row
-                    }
-                };
-                Ok(AccessOp {
-                    table_ref,
-                    residual: residual.clone(),
-                    source: AccessSource::Single(row),
-                    outer: outer.clone(),
-                    obs: None,
-                })
-            }
-            PhysicalAccess::IndexScan {
-                table_ref,
-                index_id,
-                mode,
-                residual,
-                fallback,
-                ..
-            } => {
-                let table_ref = *table_ref;
-                let table_id = access.table_id();
-                let as_of = ec.txn.snapshot_seq();
-                // Resolve the key/bounds from *this execution's* values (a
-                // parameter, or the current outer row of a correlated
-                // join). A NULL component can never match (item 62).
-                let spec = match mode {
-                    IndexAccessMode::Equality { prefix } => resolve_values(prefix, outer, ec)?
-                        .map(|v| IndexScanSpec::Equality(v.into_iter().map(Some).collect())),
-                    IndexAccessMode::Range { start, end } => {
-                        match (
-                            resolve_bound(start, outer, ec)?,
-                            resolve_bound(end, outer, ec)?,
-                        ) {
-                            (Some(start), Some(end)) => Some(IndexScanSpec::Range { start, end }),
-                            _ => None,
-                        }
-                    }
-                };
-                let Some(spec) = spec else {
-                    return Ok(AccessOp {
-                        table_ref,
-                        residual: residual.clone(),
-                        source: AccessSource::Vec(Vec::new().into_iter()),
-                        outer: outer.clone(),
-                        obs: None,
-                    });
-                };
-                ec.metrics.record_index_scan();
-
-                let path_mode = ec.limits.access_path;
-                if path_mode == AccessPathMode::ForceSeq {
-                    return Self::build_fallback(
-                        table_id,
-                        table_ref,
-                        fallback,
-                        outer,
-                        ec,
-                        FallbackReason::Cost,
-                    );
-                }
-
-                // The cost-based decision happens here, at execution, because
-                // it needs what a plan cannot know: the bound key values (a
-                // correlated join supplies a different one per outer row),
-                // the transaction snapshot, and the table's current size. An
-                // `ORDER BY` an eliminated Sort relies on never abandons the
-                // index (its ordering is part of its value).
-                let may_abandon =
-                    path_mode == AccessPathMode::Auto && fallback.order_ordinals.is_empty();
-                let stats = ec.table_store.runtime_stats();
-                let max_rows = ec.limits.max_index_scan_rows;
-                let started = std::time::Instant::now();
-                let mut counted = false;
-                let entries = loop {
-                    let est = stats.row_estimate(table_id);
-                    let entry_limit = if may_abandon {
-                        cost::entry_limit(est, stats.cost_params())
-                    } else {
-                        usize::MAX
-                    };
-                    match ec.index_builder.probe_index_entries_as_of(
-                        *index_id,
-                        &spec,
-                        as_of,
-                        entry_limit,
-                        max_rows,
-                    )? {
-                        IndexProbe::Entries(entries) => break entries,
-                        // F-2: the index was not Ready as of this snapshot,
-                        // so it does not represent the table this
-                        // transaction sees. Never use it, never return an
-                        // empty/partial result: run the semantically
-                        // identical table scan instead.
-                        IndexProbe::Unusable => {
-                            return Self::build_fallback(
-                                table_id,
-                                table_ref,
-                                fallback,
-                                outer,
-                                ec,
-                                FallbackReason::Snapshot,
-                            );
-                        }
-                        // More matches than the index path is estimated to
-                        // be worth. If the table size is unknown or stale,
-                        // count it once (cached) and decide again; otherwise
-                        // the scan is cheaper.
-                        IndexProbe::Truncated => {
-                            if !counted && cost::estimate_is_unreliable(est) {
-                                ec.table_store.count_rows(table_id)?;
-                                counted = true;
-                                continue;
-                            }
-                            return Self::build_fallback(
-                                table_id,
-                                table_ref,
-                                fallback,
-                                outer,
-                                ec,
-                                FallbackReason::Cost,
-                            );
-                        }
-                    }
-                };
-                let n_entries = entries.len();
-                let rows = ec.index_builder.fetch_index_rows_as_of(entries, as_of)?;
-                if !counted && n_entries >= INDEX_COST_SAMPLE_ROWS {
-                    stats.observe_index_cost(n_entries as u64, started.elapsed().as_nanos() as u64);
-                }
-                ec.metrics.record_index_rows_examined(rows.len() as u64);
-                ec.metrics.record_table_fetch();
-                Ok(AccessOp {
-                    table_ref,
-                    residual: residual.clone(),
-                    source: AccessSource::Vec(rows.into_iter()),
-                    outer: outer.clone(),
-                    obs: None,
-                })
-            }
-            PhysicalAccess::SeqScan {
-                table_ref,
-                predicate,
-                ..
-            } => {
-                let table_ref = *table_ref;
-                ec.metrics.record_seq_scan();
-                let as_of = ec.txn.snapshot_seq();
-                let iter = ec
-                    .table_store
-                    .scan_table_rows_as_of(access.table_id(), as_of)?;
-                Ok(AccessOp {
-                    table_ref,
-                    residual: predicate.clone(),
-                    source: AccessSource::Lazy(Box::new(iter)),
-                    outer: outer.clone(),
-                    obs: Some(ScanObs::new(access.table_id(), true)),
-                })
-            }
-            PhysicalAccess::PkRangeScan {
-                table_ref,
-                start,
-                end,
-                residual,
-                ..
-            } => {
-                let table_ref = *table_ref;
-                let as_of = ec.txn.snapshot_seq();
-                match (
-                    resolve_pk_bound(start, outer, ec)?,
-                    resolve_pk_bound(end, outer, ec)?,
-                ) {
-                    (Some(start), Some(end)) => {
-                        ec.metrics.record_pk_range_scan();
-                        let iter = ec.table_store.scan_table_pk_range_rows_as_of(
-                            access.table_id(),
-                            start,
-                            end,
-                            as_of,
-                        )?;
-                        ec.metrics.record_table_fetch();
-                        Ok(AccessOp {
-                            table_ref,
-                            residual: residual.clone(),
-                            source: AccessSource::Lazy(Box::new(iter)),
-                            outer: outer.clone(),
-                            obs: Some(ScanObs::new(access.table_id(), false)),
-                        })
-                    }
-                    // A NULL bound endpoint can never match (item 62,
-                    // same rule `PkLookup`/`IndexScan` already apply).
-                    _ => Ok(AccessOp {
-                        table_ref,
-                        residual: residual.clone(),
-                        source: AccessSource::Vec(Vec::new().into_iter()),
-                        outer: outer.clone(),
-                        obs: None,
-                    }),
-                }
-            }
-        }
-    }
-
-    /// The table-scan an `IndexScan` falls back to (see `IndexFallback`):
-    /// the table's whole predicate over a snapshot-consistent scan, with
-    /// the index's ordering re-established when an eliminated `Sort` relied
-    /// on it. Result-equivalent to the index path by construction -- it is
-    /// the same predicate over the same snapshot of the table, only without
-    /// the index.
-    fn build_fallback(
-        table_id: u32,
-        table_ref: u32,
-        fallback: &IndexFallback,
-        outer: &RowContext,
-        ec: &ExecCtx<'a>,
-        reason: FallbackReason,
-    ) -> Result<Self> {
-        ec.metrics.record_seq_scan();
-        match reason {
-            FallbackReason::Snapshot => ec.metrics.record_index_snapshot_fallback(),
-            FallbackReason::Cost => ec.metrics.record_index_cost_fallback(),
-        }
-        let as_of = ec.txn.snapshot_seq();
-        let iter = ec.table_store.scan_table_rows_as_of(table_id, as_of)?;
-        if fallback.order_ordinals.is_empty() {
-            return Ok(AccessOp {
-                table_ref,
-                residual: fallback.predicate.clone(),
-                source: AccessSource::Lazy(Box::new(iter)),
-                outer: outer.clone(),
-                obs: Some(ScanObs::new(table_id, true)),
-            });
-        }
-        // Ordered: collect the matching rows, then sort by the index's own
-        // column order (ascending, NULLS FIRST -- the only order an index
-        // scan can deliver). The scan yields primary-key order and the sort
-        // is stable, so ties come out in primary-key order, exactly the
-        // physical index order. Bounded like every other materializing
-        // operator.
-        let mut rows: Vec<(Vec<RelationalValue>, Row)> = Vec::new();
-        let mut scanned: u64 = 0;
-        for item in iter {
-            ec.check()?;
-            let (pk, row) = item?;
-            scanned += 1;
-            ec.metrics.record_rows_scanned(1);
-            let keep = match &fallback.predicate {
-                None => true,
-                Some(p) => {
-                    let ctx = outer.merged(&RowContext::single(table_ref, row.clone()));
-                    eval_predicate(p, &ctx, ec)?.is_true()
-                }
-            };
-            if !keep {
-                ec.metrics.record_rows_filtered(1);
-                continue;
-            }
-            if rows.len() >= ec.limits.max_materialized_rows {
-                return Err(SqlError::ResourceLimit {
-                    detail: format!(
-                        "ordered index-scan fallback exceeds max_materialized_rows ({})",
-                        ec.limits.max_materialized_rows
-                    ),
-                });
-            }
-            rows.push((pk, row));
-        }
-        ec.table_store
-            .runtime_stats()
-            .observe_row_count(table_id, scanned);
-        let ords = &fallback.order_ordinals;
-        rows.sort_by(|(_, a), (_, b)| compare_rows_by_ordinals(ords, a, b));
-        Ok(AccessOp {
-            table_ref,
-            residual: None,
-            source: AccessSource::Vec(rows.into_iter()),
-            outer: outer.clone(),
-            obs: None,
-        })
-    }
-
-    fn fetch_next(&mut self, ec: &ExecCtx<'a>) -> Result<Option<Row>> {
-        match &mut self.source {
-            AccessSource::Single(row) => Ok(row.take()),
-            AccessSource::Vec(iter) => Ok(iter.next().map(|(_, row)| row)),
-            AccessSource::Lazy(iter) => {
-                let next = iter.next().transpose()?;
-                if next.is_some() {
-                    ec.metrics.record_rows_scanned(1);
-                }
-                Ok(next.map(|(_, row)| row))
-            }
-        }
-    }
-}
-
-impl<'a> Operator<'a> for AccessOp<'a> {
-    fn next(&mut self, ec: &ExecCtx<'a>) -> Result<Option<Tuple>> {
-        loop {
-            ec.check()?;
-            let sample = self.obs.as_mut().and_then(|o| o.start());
-            let Some(row) = self.fetch_next(ec)? else {
-                if let Some(o) = &self.obs {
-                    o.finish(ec);
-                }
-                return Ok(None);
-            };
-            if let Some(o) = self.obs.as_mut() {
-                o.rows += 1;
-            }
-            let row_ctx = self.outer.merged(&RowContext::single(self.table_ref, row));
-            let keep = match &self.residual {
-                None => true,
-                Some(predicate) => eval_predicate(predicate, &row_ctx, ec)?.is_true(),
-            };
-            if let Some(o) = self.obs.as_mut() {
-                o.stop(sample);
-            }
-            if keep {
-                return Ok(Some(Tuple {
-                    ctx: row_ctx,
-                    projected: Vec::new(),
-                }));
-            }
-            ec.metrics.record_rows_filtered(1);
-        }
-    }
-}
-
-/// Rows behind an index-path cost observation (below it fixed per-scan
-/// overheads would distort the per-row figure).
-const INDEX_COST_SAMPLE_ROWS: usize = 256;
-
-/// Every `SCAN_SAMPLE_EVERY`-th scanned row of a lazy scan is timed (fetch,
-/// decode, and residual-predicate evaluation -- the whole per-row cost of
-/// the scan path), so the model learns the real per-row cost of *this*
-/// machine and data at a cost of two clock reads per 16 rows.
-const SCAN_SAMPLE_EVERY: u64 = 16;
-
-/// Observes one lazy table scan for the cost model: its sampled per-row
-/// cost, and -- if it visited the whole table and ran to exhaustion -- the
-/// table's exact row count. Purely statistical; never affects results.
-struct ScanObs {
-    table_id: u32,
-    /// `true` for a scan of the entire table (a `SeqScan` or the cost/
-    /// snapshot fallback); `false` for a bounded range, which yields cost
-    /// samples but no table size.
-    whole_table: bool,
-    rows: u64,
-    attempts: u64,
-    sampled_rows: u64,
-    sampled_ns: u64,
-}
-
-impl ScanObs {
-    fn new(table_id: u32, whole_table: bool) -> Self {
-        ScanObs {
-            table_id,
-            whole_table,
-            rows: 0,
-            attempts: 0,
-            sampled_rows: 0,
-            sampled_ns: 0,
-        }
-    }
-
-    #[inline]
-    fn start(&mut self) -> Option<std::time::Instant> {
-        self.attempts += 1;
-        if self.attempts % SCAN_SAMPLE_EVERY == 1 {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn stop(&mut self, started: Option<std::time::Instant>) {
-        if let Some(t) = started {
-            self.sampled_ns += t.elapsed().as_nanos() as u64;
-            self.sampled_rows += 1;
-        }
-    }
-
-    /// Called when the scan is exhausted.
-    fn finish(&self, ec: &ExecCtx) {
-        let stats = ec.table_store.runtime_stats();
-        if self.whole_table {
-            stats.observe_row_count(self.table_id, self.rows);
-        }
-        stats.observe_seq_cost(self.sampled_rows, self.sampled_ns);
-    }
-}
-
-/// Why an `IndexScan` ran as a table scan instead.
-enum FallbackReason {
-    /// F-2: the index was not `Ready` as of the transaction's snapshot.
-    Snapshot,
-    /// The cost model (or a forced mode) chose the table scan.
-    Cost,
-}
-
-/// Ascending, `NULLS FIRST` comparison of two rows over `ordinals` -- the
-/// same comparator `SortOp` applies to an `ORDER BY` item with those
-/// defaults, so a fallback's order is exactly what the eliminated `Sort`
-/// would have produced.
-fn compare_rows_by_ordinals(ordinals: &[u16], a: &Row, b: &Row) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    for &ord in ordinals {
-        let av = a.get(ord as usize).and_then(|v| v.as_ref());
-        let bv = b.get(ord as usize).and_then(|v| v.as_ref());
-        let o = match (av, bv) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (Some(x), Some(y)) => value_ordering(x, y),
-        };
-        if o != Ordering::Equal {
-            return o;
-        }
-    }
-    Ordering::Equal
-}
 
 /// Evaluates every expression in `exprs` against `outer`; `None` overall
 /// (short-circuiting the caller to zero rows, never a wrong lookup) the
@@ -605,7 +137,7 @@ fn compare_rows_by_ordinals(ordinals: &[u16], a: &Row, b: &Row) -> std::cmp::Ord
 /// would incorrectly search for physically-`NULL`-indexed rows (`IS
 /// NULL` semantics) instead of correctly matching nothing (`=`
 /// semantics).
-fn resolve_values(
+pub(super) fn resolve_values(
     exprs: &[BoundExpr],
     outer: &RowContext,
     ec: &ExecCtx,
@@ -620,7 +152,7 @@ fn resolve_values(
     Ok(Some(out))
 }
 
-fn resolve_bound(
+pub(super) fn resolve_bound(
     bound: &Bound<Vec<BoundExpr>>,
     outer: &RowContext,
     ec: &ExecCtx,
@@ -639,7 +171,7 @@ fn resolve_bound(
 /// never `NULL`), so this produces a plain `Bound<Vec<RelationalValue>>`
 /// directly, matching `TableStore::scan_table_pk_range_rows_as_of`'s
 /// (and `relational::key::encode_composite_key`'s) own signature.
-fn resolve_pk_bound(
+pub(super) fn resolve_pk_bound(
     bound: &Bound<Vec<BoundExpr>>,
     outer: &RowContext,
     ec: &ExecCtx,
@@ -1016,7 +548,7 @@ fn compare_sort_keys(
 /// row could be produced with one as a sort key's source column... this
 /// helper exists only because `Sort` evaluates keys independently of
 /// `WHERE`, so it takes the same defensive stance rather than assuming).
-fn value_ordering(a: &RelationalValue, b: &RelationalValue) -> std::cmp::Ordering {
+pub(super) fn value_ordering(a: &RelationalValue, b: &RelationalValue) -> std::cmp::Ordering {
     use RelationalValue::*;
     match (a, b) {
         (Boolean(x), Boolean(y)) => x.cmp(y),

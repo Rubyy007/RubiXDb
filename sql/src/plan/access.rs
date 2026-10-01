@@ -125,6 +125,15 @@ pub enum PhysicalAccess {
         mode: IndexAccessMode,
         residual: Option<BoundExpr>,
         fallback: IndexFallback,
+        /// Increment 18: the other sargable candidates for this same table
+        /// access (a PK range and/or other secondary indexes), each a
+        /// complete, independently executable access with its own residual
+        /// and fallback. The planner keeps its structural choice
+        /// (`self`) and the executor -- which alone knows the bound values,
+        /// the snapshot, and the exact per-candidate match counts -- picks
+        /// the cheapest. Empty when only one candidate exists, and ignored
+        /// when an eliminated `Sort` relies on this scan's order.
+        alternatives: Vec<PhysicalAccess>,
     },
     SeqScan {
         table_id: u32,
@@ -156,6 +165,12 @@ pub enum PhysicalAccess {
         /// Every remaining conjunct not consumed by the range bound
         /// itself — never dropped (same rule as `PkLookup`/`IndexScan`).
         residual: Option<BoundExpr>,
+        /// The table access's complete predicate (Increment 18): a
+        /// transaction's own uncommitted rows are tested against it, and
+        /// it is what a table scan would apply (see `IndexFallback`).
+        fallback: IndexFallback,
+        /// See `IndexScan::alternatives`.
+        alternatives: Vec<PhysicalAccess>,
     },
 }
 
@@ -248,9 +263,14 @@ pub fn plan_table_access(
     // already-certified secondary-index selection path. Seeded into
     // `best` first so it competes with secondary indexes on the same
     // "most consumed conjuncts wins" rule below.
-    let mut best: Option<(usize, PhysicalAccess, Vec<bool>)> = None;
+    // Every sargable candidate, in deterministic order: the PK range first,
+    // then each Ready secondary index in catalog order. The structural
+    // choice below is exactly the pre-Increment-18 rule (strictly more
+    // consumed conjuncts wins; first-seen on a tie); the other candidates
+    // ride along as `alternatives` for the executor's cost-based decision.
+    let mut candidates: Vec<(usize, PhysicalAccess, Vec<bool>)> = Vec::new();
     if !table.pk_ordinals.is_empty() {
-        if let Some((access, consumed_count, consumed)) = candidate_pk_range_access(
+        if let Some(c) = candidate_pk_range_access(
             table_id,
             table_ref,
             &table.pk_ordinals,
@@ -258,7 +278,7 @@ pub fn plan_table_access(
             &equality_by_ordinal,
             &comparisons,
         ) {
-            best = Some((consumed_count, access, consumed));
+            candidates.push((c.1, c.0, c.2));
         }
     }
 
@@ -283,62 +303,42 @@ pub fn plan_table_access(
         ) else {
             continue;
         };
-        let better = match &best {
-            None => true,
-            // Deterministic tie-break (item 53): strictly more consumed
-            // conjuncts wins; on an exact tie, the first-seen (lowest
-            // `index_id`, since `list_indexes` returns catalog order)
-            // is kept — never a `HashMap`-order-dependent choice.
-            Some((best_count, _, _)) => consumed_count > *best_count,
-        };
-        if better {
-            best = Some((consumed_count, access, consumed));
-        }
+        candidates.push((consumed_count, access, consumed));
     }
 
-    if let Some((_, access, consumed)) = best {
-        let residual = residual_of(&parts, &consumed);
-        return Ok(match access {
-            PhysicalAccess::IndexScan {
-                table_id,
-                table_ref,
-                index_id,
-                index_name,
-                mode,
-                ..
-            } => {
-                metrics.record_index_scan();
-                PhysicalAccess::IndexScan {
-                    table_id,
-                    table_ref,
-                    index_id,
-                    index_name,
-                    mode,
-                    residual,
-                    fallback: IndexFallback {
-                        predicate: Some(predicate.clone()),
-                        order_ordinals: Vec::new(),
-                    },
-                }
+    if !candidates.is_empty() {
+        // Deterministic tie-break (item 53): strictly more consumed
+        // conjuncts wins; on an exact tie the first-seen candidate (the PK
+        // range, then the lowest `index_id`) is kept -- never a
+        // `HashMap`-order-dependent choice.
+        let mut best_idx = 0;
+        for (i, (count, _, _)) in candidates.iter().enumerate() {
+            if *count > candidates[best_idx].0 {
+                best_idx = i;
             }
-            PhysicalAccess::PkRangeScan {
-                table_id,
-                table_ref,
-                start,
-                end,
-                ..
-            } => {
-                metrics.record_pk_range_scan();
-                PhysicalAccess::PkRangeScan {
-                    table_id,
-                    table_ref,
-                    start,
-                    end,
-                    residual,
-                }
+        }
+        let (_, primary, primary_consumed) = candidates.remove(best_idx);
+        let mut alternatives: Vec<PhysicalAccess> = Vec::new();
+        for (_, alt, alt_consumed) in candidates {
+            if alternatives.len() >= MAX_ACCESS_ALTERNATIVES {
+                break;
             }
-            other => other,
-        });
+            alternatives.push(finish_candidate(
+                alt,
+                &alt_consumed,
+                &parts,
+                predicate,
+                Vec::new(),
+            ));
+        }
+        let finished =
+            finish_candidate(primary, &primary_consumed, &parts, predicate, alternatives);
+        match &finished {
+            PhysicalAccess::IndexScan { .. } => metrics.record_index_scan(),
+            PhysicalAccess::PkRangeScan { .. } => metrics.record_pk_range_scan(),
+            _ => {}
+        }
+        return Ok(finished);
     }
 
     // --- item 41: no safe index access exists — fall back to SeqScan
@@ -351,6 +351,61 @@ pub fn plan_table_access(
         table_ref,
         predicate: Some(predicate.clone()),
     })
+}
+
+/// Hard bound on the alternatives carried by one access (a plan's size must
+/// not grow with the number of indexes on a table).
+pub const MAX_ACCESS_ALTERNATIVES: usize = 3;
+
+/// Completes a candidate access: its residual (every conjunct it did not
+/// consume), its complete-predicate fallback, and its alternatives.
+fn finish_candidate(
+    access: PhysicalAccess,
+    consumed: &[bool],
+    parts: &[BoundExpr],
+    predicate: &BoundExpr,
+    alternatives: Vec<PhysicalAccess>,
+) -> PhysicalAccess {
+    let residual = residual_of(parts, consumed);
+    let fallback = IndexFallback {
+        predicate: Some(predicate.clone()),
+        order_ordinals: Vec::new(),
+    };
+    match access {
+        PhysicalAccess::IndexScan {
+            table_id,
+            table_ref,
+            index_id,
+            index_name,
+            mode,
+            ..
+        } => PhysicalAccess::IndexScan {
+            table_id,
+            table_ref,
+            index_id,
+            index_name,
+            mode,
+            residual,
+            fallback,
+            alternatives,
+        },
+        PhysicalAccess::PkRangeScan {
+            table_id,
+            table_ref,
+            start,
+            end,
+            ..
+        } => PhysicalAccess::PkRangeScan {
+            table_id,
+            table_ref,
+            start,
+            end,
+            residual,
+            fallback,
+            alternatives,
+        },
+        other => other,
+    }
 }
 
 fn residual_of(parts: &[BoundExpr], consumed: &[bool]) -> Option<BoundExpr> {
@@ -407,6 +462,7 @@ fn candidate_index_access(
                 mode: IndexAccessMode::Equality { prefix },
                 residual: None,
                 fallback: IndexFallback::unset(),
+                alternatives: Vec::new(),
             },
             count,
             consumed,
@@ -499,6 +555,7 @@ fn candidate_index_access(
             mode: IndexAccessMode::Range { start, end },
             residual: None,
             fallback: IndexFallback::unset(),
+            alternatives: Vec::new(),
         },
         count,
         consumed,
@@ -618,6 +675,8 @@ fn candidate_pk_range_access(
             start,
             end,
             residual: None,
+            fallback: IndexFallback::unset(),
+            alternatives: Vec::new(),
         },
         count,
         consumed,

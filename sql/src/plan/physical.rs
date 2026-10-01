@@ -396,6 +396,7 @@ fn order_only_index_access(
                     predicate: None,
                     order_ordinals: ordinals.clone(),
                 },
+                alternatives: Vec::new(),
             }));
         }
     }

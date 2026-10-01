@@ -9,6 +9,7 @@
 //! outside this increment," item 65's "no plan node may silently fall
 //! through").
 
+mod access_op;
 pub mod cost;
 pub mod expr_eval;
 pub mod operators;
@@ -317,6 +318,7 @@ pub struct ExecMetrics {
     index_scans: AtomicU64,
     index_snapshot_fallbacks: AtomicU64,
     index_cost_fallbacks: AtomicU64,
+    access_path_switches: AtomicU64,
     pk_range_scans: AtomicU64,
     joins: AtomicU64,
     execution_time_ms_total: AtomicU64,
@@ -363,6 +365,10 @@ pub struct ExecMetricsSnapshot {
     /// Increment 17: index scans abandoned for a table scan by the cost
     /// model.
     pub index_cost_fallbacks: u64,
+    /// Increment 18: accesses executed through a different candidate than
+    /// the planner's structural choice (a cheaper PK range or secondary
+    /// index, priced by exact row counts).
+    pub access_path_switches: u64,
     pub pk_range_scans: u64,
     pub joins: u64,
     pub execution_time_ms_total: u64,
@@ -410,6 +416,9 @@ impl ExecMetrics {
     pub fn record_index_cost_fallback(&self) {
         self.index_cost_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_access_path_switch(&self) {
+        self.access_path_switches.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn record_pk_range_scan(&self) {
         self.pk_range_scans.fetch_add(1, Ordering::Relaxed);
     }
@@ -448,6 +457,7 @@ impl ExecMetrics {
             index_scans: self.index_scans.load(Ordering::Relaxed),
             index_snapshot_fallbacks: self.index_snapshot_fallbacks.load(Ordering::Relaxed),
             index_cost_fallbacks: self.index_cost_fallbacks.load(Ordering::Relaxed),
+            access_path_switches: self.access_path_switches.load(Ordering::Relaxed),
             pk_range_scans: self.pk_range_scans.load(Ordering::Relaxed),
             joins: self.joins.load(Ordering::Relaxed),
             execution_time_ms_total: self.execution_time_ms_total.load(Ordering::Relaxed),

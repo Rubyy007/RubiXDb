@@ -786,6 +786,28 @@ impl IndexBuilder {
         }))
     }
 
+    /// Phase 2, lazily: an iterator that fetches each enumerated entry's
+    /// row on demand (see `IndexRowFetcher`).
+    pub fn lazy_row_fetcher<'a>(
+        &'a self,
+        entries: IndexEntries,
+        as_of_seq: u64,
+    ) -> IndexRowFetcher<'a> {
+        let IndexEntries {
+            table,
+            columns,
+            entries,
+        } = entries;
+        IndexRowFetcher {
+            store: &self.table_store,
+            table,
+            columns,
+            entries: entries.into_iter(),
+            as_of_seq,
+            stats: &self.stats,
+        }
+    }
+
     /// Phase 2: fetch the row for every enumerated entry at `as_of_seq`.
     /// A row whose entry exists but which is not visible at the snapshot
     /// (deleted before it) is skipped, exactly as before.
@@ -819,6 +841,59 @@ impl IndexBuilder {
     }
 }
 
+/// Increment 18: phase 2 of an index read as a *lazy* iterator. The matching
+/// index entries were enumerated up front (key-only, ~0.6us each, bounded by
+/// `max_index_scan_rows`); the point read and decode of each row now happens
+/// only when a consumer asks for it. Holds the enumerated entries (primary
+/// keys, tens of bytes each) -- never the rows -- so a `LIMIT 10` over a
+/// 25,000-match index range fetches ten rows, not 25,000, and an operator
+/// that stops pulling (cancellation, deadline, early exit) stops the work.
+/// Same snapshot as the probe, so MVCC visibility is unchanged.
+pub struct IndexRowFetcher<'a> {
+    store: &'a TableStore,
+    table: crate::catalog::schema::TableRow,
+    columns: Vec<crate::catalog::schema::ColumnRow>,
+    entries: std::vec::IntoIter<(Vec<RelationalValue>, Vec<u8>)>,
+    as_of_seq: u64,
+    stats: &'a IndexStats,
+}
+
+impl IndexRowFetcher<'_> {
+    /// Entries not yet fetched (an upper bound on the rows still to come).
+    pub fn remaining(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Iterator for IndexRowFetcher<'_> {
+    type Item = Result<(Vec<RelationalValue>, Row)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (pk_values, pk_bytes) in self.entries.by_ref() {
+            match self.store.fetch_row_by_encoded_pk(
+                &self.table,
+                &self.columns,
+                &pk_values,
+                &pk_bytes,
+                self.as_of_seq,
+            ) {
+                // A row whose entry exists but which is not visible at the
+                // snapshot (deleted before it) is skipped, as in the eager
+                // path.
+                Ok(None) => continue,
+                Ok(Some(row)) => {
+                    self.stats
+                        .index_rows_fetched
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(Ok((pk_values, row)));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
+}
+
 /// What an index read is asked to enumerate (Increment 17).
 #[derive(Debug, Clone)]
 pub enum IndexScanSpec {
@@ -847,6 +922,14 @@ impl IndexEntries {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Drops every entry whose encoded primary key fails `keep`. A
+    /// transaction's scan uses this to hide base-snapshot rows the
+    /// transaction has itself rewritten or deleted (their local version, if
+    /// any, is added back by the overlay), *before* any row is fetched.
+    pub fn retain_pk_bytes(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
+        self.entries.retain(|(_, pk_bytes)| keep(pk_bytes));
     }
 }
 

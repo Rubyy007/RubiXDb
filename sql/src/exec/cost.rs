@@ -61,6 +61,9 @@ pub enum AccessPathMode {
     #[default]
     Auto,
     ForceIndex,
+    /// Increment 18: run the PK-range candidate if the access has one
+    /// (benchmarking; otherwise behaves as `Auto`).
+    ForcePkRange,
     ForceSeq,
 }
 

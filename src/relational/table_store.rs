@@ -415,16 +415,7 @@ impl TableStore {
         as_of_seq: u64,
     ) -> Result<impl Iterator<Item = Result<(Vec<RelationalValue>, Row)>> + '_> {
         let (table, columns) = self.resolve_table(table_id)?;
-        let encode_bound = |b: Bound<Vec<RelationalValue>>| -> Result<Bound<Vec<u8>>> {
-            Ok(match b {
-                Bound::Unbounded => Bound::Unbounded,
-                Bound::Included(values) => Bound::Included(encode_composite_key(&values)?),
-                Bound::Excluded(values) => Bound::Excluded(encode_composite_key(&values)?),
-            })
-        };
-        let start_bytes = encode_bound(start)?;
-        let end_bytes = encode_bound(end)?;
-        let (phys_start, phys_end) = index_scan_range(table_id, 0, start_bytes, end_bytes);
+        let (phys_start, phys_end) = pk_range_physical_bounds(table_id, start, end)?;
         Ok(self
             .engine
             .range_scan(
@@ -437,6 +428,56 @@ impl TableStore {
                 decode_table_row_entry(&table, &columns, &key, &value)
             }))
     }
+
+    /// Increment 18: how many rows a PK range covers at `as_of_seq`,
+    /// counted exactly but **only up to `limit`** (the second element is
+    /// `true` when the range holds more than `limit` rows and counting
+    /// stopped early). Key-only work (no row decode), so the cost model can
+    /// price a PK range exactly the way it prices an index scan -- by its
+    /// real row count -- without ever walking more than the budget allows.
+    pub fn count_pk_range_rows_as_of(
+        &self,
+        table_id: u32,
+        start: Bound<Vec<RelationalValue>>,
+        end: Bound<Vec<RelationalValue>>,
+        as_of_seq: u64,
+        limit: u64,
+    ) -> Result<(u64, bool)> {
+        let (phys_start, phys_end) = pk_range_physical_bounds(table_id, start, end)?;
+        let mut n: u64 = 0;
+        for entry in self.engine.range_scan(
+            as_bound_ref(&phys_start),
+            as_bound_ref(&phys_end),
+            as_of_seq,
+        ) {
+            entry?;
+            if n >= limit {
+                return Ok((n, true));
+            }
+            n += 1;
+        }
+        Ok((n, false))
+    }
+}
+
+/// The physical `[start, end)` key range of a PK-prefix range (shared by
+/// `scan_table_pk_range_rows_as_of` and `count_pk_range_rows_as_of`, so the
+/// two can never disagree about which rows a range covers).
+fn pk_range_physical_bounds(
+    table_id: u32,
+    start: Bound<Vec<RelationalValue>>,
+    end: Bound<Vec<RelationalValue>>,
+) -> Result<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {
+    let encode_bound = |b: Bound<Vec<RelationalValue>>| -> Result<Bound<Vec<u8>>> {
+        Ok(match b {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(values) => Bound::Included(encode_composite_key(&values)?),
+            Bound::Excluded(values) => Bound::Excluded(encode_composite_key(&values)?),
+        })
+    };
+    let start_bytes = encode_bound(start)?;
+    let end_bytes = encode_bound(end)?;
+    Ok(index_scan_range(table_id, 0, start_bytes, end_bytes))
 }
 
 /// Decodes one raw `(key, value)` pair from a table's physical row range

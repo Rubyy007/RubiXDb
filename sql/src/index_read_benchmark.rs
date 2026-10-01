@@ -326,6 +326,7 @@ impl Env {
                 access_path: match self.mode.load(std::sync::atomic::Ordering::Relaxed) {
                     1 => crate::exec::cost::AccessPathMode::ForceIndex,
                     2 => crate::exec::cost::AccessPathMode::ForceSeq,
+                    3 => crate::exec::cost::AccessPathMode::ForcePkRange,
                     _ => crate::exec::cost::AccessPathMode::Auto,
                 },
                 ..ExecLimits::default()
@@ -343,6 +344,7 @@ impl Env {
                 M::Auto => 0,
                 M::ForceIndex => 1,
                 M::ForceSeq => 2,
+                M::ForcePkRange => 3,
             },
             std::sync::atomic::Ordering::Relaxed,
         );
@@ -1429,4 +1431,128 @@ fn count_rows_cost() {
         );
         env.cleanup();
     }
+}
+
+// ---------------------------------------------------------------------
+// Increment 18 baselines
+// ---------------------------------------------------------------------
+
+/// PK-range vs secondary-index baseline (the current planner always prefers
+/// the access consuming more conjuncts, so `id range AND e = x` is a
+/// PkRangeScan with the index ignored). Each path is measured
+/// independently by writing the same logical predicate in a shape the
+/// planner cannot use for the other path:
+///   auto  : id >= lo AND id < hi AND e = 'g0'                  (planner's choice)
+///   pk    : id >= lo AND id < hi AND (e = 'g0' OR e = 'g0')    (index not sargable)
+///   index : id + 0 >= lo AND id + 0 < hi AND e = 'g0'          (PK range not sargable)
+///   seq   : id + 0 >= lo AND id + 0 < hi AND (e = 'g0' OR e = 'g0')
+/// `COUNT(*)` keeps result materialization out of the comparison.
+#[test]
+#[ignore]
+fn pk_range_vs_index_baseline() {
+    let n: usize = env_list("INC16_SIZES", &[100_000])[0];
+    let env = sx_env(
+        &format!("inc18_pkidx_{n}"),
+        n,
+        &[10_000, 1_000, 100, 10, 4, 2],
+    );
+    println!(
+        "\n=== PK range vs index vs seq, N={n} (COUNT(*), p50 ms; compact_auto={}) ===",
+        std::env::var("INC16_COMPACT").unwrap_or_default()
+    );
+    println!(
+        "{:>9} {:>9} | {:>9} {:>9} {:>9} {:>9} | {:<6} {:<6} {:>7} | {:>6}",
+        "pk rows R", "idx rows K", "auto", "pk", "index", "seq", "auto=", "best", "regret", "match"
+    );
+    let range_rows = [10usize, 1_000, n / 10, n / 2];
+    let groups = [10_000usize, 1_000, 10, 2]; // K = n/G
+    for &r in &range_rows {
+        for &g in &groups {
+            let lo = n / 4;
+            let hi = lo + r;
+            let col = format!("e{g}");
+            let k = n / g;
+            let q = |range: &str, pred: &str| {
+                format!("SELECT COUNT(*) FROM sx WHERE {range} AND {pred}")
+            };
+            let sargable_pk = format!("id >= {lo} AND id < {hi}");
+            let blind_pk = format!("id + 0 >= {lo} AND id + 0 < {hi}");
+            let sargable_ix = format!("{col} = 'g0'");
+            let blind_ix = format!("({col} = 'g0' OR {col} = 'g0')");
+            let auto = run_query(&env, &q(&sargable_pk, &sargable_ix));
+            let pk = run_query(&env, &q(&sargable_pk, &blind_ix));
+            let ix = run_query(&env, &q(&blind_pk, &sargable_ix));
+            let sq = run_query(&env, &q(&blind_pk, &blind_ix));
+            assert_eq!(auto.rows, 1);
+            let times = [
+                ("pk", pk.lat.pct(0.5)),
+                ("index", ix.lat.pct(0.5)),
+                ("seq", sq.lat.pct(0.5)),
+            ];
+            let best = times
+                .iter()
+                .cloned()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            println!(
+                "{r:>9} {k:>9} | {:>9.3} {:>9.3} {:>9.3} {:>9.3} | {:<6} {:<6} {:>6.2}x | {}",
+                auto.lat.pct(0.5),
+                pk.lat.pct(0.5),
+                ix.lat.pct(0.5),
+                sq.lat.pct(0.5),
+                "pk(plan)",
+                best.0,
+                auto.lat.pct(0.5) / best.1,
+                if auto.exec.pk_range_scans == 1 {
+                    "PkRange"
+                } else {
+                    "other"
+                }
+            );
+        }
+    }
+    env.cleanup();
+}
+
+/// Materialization baseline: resident-set growth, latency and the LIMIT
+/// behaviour of the eager index scan. `LIMIT 10` over an index range of K
+/// rows currently fetches all K rows before returning 10.
+#[test]
+#[ignore]
+fn materialization_baseline() {
+    use crate::exec::cost::AccessPathMode as M;
+    let n = 100_000;
+    let env = sx_env("inc18_mat", n, &[]);
+    env.set_mode(M::ForceIndex);
+    println!("\n=== eager index materialization, N={n} (ForceIndex) ===");
+    println!(
+        "{:>8} | {:>10} {:>10} | {:>12} {:>12} {:>10}",
+        "K", "full p50ms", "RSS MB", "LIMIT10 p50", "LIMIT10 rows", "ratio"
+    );
+    for k in [10usize, 100, 1_000, 10_000, 25_000] {
+        let full = format!("SELECT * FROM sx WHERE s >= 0 AND s < {k}");
+        let lim = format!("SELECT * FROM sx WHERE s >= 0 AND s < {k} LIMIT 10");
+        let plan = env.prepare(&full);
+        // RSS delta with the result alive, best of 5
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let before = proc_sample().rss_mb;
+            let res = env.exec(&plan, &ExecMetrics::default());
+            let after = proc_sample().rss_mb;
+            assert_eq!(res.rows.len(), k);
+            best = best.min((after - before).max(0.0));
+            drop(res);
+        }
+        let r_full = run_query(&env, &full);
+        let r_lim = run_query(&env, &lim);
+        println!(
+            "{k:>8} | {:>10.3} {:>10.1} | {:>12.3} {:>12} {:>9.1}x",
+            r_full.lat.pct(0.5),
+            best,
+            r_lim.lat.pct(0.5),
+            r_lim.rows,
+            r_lim.lat.pct(0.5) / r_full.lat.pct(0.5)
+        );
+    }
+    env.cleanup();
 }

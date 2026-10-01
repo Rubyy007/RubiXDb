@@ -128,6 +128,53 @@ enum RowOp {
 /// `Transaction::writes`'s own doc comment.
 type WriteSet = HashMap<u32, HashMap<Vec<u8>, (Vec<RelationalValue>, RowOp)>>;
 
+/// Increment 18: one local write as a transaction's own scans see it.
+/// `row == None` is a buffered `DELETE` (the key must be hidden from the
+/// base snapshot); `Some(row)` is the transaction's latest version of the
+/// row (an insertion, or an update that replaces the base version).
+#[derive(Debug, Clone)]
+pub struct OverlayEntry {
+    pub encoded_pk: Vec<u8>,
+    pub pk_values: Vec<RelationalValue>,
+    pub row: Option<Row>,
+}
+
+/// An immutable, key-ordered snapshot of one table's slice of a
+/// transaction's write set (`PHASE_RUBIXDB_INCREMENT18_TRANSACTION_SCAN_
+/// SEMANTICS.md`): the base snapshot PLUS this overlay is exactly the table
+/// the transaction can see. Bounded by `TxnLimits::max_write_set_ops`
+/// (one entry per distinct key the transaction touched), built lazily and
+/// cached until the transaction next writes, so a scan of a table the
+/// transaction has not written costs one hash probe and a correlated join
+/// pays for the build once, not per outer row. Entries are sorted by
+/// encoded primary key, which is the table's physical key order, so a scan
+/// can merge them into a PK-ordered base scan in one pass.
+#[derive(Debug)]
+pub struct TableOverlay {
+    entries: Vec<OverlayEntry>,
+    by_pk: HashMap<Vec<u8>, usize>,
+}
+
+impl TableOverlay {
+    pub fn entries(&self) -> &[OverlayEntry] {
+        &self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Does the transaction hold a local write (insert, update or delete)
+    /// for this encoded primary key?
+    pub fn contains(&self, encoded_pk: &[u8]) -> bool {
+        self.by_pk.contains_key(encoded_pk)
+    }
+}
+
 fn approx_row_bytes(values: &[Option<RelationalValue>]) -> usize {
     values
         .iter()
@@ -216,6 +263,8 @@ impl TransactionManager {
             op_count: 0,
             byte_count: 0,
             finished: false,
+            write_version: 0,
+            overlay_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -287,6 +336,10 @@ pub struct Transaction {
     op_count: usize,
     byte_count: usize,
     finished: bool,
+    /// Bumped by every buffered write; keys `overlay_cache`.
+    write_version: u64,
+    /// `table_id -> (write_version it was built at, overlay)`.
+    overlay_cache: std::sync::Mutex<HashMap<u32, (u64, Arc<TableOverlay>)>>,
 }
 
 impl Transaction {
@@ -310,6 +363,44 @@ impl Transaction {
     /// is entirely unaffected by reading this value.
     pub fn snapshot_seq(&self) -> u64 {
         self.snapshot.seq()
+    }
+
+    /// Increment 18: this transaction's own uncommitted writes to `table_id`,
+    /// as an immutable key-ordered overlay a scan merges over its base
+    /// snapshot read -- or `None` if the transaction has not written the
+    /// table (the common case, which costs one hash probe). Never reads the
+    /// engine and never exposes another transaction's writes.
+    pub fn overlay_for(&self, table_id: u32) -> Option<Arc<TableOverlay>> {
+        let table_writes = self.writes.get(&table_id)?;
+        if table_writes.is_empty() {
+            return None;
+        }
+        let mut cache = self.overlay_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((version, overlay)) = cache.get(&table_id) {
+            if *version == self.write_version {
+                return Some(Arc::clone(overlay));
+            }
+        }
+        let mut entries: Vec<OverlayEntry> = table_writes
+            .iter()
+            .map(|(encoded_pk, (pk_values, op))| OverlayEntry {
+                encoded_pk: encoded_pk.clone(),
+                pk_values: pk_values.clone(),
+                row: match op {
+                    RowOp::Put(row) => Some(row.clone()),
+                    RowOp::Delete => None,
+                },
+            })
+            .collect();
+        entries.sort_by(|a, b| a.encoded_pk.cmp(&b.encoded_pk));
+        let by_pk = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.encoded_pk.clone(), i))
+            .collect();
+        let overlay = Arc::new(TableOverlay { entries, by_pk });
+        cache.insert(table_id, (self.write_version, Arc::clone(&overlay)));
+        Some(overlay)
     }
 
     fn require_active(&self) -> Result<()> {
@@ -423,6 +514,7 @@ impl Transaction {
             self.op_count += 1;
         }
         self.byte_count += approx_bytes;
+        self.write_version += 1;
         Ok(())
     }
 

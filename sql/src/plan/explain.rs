@@ -240,6 +240,7 @@ fn write_access(access: &PhysicalAccess, out: &mut String) {
             start,
             end,
             residual,
+            ..
         } => {
             let _ = write!(
                 out,
