@@ -4413,3 +4413,74 @@ only on pre-existing, unrelated items**: WAL throughput targets M1.2/M1.3
 `..._RESULTS.md` section 1/4. Not claimed: "secondary indexes are
 production-ready". Not measured: >1M rows, process-cold runs, mixed
 read+write concurrency. Stopped after Increment 16 per the mandate.
+
+## 2026-10-02 (Increment 17: secondary-index snapshot correctness + cost-based access-path selection)
+
+Closes the two open items Increment 16 recorded: F-2 (a snapshot older than
+an index (re)build missed rows through that index) and the absence of a
+cost-based index-vs-scan decision. Append-only; the Increment 14/15/16
+records are unchanged. Full record:
+`PHASE_RUBIXDB_INCREMENT17_INDEX_SNAPSHOT_ARCHITECTURE.md`,
+`PHASE_RUBIXDB_INCREMENT17_COST_MODEL_ARCHITECTURE.md`,
+`PHASE_RUBIXDB_INCREMENT17_PERFORMANCE.md`,
+`PHASE_RUBIXDB_INCREMENT17_RESULTS.md`.
+
+**F-2 FIXED.** Reproduced first on unmodified HEAD (730ecca) in five
+deterministic scenarios (no sleeps; the "BEGIN during CREATE INDEX" cases
+drive the real lifecycle via `create_index` + `recover_incomplete_builds`).
+Root cause: backfilled index entries are retroactive derived data stamped
+with a later sequence than the rows they describe, while the planner treated
+any currently-Ready index as valid for every snapshot. The readiness
+sequence is the engine sequence of the Building->Ready catalog write, which
+is already a durable MVCC version of the index's catalog row -- so the fix
+adds no persisted metadata: an index may serve a read only if its catalog row
+read *as of the snapshot* is Ready (`CatalogService::get_index_as_of`,
+`IndexBuilder::index_row_usable_at`). Otherwise the executor runs the
+identical table scan (the physical plan carries a complete fallback predicate
+and, where an eliminated Sort relied on index order, the order columns, so
+ordering is re-established with the Sort operator's own comparator). A
+mutation test (validity ignoring the snapshot) fails all 10 F-2 tests. The
+Increment 16 ignored reproduction is now a permanent regression; the
+differential harness's snapshot-retirement workaround is deleted. Only
+*missing* rows occur in F-2 (a first-draft "extra rows" claim was corrected).
+
+**Cost-based selection.** Decided at execution (a plan cannot know the
+snapshot, parameter values or, for a correlated join, the current outer row)
+from the exact match count K (index entries are enumerated key-only,
+~0.6us each, before any row is fetched), a table-size estimate with a
+rigorous drift bound (`|true-rows| <= drift`, property-tested) learned from
+scans/backfills/an on-demand count (0.58us/row), and self-calibrating per-row
+costs (EWMA, clamped). Break-even K* = N_hi * seq_ns / index_ns -- no
+percentage constant. Conservative by construction (unknown/stale -> index).
+Statistics: bounded in-memory (<= 4,096 tables), nothing persisted, write
+hook 21-26ns (~850ns with 8 contending threads) vs ~4ms per durable write.
+
+**Measured (same machine, before = Increment 16 tree in a clean worktree).**
+57 selectivity points across 4 regimes (10K, 100K compaction on/off, 1M):
+the model picked the faster path at 55; the other 2 were dead-even ties
+(regret <= 1.01x). Crossover 17%-25% (differs per regime). Always-index was
+up to 3.7x slower (100K, 90%) / 2.7x (1M, 50%); Auto within 5% of the oracle.
+Selective queries, PK paths, planner (8-23us), concurrency 1-32 threads,
+JOIN/aggregation/UPDATE/DELETE: unchanged within noise (an apparent 6% DELETE
+gap in back-to-back batches was bisected to machine drift; interleaved A/B:
+108.2 vs 107.7ms).
+
+**Tests added:** 8 F-2 scenario tests; F-2 churn property (76 rebuilds, 37
+Compactions); every differential step now randomizes the access path;
+path-independence property with poisoned statistics (12 fixed seeds + 16
+proptest cases, INNER/LEFT JOIN, COUNT); decision tests; drift-bound
+property; restart test of the ready-sequence boundary; unit tests for cost
+and stats.
+
+**Verification:** fmt and `clippy -D warnings` clean; protected-path audit
+(`src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`) zero diff.
+Full regression is FAIL only on pre-existing, unrelated items re-verified on
+the Increment 16 tree: WAL throughput targets M1.2/M1.3 (documented in
+PROCESS.md since 2026-09-14) and the debug-only CLI test
+`two_instances_simultaneous_...` (tokio blocking-in-async; passes in release).
+Not claimed: blanket "secondary indexes production-ready", "cost-based
+planner production-ready", or "RubixDB production-ready". Not measured: >1M
+rows, process-cold runs, mixed read+write load. Eager index-result
+materialization, PK-range-vs-index cost comparison, and read-your-own-writes
+on scans (pre-existing) are recorded as separate items. Stopped after
+Increment 17 per the mandate.

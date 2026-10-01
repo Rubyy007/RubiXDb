@@ -15,6 +15,7 @@ pub mod error;
 pub mod index;
 pub mod index_key;
 pub mod key;
+pub mod stats;
 pub mod table_store;
 pub mod txn;
 pub mod value;

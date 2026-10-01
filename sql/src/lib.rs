@@ -71,3 +71,12 @@ mod index_read_benchmark;
 
 #[cfg(test)]
 mod index_read_differential_tests;
+
+#[cfg(test)]
+mod index_snapshot_tests;
+
+#[cfg(test)]
+mod cost_model_tests;
+
+#[cfg(test)]
+mod inc17_overhead_bench;

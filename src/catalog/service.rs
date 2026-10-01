@@ -621,6 +621,26 @@ impl CatalogService {
         }
     }
 
+    /// Increment 17 (F-2): the index catalog row exactly as a reader
+    /// pinned at `as_of_seq` sees it -- the catalog rows are ordinary
+    /// MVCC-versioned engine keys, so the version visible at a
+    /// transaction's snapshot is the authoritative answer to "what state
+    /// was this index in when that snapshot was taken" (`Building` before
+    /// the `Building -> Ready` promotion's own write, `Ready` after it).
+    /// No separate "ready sequence" is stored: the promotion's engine
+    /// sequence number *is* the version boundary, and it is durable and
+    /// recovered exactly like every other catalog row.
+    pub fn get_index_as_of(&self, index_id: u32, as_of_seq: u64) -> Result<Option<IndexRow>> {
+        let key = catalog_key(SYSTEM_TABLE_INDEXES, &index_id.to_be_bytes());
+        match self.engine.get_as_of(&key, as_of_seq)? {
+            None => Ok(None),
+            Some(bytes) => {
+                let (_, fields) = decode_row(&bytes, &INDEXES_SCHEMA)?;
+                Ok(Some(IndexRow::from_fields(index_id, fields)?))
+            }
+        }
+    }
+
     /// Surrogate `index_id` PK (CA.2) — full-table scan filtered by
     /// `table_id`, the same documented tradeoff as `list_tables`.
     pub fn list_indexes(&self, table_id: u32) -> Result<Vec<IndexRow>> {

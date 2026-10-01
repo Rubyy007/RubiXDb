@@ -40,6 +40,9 @@ pub struct TableStore {
     /// entry per table ever written to or indexed, for this process's
     /// lifetime — bounded by the table count, never by write volume).
     epoch_locks: Mutex<HashMap<u32, Arc<RwLock<()>>>>,
+    /// Increment 17: bounded in-memory runtime statistics for cost-based
+    /// access-path selection (performance only, never correctness).
+    stats: crate::relational::stats::RuntimeStats,
 }
 
 impl TableStore {
@@ -48,7 +51,32 @@ impl TableStore {
             engine,
             catalog,
             epoch_locks: Mutex::new(HashMap::new()),
+            stats: crate::relational::stats::RuntimeStats::default(),
         }
+    }
+
+    /// The runtime statistics registry (row-count estimates with drift
+    /// bounds, observed per-row costs). See `relational::stats`.
+    pub fn runtime_stats(&self) -> &crate::relational::stats::RuntimeStats {
+        &self.stats
+    }
+
+    /// Exact number of rows currently in `table_id` (one pass over the
+    /// table's row range), recorded as the table's row-count estimate. Cost
+    /// is linear in the table size, so callers use it sparingly: only when a
+    /// decision genuinely needs a count and none has been observed.
+    pub fn count_rows(&self, table_id: u32) -> Result<u64> {
+        let (start, end) = table_row_range(table_id);
+        let mut n: u64 = 0;
+        for row in self
+            .engine
+            .range_scan(as_bound_ref(&start), as_bound_ref(&end), u64::MAX)
+        {
+            row?;
+            n += 1;
+        }
+        self.stats.observe_row_count(table_id, n);
+        Ok(n)
     }
 
     /// The affected table's index epoch lock, creating it on first use.
@@ -145,7 +173,9 @@ impl TableStore {
             )?);
         }
         ops.push(build_put_op(&table, &encoded_pk, &columns, values)?);
-        Ok(self.engine.write_batch(&ops)?)
+        let seq = self.engine.write_batch(&ops)?;
+        self.stats.note_mutations(table_id, 1);
+        Ok(seq)
     }
 
     /// A genuinely multi-row atomic write through one `write_batch`
@@ -191,7 +221,9 @@ impl TableStore {
             }
             ops.push(build_put_op(&table, &encoded_pk, &columns, values)?);
         }
-        Ok(self.engine.write_batch(&ops)?)
+        let seq = self.engine.write_batch(&ops)?;
+        self.stats.note_mutations(table_id, rows.len() as u64);
+        Ok(seq)
     }
 
     pub fn get_row(&self, table_id: u32, pk_values: &[RelationalValue]) -> Result<Option<Row>> {
@@ -284,7 +316,9 @@ impl TableStore {
             )?);
         }
         ops.push(WriteOp::Delete { key });
-        Ok(self.engine.write_batch(&ops)?)
+        let seq = self.engine.write_batch(&ops)?;
+        self.stats.note_mutations(table_id, 1);
+        Ok(seq)
     }
 
     /// A table-scoped range scan (D2's physical namespace/`table_id`

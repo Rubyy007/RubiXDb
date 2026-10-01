@@ -304,6 +304,7 @@ impl IndexBuilder {
         let (start, end) = table_row_range(table_id);
         let epoch = self.table_store.epoch_lock(table_id);
         let mut total_written: u64 = 0;
+        let mut rows_enumerated: u64 = 0;
 
         let mut iter = self
             .engine
@@ -322,6 +323,7 @@ impl IndexBuilder {
             if candidates.is_empty() {
                 break;
             }
+            rows_enumerated += candidates.len() as u64;
 
             let mut ops = Vec::with_capacity(candidates.len());
             {
@@ -353,6 +355,12 @@ impl IndexBuilder {
                 .index_entries_written
                 .fetch_add(ops.len() as u64, Ordering::Relaxed);
         }
+        // Increment 17: the enumeration visited every row of the table at
+        // the backfill snapshot -- a free, exact row count for the cost
+        // model's statistics.
+        self.table_store
+            .runtime_stats()
+            .observe_row_count(table_id, rows_enumerated);
         Ok(total_written)
     }
 
@@ -490,22 +498,31 @@ impl IndexBuilder {
     // by normal reads).
     // -----------------------------------------------------------------
 
-    fn ready_index(&self, index_id: u32) -> Result<IndexRow> {
-        let index_row =
-            self.catalog
-                .get_index(index_id)?
-                .ok_or_else(|| RelationalError::NotFound {
-                    object: format!("index {index_id}"),
-                })?;
-        if index_row.state != IndexState::Ready {
-            return Err(RelationalError::InvalidInput {
-                detail: format!(
-                    "index {index_id} is not Ready (state {:?}) and cannot be used for reads",
-                    index_row.state
-                ),
-            });
+    /// Increment 17 (F-2): is `index_id` a faithful representation of the
+    /// table as visible at `as_of_seq`? Returns the index's catalog row
+    /// *as that snapshot saw it* iff its state there was `Ready`, else
+    /// `None`.
+    ///
+    /// Why this is exactly "`snapshot_seq >= index_ready_seq`": backfill
+    /// writes the index entries at engine sequence numbers strictly below
+    /// the `Building -> Ready` promotion's own catalog write, and from the
+    /// promotion onward every writer maintains the index in the same
+    /// atomic batch as the row. A reader whose snapshot is at or after the
+    /// promotion therefore sees a complete, correct index; a reader whose
+    /// snapshot is before it sees the index absent, `Building`, or only
+    /// partially populated (and, if an indexed value changed in between,
+    /// entries that disagree with the row version it can see) -- it must
+    /// not use it. The promotion's version in the (MVCC) catalog row is
+    /// the persisted, crash-safe ready sequence; no new metadata exists to
+    /// lose or migrate. An index that was `Dropping` at the snapshot is
+    /// likewise unusable (writers had stopped maintaining it), while one
+    /// dropped *after* the snapshot is still valid for it (its entry
+    /// tombstones carry later sequences).
+    pub fn index_row_usable_at(&self, index_id: u32, as_of_seq: u64) -> Result<Option<IndexRow>> {
+        match self.catalog.get_index_as_of(index_id, as_of_seq)? {
+            Some(row) if row.state == IndexState::Ready => Ok(Some(row)),
+            _ => Ok(None),
         }
-        Ok(index_row)
     }
 
     fn indexed_types(
@@ -570,28 +587,8 @@ impl IndexBuilder {
         as_of_seq: u64,
         max_rows: usize,
     ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
-        let index_row = self.ready_index(index_id)?;
-        if prefix_values.is_empty() || prefix_values.len() > index_row.column_ordinals.len() {
-            return Err(RelationalError::InvalidInput {
-                detail: format!(
-                    "index {index_id} covers {} column(s); lookup prefix must supply 1..={} value(s), got {}",
-                    index_row.column_ordinals.len(),
-                    index_row.column_ordinals.len(),
-                    prefix_values.len()
-                ),
-            });
-        }
-        let prefix_bytes = encode_indexed_columns(prefix_values)?;
-        let (start, end) = index_entry_prefix_range(index_row.table_id, index_id, &prefix_bytes);
-        let rows = self.scan_entries(
-            &index_row,
-            as_bound_ref(&start),
-            as_bound_ref(&end),
-            as_of_seq,
-            max_rows,
-        )?;
-        self.stats.index_lookups.fetch_add(1, Ordering::Relaxed);
-        Ok(rows)
+        let spec = IndexScanSpec::Equality(prefix_values.to_vec());
+        self.scan_via_probe(index_id, &spec, as_of_seq, max_rows)
     }
 
     /// A real ordered range scan over one index's entries — item 17's
@@ -632,45 +629,104 @@ impl IndexBuilder {
         as_of_seq: u64,
         max_rows: usize,
     ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
-        let index_row = self.ready_index(index_id)?;
-        let encode_bound = |b: Bound<Vec<Option<RelationalValue>>>| -> Result<Bound<Vec<u8>>> {
-            Ok(match b {
-                Bound::Unbounded => Bound::Unbounded,
-                Bound::Included(v) => Bound::Included(encode_indexed_columns(&v)?),
-                Bound::Excluded(v) => Bound::Excluded(encode_indexed_columns(&v)?),
-            })
-        };
-        let start_bytes = encode_bound(start)?;
-        let end_bytes = encode_bound(end)?;
-        let (phys_start, phys_end) =
-            index_scan_range(index_row.table_id, index_id, start_bytes, end_bytes);
-        let rows = self.scan_entries(
-            &index_row,
-            as_bound_ref(&phys_start),
-            as_bound_ref(&phys_end),
-            as_of_seq,
-            max_rows,
-        )?;
-        self.stats.index_range_scans.fetch_add(1, Ordering::Relaxed);
-        Ok(rows)
+        let spec = IndexScanSpec::Range { start, end };
+        self.scan_via_probe(index_id, &spec, as_of_seq, max_rows)
     }
 
-    fn scan_entries(
+    /// The eager one-call scan every pre-Increment-17 caller uses: probe
+    /// every entry, then fetch every row. An index that was not `Ready` at
+    /// `as_of_seq` is an error here (these callers have no fallback path);
+    /// the SQL executor instead calls `probe_index_entries_as_of` directly
+    /// and falls back to a table scan.
+    fn scan_via_probe(
         &self,
-        index_row: &IndexRow,
-        start: Bound<&[u8]>,
-        end: Bound<&[u8]>,
+        index_id: u32,
+        spec: &IndexScanSpec,
         as_of_seq: u64,
         max_rows: usize,
     ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
-        // Increment 16: table/column metadata is resolved exactly once per
-        // scan and reused for every row fetch (previously `get_row_as_of`
-        // re-resolved it -- a catalog point read plus a catalog range scan
-        // -- once per matched row; see PHASE_RUBIXDB_INCREMENT16_INDEX_READ_
-        // ARCHITECTURE.md). Same schema-snapshot semantics `scan_table_rows_
-        // as_of` already has: one resolution per scan.
+        match self.probe_index_entries_as_of(index_id, spec, as_of_seq, usize::MAX, max_rows)? {
+            IndexProbe::Entries(entries) => self.fetch_index_rows_as_of(entries, as_of_seq),
+            IndexProbe::Unusable => Err(RelationalError::InvalidInput {
+                detail: format!(
+                    "index {index_id} was not Ready at snapshot {as_of_seq} and cannot be used \
+                     for reads"
+                ),
+            }),
+            IndexProbe::Truncated => unreachable!("entry_limit is usize::MAX"),
+        }
+    }
+
+    /// Increment 17, phase 1 of an index read: validate that the index is
+    /// usable for the snapshot (F-2), then enumerate the matching index
+    /// entries **without fetching any row**. Entry enumeration costs
+    /// ~0.6us per entry (Increment 16 measurement) against ~15us per row
+    /// fetched, so the caller learns the exact match count -- and can still
+    /// choose a different access path -- at a small fraction of the cost of
+    /// the index path itself.
+    ///
+    /// - `Unusable`: the index was not `Ready` as of `as_of_seq`; it does
+    ///   not represent the table that snapshot sees and must not be used.
+    /// - `Truncated`: more than `entry_limit` entries match (enumeration
+    ///   stopped early; nothing was fetched).
+    /// - `max_rows` is the hard resource bound: exceeding it fails closed
+    ///   with `ResourceLimit` (checked in preference to `Truncated` when
+    ///   `max_rows <= entry_limit`).
+    pub fn probe_index_entries_as_of(
+        &self,
+        index_id: u32,
+        spec: &IndexScanSpec,
+        as_of_seq: u64,
+        entry_limit: usize,
+        max_rows: usize,
+    ) -> Result<IndexProbe> {
+        let started = std::time::Instant::now();
+        let Some(index_row) = self.index_row_usable_at(index_id, as_of_seq)? else {
+            return Ok(IndexProbe::Unusable);
+        };
+        let (start, end) = match spec {
+            IndexScanSpec::Equality(prefix_values) => {
+                if prefix_values.is_empty() || prefix_values.len() > index_row.column_ordinals.len()
+                {
+                    return Err(RelationalError::InvalidInput {
+                        detail: format!(
+                            "index {index_id} covers {} column(s); lookup prefix must supply 1..={} value(s), got {}",
+                            index_row.column_ordinals.len(),
+                            index_row.column_ordinals.len(),
+                            prefix_values.len()
+                        ),
+                    });
+                }
+                let prefix_bytes = encode_indexed_columns(prefix_values)?;
+                index_entry_prefix_range(index_row.table_id, index_id, &prefix_bytes)
+            }
+            IndexScanSpec::Range { start, end } => {
+                let encode_bound =
+                    |b: &Bound<Vec<Option<RelationalValue>>>| -> Result<Bound<Vec<u8>>> {
+                        Ok(match b {
+                            Bound::Unbounded => Bound::Unbounded,
+                            Bound::Included(v) => Bound::Included(encode_indexed_columns(v)?),
+                            Bound::Excluded(v) => Bound::Excluded(encode_indexed_columns(v)?),
+                        })
+                    };
+                index_scan_range(
+                    index_row.table_id,
+                    index_id,
+                    encode_bound(start)?,
+                    encode_bound(end)?,
+                )
+            }
+        };
+        match spec {
+            IndexScanSpec::Equality(_) => self.stats.index_lookups.fetch_add(1, Ordering::Relaxed),
+            IndexScanSpec::Range { .. } => {
+                self.stats.index_range_scans.fetch_add(1, Ordering::Relaxed)
+            }
+        };
+
+        // Resolved once per scan (Increment 16) and carried to phase 2.
         let (table, columns) = self.table_store.resolve_table(index_row.table_id)?;
-        let indexed_types = Self::indexed_types(index_row, &columns)?;
+        let indexed_types = Self::indexed_types(&index_row, &columns)?;
         let pk_types: Vec<RelationalType> = table
             .pk_ordinals
             .iter()
@@ -684,57 +740,124 @@ impl IndexBuilder {
             })
             .collect::<Result<_>>()?;
 
-        let scan_started = std::time::Instant::now();
-        let mut out = Vec::new();
+        let cap = entry_limit.min(max_rows);
+        let mut entries: Vec<(Vec<RelationalValue>, Vec<u8>)> = Vec::new();
         let mut examined: u64 = 0;
-        for entry in self.engine.range_scan(start, end, as_of_seq) {
+        let mut outcome = None;
+        for entry in self
+            .engine
+            .range_scan(as_bound_ref(&start), as_bound_ref(&end), as_of_seq)
+        {
             let (key, _value) = entry?;
             examined += 1;
+            if entries.len() >= cap {
+                outcome = Some(if max_rows <= entry_limit {
+                    Err(RelationalError::ResourceLimit {
+                        detail: format!(
+                            "index scan exceeded the {max_rows}-row materialization limit (max_index_scan_rows)"
+                        ),
+                    })
+                } else {
+                    Ok(IndexProbe::Truncated)
+                });
+                break;
+            }
             let body = key.get(9..).ok_or_else(|| RelationalError::InvalidInput {
                 detail: "index entry key shorter than the fixed 9-byte header".to_string(),
             })?;
             let (_indexed_values, consumed) = decode_indexed_columns(&indexed_types, body)?;
             let pk_bytes = &body[consumed..];
             let pk_values = decode_composite_key(&pk_types, pk_bytes)?;
-            // Both the index-entry scan above and this row fetch use the
-            // *same* `as_of_seq` (`u64::MAX` for the un-snapshotted
-            // `index_lookup`/`index_range_scan` callers, a real pinned
-            // seq for `..._as_of`) — this is what actually closes the
-            // index-then-fetch race the un-snapshotted path still has
-            // (see `index_lookup_as_of`'s own doc comment): a row
-            // deleted *after* `as_of_seq` still resolves here, exactly
-            // as D10 requires; one deleted strictly *before* it is
-            // correctly absent, not an error, same as always.
-            // `pk_bytes` is the already-encoded primary key straight from
-            // the index entry -- no decode/re-encode round trip.
-            if let Some(row) = self
-                .table_store
-                .fetch_row_by_encoded_pk(&table, &columns, &pk_values, pk_bytes, as_of_seq)?
-            {
-                if out.len() >= max_rows {
-                    self.stats
-                        .index_entries_examined
-                        .fetch_add(examined, Ordering::Relaxed);
-                    return Err(RelationalError::ResourceLimit {
-                        detail: format!(
-                            "index scan exceeded the {max_rows}-row materialization limit (max_index_scan_rows)"
-                        ),
-                    });
-                }
-                out.push((pk_values, row));
-            }
+            entries.push((pk_values, pk_bytes.to_vec()));
         }
         self.stats
             .index_entries_examined
             .fetch_add(examined, Ordering::Relaxed);
         self.stats
+            .index_scan_micros_total
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(o) = outcome {
+            return o;
+        }
+        Ok(IndexProbe::Entries(IndexEntries {
+            table,
+            columns,
+            entries,
+        }))
+    }
+
+    /// Phase 2: fetch the row for every enumerated entry at `as_of_seq`.
+    /// A row whose entry exists but which is not visible at the snapshot
+    /// (deleted before it) is skipped, exactly as before.
+    pub fn fetch_index_rows_as_of(
+        &self,
+        entries: IndexEntries,
+        as_of_seq: u64,
+    ) -> Result<Vec<(Vec<RelationalValue>, Row)>> {
+        let started = std::time::Instant::now();
+        let IndexEntries {
+            table,
+            columns,
+            entries,
+        } = entries;
+        let mut out = Vec::with_capacity(entries.len());
+        for (pk_values, pk_bytes) in entries {
+            if let Some(row) = self
+                .table_store
+                .fetch_row_by_encoded_pk(&table, &columns, &pk_values, &pk_bytes, as_of_seq)?
+            {
+                out.push((pk_values, row));
+            }
+        }
+        self.stats
             .index_rows_fetched
             .fetch_add(out.len() as u64, Ordering::Relaxed);
         self.stats
             .index_scan_micros_total
-            .fetch_add(scan_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(out)
     }
+}
+
+/// What an index read is asked to enumerate (Increment 17).
+#[derive(Debug, Clone)]
+pub enum IndexScanSpec {
+    /// Prefix equality over the index's leading columns.
+    Equality(Vec<Option<RelationalValue>>),
+    /// Inclusive/exclusive/unbounded bounds over the leading columns.
+    Range {
+        start: Bound<Vec<Option<RelationalValue>>>,
+        end: Bound<Vec<Option<RelationalValue>>>,
+    },
+}
+
+/// Phase-1 result of an index read: the enumerated entries (primary-key
+/// values + encoded PK bytes) and the table metadata resolved once for the
+/// scan, ready for `IndexBuilder::fetch_index_rows_as_of`.
+pub struct IndexEntries {
+    table: crate::catalog::schema::TableRow,
+    columns: Vec<crate::catalog::schema::ColumnRow>,
+    entries: Vec<(Vec<RelationalValue>, Vec<u8>)>,
+}
+
+impl IndexEntries {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Outcome of `IndexBuilder::probe_index_entries_as_of`.
+pub enum IndexProbe {
+    /// The index was not `Ready` as of the snapshot (F-2): do not use it.
+    Unusable,
+    /// More than the caller's `entry_limit` entries match; nothing fetched.
+    Truncated,
+    /// Every matching entry.
+    Entries(IndexEntries),
 }
 
 fn as_bound_ref(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {

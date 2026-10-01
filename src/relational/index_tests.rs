@@ -1043,3 +1043,98 @@ fn bounded_index_scans_fail_closed_at_the_limit_and_count_work() {
     assert_eq!(after.index_lookups - before.index_lookups, 1);
     f.cleanup();
 }
+
+/// Increment 17 (F-2): the "index ready sequence" is the engine sequence of
+/// the `Building -> Ready` catalog write, i.e. an ordinary durable MVCC
+/// version -- so it must survive a real engine restart (WAL replay and
+/// SSTable recovery) with its boundary intact: as of a sequence before the
+/// promotion the index is *not* usable, at and after it it is, and a
+/// `DROP`/`CREATE` cycle across restarts keeps every version boundary.
+#[test]
+fn index_ready_sequence_survives_restart() {
+    let dir = temp_dir("ready_seq_restart");
+    let (index_id, seq_building, seq_ready, index_id2, seq_ready2);
+    {
+        let engine = open(&dir);
+        let catalog = Arc::new(CatalogService::new(Arc::clone(&engine)));
+        catalog.bootstrap().unwrap();
+        let store = Arc::new(TableStore::new(Arc::clone(&engine), Arc::clone(&catalog)));
+        let builder = IndexBuilder::new(
+            Arc::clone(&engine),
+            Arc::clone(&catalog),
+            Arc::clone(&store),
+        );
+        let table_id = create_simple_table(&catalog, "t");
+        for i in 0..20 {
+            store.put_row(table_id, &row(i, "x", true)).unwrap();
+        }
+        // Building row, then a snapshot strictly inside the build window.
+        index_id = catalog
+            .create_index(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+            .unwrap();
+        store.put_row(table_id, &row(100, "x", true)).unwrap();
+        seq_building = engine.snapshot_seq();
+        builder.recover_incomplete_builds().unwrap();
+        seq_ready = engine.snapshot_seq();
+        // A drop/create cycle: the second incarnation gets a new id.
+        builder.drop_index_online(index_id).unwrap();
+        index_id2 = builder
+            .create_index_online(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+            .unwrap();
+        seq_ready2 = engine.snapshot_seq();
+        assert_ne!(index_id, index_id2);
+        engine.shutdown();
+    }
+    {
+        // Real restart: the engine replays its WAL / loads its SSTables.
+        let engine = open(&dir);
+        let catalog = Arc::new(CatalogService::new(Arc::clone(&engine)));
+        let store = Arc::new(TableStore::new(Arc::clone(&engine), Arc::clone(&catalog)));
+        let builder = IndexBuilder::new(
+            Arc::clone(&engine),
+            Arc::clone(&catalog),
+            Arc::clone(&store),
+        );
+        // First incarnation: no longer present now, but its history is --
+        // Building as of the window, Ready as of the promotion.
+        assert!(catalog.get_index(index_id).unwrap().is_none());
+        assert_eq!(
+            catalog
+                .get_index_as_of(index_id, seq_building)
+                .unwrap()
+                .map(|r| r.state),
+            Some(IndexState::Building),
+            "the pre-promotion version must survive the restart"
+        );
+        assert!(builder
+            .index_row_usable_at(index_id, seq_building)
+            .unwrap()
+            .is_none());
+        assert!(builder
+            .index_row_usable_at(index_id, seq_ready)
+            .unwrap()
+            .is_some());
+        // Second incarnation: unusable before its own promotion, usable at
+        // and after it, and unusable for any snapshot that predates it
+        // entirely (including the first incarnation's era).
+        assert!(builder
+            .index_row_usable_at(index_id2, seq_ready)
+            .unwrap()
+            .is_none());
+        assert!(builder
+            .index_row_usable_at(index_id2, seq_ready2)
+            .unwrap()
+            .is_some());
+        assert!(builder
+            .index_row_usable_at(index_id2, u64::MAX)
+            .unwrap()
+            .is_some());
+        // And a new snapshot after restart reads through it normally.
+        let results = builder
+            .index_lookup(index_id2, &[Some(RelationalValue::Text("x".to_string()))])
+            .unwrap();
+        assert_eq!(results.len(), 21);
+        engine.shutdown();
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

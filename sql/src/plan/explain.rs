@@ -207,6 +207,7 @@ fn write_access(access: &PhysicalAccess, out: &mut String) {
             index_name,
             mode,
             residual,
+            ..
         } => {
             let mode_s = match mode {
                 IndexAccessMode::Equality { prefix } => {

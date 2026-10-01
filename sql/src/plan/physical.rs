@@ -224,10 +224,21 @@ pub fn build_physical_plan(
                 }
             }
 
-            let input_phys = build_physical_plan(input, catalog, metrics)?;
+            let mut input_phys = build_physical_plan(input, catalog, metrics)?;
             if let Some(access) = single_table_access(&input_phys) {
                 if order_satisfied_by_access(items, access, catalog)? {
                     metrics.record_sort_node_eliminated();
+                    // The `Sort` is gone because this access delivers the
+                    // order: record that on the access so a snapshot- or
+                    // cost-driven fallback re-establishes it (F-2).
+                    let ordinals: Vec<u16> = items
+                        .iter()
+                        .filter_map(|item| match &item.expr.kind {
+                            BoundExprKind::Column(c) => Some(c.ordinal),
+                            _ => None,
+                        })
+                        .collect();
+                    mark_access_ordered(&mut input_phys, &ordinals);
                     return Ok(input_phys);
                 }
             }
@@ -249,6 +260,20 @@ pub fn build_physical_plan(
                 pushable,
             })
         }
+    }
+}
+
+/// Flags the `IndexScan` under a `Filter`/`Projection` chain as one an
+/// eliminated `Sort` depends on (see `IndexFallback::order_ordinals`).
+fn mark_access_ordered(plan: &mut PhysicalPlan, ordinals: &[u16]) {
+    match plan {
+        PhysicalPlan::Access(PhysicalAccess::IndexScan { fallback, .. }) => {
+            fallback.order_ordinals = ordinals.to_vec();
+        }
+        PhysicalPlan::Filter { input, .. } | PhysicalPlan::Projection { input, .. } => {
+            mark_access_ordered(input, ordinals)
+        }
+        _ => {}
     }
 }
 
@@ -364,6 +389,13 @@ fn order_only_index_access(
                     end: std::ops::Bound::Unbounded,
                 },
                 residual: None,
+                // No WHERE predicate exists here; the fallback is a full
+                // scan that re-establishes the ordering the eliminated
+                // `Sort` relied on.
+                fallback: crate::plan::access::IndexFallback {
+                    predicate: None,
+                    order_ordinals: ordinals.clone(),
+                },
             }));
         }
     }

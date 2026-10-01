@@ -6,6 +6,50 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 17 -- index snapshot correctness + cost-based access path (2026-10-02)
+
+Full record: `PHASE_RUBIXDB_INCREMENT17_INDEX_SNAPSHOT_ARCHITECTURE.md`,
+`PHASE_RUBIXDB_INCREMENT17_COST_MODEL_ARCHITECTURE.md`, `_PERFORMANCE.md`,
+`_RESULTS.md`. Closes Increment 16's open F-2 finding and its missing cost
+model; Increment 14/15/16 records unchanged.
+
+#### Fixed
+
+- **F-2:** a transaction whose snapshot predates an index's creation,
+  rebuild or `DROP`/`CREATE` could be answered through that index and miss
+  rows (backfilled entries carry a later sequence than the rows). An index
+  now serves a read only if its catalog row, read as of the snapshot, was
+  `Ready`; otherwise the identical table scan runs (ordering re-established
+  where a `Sort` had been eliminated). No new persisted metadata: the
+  readiness sequence is the catalog row's own MVCC version.
+- Always choosing a sargable secondary index: up to 3.7x slower than a table
+  scan at high selectivity (100K rows, 90%) and 2.7x at 1M rows (50%).
+  Selection is now cost-based, made at execution from the exact match count,
+  a drift-bounded table-size estimate and self-calibrating per-row costs --
+  no hard-coded percentage; measured crossover 17%-25% and regime-dependent.
+
+#### Added
+
+- `CatalogService::get_index_as_of`, `IndexBuilder::index_row_usable_at`,
+  two-phase index reads (`probe_index_entries_as_of` -> `IndexProbe`,
+  `fetch_index_rows_as_of`); `IndexFallback` on `PhysicalAccess::IndexScan`.
+- `rubixdb::relational::stats::RuntimeStats` (bounded, in-memory, never
+  persisted; statistics affect performance only), `TableStore::count_rows`,
+  `sql::exec::cost` (`AccessPathMode` in `ExecLimits` for benchmarking;
+  server configuration, not reachable from SQL), counters
+  `index_snapshot_fallbacks`, `index_cost_fallbacks`.
+- Differential/property tests: F-2 scenarios and churn, path independence
+  under poisoned statistics, drift-bound property, restart test; benchmarks.
+
+#### Known / open
+
+- Eager index-result materialization (deferred; +13% over the result at
+  25,000 matches), PK-range-vs-index not cost-compared, read-your-own-writes
+  not overlaid on scans (pre-existing), estimates re-learned after restart.
+- Full regression fails only on pre-existing, unrelated items (WAL throughput
+  M1.2/M1.3; debug-only CLI two-instance test), re-verified on the previous
+  tree.
+
 ### Product: Increment 16 -- secondary-index read performance (2026-10-01)
 
 Full record: `PHASE_RUBIXDB_INCREMENT16_INDEX_READ_ARCHITECTURE.md`,

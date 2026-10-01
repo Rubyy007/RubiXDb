@@ -9,6 +9,7 @@
 //! outside this increment," item 65's "no plan node may silently fall
 //! through").
 
+pub mod cost;
 pub mod expr_eval;
 pub mod operators;
 pub mod write;
@@ -208,6 +209,12 @@ pub struct ExecLimits {
     /// of`/`index_range_scan_as_of` are not lazy — this bounds their
     /// eager `Vec` instead of leaving it unbounded).
     pub max_index_scan_rows: usize,
+    /// Increment 17: how the executor chooses between an `IndexScan` and
+    /// a table scan (`Auto` = the cost model). The `Force*` modes select
+    /// between result-equivalent paths and exist for benchmarking and
+    /// diagnostics; they are server-side configuration, never reachable
+    /// from SQL.
+    pub access_path: crate::exec::cost::AccessPathMode,
     /// Item 41: wall-clock (monotonic) budget for one query's entire
     /// execution, checked at every operator's own natural iteration
     /// point — never only at the top level, since a single `Filter`
@@ -260,6 +267,7 @@ impl Default for ExecLimits {
             max_result_rows: 100_000,
             max_materialized_rows: 1_000_000,
             max_index_scan_rows: 1_000_000,
+            access_path: crate::exec::cost::AccessPathMode::Auto,
             deadline: Some(std::time::Duration::from_secs(30)),
             max_dml_target_rows: 10_000,
             max_group_count: 1_000_000,
@@ -307,6 +315,8 @@ pub struct ExecMetrics {
     pk_lookups: AtomicU64,
     seq_scans: AtomicU64,
     index_scans: AtomicU64,
+    index_snapshot_fallbacks: AtomicU64,
+    index_cost_fallbacks: AtomicU64,
     pk_range_scans: AtomicU64,
     joins: AtomicU64,
     execution_time_ms_total: AtomicU64,
@@ -347,6 +357,12 @@ pub struct ExecMetricsSnapshot {
     pub pk_lookups: u64,
     pub seq_scans: u64,
     pub index_scans: u64,
+    /// Increment 17 (F-2): index scans that ran as table scans because the
+    /// index was not `Ready` as of the transaction's snapshot.
+    pub index_snapshot_fallbacks: u64,
+    /// Increment 17: index scans abandoned for a table scan by the cost
+    /// model.
+    pub index_cost_fallbacks: u64,
     pub pk_range_scans: u64,
     pub joins: u64,
     pub execution_time_ms_total: u64,
@@ -387,6 +403,13 @@ impl ExecMetrics {
     pub fn record_index_scan(&self) {
         self.index_scans.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_index_snapshot_fallback(&self) {
+        self.index_snapshot_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_index_cost_fallback(&self) {
+        self.index_cost_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn record_pk_range_scan(&self) {
         self.pk_range_scans.fetch_add(1, Ordering::Relaxed);
     }
@@ -423,6 +446,8 @@ impl ExecMetrics {
             pk_lookups: self.pk_lookups.load(Ordering::Relaxed),
             seq_scans: self.seq_scans.load(Ordering::Relaxed),
             index_scans: self.index_scans.load(Ordering::Relaxed),
+            index_snapshot_fallbacks: self.index_snapshot_fallbacks.load(Ordering::Relaxed),
+            index_cost_fallbacks: self.index_cost_fallbacks.load(Ordering::Relaxed),
             pk_range_scans: self.pk_range_scans.load(Ordering::Relaxed),
             joins: self.joins.load(Ordering::Relaxed),
             execution_time_ms_total: self.execution_time_ms_total.load(Ordering::Relaxed),

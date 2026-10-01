@@ -54,6 +54,41 @@ pub enum IndexAccessMode {
     },
 }
 
+/// Increment 17 (F-2 + cost-based access selection): what an
+/// `IndexScan` falls back to when the index cannot be used for the
+/// executing transaction's snapshot (an index (re)built after the
+/// snapshot does not represent the table the snapshot sees), or when the
+/// executor's cost model finds a sequential scan cheaper.
+///
+/// A plan is built before any transaction snapshot or parameter value is
+/// known, so the *validity* decision cannot be made at plan time; the
+/// physical plan instead carries everything a correct fallback needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexFallback {
+    /// The table access's **complete** predicate (what a `SeqScan` would
+    /// apply as its filter) -- never just the index's residual. `None`
+    /// only for an `ORDER BY`-only scan, which has no predicate.
+    pub predicate: Option<BoundExpr>,
+    /// Non-empty when an eliminated `Sort` node relies on this scan
+    /// delivering rows in index order: the index's column ordinals
+    /// (ascending, `NULLS FIRST`, ties in primary-key order). A fallback
+    /// then re-establishes that order exactly, and cost-based abandonment
+    /// of the index is disabled (its free ordering is part of its value).
+    pub order_ordinals: Vec<u16>,
+}
+
+impl IndexFallback {
+    /// Placeholder used by candidate construction; `plan_table_access`
+    /// replaces it with the real predicate before the access leaves the
+    /// planner.
+    pub fn unset() -> Self {
+        IndexFallback {
+            predicate: None,
+            order_ordinals: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalAccess {
     PkLookup {
@@ -89,6 +124,7 @@ pub enum PhysicalAccess {
         index_name: String,
         mode: IndexAccessMode,
         residual: Option<BoundExpr>,
+        fallback: IndexFallback,
     },
     SeqScan {
         table_id: u32,
@@ -279,6 +315,10 @@ pub fn plan_table_access(
                     index_name,
                     mode,
                     residual,
+                    fallback: IndexFallback {
+                        predicate: Some(predicate.clone()),
+                        order_ordinals: Vec::new(),
+                    },
                 }
             }
             PhysicalAccess::PkRangeScan {
@@ -366,6 +406,7 @@ fn candidate_index_access(
                 index_name: index_name.to_string(),
                 mode: IndexAccessMode::Equality { prefix },
                 residual: None,
+                fallback: IndexFallback::unset(),
             },
             count,
             consumed,
@@ -457,6 +498,7 @@ fn candidate_index_access(
             index_name: index_name.to_string(),
             mode: IndexAccessMode::Range { start, end },
             residual: None,
+            fallback: IndexFallback::unset(),
         },
         count,
         consumed,

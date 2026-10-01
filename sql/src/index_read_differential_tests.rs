@@ -40,37 +40,50 @@ use crate::parse::parse_statement;
 use crate::plan::{build_plan, Plan, PlannerLimits, PlannerMetrics};
 use crate::test_support::Fixture;
 
-type Mrow = (i32, Option<i32>, Option<String>, i32);
-type Model = BTreeMap<i32, Mrow>;
+pub(crate) type Mrow = (i32, Option<i32>, Option<String>, i32);
+pub(crate) type Model = BTreeMap<i32, Mrow>;
 
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 }
 
-struct Diff {
-    f: Fixture,
-    catalog: Arc<CatalogService>,
-    store: Arc<TableStore>,
-    builder: Arc<IndexBuilder>,
-    txm: TransactionManager,
+pub(crate) struct Diff {
+    pub(crate) f: Fixture,
+    pub(crate) catalog: Arc<CatalogService>,
+    pub(crate) store: Arc<TableStore>,
+    pub(crate) builder: Arc<IndexBuilder>,
+    pub(crate) txm: TransactionManager,
+    /// Access-path mode every statement runs under (Increment 17): the
+    /// differential runs randomize it per step so DML, joins and
+    /// aggregation are verified under the cost model, a forced index and a
+    /// forced table scan alike.
+    pub(crate) mode: std::cell::Cell<crate::exec::cost::AccessPathMode>,
 }
 
 impl Diff {
-    fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
+        Self::with_memtable(tag, 24 * 1024)
+    }
+
+    /// `new` with an explicit MemTable size: the default 24KB forces
+    /// frequent flushes and Compactions (what the differential runs want);
+    /// bulk-loading tests use a larger one so the load does not trip the
+    /// engine's (accepted) immutable-MemTable backpressure.
+    pub(crate) fn with_memtable(tag: &str, memtable_bytes: usize) -> Self {
         let f = Fixture::new_with_lsm(
             tag,
             LsmConfig {
-                memtable_max_size_bytes: 24 * 1024,
+                memtable_max_size_bytes: memtable_bytes,
                 compaction_trigger_count: 2,
                 compaction_auto_trigger: true,
                 ..LsmConfig::default()
@@ -90,6 +103,7 @@ impl Diff {
             store,
             builder,
             txm,
+            mode: std::cell::Cell::new(crate::exec::cost::AccessPathMode::Auto),
         };
         d.write("CREATE TABLE dt (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER)");
         d.write("CREATE TABLE dj (a INTEGER PRIMARY KEY, label TEXT)");
@@ -102,7 +116,14 @@ impl Diff {
         d
     }
 
-    fn plan(&self, sql: &str) -> Plan {
+    pub(crate) fn limits(&self) -> ExecLimits {
+        ExecLimits {
+            access_path: self.mode.get(),
+            ..ExecLimits::default()
+        }
+    }
+
+    pub(crate) fn plan(&self, sql: &str) -> Plan {
         let limits = SqlLimits::default();
         let stmt = parse_statement(sql, &limits).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
         let bound = bind_statement(
@@ -123,7 +144,7 @@ impl Diff {
         .unwrap_or_else(|e| panic!("plan {sql:?}: {e}"))
     }
 
-    fn write(&self, sql: &str) -> u64 {
+    pub(crate) fn write(&self, sql: &str) -> u64 {
         execute_write_autocommit(
             &self.plan(sql),
             &self.txm,
@@ -131,7 +152,7 @@ impl Diff {
             &self.catalog,
             &self.builder,
             &[],
-            &ExecLimits::default(),
+            &self.limits(),
             &WriteMetrics::default(),
             &CancellationToken::new(),
         )
@@ -139,28 +160,66 @@ impl Diff {
         .rows_affected
     }
 
-    fn select(&self, sql: &str) -> QueryResult {
+    pub(crate) fn select(&self, sql: &str) -> QueryResult {
         execute_autocommit(
             &self.plan(sql),
             &self.txm,
             &self.store,
             &self.builder,
             &[],
-            &ExecLimits::default(),
+            &self.limits(),
             &ExecMetrics::default(),
             &CancellationToken::new(),
         )
         .unwrap_or_else(|e| panic!("select {sql:?}: {e}"))
     }
 
-    fn select_in(&self, sql: &str, txn: &Transaction) -> QueryResult {
+    /// `select_in`, also returning the execution's counters (Increment 17:
+    /// lets tests assert *which* access path actually ran).
+    pub(crate) fn select_in_metrics(
+        &self,
+        sql: &str,
+        txn: &Transaction,
+    ) -> (QueryResult, crate::exec::ExecMetricsSnapshot) {
+        let m = ExecMetrics::default();
+        let r = execute(
+            &self.plan(sql),
+            txn,
+            &self.store,
+            &self.builder,
+            &[],
+            &self.limits(),
+            &m,
+            &CancellationToken::new(),
+        )
+        .unwrap_or_else(|e| panic!("select {sql:?}: {e}"));
+        (r, m.snapshot())
+    }
+
+    pub(crate) fn write_in(&self, sql: &str, txn: &mut Transaction) -> u64 {
+        crate::exec::write::execute_write(
+            &self.plan(sql),
+            txn,
+            &self.store,
+            &self.catalog,
+            &self.builder,
+            &[],
+            &self.limits(),
+            &WriteMetrics::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap_or_else(|e| panic!("write {sql:?}: {e}"))
+        .rows_affected
+    }
+
+    pub(crate) fn select_in(&self, sql: &str, txn: &Transaction) -> QueryResult {
         execute(
             &self.plan(sql),
             txn,
             &self.store,
             &self.builder,
             &[],
-            &ExecLimits::default(),
+            &self.limits(),
             &ExecMetrics::default(),
             &CancellationToken::new(),
         )
@@ -189,7 +248,7 @@ fn to_mrow(r: &[Option<RelationalValue>]) -> Mrow {
     (i(&r[0]).unwrap(), i(&r[1]), s(&r[2]), i(&r[3]).unwrap())
 }
 
-fn rows_of(res: &QueryResult) -> Vec<Mrow> {
+pub(crate) fn rows_of(res: &QueryResult) -> Vec<Mrow> {
     let mut v: Vec<Mrow> = res.rows.iter().map(|r| to_mrow(r)).collect();
     v.sort();
     v
@@ -370,12 +429,27 @@ fn check_index_entries(d: &Diff, model: &Model) {
 }
 
 fn run(seed: u64, steps: usize) -> u64 {
+    run_with(seed, steps, 8, 29).0
+}
+
+/// `rebuild_per_mille`: chance (per mille, per step) of a `DROP INDEX` +
+/// `CREATE INDEX` on `ib`; `snapshot_every`: a transaction snapshot is
+/// begun every this-many steps (the newest 3 are kept open and verified
+/// against the model at every checkpoint). Returns (Compaction cycles,
+/// index rebuilds performed).
+fn run_with(seed: u64, steps: usize, rebuild_per_mille: u64, snapshot_every: usize) -> (u64, u64) {
     let mut rng = Rng(seed);
     let d = Diff::new(&format!("diff_{seed}"));
+    let mut rebuilds = 0u64;
     let mut model: Model = BTreeMap::new();
     let mut snaps: Vec<(Transaction, Model)> = Vec::new();
     let ctx = |step: usize| format!("seed={seed} step={step}");
     for step in 0..steps {
+        d.mode.set(match rng.below(3) {
+            0 => crate::exec::cost::AccessPathMode::Auto,
+            1 => crate::exec::cost::AccessPathMode::ForceIndex,
+            _ => crate::exec::cost::AccessPathMode::ForceSeq,
+        });
         let id = rng.below(300) as i32;
         let a = if rng.below(10) == 0 {
             None
@@ -440,19 +514,17 @@ fn run(seed: u64, steps: usize) -> u64 {
                     ctx(step)
                 );
             }
-            78..=80 if step > 20 && step < steps - 20 && rng.below(4) == 0 => {
+            78..=99 if step > 5 && step < steps - 5 && rng.below(1000) < rebuild_per_mille * 3 => {
+                rebuilds += 1;
                 // DROP INDEX + CREATE INDEX (online backfill) mid-run.
                 d.write("DROP INDEX ib ON dt");
                 d.write("CREATE INDEX ib ON dt (b)");
-                // Finding F-2: a snapshot older than an index rebuild
-                // cannot read through the rebuilt index (open, pre-
-                // existing); retire such snapshots rather than assert a
-                // known-open behavior.
-                snaps.clear();
+                // F-2 (fixed in Increment 17): open snapshots deliberately
+                // survive the rebuild and are verified against the model.
             }
             _ => {}
         }
-        if step % 29 == 0 {
+        if step % snapshot_every == 0 {
             snaps.push((d.txm.begin().unwrap(), model.clone()));
             if snaps.len() > 3 {
                 snaps.remove(0);
@@ -478,7 +550,7 @@ fn run(seed: u64, steps: usize) -> u64 {
     drop(snaps);
     let cycles = d.f.engine.compaction_metrics().cycles_completed;
     d.f.cleanup();
-    cycles
+    (cycles, rebuilds)
 }
 
 proptest! {
@@ -497,6 +569,24 @@ fn index_reads_match_reference_model_fixed_seeds_long() {
     }
     println!("automatic Compaction cycles completed during differential runs: {cycles}");
     assert!(cycles > 0, "differential run must overlap real Compaction");
+}
+
+/// F-2 property: heavy index-rebuild churn with frequent snapshots. Every
+/// open snapshot must keep answering exactly what the model says it saw,
+/// whichever access path the executor ends up using.
+#[test]
+fn f2_property_heavy_rebuild_churn_with_open_snapshots() {
+    let (mut cycles, mut rebuilds) = (0, 0);
+    for seed in [11u64, 12, 13, 14, 15, 16] {
+        let (c, r) = run_with(seed, 400, 60, 9);
+        cycles += c;
+        rebuilds += r;
+    }
+    println!("F-2 churn: {rebuilds} index rebuilds, {cycles} Compaction cycles");
+    assert!(
+        rebuilds >= 20,
+        "churn test must perform many rebuilds, did {rebuilds}"
+    );
 }
 
 /// Large-result + selectivity sweep: a deterministic table where one
@@ -528,6 +618,7 @@ fn index_reads_match_model_across_selectivities_and_result_sizes() {
         store,
         builder,
         txm,
+        mode: std::cell::Cell::new(crate::exec::cost::AccessPathMode::Auto),
     };
     d.write("CREATE TABLE sel (id INTEGER PRIMARY KEY, hi INTEGER, md INTEGER, lo INTEGER)");
     let n = 3_000;
@@ -600,6 +691,10 @@ fn index_scan_row_limit_is_enforced_while_collecting() {
             &[],
             &ExecLimits {
                 max_index_scan_rows: max,
+                // This test targets the *index* scan's bound; on a 50-row
+                // table where every row matches, the cost model would
+                // (correctly) pick the table scan instead.
+                access_path: crate::exec::cost::AccessPathMode::ForceIndex,
                 ..ExecLimits::default()
             },
             &ExecMetrics::default(),
@@ -638,16 +733,13 @@ fn upper_bound_only_index_range_excludes_null_indexed_values() {
     d.f.cleanup();
 }
 
-/// Finding F-2 (pre-existing, NOT fixed in Increment 16): a snapshot
-/// transaction that began *before* an index was (re)built, and then
-/// reads through that index, misses rows -- the backfilled index
-/// entries carry post-snapshot sequence numbers, so the old snapshot
-/// sees an empty index while the planner still selects it. Documented
-/// in PHASE_RUBIXDB_INCREMENT16_INDEX_READ_RESULTS.md as an open
-/// finding; `#[ignore]`d so the suite does not codify the bug.
+/// F-2 regression (Increment 17 -- permanent; previously `#[ignore]`d as an
+/// open Increment 16 finding): a snapshot transaction that began *before*
+/// an index was (re)built and then reads through that predicate must see
+/// exactly the rows it could see -- the planner may no longer treat an
+/// index created after the snapshot as representing it.
 #[test]
-#[ignore]
-fn known_gap_snapshot_started_before_index_rebuild_misses_rows() {
+fn snapshot_started_before_index_rebuild_sees_all_rows_f2_regression() {
     let d = Diff::new("diff_f2");
     d.write("INSERT INTO dt (id, a, b, c) VALUES (4, 6, 's2', 2)");
     let txn = d.txm.begin().unwrap();

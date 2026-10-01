@@ -163,6 +163,8 @@ pub struct Env {
     pub txm: Arc<TransactionManager>,
     pub n: usize,
     pub table_id: u32,
+    /// 0 = Auto (cost model), 1 = ForceIndex, 2 = ForceSeq.
+    pub mode: std::sync::atomic::AtomicU8,
 }
 
 fn env_list(name: &str, default: &[usize]) -> Vec<usize> {
@@ -234,6 +236,7 @@ impl Env {
             txm,
             n,
             table_id,
+            mode: std::sync::atomic::AtomicU8::new(0),
         };
         env.seed();
         for &k in ks {
@@ -319,11 +322,30 @@ impl Env {
             &self.store,
             &self.builder,
             &[],
-            &ExecLimits::default(),
+            &ExecLimits {
+                access_path: match self.mode.load(std::sync::atomic::Ordering::Relaxed) {
+                    1 => crate::exec::cost::AccessPathMode::ForceIndex,
+                    2 => crate::exec::cost::AccessPathMode::ForceSeq,
+                    _ => crate::exec::cost::AccessPathMode::Auto,
+                },
+                ..ExecLimits::default()
+            },
             m,
             &CancellationToken::new(),
         )
         .unwrap()
+    }
+
+    pub fn set_mode(&self, mode: crate::exec::cost::AccessPathMode) {
+        use crate::exec::cost::AccessPathMode as M;
+        self.mode.store(
+            match mode {
+                M::Auto => 0,
+                M::ForceIndex => 1,
+                M::ForceSeq => 2,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn cleanup(self) {
@@ -1082,9 +1104,329 @@ fn endurance_shape_replay() {
             txm,
             n,
             table_id,
+            mode: std::sync::atomic::AtomicU8::new(0),
         };
         let r = run_query(&env, "SELECT * FROM rp WHERE grp = 'g3'");
         report(&format!("indexed_select replay N={n}"), &r);
+        env.cleanup();
+    }
+}
+
+// ---------------------------------------------------------------------
+// Increment 17: selectivity crossover and cost-model validation
+// ---------------------------------------------------------------------
+
+/// Equality-group counts for the sweep table: `e{G}` has `G` distinct
+/// values, so `e{G} = 'g0'` matches `N / G` rows spread evenly.
+const SX_GROUPS: [usize; 7] = [10_000, 1_000, 100, 20, 10, 4, 2];
+
+/// `sx(id INT PK, s INT, e{G} TEXT x7, pad TEXT)`; `s = (id * 7919) % N` is
+/// a permutation of `0..N`, so `s >= 0 AND s < K` matches EXACTLY `K` rows,
+/// scattered uniformly across the primary-key space (the worst case for the
+/// index path's point reads). Indexes on `s` and every `e{G}` requested.
+fn sx_env(tag: &str, n: usize, eq_groups: &[usize]) -> Env {
+    let f = bench_fixture(tag);
+    let catalog = Arc::new(CatalogService::new(Arc::clone(&f.engine)));
+    let mut cols = vec![
+        col("id", TYPE_TAG_INTEGER, false),
+        col("s", TYPE_TAG_INTEGER, false),
+    ];
+    for g in SX_GROUPS {
+        cols.push(col(&format!("e{g}"), TYPE_TAG_TEXT, true));
+    }
+    cols.push(col("pad", TYPE_TAG_TEXT, true));
+    let table_id = catalog
+        .create_table(f.ctx.default_schema_id, "sx", &cols, &[0])
+        .unwrap();
+    let store = Arc::new(TableStore::new(Arc::clone(&f.engine), Arc::clone(&catalog)));
+    let builder = Arc::new(IndexBuilder::new(
+        Arc::clone(&f.engine),
+        Arc::clone(&catalog),
+        Arc::clone(&store),
+    ));
+    let txm = Arc::new(TransactionManager::new(
+        Arc::clone(&f.engine),
+        Arc::clone(&store),
+    ));
+    let mut chunk = Vec::with_capacity(2000);
+    for id in 0..n {
+        let mut row: Vec<Option<RelationalValue>> = vec![
+            Some(RelationalValue::Integer(id as i32)),
+            Some(RelationalValue::Integer(((id * 7919) % n) as i32)),
+        ];
+        for g in SX_GROUPS {
+            row.push(Some(RelationalValue::Text(format!("g{}", id % g))));
+        }
+        row.push(Some(RelationalValue::Text("pad-pad-pad-pad".to_string())));
+        chunk.push(row);
+        if chunk.len() == 2000 {
+            store.put_rows(table_id, &chunk).unwrap();
+            chunk.clear();
+        }
+    }
+    if !chunk.is_empty() {
+        store.put_rows(table_id, &chunk).unwrap();
+    }
+    builder
+        .create_index_online(table_id, "sx_s", IndexKind::NonUnique, &[1])
+        .unwrap();
+    for &g in eq_groups {
+        let pos = SX_GROUPS.iter().position(|&x| x == g).unwrap();
+        builder
+            .create_index_online(
+                table_id,
+                &format!("sx_e{g}"),
+                IndexKind::NonUnique,
+                &[2 + pos as u16],
+            )
+            .unwrap();
+    }
+    Env {
+        f,
+        catalog,
+        store,
+        builder,
+        txm,
+        n,
+        table_id,
+        mode: std::sync::atomic::AtomicU8::new(0),
+    }
+}
+
+struct SweepPoint {
+    label: String,
+    k: usize,
+    idx: Run,
+    seq: Run,
+    auto: Run,
+    predicted_scan: bool,
+}
+
+fn sweep_point(env: &Env, label: &str, sql: &str, expected_k: usize) -> SweepPoint {
+    use crate::exec::cost::{predict_prefers_scan, AccessPathMode as M};
+    let stats = env.store.runtime_stats();
+    env.set_mode(M::ForceIndex);
+    let idx = run_query(env, sql);
+    env.set_mode(M::ForceSeq);
+    let seq = run_query(env, sql);
+    // The model's prediction uses the table-size estimate and the per-row
+    // costs *as they stand before the Auto run* (the seq run above has had
+    // the chance to refine the scan cost, exactly as in production).
+    let n_est = stats
+        .row_estimate(env.table_id)
+        .map(|e| e.rows + e.drift)
+        .unwrap_or(env.n as u64);
+    let predicted_scan = predict_prefers_scan(expected_k as u64, n_est, stats.cost_params());
+    env.set_mode(M::Auto);
+    let auto = run_query(env, sql);
+    SweepPoint {
+        label: label.to_string(),
+        k: expected_k,
+        idx,
+        seq,
+        auto,
+        predicted_scan,
+    }
+}
+
+fn print_sweep(points: &[SweepPoint], n: usize) {
+    println!(
+        "{:<18} {:>7} {:>6} | {:>9} {:>9} {:>9} {:>9} | {:>9} {:>9} {:>9} {:>9} | {:>9} {:>6} | {:<6} {:<6} {:>7}",
+        "predicate",
+        "K",
+        "sel%",
+        "idx p50",
+        "p95",
+        "p99",
+        "max",
+        "seq p50",
+        "p95",
+        "p99",
+        "max",
+        "auto p50",
+        "fell",
+        "pred",
+        "actual",
+        "regret"
+    );
+    for p in points {
+        let actual_scan = p.seq.lat.pct(0.5) < p.idx.lat.pct(0.5);
+        let best = p.seq.lat.pct(0.5).min(p.idx.lat.pct(0.5));
+        let chosen = if p.predicted_scan {
+            p.seq.lat.pct(0.5)
+        } else {
+            p.idx.lat.pct(0.5)
+        };
+        println!(
+            "{:<18} {:>7} {:>6.2} | {:>9.3} {:>9.3} {:>9.3} {:>9.3} | {:>9.3} {:>9.3} {:>9.3} {:>9.3} | {:>9.3} {:>6} | {:<6} {:<6} {:>6.2}x",
+            p.label,
+            p.k,
+            100.0 * p.k as f64 / n as f64,
+            p.idx.lat.pct(0.5),
+            p.idx.lat.pct(0.95),
+            p.idx.lat.pct(0.99),
+            p.idx.lat.max(),
+            p.seq.lat.pct(0.5),
+            p.seq.lat.pct(0.95),
+            p.seq.lat.pct(0.99),
+            p.seq.lat.max(),
+            p.auto.lat.pct(0.5),
+            p.auto.exec.index_cost_fallbacks,
+            if p.predicted_scan { "scan" } else { "index" },
+            if actual_scan { "scan" } else { "index" },
+            chosen / best,
+        );
+    }
+    println!("detail (CPU ms/op | rss MB | rows examined / returned | blocks read idx/seq | sstables consulted idx/seq):");
+    for p in points {
+        println!(
+            "  {:<18} cpu idx={:>8.2} seq={:>8.2} auto={:>8.2} | rss={:>5.0} | idx_ex={} ret={} | blk {}/{} | sst {}/{}",
+            p.label,
+            p.idx.cpu_ms_per_op,
+            p.seq.cpu_ms_per_op,
+            p.auto.cpu_ms_per_op,
+            p.auto.rss_mb,
+            p.idx.exec.index_rows_examined,
+            p.idx.rows,
+            p.idx.reads.2,
+            p.seq.reads.2,
+            p.idx.reads.1,
+            p.seq.reads.1,
+        );
+    }
+}
+
+/// Mandatory sweep: actual index plan vs actual SeqScan vs the cost model's
+/// automatic choice at selectivities 0.01% .. 90%, for a range predicate
+/// (exact K, any fraction) and an equality predicate (K = N / G).
+#[test]
+#[ignore]
+fn selectivity_crossover_sweep() {
+    let sizes = env_list("INC16_SIZES", &[100_000]);
+    let eq_groups = env_list("INC17_EQ", &SX_GROUPS);
+    // `INC17_COUNT=1` projects COUNT(*) (one result row) so very large
+    // matches stay under `max_result_rows`; the access-path decision and
+    // the work done to produce the matching rows are unchanged.
+    let count_mode = std::env::var("INC17_COUNT").is_ok_and(|v| v == "1");
+    for &n in &sizes {
+        let env = sx_env(&format!("inc17_sweep_{n}"), n, &eq_groups);
+        println!(
+            "\n=== selectivity sweep N={n} sstables={} compact_auto={} ===",
+            env.f.engine.sstable_count(),
+            std::env::var("INC16_COMPACT").unwrap_or_default()
+        );
+        println!(
+            "params at start: {:?}",
+            env.store.runtime_stats().cost_params()
+        );
+        let mut points = Vec::new();
+        for bp in env_list(
+            "INC17_BP",
+            &[1usize, 10, 100, 500, 1_000, 2_500, 5_000, 7_500, 9_000],
+        ) {
+            let k = (n * bp / 10_000).max(1);
+            let proj = if count_mode { "COUNT(*)" } else { "*" };
+            points.push(sweep_point(
+                &env,
+                &format!("range s<{k}"),
+                &format!("SELECT {proj} FROM sx WHERE s >= 0 AND s < {k}"),
+                k,
+            ));
+        }
+        print_sweep(&points, n);
+        let mut points = Vec::new();
+        for &g in &eq_groups {
+            if n / g == 0 {
+                continue;
+            }
+            let proj = if count_mode { "COUNT(*)" } else { "*" };
+            points.push(sweep_point(
+                &env,
+                &format!("eq e{g}='g0'"),
+                &format!("SELECT {proj} FROM sx WHERE e{g} = 'g0'"),
+                n / g,
+            ));
+        }
+        print_sweep(&points, n);
+        println!(
+            "params at end: {:?} estimate={:?}",
+            env.store.runtime_stats().cost_params(),
+            env.store.runtime_stats().row_estimate(env.table_id)
+        );
+        env.cleanup();
+    }
+}
+
+/// Increment 17 memory measurement: resident-set growth while a query's
+/// result is alive, for 1 / 10 / 100 / 1,000 / 10,000 / 25,000 matched
+/// rows, through the index path (eager entry+row `Vec`) and through the
+/// table scan (lazy, streaming into the result). Process-level RSS is
+/// coarse (allocator retention), so each size is run in a fresh scope after
+/// a warm-up and the *delta over a baseline taken immediately before* is
+/// reported, best of 5.
+#[test]
+#[ignore]
+fn memory_by_result_size() {
+    use crate::exec::cost::AccessPathMode as M;
+    let n = 100_000;
+    let env = sx_env("inc17_mem", n, &[]);
+    // warm: touch both paths once so one-off allocations are excluded.
+    for m in [M::ForceIndex, M::ForceSeq] {
+        env.set_mode(m);
+        let plan = env.prepare("SELECT * FROM sx WHERE s >= 0 AND s < 10");
+        let _ = env.exec(&plan, &ExecMetrics::default());
+    }
+    println!("\n=== memory (RSS delta MB while result alive), N={n} ===");
+    println!("{:>8} | {:>12} {:>12}", "K", "index path", "table scan");
+    for k in [1usize, 10, 100, 1_000, 10_000, 25_000] {
+        let sql = format!("SELECT * FROM sx WHERE s >= 0 AND s < {k}");
+        let plan = env.prepare(&sql);
+        let mut out = Vec::new();
+        for m in [M::ForceIndex, M::ForceSeq] {
+            env.set_mode(m);
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let before = proc_sample().rss_mb;
+                let res = env.exec(&plan, &ExecMetrics::default());
+                let after = proc_sample().rss_mb;
+                assert_eq!(res.rows.len(), k);
+                best = best.min((after - before).max(0.0));
+                drop(res);
+            }
+            out.push(best);
+        }
+        println!("{k:>8} | {:>9.1} MB {:>9.1} MB", out[0], out[1]);
+    }
+    println!(
+        "statistics registry bound: {} tables x (2 atomics + map slot) ~ {} KB at the {}-table cap",
+        rubixdb::relational::stats::MAX_TRACKED_TABLES,
+        rubixdb::relational::stats::MAX_TRACKED_TABLES * 100 / 1024,
+        rubixdb::relational::stats::MAX_TRACKED_TABLES
+    );
+    env.cleanup();
+}
+
+/// Cost of the exact row count the cost model takes (once per table, then
+/// cached) when it has no usable estimate.
+#[test]
+#[ignore]
+fn count_rows_cost() {
+    for n in env_list("INC16_SIZES", &[100_000, 1_000_000]) {
+        let env = Env::new(&format!("inc17_count_{n}"), n, &[], false);
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let c = env.store.count_rows(env.table_id).unwrap();
+            samples.push(t.elapsed());
+            assert_eq!(c as usize, n);
+        }
+        samples.sort();
+        println!(
+            "count_rows N={n}: p50={:.1} ms ({:.2} us/row), max={:.1} ms",
+            samples[2].as_secs_f64() * 1e3,
+            samples[2].as_secs_f64() * 1e6 / n as f64,
+            samples[4].as_secs_f64() * 1e3
+        );
         env.cleanup();
     }
 }

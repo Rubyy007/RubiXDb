@@ -489,6 +489,12 @@ impl Transaction {
         match self.validate_and_build_ops(&table_ids) {
             Ok(physical_ops) => {
                 let seq = self.inner.engine.write_batch(&physical_ops)?;
+                for (&table_id, table_writes) in &self.writes {
+                    self.inner
+                        .table_store
+                        .runtime_stats()
+                        .note_mutations(table_id, table_writes.len() as u64);
+                }
                 drop(_guards);
                 self.finish(TxnState::Committed);
                 self.inner
