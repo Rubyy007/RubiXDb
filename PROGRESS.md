@@ -4344,3 +4344,72 @@ PK_RANGE_RESULTS.md` §4.
 now closed.** Blocker 9's remaining two endurance segments continue in
 parallel; final consolidated Increment 14+15 certification is deferred
 until they complete.
+
+## 2026-10-01 (Increment 16: secondary-index read performance + scaling)
+
+Closes the separate open performance finding Blocker 9 recorded for
+`indexed_select` (277.8ms -> 783.7ms -> 1,148.1ms as the table grew
+~105K -> ~206K rows) that Increment 15 deliberately did not touch. The
+Increment 14 Blocker 9 record and the Increment 15 PK-range
+certification are unchanged; this is an append-only closure. Full
+record: `PHASE_RUBIXDB_INCREMENT16_INDEX_READ_ARCHITECTURE.md`,
+`_PERFORMANCE.md`, `_RESULTS.md`.
+
+**Root cause (measured, not guessed):** not the secondary index (index
+traversal + entry decode ~0.6us/entry, flat) and not the certified
+engine (raw point read ~11us). `IndexBuilder::scan_entries` called
+`TableStore::get_row_as_of` once per matched row, and that call
+re-resolved table/column catalog metadata (an engine point read + an
+engine range scan) every time: 81% of a 1,238ms read at K=10,000 matched
+rows / 100K rows. Cost is proportional to matched rows, with a per-row
+constant that grew with SSTable count in the old code (~40us/row with
+auto-Compaction on, ~100us at 9 SSTables, ~700us at 64). The endurance
+predicate matches ~1/10 of the table, so matches grow with the table
+*and* the per-row constant grows with the LSM -- hence faster-than-
+linear drift. No certified-engine code was changed; no engine ADR needed.
+
+**Fix:** resolve metadata once per scan; fetch each row by the encoded
+PK taken directly from the index entry; enforce `max_index_scan_rows`
+while collecting (not after). Two label-free counters added
+(`index_rows_fetched`, `index_scan_micros_total`).
+Candidates measured and rejected: covering index (index +5.3x / ~123%
+of the table per index, +232ms per 20K rows of write cost per index),
+parallel prefetch (same CPU, no gain once CPU-bound), caches (not
+needed once the repeated work is gone).
+
+**Measured (same build, before/after, release):** compaction-on
+(production default), 100K rows: K=1,000 56.9 -> 15.3ms, K=10,000
+564 -> 145ms; Blocker 9 replay at 105K/155K/206K rows 613/709/1,199ms
+-> 194/240/327ms; compaction-off 1M rows K=1,000 734.5 -> 25.6ms
+(28.7x). Table-size effect flat 100K -> 1M (K=1,000: 15.3 -> 18.2ms).
+32-thread throughput ceiling 2.4x higher, p99 ~2.2x lower; PK reads,
+PK range, SeqScan unchanged; JOIN/aggregation over an index predicate
+1.7-7x faster; UPDATE/DELETE via index 1.2-1.6x faster.
+
+**Two pre-existing correctness defects found by the new randomized
+differential tests (flagged, not silently resolved):**
+F-1 (FIXED) an upper-bound-only index range (`a <= x`) returned rows
+whose indexed value is NULL (reproduced on unmodified HEAD; fixed in
+`candidate_index_access`, regression test added). F-2 (OPEN) a snapshot
+transaction older than an index (re)build misses rows when it reads
+through that index (reproduced, `#[ignore]`d test; needs a design
+decision, recommended as its own increment).
+
+**Tests added:** independent-reference-model differential/property
+suite (24 proptest cases + 5x600-step seeds, 37 automatic Compaction
+cycles overlapped, snapshot reads, composite index, JOIN/COUNT, exact
+UPDATE/DELETE counts, physical index-entry audit: zero stale/orphan/
+duplicate), selectivity/result-size sweep, resource-limit boundary test,
+bounded-scan relational test, F-1 regression.
+
+**Verification:** `cargo fmt --check` clean; `cargo clippy --workspace
+--all-targets --all-features -D warnings` clean (the two previously-known
+CLI test clippy failures cleaned up as housekeeping, semantics
+unchanged); protected-path audit (`src/wal/`, `src/manifest/`,
+`src/sstable/`, `src/compaction/`) zero diff. Full regression is **FAIL
+only on pre-existing, unrelated items**: WAL throughput targets M1.2/M1.3
+(already documented in `PROCESS.md`), and a pre-existing CLI test defect
+(`two_instances_simultaneous_...`, identical failure on HEAD) -- see
+`..._RESULTS.md` section 1/4. Not claimed: "secondary indexes are
+production-ready". Not measured: >1M rows, process-cold runs, mixed
+read+write concurrency. Stopped after Increment 16 per the mandate.

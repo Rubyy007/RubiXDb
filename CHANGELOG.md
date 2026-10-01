@@ -6,6 +6,53 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 16 -- secondary-index read performance (2026-10-01)
+
+Full record: `PHASE_RUBIXDB_INCREMENT16_INDEX_READ_ARCHITECTURE.md`,
+`_PERFORMANCE.md`, `_RESULTS.md`. Append-only closure of Blocker 9's
+`indexed_select` finding; Increment 14/15 records unchanged.
+
+#### Fixed
+
+- Secondary-index reads re-resolved table/column catalog metadata once
+  per matched row (`get_row_as_of` inside `IndexBuilder::scan_entries`),
+  making cost ~ matched rows x an LSM-dependent constant. Metadata is
+  now resolved once per scan and rows are fetched by the encoded PK
+  from the index entry. Measured (release, same build): 3-4x faster with
+  auto-Compaction on, 7-29x with SSTables accumulated; ~15us/row,
+  flat in table size 100K -> 1M. No certified-engine change.
+- **Wrong results:** an upper-bound-only index range (`a <= x`,
+  `a < x`, or `a = p AND b <= x` on a composite index) returned rows
+  whose indexed value is NULL. Reproduced on unmodified HEAD; the bound
+  is now kept as a residual filter (`sql/src/plan/access.rs`).
+- `max_index_scan_rows` is enforced while collecting rather than after
+  the whole result is materialized.
+
+#### Added
+
+- `IndexBuilder::index_lookup_as_of_bounded` /
+  `index_range_scan_as_of_bounded`; label-free counters
+  `index_rows_fetched`, `index_scan_micros_total`.
+- Randomized differential/property tests against an independent
+  reference model (snapshots, composite index, JOIN/aggregation, exact
+  UPDATE/DELETE counts, physical index-entry audit, overlapping automatic
+  Compaction); selectivity/result-size sweep; limit-boundary and
+  bounded-scan tests; ignored measurement benchmarks.
+- `Fixture::new_with_lsm` test helper.
+
+#### Known / open
+
+- F-2: a snapshot older than an index (re)build misses rows when reading
+  through that index (reproduced; `#[ignore]`d test; not fixed).
+- No cost-based index-vs-scan choice; eager index-scan `Vec`; index stats
+  not on the HTTP metrics route.
+
+#### Housekeeping
+
+- `cargo fmt --all` applied (formatting-only changes to nine
+  pre-existing test/example files); the two known CLI test clippy
+  failures fixed without changing test semantics.
+
 ### Product: Increment 15 -- PK range scan fix (2026-09-30)
 
 Full record: `PHASE_RUBIXDB_INCREMENT15_PK_RANGE_ARCHITECTURE.md`,

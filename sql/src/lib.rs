@@ -65,3 +65,9 @@ mod aggregate_reference_model;
 
 #[cfg(test)]
 mod pk_range_benchmark;
+
+#[cfg(test)]
+mod index_read_benchmark;
+
+#[cfg(test)]
+mod index_read_differential_tests;

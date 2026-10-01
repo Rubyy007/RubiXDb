@@ -436,6 +436,19 @@ fn candidate_index_access(
     if count == 0 {
         return None;
     }
+    // Increment 16, finding F-1: NULL entries sort *before* every present
+    // value in the physical index key, so a range with an upper bound but
+    // no lower bound on the column after the equality prefix (`a <= x`,
+    // `a < x`, or `a = p AND b <= x`) physically spans that column's
+    // NULL entries. The comparison cannot be "consumed" by the scan or
+    // those NULL-valued rows would be returned (`NULL <= x` is not
+    // true) -- keep it as a residual filter. It still counts toward
+    // `count`, so the index range keeps competing for the access path.
+    if lower.is_none() {
+        if let Some((_, _, idx)) = upper {
+            consumed[idx] = false;
+        }
+    }
     Some((
         PhysicalAccess::IndexScan {
             table_id,

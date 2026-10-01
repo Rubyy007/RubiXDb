@@ -225,7 +225,7 @@ impl TableStore {
         self.fetch_row_by_encoded_pk(&table, &columns, pk_values, &encoded_pk, as_of_seq)
     }
 
-    fn fetch_row_by_encoded_pk(
+    pub(crate) fn fetch_row_by_encoded_pk(
         &self,
         table: &TableRow,
         columns: &[ColumnRow],

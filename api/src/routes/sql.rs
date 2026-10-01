@@ -582,3 +582,72 @@ async fn handle_write(
         }
     }
 }
+
+#[cfg(test)]
+mod serialization_benchmark {
+    use super::*;
+    use rubixdb::relational::RelationalValue;
+    use rubixdb_sql::exec::{ResultField, ResultSchema};
+    use std::time::Instant;
+
+    /// Increment 16: the HTTP-layer serialization stage of an indexed
+    /// `SELECT *` result (`query_result_to_json` + `serde_json` encode),
+    /// measured on a synthetic result with the benchmark table's shape
+    /// (2 INTEGER + 6 TEXT columns). `#[ignore]`d measurement, not a
+    /// correctness test:
+    ///   cargo test --release -p rubixdb-api --lib serialization_benchmark -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn serialization_cost_by_result_size() {
+        let fields: Vec<ResultField> = (0..8)
+            .map(|i| ResultField {
+                name: format!("c{i}"),
+                ty: Some(if i < 2 {
+                    rubixdb::relational::RelationalType::Integer
+                } else {
+                    rubixdb::relational::RelationalType::Text
+                }),
+                nullable: true,
+            })
+            .collect();
+        for k in [1usize, 10, 100, 1_000, 10_000] {
+            let make = || {
+                let rows: Vec<Vec<Option<RelationalValue>>> = (0..k)
+                    .map(|i| {
+                        let mut r = vec![
+                            Some(RelationalValue::Integer(i as i32)),
+                            Some(RelationalValue::Integer(i as i32)),
+                        ];
+                        for c in 0..6 {
+                            r.push(Some(RelationalValue::Text(format!("g{}", (i + c) % 1000))));
+                        }
+                        r
+                    })
+                    .collect();
+                QueryResult {
+                    schema: ResultSchema {
+                        fields: fields.clone(),
+                    },
+                    rows,
+                }
+            };
+            let metrics = crate::sql_metrics::SqlApiMetrics::default();
+            let mut samples = Vec::new();
+            let mut bytes = 0;
+            for _ in 0..15 {
+                let res = make();
+                let s = Instant::now();
+                let body = query_result_to_json(res, &metrics);
+                let out = serde_json::to_vec(&body).unwrap();
+                samples.push(s.elapsed());
+                bytes = out.len();
+            }
+            samples.sort();
+            println!(
+                "serialize K={k:<6} p50={:>8.3} ms  max={:>8.3} ms  json={bytes} B",
+                samples[samples.len() / 2].as_secs_f64() * 1000.0,
+                samples.last().unwrap().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}

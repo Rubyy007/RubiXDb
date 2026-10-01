@@ -52,16 +52,8 @@ fn small_pool_config() -> BatchCoordinatorConfig {
     }
 }
 
-fn open(dir: &Path) -> Arc<LsmEngine> {
-    Arc::new(
-        LsmEngine::open(
-            dir,
-            test_wal_config(),
-            small_pool_config(),
-            LsmConfig::default(),
-        )
-        .unwrap(),
-    )
+fn open(dir: &Path, lsm: LsmConfig) -> Arc<LsmEngine> {
+    Arc::new(LsmEngine::open(dir, test_wal_config(), small_pool_config(), lsm).unwrap())
 }
 
 pub struct Fixture {
@@ -82,8 +74,15 @@ impl Fixture {
     /// implicit coercion" rule) — both tables live in the default
     /// (`public`) schema.
     pub fn new(tag: &str) -> Self {
+        Self::new_with_lsm(tag, LsmConfig::default())
+    }
+
+    /// `new` with a caller-supplied `LsmConfig` (Increment 16: lets the
+    /// index differential tests force frequent flushes and automatic
+    /// Compaction while index reads are in flight).
+    pub fn new_with_lsm(tag: &str, lsm: LsmConfig) -> Self {
         let dir = temp_dir(tag);
-        let engine = open(&dir);
+        let engine = open(&dir, lsm);
         let catalog = CatalogService::new(Arc::clone(&engine));
         catalog.bootstrap().unwrap();
         let database_id = catalog.list_databases().unwrap()[0].database_id;

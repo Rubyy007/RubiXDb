@@ -18,7 +18,7 @@ use crate::execution::batch_coordinator::BatchCoordinatorConfig;
 use crate::lsm::{LsmConfig, LsmEngine};
 use crate::relational::index::IndexBuilder;
 use crate::relational::value::{TYPE_TAG_BOOLEAN, TYPE_TAG_INTEGER, TYPE_TAG_TEXT};
-use crate::relational::{RelationalValue, TableStore};
+use crate::relational::{RelationalError, RelationalValue, TableStore};
 use crate::wal::{SyncMode, WalConfig};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -973,5 +973,73 @@ fn index_range_scan_as_of_is_stable_against_a_later_delete() {
         "snapshotted range scan must still see the row as of the snapshot"
     );
 
+    f.cleanup();
+}
+
+/// Increment 16: the materialization bound is enforced while collecting,
+/// exactly at the boundary, for both lookup and range scan; the bounded
+/// variants return identical rows to the unbounded ones when under the
+/// limit; and the new bounded counters move by exactly the work done.
+#[test]
+fn bounded_index_scans_fail_closed_at_the_limit_and_count_work() {
+    use std::ops::Bound;
+    let f = Fixture::new("bounded_scan");
+    let table_id = create_simple_table(&f.catalog, "t");
+    let index_id = f
+        .builder
+        .create_index_online(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+        .unwrap();
+    for i in 0..20 {
+        f.store.put_row(table_id, &row(i, "same", true)).unwrap();
+    }
+    let key = [Some(RelationalValue::Text("same".to_string()))];
+
+    let unbounded = f
+        .builder
+        .index_lookup_as_of(index_id, &key, u64::MAX)
+        .unwrap();
+    let at_limit = f
+        .builder
+        .index_lookup_as_of_bounded(index_id, &key, u64::MAX, 20)
+        .unwrap();
+    assert_eq!(
+        unbounded, at_limit,
+        "bounded == unbounded when under the limit"
+    );
+    let over = f
+        .builder
+        .index_lookup_as_of_bounded(index_id, &key, u64::MAX, 19);
+    assert!(
+        matches!(over, Err(RelationalError::ResourceLimit { .. })),
+        "limit one below the match count must fail closed"
+    );
+    let range_over = f.builder.index_range_scan_as_of_bounded(
+        index_id,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        u64::MAX,
+        5,
+    );
+    assert!(matches!(
+        range_over,
+        Err(RelationalError::ResourceLimit { .. })
+    ));
+    let range_ok = f
+        .builder
+        .index_range_scan_as_of_bounded(index_id, Bound::Unbounded, Bound::Unbounded, u64::MAX, 20)
+        .unwrap();
+    assert_eq!(range_ok.len(), 20);
+
+    let before = f.builder.stats();
+    f.builder
+        .index_lookup_as_of(index_id, &key, u64::MAX)
+        .unwrap();
+    let after = f.builder.stats();
+    assert_eq!(
+        after.index_entries_examined - before.index_entries_examined,
+        20
+    );
+    assert_eq!(after.index_rows_fetched - before.index_rows_fetched, 20);
+    assert_eq!(after.index_lookups - before.index_lookups, 1);
     f.cleanup();
 }

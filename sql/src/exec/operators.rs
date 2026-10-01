@@ -194,10 +194,11 @@ impl<'a> AccessOp<'a> {
                             None => Vec::new(),
                             Some(values) => {
                                 ec.metrics.record_index_scan();
-                                ec.index_builder.index_lookup_as_of(
+                                ec.index_builder.index_lookup_as_of_bounded(
                                     *index_id,
                                     &values.into_iter().map(Some).collect::<Vec<_>>(),
                                     as_of,
+                                    ec.limits.max_index_scan_rows,
                                 )?
                             }
                         }
@@ -209,8 +210,13 @@ impl<'a> AccessOp<'a> {
                         ) {
                             (Some(start), Some(end)) => {
                                 ec.metrics.record_index_scan();
-                                ec.index_builder
-                                    .index_range_scan_as_of(*index_id, start, end, as_of)?
+                                ec.index_builder.index_range_scan_as_of_bounded(
+                                    *index_id,
+                                    start,
+                                    end,
+                                    as_of,
+                                    ec.limits.max_index_scan_rows,
+                                )?
                             }
                             _ => Vec::new(), // a NULL bound endpoint can never match (item 62)
                         }
