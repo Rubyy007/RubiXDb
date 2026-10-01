@@ -429,6 +429,26 @@ impl TableStore {
             }))
     }
 
+    /// Opens a resumable count of the rows a PK range covers at `as_of_seq`.
+    pub fn pk_count_cursor(
+        &self,
+        table_id: u32,
+        start: Bound<Vec<RelationalValue>>,
+        end: Bound<Vec<RelationalValue>>,
+        as_of_seq: u64,
+    ) -> Result<PkCountCursor> {
+        let (phys_start, phys_end) = pk_range_physical_bounds(table_id, start, end)?;
+        Ok(PkCountCursor {
+            iter: self.engine.range_scan(
+                as_bound_ref(&phys_start),
+                as_bound_ref(&phys_end),
+                as_of_seq,
+            ),
+            count: 0,
+            done: false,
+        })
+    }
+
     /// Increment 18: how many rows a PK range covers at `as_of_seq`,
     /// counted exactly but **only up to `limit`** (the second element is
     /// `true` when the range holds more than `limit` rows and counting
@@ -460,6 +480,43 @@ impl TableStore {
     }
 }
 
+/// Increment 18: a resumable, key-only count of the rows in a PK range (see
+/// `IndexProbeCursor`: the cost-based access chooser advances it in lockstep
+/// with competing candidates and never re-counts).
+pub struct PkCountCursor {
+    iter: crate::lsm::RangeScanIter,
+    count: u64,
+    done: bool,
+}
+
+impl PkCountCursor {
+    /// Counts until at least `total` rows have been seen or the range is
+    /// exhausted; returns whether it is exhausted.
+    pub fn advance_until(&mut self, total: u64) -> Result<bool> {
+        while !self.done && self.count < total {
+            match self.iter.next() {
+                None => self.done = true,
+                Some(entry) => {
+                    entry?;
+                    self.count += 1;
+                }
+            }
+        }
+        Ok(self.done)
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+/// A physical `[start, end)` key range.
+type PhysicalBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
 /// The physical `[start, end)` key range of a PK-prefix range (shared by
 /// `scan_table_pk_range_rows_as_of` and `count_pk_range_rows_as_of`, so the
 /// two can never disagree about which rows a range covers).
@@ -467,7 +524,7 @@ fn pk_range_physical_bounds(
     table_id: u32,
     start: Bound<Vec<RelationalValue>>,
     end: Bound<Vec<RelationalValue>>,
-) -> Result<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {
+) -> Result<PhysicalBounds> {
     let encode_bound = |b: Bound<Vec<RelationalValue>>| -> Result<Bound<Vec<u8>>> {
         Ok(match b {
             Bound::Unbounded => Bound::Unbounded,

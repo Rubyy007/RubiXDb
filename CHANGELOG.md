@@ -6,6 +6,58 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Increment 18 -- unified access path, lazy index fetch, transaction scan semantics (2026-10-02)
+
+Full record: `PHASE_RUBIXDB_INCREMENT18_ACCESS_PATH_ARCHITECTURE.md`,
+`_MATERIALIZATION_ARCHITECTURE.md`, `_TRANSACTION_SCAN_SEMANTICS.md`,
+`_PERFORMANCE.md`, `_RESULTS.md`. Closes the four open items of Increment 17.
+
+#### Fixed
+
+- **A transaction's scans now include its own uncommitted writes.** Previously
+  only PK lookups did, so a multi-statement transaction's `UPDATE`/`DELETE`
+  silently skipped rows the same transaction had inserted (reproduced: 3 of 5
+  rows updated) and scans returned stale rows after an in-transaction
+  update/delete. A bounded, versioned overlay of the write set is merged into
+  every access path; no cost when the table is not written. Contract: D10 and
+  the transaction ADR's "local overlay first" read path.
+- **PK range vs secondary index:** when both could satisfy a predicate the
+  planner always kept the PK range (up to 838x slower than the index). The
+  executor now prices every candidate by its exact row count (a lockstep race of
+  resumable cursors, bounded probing cost) and runs the cheapest; worst regret
+  1.44x at 100K rows.
+- **Index results are fetched lazily:** `LIMIT 10` over 25,000 index matches
+  373 -> 16ms; cancellation and deadlines stop the fetch; per-scan memory is the
+  bounded entry list.
+
+#### Added
+
+- `Transaction::overlay_for`, `TableOverlay`; `IndexRowFetcher`,
+  `IndexProbeCursor`, `PkCountCursor`, `TableStore::count_pk_range_rows_as_of`;
+  `PhysicalAccess::{IndexScan,PkRangeScan}::alternatives`,
+  `AccessPathMode::ForcePkRange`, counter `access_path_switches`, cost
+  parameter `index_open_ns`; `sql/src/exec/access_op.rs` (the access operator,
+  moved out of `operators.rs`).
+- Differential/property tests: transaction scans vs an independent model
+  (randomized, with outside writers, index rebuilds and Compaction), lazy-fetch
+  behaviour (LIMIT, backpressure, cancel, deadline), path independence across
+  four access-path modes with mixed PK/index predicates; benchmarks.
+
+#### Changed (performance, measured)
+
+- A single-clone row context makes every fetched row cheaper: seq scan -33%,
+  PK range -14%.
+
+#### Known / open
+
+- Index entry enumeration is still eager (`LIMIT` is O(K) key work); a
+  two-candidate decision costs ~0.1ms fixed; overlay cost is O(w) per scan; a
+  read-path concurrency plateau (~72-100 op/s from ~4 threads) is observed and
+  not investigated; statistics are in-memory and re-learned after restart
+  (measured immaterial).
+- Full regression fails only on pre-existing, unrelated items (WAL throughput
+  M1.2/M1.3; debug-only CLI two-instance test), re-verified on the previous tree.
+
 ### Product: Increment 17 -- index snapshot correctness + cost-based access path (2026-10-02)
 
 Full record: `PHASE_RUBIXDB_INCREMENT17_INDEX_SNAPSHOT_ARCHITECTURE.md`,

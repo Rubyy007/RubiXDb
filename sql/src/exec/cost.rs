@@ -113,6 +113,7 @@ mod tests {
         CostParams {
             seq_ns_per_row: DEFAULT_SEQ_NS_PER_ROW,
             index_ns_per_row: DEFAULT_INDEX_NS_PER_ROW,
+            index_open_ns: rubixdb::relational::stats::DEFAULT_INDEX_OPEN_NS,
         }
     }
 
@@ -137,6 +138,7 @@ mod tests {
         let fast_index = CostParams {
             seq_ns_per_row: 2_700,
             index_ns_per_row: 3_650,
+            index_open_ns: 100_000,
         };
         assert!(break_even_entries(e, fast_index) > 70_000);
     }

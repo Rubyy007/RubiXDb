@@ -1464,10 +1464,17 @@ fn pk_range_vs_index_baseline() {
         "{:>9} {:>9} | {:>9} {:>9} {:>9} {:>9} | {:<6} {:<6} {:>7} | {:>6}",
         "pk rows R", "idx rows K", "auto", "pk", "index", "seq", "auto=", "best", "regret", "match"
     );
-    let range_rows = [10usize, 1_000, n / 10, n / 2];
-    let groups = [10_000usize, 1_000, 10, 2]; // K = n/G
+    // `INC18_R` / `INC18_G` override the grids (the 1M run uses a subset).
+    let mut range_rows = env_list("INC18_R", &[10usize, 1_000, n / 10, n / 2]);
+    range_rows.retain(|&r| r > 0 && r < n);
+    range_rows.sort_unstable();
+    range_rows.dedup();
+    let groups = env_list("INC18_G", &[10_000usize, 1_000, 10, 2]); // K = n/G
     for &r in &range_rows {
         for &g in &groups {
+            if n / g == 0 {
+                continue;
+            }
             let lo = n / 4;
             let hi = lo + r;
             let col = format!("e{g}");
@@ -1553,6 +1560,262 @@ fn materialization_baseline() {
             r_lim.rows,
             r_lim.lat.pct(0.5) / r_full.lat.pct(0.5)
         );
+    }
+    env.cleanup();
+}
+
+// ---------------------------------------------------------------------
+// Increment 18: transaction-overlay overhead and restart statistics
+// ---------------------------------------------------------------------
+
+fn sx_row(n: usize, id: usize) -> Vec<Option<RelationalValue>> {
+    let mut row: Vec<Option<RelationalValue>> = vec![
+        Some(RelationalValue::Integer(id as i32)),
+        Some(RelationalValue::Integer((n + id) as i32)), // s outside every range used
+    ];
+    for g in SX_GROUPS {
+        row.push(Some(RelationalValue::Text(format!("g{}", id % g))));
+    }
+    row.push(Some(RelationalValue::Text("pad-pad-pad-pad".to_string())));
+    row
+}
+
+/// Scans inside a transaction that has written w rows to the table: w = 0
+/// must cost the same as an autocommit scan (the common case), and cost may
+/// grow with w only by the (bounded) overlay merge.
+#[test]
+#[ignore]
+fn txn_overlay_overhead() {
+    let n: usize = env_list("INC16_SIZES", &[100_000])[0];
+    let env = sx_env(&format!("inc18_ovl_{n}"), n, &[1_000]);
+    let queries: [(&str, String); 4] = [
+        (
+            "seq scan COUNT",
+            "SELECT COUNT(*) FROM sx WHERE pad = 'pad-pad-pad-pad'".to_string(),
+        ),
+        (
+            "PK range K=1000",
+            "SELECT * FROM sx WHERE id >= 5000 AND id < 6000".to_string(),
+        ),
+        (
+            "index eq K=100",
+            "SELECT * FROM sx WHERE e1000 = 'g0'".to_string(),
+        ),
+        (
+            "index range K=100",
+            "SELECT * FROM sx WHERE s >= 0 AND s < 100".to_string(),
+        ),
+    ];
+    println!(
+        "\n=== transaction scan overhead N={n} (p50 ms; 'autocommit' = no transaction writes) ==="
+    );
+    print!("{:<20} {:>11}", "query", "autocommit");
+    let ws_vec = env_list("INC18_WS", &[0usize, 1, 10, 100, 1_000]);
+    let ws = ws_vec.as_slice();
+    for &w in ws {
+        print!(" {:>9}", format!("w={w}"));
+    }
+    println!();
+    for (label, sql) in &queries {
+        let plan = env.prepare(sql);
+        let auto = run_query(&env, sql);
+        print!("{label:<20} {:>11.3}", auto.lat.pct(0.5));
+        for &w in ws {
+            let mut txn = env.txm.begin().unwrap();
+            for i in 0..w {
+                txn.put_row(env.table_id, &sx_row(n, n + 10 + i)).unwrap();
+            }
+            let reps = if label.starts_with("seq") { 5 } else { 30 };
+            let mut lat = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let s = Instant::now();
+                let r = crate::exec::execute(
+                    &plan,
+                    &txn,
+                    &env.store,
+                    &env.builder,
+                    &[],
+                    &ExecLimits::default(),
+                    &ExecMetrics::default(),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+                lat.push(s.elapsed());
+                // the transaction's own rows are visible to the seq scan
+                if label.starts_with("seq") {
+                    assert_eq!(
+                        r.rows[0][0],
+                        Some(RelationalValue::Bigint((n + w) as i64)),
+                        "overlay rows must be counted"
+                    );
+                }
+            }
+            print!(" {:>9.3}", Lat(lat).pct(0.5));
+            txn.rollback().unwrap();
+        }
+        println!();
+    }
+    // Order-confound check for the seq-scan row (w=1/10 looked slower than
+    // w=100/1000): the same query with the write counts in REVERSE order.
+    {
+        let plan = env.prepare(&queries[0].1);
+        print!("{:<20} {:>11}", "seq (reversed order)", "-");
+        for &w in ws.iter().rev() {
+            let mut txn = env.txm.begin().unwrap();
+            for i in 0..w {
+                txn.put_row(env.table_id, &sx_row(n, n + 10 + i)).unwrap();
+            }
+            let mut lat = Vec::new();
+            for _ in 0..7 {
+                let s = Instant::now();
+                crate::exec::execute(
+                    &plan,
+                    &txn,
+                    &env.store,
+                    &env.builder,
+                    &[],
+                    &ExecLimits::default(),
+                    &ExecMetrics::default(),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+                lat.push(s.elapsed());
+            }
+            print!(" w={w}:{:>8.1}", Lat(lat).pct(0.5));
+            txn.rollback().unwrap();
+        }
+        println!();
+    }
+    env.cleanup();
+}
+
+/// Rebuilds an `Env` over the same on-disk database after a real engine
+/// restart (WAL replay + SSTable recovery). All runtime statistics are lost.
+fn reopen_env(env: Env) -> Env {
+    let Env {
+        f,
+        catalog,
+        store,
+        builder,
+        txm,
+        n,
+        table_id,
+        mode,
+    } = env;
+    // Drop every handle layered on the old engine (and with it all runtime
+    // statistics) so the engine can release its WAL lock.
+    drop((catalog, store, builder, txm));
+    let f = f.reopen();
+    let catalog = Arc::new(CatalogService::new(Arc::clone(&f.engine)));
+    let store = Arc::new(TableStore::new(Arc::clone(&f.engine), Arc::clone(&catalog)));
+    let builder = Arc::new(IndexBuilder::new(
+        Arc::clone(&f.engine),
+        Arc::clone(&catalog),
+        Arc::clone(&store),
+    ));
+    let txm = Arc::new(TransactionManager::new(
+        Arc::clone(&f.engine),
+        Arc::clone(&store),
+    ));
+    Env {
+        f,
+        catalog,
+        store,
+        builder,
+        txm,
+        n,
+        table_id,
+        mode,
+    }
+}
+
+/// Runtime statistics across a real restart: identical database, measured
+/// before and after. Reports, per query, the first-execution latency (where
+/// any one-time statistics warm-up lands), the warm p50, planning time, the
+/// access decision (cost fallback), and whether a table-size estimate exists.
+#[test]
+#[ignore]
+fn restart_statistics_experiment() {
+    let n: usize = env_list("INC16_SIZES", &[100_000])[0];
+    let mut env = sx_env(&format!("inc18_restart_{n}"), n, &[10_000, 10, 2]);
+    let qs: [(&str, String); 4] = [
+        (
+            "selective K=10",
+            "SELECT COUNT(*) FROM sx WHERE e10000 = 'g0'".to_string(),
+        ),
+        (
+            "10% K=n/10",
+            "SELECT COUNT(*) FROM sx WHERE e10 = 'g0'".to_string(),
+        ),
+        (
+            "50% K=n/2 (scan wins)",
+            "SELECT COUNT(*) FROM sx WHERE e2 = 'g0'".to_string(),
+        ),
+        (
+            "PK range+idx",
+            format!(
+                "SELECT * FROM sx WHERE id >= 100 AND id < {} AND e10 = 'g0'",
+                n / 2
+            ),
+        ),
+    ];
+    for phase in ["before restart", "after restart "] {
+        println!(
+            "\n=== {phase} (N={n}) estimate={:?} ===",
+            env.store.runtime_stats().row_estimate(env.table_id)
+        );
+        println!(
+            "{:<24} {:>9} {:>9} {:>9} | {:>10} | {:>5} {:>6}",
+            "query", "plan us", "first ms", "warm p50", "cost-fb", "swtch", "est?"
+        );
+        for (label, sql) in &qs {
+            // planning time (parse+bind+plan), median of 200
+            let limits = SqlLimits::default();
+            let auth = AuthContext::admin("bench");
+            let mut plan_t = Vec::new();
+            for _ in 0..200 {
+                let t = Instant::now();
+                let stmt = parse_statement(sql, &limits).unwrap();
+                let bound = bind_statement(
+                    &env.f.catalog,
+                    &env.f.ctx,
+                    &auth,
+                    &SqlMetrics::default(),
+                    &limits,
+                    &stmt,
+                )
+                .unwrap();
+                let _ = build_plan(
+                    &bound,
+                    &env.f.catalog,
+                    &PlannerLimits::default(),
+                    &PlannerMetrics::default(),
+                )
+                .unwrap();
+                plan_t.push(t.elapsed());
+            }
+            let plan_us = Lat(plan_t).pct(0.5) * 1000.0;
+            let plan = env.prepare(sql);
+            let m = ExecMetrics::default();
+            let t = Instant::now();
+            let _ = env.exec(&plan, &m);
+            let first = t.elapsed().as_secs_f64() * 1000.0;
+            let snap = m.snapshot();
+            let warm = run_query(&env, sql);
+            println!(
+                "{label:<24} {plan_us:>9.1} {first:>9.2} {:>9.3} | {:>10} | {:>5} {:>6}",
+                warm.lat.pct(0.5),
+                snap.index_cost_fallbacks,
+                snap.access_path_switches,
+                env.store
+                    .runtime_stats()
+                    .row_estimate(env.table_id)
+                    .is_some()
+            );
+        }
+        if phase.starts_with("before") {
+            env = reopen_env(env);
+        }
     }
     env.cleanup();
 }

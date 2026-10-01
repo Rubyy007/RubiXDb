@@ -86,3 +86,6 @@ mod txn_scan_tests;
 
 #[cfg(test)]
 mod materialization_tests;
+
+#[cfg(test)]
+mod inc18_compare_bench;

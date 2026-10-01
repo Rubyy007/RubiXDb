@@ -104,6 +104,20 @@ impl RowContext {
             .map(|(_, row)| row)
     }
 
+    /// `self` plus one more table's row, taking the row by value -- exactly
+    /// `self.merged(&RowContext::single(table_ref, row))` without cloning the
+    /// row a second time (every fetched row of every access passes through
+    /// here).
+    pub fn with_row(&self, table_ref: u32, row: Row) -> RowContext {
+        let mut rows = Vec::with_capacity(self.rows.len() + 1);
+        rows.extend(self.rows.iter().cloned());
+        rows.push((table_ref, row));
+        RowContext {
+            rows,
+            aggregates: self.aggregates.clone(),
+        }
+    }
+
     /// Combines this context with another (a `Join`'s own left/right row
     /// contexts) — item 28: exact join multiplicity depends on never
     /// losing either side's own bindings.

@@ -657,32 +657,18 @@ impl IndexBuilder {
         }
     }
 
-    /// Increment 17, phase 1 of an index read: validate that the index is
-    /// usable for the snapshot (F-2), then enumerate the matching index
-    /// entries **without fetching any row**. Entry enumeration costs
-    /// ~0.6us per entry (Increment 16 measurement) against ~15us per row
-    /// fetched, so the caller learns the exact match count -- and can still
-    /// choose a different access path -- at a small fraction of the cost of
-    /// the index path itself.
-    ///
-    /// - `Unusable`: the index was not `Ready` as of `as_of_seq`; it does
-    ///   not represent the table that snapshot sees and must not be used.
-    /// - `Truncated`: more than `entry_limit` entries match (enumeration
-    ///   stopped early; nothing was fetched).
-    /// - `max_rows` is the hard resource bound: exceeding it fails closed
-    ///   with `ResourceLimit` (checked in preference to `Truncated` when
-    ///   `max_rows <= entry_limit`).
-    pub fn probe_index_entries_as_of(
+    /// Validates the index for the snapshot (F-2) and resolves everything an
+    /// entry enumeration needs, once: the physical key range, the table's
+    /// metadata, and the indexed-column / primary-key decode types.
+    /// `None` = the index was not `Ready` as of the snapshot.
+    fn probe_setup(
         &self,
         index_id: u32,
         spec: &IndexScanSpec,
         as_of_seq: u64,
-        entry_limit: usize,
-        max_rows: usize,
-    ) -> Result<IndexProbe> {
-        let started = std::time::Instant::now();
+    ) -> Result<Option<ProbeSetup>> {
         let Some(index_row) = self.index_row_usable_at(index_id, as_of_seq)? else {
-            return Ok(IndexProbe::Unusable);
+            return Ok(None);
         };
         let (start, end) = match spec {
             IndexScanSpec::Equality(prefix_values) => {
@@ -739,6 +725,51 @@ impl IndexBuilder {
                     .and_then(relational_type_from_column)
             })
             .collect::<Result<_>>()?;
+        Ok(Some(ProbeSetup {
+            start,
+            end,
+            table,
+            columns,
+            indexed_types,
+            pk_types,
+        }))
+    }
+
+    /// Increment 17, phase 1 of an index read: validate that the index is
+    /// usable for the snapshot (F-2), then enumerate the matching index
+    /// entries **without fetching any row**. Entry enumeration costs
+    /// ~0.6us per entry (Increment 16 measurement) against ~15us per row
+    /// fetched, so the caller learns the exact match count -- and can still
+    /// choose a different access path -- at a small fraction of the cost of
+    /// the index path itself.
+    ///
+    /// - `Unusable`: the index was not `Ready` as of `as_of_seq`; it does
+    ///   not represent the table that snapshot sees and must not be used.
+    /// - `Truncated`: more than `entry_limit` entries match (enumeration
+    ///   stopped early; nothing was fetched).
+    /// - `max_rows` is the hard resource bound: exceeding it fails closed
+    ///   with `ResourceLimit` (checked in preference to `Truncated` when
+    ///   `max_rows <= entry_limit`).
+    pub fn probe_index_entries_as_of(
+        &self,
+        index_id: u32,
+        spec: &IndexScanSpec,
+        as_of_seq: u64,
+        entry_limit: usize,
+        max_rows: usize,
+    ) -> Result<IndexProbe> {
+        let started = std::time::Instant::now();
+        let Some(ProbeSetup {
+            start,
+            end,
+            table,
+            columns,
+            indexed_types,
+            pk_types,
+        }) = self.probe_setup(index_id, spec, as_of_seq)?
+        else {
+            return Ok(IndexProbe::Unusable);
+        };
 
         let cap = entry_limit.min(max_rows);
         let mut entries: Vec<(Vec<RelationalValue>, Vec<u8>)> = Vec::new();
@@ -784,6 +815,48 @@ impl IndexBuilder {
             columns,
             entries,
         }))
+    }
+
+    /// Opens a resumable enumeration of the entries matching `spec` as of
+    /// `as_of_seq`, or `None` if the index was not `Ready` at the snapshot
+    /// (F-2). Nothing is enumerated until `advance_until` is called.
+    pub fn probe_cursor(
+        &self,
+        index_id: u32,
+        spec: &IndexScanSpec,
+        as_of_seq: u64,
+    ) -> Result<Option<IndexProbeCursor>> {
+        let Some(setup) = self.probe_setup(index_id, spec, as_of_seq)? else {
+            return Ok(None);
+        };
+        let iter = self.engine.range_scan(
+            as_bound_ref(&setup.start),
+            as_bound_ref(&setup.end),
+            as_of_seq,
+        );
+        Ok(Some(IndexProbeCursor {
+            iter,
+            table: setup.table,
+            columns: setup.columns,
+            indexed_types: setup.indexed_types,
+            pk_types: setup.pk_types,
+            entries: Vec::new(),
+            done: false,
+            examined: 0,
+        }))
+    }
+
+    /// Turns a fully enumerated cursor into the entries `lazy_row_fetcher`
+    /// consumes, recording the work it did.
+    pub fn finish_probe_cursor(&self, cursor: IndexProbeCursor) -> IndexEntries {
+        self.stats
+            .index_entries_examined
+            .fetch_add(cursor.examined, Ordering::Relaxed);
+        IndexEntries {
+            table: cursor.table,
+            columns: cursor.columns,
+            entries: cursor.entries,
+        }
     }
 
     /// Phase 2, lazily: an iterator that fetches each enumerated entry's
@@ -891,6 +964,71 @@ impl Iterator for IndexRowFetcher<'_> {
             }
         }
         None
+    }
+}
+
+/// Everything an entry enumeration needs, resolved once (see `probe_setup`).
+struct ProbeSetup {
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+    table: crate::catalog::schema::TableRow,
+    columns: Vec<crate::catalog::schema::ColumnRow>,
+    indexed_types: Vec<RelationalType>,
+    pk_types: Vec<RelationalType>,
+}
+
+/// Increment 18: a *resumable* index-entry enumeration. The cost-based access
+/// chooser races several candidates (a PK range and secondary indexes) in
+/// lockstep in cost units: each is advanced by the same slice of estimated
+/// cost, the first to finish wins, and no candidate's work is ever repeated.
+/// The loser has enumerated only about as much as the winner's cost, so
+/// pricing a candidate costs a few percent of executing it.
+pub struct IndexProbeCursor {
+    iter: crate::lsm::RangeScanIter,
+    table: crate::catalog::schema::TableRow,
+    columns: Vec<crate::catalog::schema::ColumnRow>,
+    indexed_types: Vec<RelationalType>,
+    pk_types: Vec<RelationalType>,
+    entries: Vec<(Vec<RelationalValue>, Vec<u8>)>,
+    done: bool,
+    examined: u64,
+}
+
+impl IndexProbeCursor {
+    /// Enumerates until at least `total` entries are held or the range is
+    /// exhausted; returns whether it is exhausted. Never errors on size --
+    /// the caller bounds `total` by `max_index_scan_rows`.
+    pub fn advance_until(&mut self, total: usize) -> Result<bool> {
+        while !self.done && self.entries.len() < total {
+            match self.iter.next() {
+                None => self.done = true,
+                Some(entry) => {
+                    let (key, _value) = entry?;
+                    self.examined += 1;
+                    let body = key.get(9..).ok_or_else(|| RelationalError::InvalidInput {
+                        detail: "index entry key shorter than the fixed 9-byte header".to_string(),
+                    })?;
+                    let (_indexed_values, consumed) =
+                        decode_indexed_columns(&self.indexed_types, body)?;
+                    let pk_bytes = &body[consumed..];
+                    let pk_values = decode_composite_key(&self.pk_types, pk_bytes)?;
+                    self.entries.push((pk_values, pk_bytes.to_vec()));
+                }
+            }
+        }
+        Ok(self.done)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 }
 

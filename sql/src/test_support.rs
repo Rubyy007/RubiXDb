@@ -168,6 +168,38 @@ impl Fixture {
         }
     }
 
+    /// Increment 18: a real engine restart over the same directory (shut
+    /// the engine down, then reopen: WAL replay and SSTable recovery). The
+    /// engine's exclusive WAL lock is released only when every handle to it
+    /// is gone, so the caller must first drop everything layered on the old
+    /// engine (catalog service, table store, index builder, transaction
+    /// manager) -- which is also what discards every runtime statistic.
+    pub fn reopen(self) -> Fixture {
+        let Fixture {
+            dir,
+            engine,
+            catalog,
+            ctx,
+        } = self;
+        drop(catalog);
+        engine.shutdown();
+        drop(engine);
+        let engine = open(
+            &dir,
+            LsmConfig {
+                compaction_auto_trigger: std::env::var("INC16_COMPACT").is_ok_and(|v| v == "1"),
+                ..LsmConfig::default()
+            },
+        );
+        let catalog = CatalogService::new(Arc::clone(&engine));
+        Fixture {
+            dir,
+            engine,
+            catalog,
+            ctx,
+        }
+    }
+
     pub fn cleanup(self) {
         self.engine.shutdown();
         let _ = std::fs::remove_dir_all(&self.dir);

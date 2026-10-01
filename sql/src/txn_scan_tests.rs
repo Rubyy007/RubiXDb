@@ -38,7 +38,8 @@ fn ins_t(d: &Diff, t: &mut rubixdb::relational::Transaction, model: &mut Model, 
 
 /// Every access-path shape, under every access-path mode, against the model.
 fn check(d: &Diff, t: &rubixdb::relational::Transaction, model: &Model, ctx: &str) {
-    let queries: Vec<(String, Box<dyn Fn(&Mrow) -> bool>)> = vec![
+    type Q = (String, Box<dyn Fn(&Mrow) -> bool>);
+    let queries: Vec<Q> = vec![
         ("SELECT * FROM dt WHERE id >= 0".into(), Box::new(|_| true)), // PK range
         (
             "SELECT * FROM dt WHERE c >= 0".into(),
@@ -235,7 +236,7 @@ fn autocommit_and_other_snapshots_never_see_uncommitted_writes() {
 
 use crate::index_read_differential_tests::Rng;
 
-fn run_txn_property(seed: u64, steps: usize) {
+fn run_txn_property(seed: u64, steps: usize) -> u64 {
     let mut rng = Rng(seed);
     let d = Diff::new(&format!("txnprop_{seed}"));
     let mut model = Model::new();
@@ -314,14 +315,14 @@ fn run_txn_property(seed: u64, steps: usize) {
             69..=84 => {
                 // an outside writer commits: invisible to the open snapshot
                 let id = rng.below(80) as i32;
-                if shadow.contains_key(&id) {
-                    d.write(&format!("DELETE FROM dt WHERE id = {id}"));
-                    shadow.remove(&id);
-                } else {
+                if let std::collections::btree_map::Entry::Vacant(e) = shadow.entry(id) {
                     d.write(&format!(
                         "INSERT INTO dt (id, a, b, c) VALUES ({id}, 1, 's0', 0)"
                     ));
-                    shadow.insert(id, m(id, Some(1), Some("s0"), 0));
+                    e.insert(m(id, Some(1), Some("s0"), 0));
+                } else {
+                    d.write(&format!("DELETE FROM dt WHERE id = {id}"));
+                    shadow.remove(&id);
                 }
             }
             85..=89 if step > 5 => {
@@ -339,20 +340,25 @@ fn run_txn_property(seed: u64, steps: usize) {
     // The outside world is unaffected by the open, uncommitted transaction.
     let other = d.txm.begin().unwrap();
     check(&d, &other, &shadow, &format!("seed={seed} outside view"));
+    let cycles = d.f.engine.compaction_metrics().cycles_completed;
     d.f.cleanup();
+    cycles
 }
 
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig { cases: 16, ..proptest::prelude::ProptestConfig::default() })]
     #[test]
     fn transaction_scans_equal_base_plus_local_writes(seed in proptest::prelude::any::<u64>()) {
-        run_txn_property(seed, 90);
+        let _ = run_txn_property(seed, 90);
     }
 }
 
 #[test]
 fn transaction_scan_property_fixed_seeds_long() {
+    let mut cycles = 0;
     for seed in 1..=6u64 {
-        run_txn_property(seed, 250);
+        cycles += run_txn_property(seed, 250);
     }
+    println!("automatic Compaction cycles during the transaction property runs: {cycles}");
+    assert!(cycles > 0, "the property runs must overlap real Compaction");
 }

@@ -37,6 +37,11 @@ pub const MAX_TRACKED_TABLES: usize = 4096;
 /// (clamped to `[default / COST_CLAMP, default * COST_CLAMP]`).
 pub const DEFAULT_SEQ_NS_PER_ROW: u64 = 3_400;
 pub const DEFAULT_INDEX_NS_PER_ROW: u64 = 14_500;
+/// Fixed cost of opening an index scan (catalog lookups for the index row
+/// as of the snapshot, table and column metadata): measured ~0.1ms from the
+/// K=1..10 index-lookup latencies of Increments 16-18. Not calibrated at
+/// runtime; it only decides whether pricing an index is worth starting.
+pub const DEFAULT_INDEX_OPEN_NS: u64 = 100_000;
 pub const COST_CLAMP: u64 = 8;
 
 /// A row-count estimate and how far it may have drifted.
@@ -61,6 +66,7 @@ struct TableStats {
 pub struct CostParams {
     pub seq_ns_per_row: u64,
     pub index_ns_per_row: u64,
+    pub index_open_ns: u64,
 }
 
 pub struct RuntimeStats {
@@ -124,6 +130,7 @@ impl RuntimeStats {
         CostParams {
             seq_ns_per_row: self.seq_ns.load(Ordering::Relaxed),
             index_ns_per_row: self.index_ns.load(Ordering::Relaxed),
+            index_open_ns: DEFAULT_INDEX_OPEN_NS,
         }
     }
 

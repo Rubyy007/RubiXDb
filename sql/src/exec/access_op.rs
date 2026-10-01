@@ -53,7 +53,7 @@ pub(super) enum AccessSource<'a> {
     /// uncommitted rows, tested against the complete predicate when reached.
     IndexFetch {
         fetcher: IndexRowFetcher<'a>,
-        extras: std::vec::IntoIter<Row>,
+        extras: Option<(Arc<TableOverlay>, usize)>,
     },
 }
 
@@ -63,7 +63,7 @@ pub(super) enum AccessSource<'a> {
 struct OverlayMerge {
     overlay: Arc<TableOverlay>,
     pos: usize,
-    pending: Option<(Vec<u8>, Row)>,
+    pending: Option<(Vec<RelationalValue>, Row)>,
     base_done: bool,
 }
 
@@ -247,6 +247,20 @@ fn compare_rows_by_ordinals(
         }
     }
     Ordering::Equal
+}
+
+/// Orders two primary keys. The physical key encoding is order-preserving
+/// (every PK range scan depends on exactly that), so comparing the decoded
+/// values lexicographically agrees with the physical key order -- and saves
+/// re-encoding every base row of a merged scan.
+fn compare_pks(a: &[RelationalValue], b: &[RelationalValue]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let o = value_ordering(x, y);
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 impl<'a> AccessOp<'a> {
@@ -589,18 +603,19 @@ impl<'a> AccessOp<'a> {
             ));
         }
 
-        let extras: Vec<Row> = overlay
-            .as_ref()
-            .map(|ov| ov.entries().iter().filter_map(|e| e.row.clone()).collect())
-            .unwrap_or_default();
+        // The transaction's own rows are visited (and cloned) only if the
+        // base fetch is exhausted -- a LIMIT that stops early never pays for
+        // them.
+        let extras = if has_local_puts {
+            overlay.clone().map(|ov| (ov, 0usize))
+        } else {
+            None
+        };
         let fetcher = ec.index_builder.lazy_row_fetcher(entries, as_of);
         let mut op = Self::new(
             table_ref,
             residual.clone(),
-            AccessSource::IndexFetch {
-                fetcher,
-                extras: extras.into_iter(),
-            },
+            AccessSource::IndexFetch { fetcher, extras },
             outer,
         );
         op.overlay_predicate = fallback.predicate.clone();
@@ -689,103 +704,268 @@ impl<'a> AccessOp<'a> {
             };
         }
 
+        if cands.len() == 1 {
+            return Self::choose_single_index(ec, table_id, &cands[0]);
+        }
+        Self::choose_by_race(ec, table_id, cands, order)
+    }
+
+    /// One secondary index and nothing else to compare it with: the
+    /// Increment 17 decision -- enumerate up to the break-even match count
+    /// against a full table scan, count the table once if its size is
+    /// unknown or stale.
+    fn choose_single_index(ec: &ExecCtx<'a>, table_id: u32, cand: &Cand) -> Result<Chosen> {
+        let as_of = ec.txn.snapshot_seq();
+        let max_rows = ec.limits.max_index_scan_rows;
+        let Cand::Index { index_id, spec, .. } = cand else {
+            unreachable!("choose_single_index is only called for an index candidate")
+        };
         let stats = ec.table_store.runtime_stats();
         let mut counted = false;
         loop {
             let est = stats.row_estimate(table_id);
-            let p = stats.cost_params();
-            // The table scan is the baseline every candidate must beat.
-            let seq_budget: Option<u128> =
-                est.map(|e| (e.rows as u128 + e.drift as u128) * p.seq_ns_per_row as u128);
-            let mut best: Option<(usize, u128, Option<(IndexEntries, u64)>)> = None;
-            let mut truncated_any = false;
-            let mut unusable = 0usize;
-            let mut indexes = 0usize;
-            for &i in order {
-                let budget = match (best.as_ref().map(|b| b.1), seq_budget) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, b) => b,
-                };
-                match &cands[i] {
-                    Cand::Index { index_id, spec, .. } => {
-                        indexes += 1;
-                        let limit = match budget {
-                            // At least one entry: a single match always
-                            // goes to the index (cost::break_even's rule).
-                            Some(b) => ((b / p.index_ns_per_row.max(1) as u128)
-                                .min(usize::MAX as u128)
-                                as usize)
-                                .max(1),
-                            None => cost::PROBE_FLOOR,
-                        };
-                        let started = std::time::Instant::now();
-                        match ec
-                            .index_builder
-                            .probe_index_entries_as_of(*index_id, spec, as_of, limit, max_rows)?
-                        {
-                            IndexProbe::Entries(entries) => {
-                                let c = entries.len() as u128 * p.index_ns_per_row as u128;
-                                if best.as_ref().is_none_or(|b| c < b.1) {
-                                    let ns = started.elapsed().as_nanos() as u64;
-                                    best = Some((i, c, Some((entries, ns))));
-                                }
-                            }
-                            IndexProbe::Truncated => truncated_any = true,
-                            IndexProbe::Unusable => unusable += 1,
-                        }
+            let entry_limit = cost::entry_limit(est, stats.cost_params());
+            let started = std::time::Instant::now();
+            match ec.index_builder.probe_index_entries_as_of(
+                *index_id,
+                spec,
+                as_of,
+                entry_limit,
+                max_rows,
+            )? {
+                IndexProbe::Entries(entries) => {
+                    return Ok(Chosen::Index {
+                        cand: 0,
+                        entries,
+                        probe_ns: started.elapsed().as_nanos() as u64,
+                    })
+                }
+                // F-2: the index was not Ready as of this snapshot.
+                IndexProbe::Unusable => return Ok(Chosen::Seq(FallbackReason::Snapshot)),
+                // More matches than the index path is estimated to be worth.
+                IndexProbe::Truncated => {
+                    if !counted && cost::estimate_is_unreliable(est) {
+                        ec.table_store.count_rows(table_id)?;
+                        counted = true;
+                        continue;
                     }
-                    Cand::Pk { start, end, .. } => {
-                        let limit = match budget {
-                            Some(b) => ((b / p.seq_ns_per_row.max(1) as u128).min(u64::MAX as u128)
-                                as u64)
-                                .max(1),
-                            None => cost::PROBE_FLOOR as u64,
-                        };
-                        let (r, truncated) = ec.table_store.count_pk_range_rows_as_of(
-                            table_id,
-                            start.clone(),
-                            end.clone(),
-                            as_of,
-                            limit,
-                        )?;
-                        if truncated {
-                            truncated_any = true;
-                        } else {
-                            let c = r as u128 * p.seq_ns_per_row as u128;
-                            if best.as_ref().is_none_or(|b| c < b.1) {
-                                best = Some((i, c, None));
-                            }
-                        }
+                    return Ok(Chosen::Seq(FallbackReason::Cost));
+                }
+            }
+        }
+    }
+
+    /// Several candidates (a PK range and/or secondary indexes) can each
+    /// satisfy the predicate. Each is priced by its *exact* row count, found
+    /// by racing resumable enumerations in lockstep in cost units: every
+    /// round advances each contender by the same slice of estimated cost,
+    /// the first to finish wins (once the others have been given at least
+    /// as much cost-equivalent progress, so none can still beat it), and no
+    /// work is repeated. Probing therefore costs a few percent of the
+    /// winner's execution, however unselective the losers are.
+    fn choose_by_race(
+        ec: &ExecCtx<'a>,
+        table_id: u32,
+        cands: &[Cand],
+        order: &[usize],
+    ) -> Result<Chosen> {
+        let as_of = ec.txn.snapshot_seq();
+        let max_rows = ec.limits.max_index_scan_rows;
+        let stats = ec.table_store.runtime_stats();
+        let mut counted = false;
+
+        'restart: loop {
+            let est = stats.row_estimate(table_id);
+            let p = stats.cost_params();
+            let idx_ns = p.index_ns_per_row.max(1) as u128;
+            let seq_ns = p.seq_ns_per_row.max(1) as u128;
+            let open_ns = p.index_open_ns as u128;
+            // The table scan is the baseline every candidate must beat.
+            let seq_budget: Option<u128> = est.map(|e| (e.rows as u128 + e.drift as u128) * seq_ns);
+
+            struct Racer {
+                cand: usize,
+                kind: RacerKind,
+                ns: u64,
+            }
+            enum RacerKind {
+                Index(rubixdb::relational::index::IndexProbeCursor),
+                Pk(rubixdb::relational::table_store::PkCountCursor),
+            }
+            impl Racer {
+                /// Estimated cost of the work enumerated so far (exact cost
+                /// once the enumeration is done).
+                fn cost(&self, idx_ns: u128, seq_ns: u128, open_ns: u128) -> u128 {
+                    match &self.kind {
+                        RacerKind::Index(c) => open_ns + c.len() as u128 * idx_ns,
+                        RacerKind::Pk(c) => c.count() as u128 * seq_ns,
+                    }
+                }
+                fn done(&self) -> bool {
+                    match &self.kind {
+                        RacerKind::Index(c) => c.is_done(),
+                        RacerKind::Pk(c) => c.is_done(),
                     }
                 }
             }
-            if let Some((i, _, payload)) = best {
-                return Ok(match payload {
-                    Some((entries, probe_ns)) => Chosen::Index {
+
+            // Round 0: PK ranges are opened first and advanced only as far
+            // as the fixed cost of opening an index scan is worth; a range
+            // that small needs no further pricing.
+            let mut racers: Vec<Racer> = Vec::new();
+            let quick_rows = ((open_ns / seq_ns) as u64).max(1);
+            for &i in order {
+                if let Cand::Pk { start, end, .. } = &cands[i] {
+                    let mut cursor = ec.table_store.pk_count_cursor(
+                        table_id,
+                        start.clone(),
+                        end.clone(),
+                        as_of,
+                    )?;
+                    if cursor.advance_until(quick_rows)? {
+                        return Ok(Chosen::Pk { cand: i });
+                    }
+                    racers.push(Racer {
                         cand: i,
-                        entries,
-                        probe_ns,
-                    },
-                    None => Chosen::Pk { cand: i },
-                });
+                        kind: RacerKind::Pk(cursor),
+                        ns: 0,
+                    });
+                }
             }
-            // Nothing priced within budget. If the table size is unknown or
-            // stale, count it once (cached) and decide again; otherwise the
-            // table scan is cheaper than every candidate.
-            if truncated_any && !counted && cost::estimate_is_unreliable(est) {
-                ec.table_store.count_rows(table_id)?;
-                counted = true;
-                continue;
+            let mut unusable = 0usize;
+            let mut index_cands = 0usize;
+            for &i in order {
+                if let Cand::Index { index_id, spec, .. } = &cands[i] {
+                    index_cands += 1;
+                    match ec.index_builder.probe_cursor(*index_id, spec, as_of)? {
+                        Some(cursor) => racers.push(Racer {
+                            cand: i,
+                            kind: RacerKind::Index(cursor),
+                            ns: 0,
+                        }),
+                        None => unusable += 1,
+                    }
+                }
             }
-            let all_unusable = indexes > 0
-                && unusable == indexes
-                && cands.iter().all(|c| matches!(c, Cand::Index { .. }));
-            return Ok(Chosen::Seq(if all_unusable {
-                FallbackReason::Snapshot
-            } else {
-                FallbackReason::Cost
-            }));
+            // Keep the planner's structural order among equal costs.
+            racers.sort_by_key(|r| {
+                order
+                    .iter()
+                    .position(|&o| o == r.cand)
+                    .unwrap_or(usize::MAX)
+            });
+
+            // The race. Slices grow geometrically so a large winner needs few
+            // rounds; every contender gets the same slice each round.
+            let mut slice: u128 = 32 * idx_ns;
+            // (racer position, cost) of the best finished contender so far.
+            let mut best: Option<(usize, u128)> = None;
+            loop {
+                for (pos, r) in racers.iter_mut().enumerate() {
+                    if r.done() {
+                        continue;
+                    }
+                    // Once a winner exists, only contenders that have not yet
+                    // consumed as much cost-equivalent work as it needed can
+                    // still beat it.
+                    if let Some((_, bc)) = best {
+                        if r.cost(idx_ns, seq_ns, open_ns) >= bc {
+                            continue;
+                        }
+                    }
+                    let started = std::time::Instant::now();
+                    match &mut r.kind {
+                        RacerKind::Index(c) => {
+                            let target = c.len() + ((slice / idx_ns) as usize).max(1);
+                            c.advance_until(target.min(max_rows.saturating_add(1)))?;
+                            if c.len() > max_rows {
+                                return Err(SqlError::ResourceLimit {
+                                    detail: format!(
+                                        "index scan exceeded the {max_rows}-row materialization limit (max_index_scan_rows)"
+                                    ),
+                                });
+                            }
+                        }
+                        RacerKind::Pk(c) => {
+                            let target = c.count() + ((slice / seq_ns) as u64).max(1);
+                            c.advance_until(target)?;
+                        }
+                    }
+                    r.ns += started.elapsed().as_nanos() as u64;
+                    if r.done() {
+                        let c = r.cost(idx_ns, seq_ns, open_ns);
+                        if best.is_none_or(|(_, bc)| c < bc) {
+                            best = Some((pos, c));
+                        }
+                    }
+                }
+                // Decide: a winner is final once every unfinished contender
+                // has consumed at least its cost.
+                if let Some((_, bc)) = best {
+                    let pending = racers
+                        .iter()
+                        .any(|r| !r.done() && r.cost(idx_ns, seq_ns, open_ns) < bc);
+                    if !pending {
+                        break;
+                    }
+                } else {
+                    // Nobody has finished. Bound the race by the table scan.
+                    let progress = racers
+                        .iter()
+                        .map(|r| r.cost(idx_ns, seq_ns, open_ns))
+                        .min()
+                        .unwrap_or(0);
+                    match seq_budget {
+                        Some(sb) if progress >= sb => {
+                            // Every candidate costs more than a full table
+                            // scan -- but a PK range never does, so if one
+                            // exists it wins; refresh a stale estimate first.
+                            if !counted && cost::estimate_is_unreliable(est) {
+                                ec.table_store.count_rows(table_id)?;
+                                counted = true;
+                                continue 'restart;
+                            }
+                            if let Some(pk) =
+                                racers.iter().find(|r| matches!(r.kind, RacerKind::Pk(_)))
+                            {
+                                return Ok(Chosen::Pk { cand: pk.cand });
+                            }
+                            let all_unusable = index_cands > 0
+                                && unusable == index_cands
+                                && cands.iter().all(|c| matches!(c, Cand::Index { .. }));
+                            return Ok(Chosen::Seq(if all_unusable {
+                                FallbackReason::Snapshot
+                            } else {
+                                FallbackReason::Cost
+                            }));
+                        }
+                        None if !counted && progress >= cost::PROBE_FLOOR as u128 * idx_ns => {
+                            // Table size unknown: count it once (cached) and
+                            // race again against a known baseline.
+                            ec.table_store.count_rows(table_id)?;
+                            counted = true;
+                            continue 'restart;
+                        }
+                        _ => {}
+                    }
+                }
+                if racers.is_empty() {
+                    // Every candidate was an unusable index (F-2).
+                    return Ok(Chosen::Seq(FallbackReason::Snapshot));
+                }
+                slice = slice.saturating_mul(2);
+            }
+
+            let (pos, _) = best.expect("loop exits only with a winner");
+            let winner = racers.swap_remove(pos);
+            return Ok(match winner.kind {
+                RacerKind::Pk(_) => Chosen::Pk { cand: winner.cand },
+                RacerKind::Index(cursor) => Chosen::Index {
+                    cand: winner.cand,
+                    entries: ec.index_builder.finish_probe_cursor(cursor),
+                    probe_ns: winner.ns,
+                },
+            });
         }
     }
 
@@ -889,7 +1069,17 @@ impl<'a> AccessOp<'a> {
             AccessSource::Vec(iter) => Ok(iter.next().map(|(_, r)| (r, false))),
             AccessSource::IndexFetch { fetcher, extras } => match fetcher.next().transpose()? {
                 Some((_, row)) => Ok(Some((row, false))),
-                None => Ok(extras.next().map(|r| (r, true))),
+                None => {
+                    if let Some((ov, pos)) = extras {
+                        while let Some(e) = ov.entries().get(*pos) {
+                            *pos += 1;
+                            if let Some(row) = &e.row {
+                                return Ok(Some((row.clone(), true)));
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
             },
             AccessSource::Lazy(iter) => match merge {
                 None => {
@@ -904,8 +1094,7 @@ impl<'a> AccessOp<'a> {
                         match iter.next().transpose()? {
                             Some((pk, row)) => {
                                 ec.metrics.record_rows_scanned(1);
-                                let enc = encode_composite_key(&pk)?;
-                                m.pending = Some((enc, row));
+                                m.pending = Some((pk, row));
                             }
                             None => m.base_done = true,
                         }
@@ -924,7 +1113,7 @@ impl<'a> AccessOp<'a> {
                             }
                         }
                         (Some((benc, _)), Some(e)) => {
-                            match benc.as_slice().cmp(e.encoded_pk.as_slice()) {
+                            match compare_pks(benc, &e.pk_values) {
                                 std::cmp::Ordering::Less => {
                                     let (_, row) = m.pending.take().expect("checked Some");
                                     return Ok(Some((row, false)));
@@ -967,7 +1156,7 @@ impl<'a> Operator<'a> for AccessOp<'a> {
             if let Some(o) = self.obs.as_mut() {
                 o.rows += 1;
             }
-            let row_ctx = self.outer.merged(&RowContext::single(self.table_ref, row));
+            let row_ctx = self.outer.with_row(self.table_ref, row);
             let predicate = if from_overlay {
                 &self.overlay_predicate
             } else {

@@ -4484,3 +4484,68 @@ rows, process-cold runs, mixed read+write load. Eager index-result
 materialization, PK-range-vs-index cost comparison, and read-your-own-writes
 on scans (pre-existing) are recorded as separate items. Stopped after
 Increment 17 per the mandate.
+
+## 2026-10-02 (Increment 18: unified access path, lazy index fetch, transaction scan semantics)
+
+Closes the four open items Increment 17 recorded. Append-only; Increment
+14-17 records are unchanged (where they call a behaviour a "scope boundary" or
+"deferred" that this increment resolved, the Increment 18 documents supersede
+them). Full record: `PHASE_RUBIXDB_INCREMENT18_ACCESS_PATH_ARCHITECTURE.md`,
+`_MATERIALIZATION_ARCHITECTURE.md`, `_TRANSACTION_SCAN_SEMANTICS.md`,
+`_PERFORMANCE.md`, `_RESULTS.md`.
+
+**1. PK range vs secondary index -- FIXED.** Baseline grid on the Increment 17
+tree: the planner always kept the PK range when it consumed more conjuncts,
+wrong by up to 838x (R=50,000, K=10: 193ms vs 0.23ms). The planner now
+carries every sargable candidate (PK range + each Ready index, bounded to 3
+alternatives) and the executor prices each by its exact row count, racing
+resumable key-only cursors in lockstep in cost units (no enumeration repeated;
+a losing candidate has done only about the winner's cost in probing; a PK range
+needs no counting once every index has lost to the table scan). A first
+version introduced 65x regret (it probed the index with a table-scan-sized
+budget) and a second 1.75x; the shipped race has worst regret 1.44x at 100K
+(<= 1.68x at 1M). Fixed cost of a two-candidate decision ~0.1ms.
+
+**2. Eager index materialization -- fixed (hybrid).** Memory was fine
+(~0.7KB/row, bounded); the real problem was latency: `LIMIT 10` cost 90% of
+the full query because all K rows were fetched. Entries are still enumerated up
+front (key-only, bounded by `max_index_scan_rows`) but rows are fetched on
+demand: `LIMIT 10` over 25,000 matches 373 -> 16.2ms (23x). Verified by exact
+fetch counts: LIMIT 5 fetches 5; no read-ahead; cancel/deadline stop the fetch;
+the transaction stays correct. Writes keep bounded materialization.
+
+**3. Transaction scan semantics -- FIXED (a correctness defect).** Contract
+(D10 + transaction ADR section 2: "every read a transaction performs" is local
+overlay first, snapshot second) requires scans to see the transaction's own
+writes; earlier docs only recorded the exclusion as a scope boundary.
+Reproduced on HEAD: scans ignored inserts/updates/deletes, and `UPDATE ...
+WHERE a = 1` after two inserts in one transaction hit 3 rows instead of 5.
+Fix: `Transaction::overlay_for` (versioned, cached, key-ordered, bounded by
+`max_write_set_ops`) merged into every scan in the one shared operator
+(PK-ordered merge for lazy scans; entry filtering + lazy extras for index
+scans; sort for ordered). Cost O(w) per scan, 0 when the table is not written
+(<= 4% to w=100; +0.7ms at w=1,000). Mutation check fails 8 of 9 tests;
+randomized property (16x90 + 6x250 steps) with outside writers, index rebuilds
+under the open snapshot and 7 Compactions passes.
+
+**4. Statistics across restart -- NOT REQUIRED.** Real engine restart
+experiment: the first query that needs a table size pays one exact count
+(+68ms at 100K, +440ms at 1M; 0.6us/row, once per table, only above 128
+matches), one borderline PK-range+index decision runs ~8% slower until the cost
+parameters are re-learned, results and all other decisions identical. No
+persistence added.
+
+**Measured side effect:** every fetched row was cloned twice into its row
+context; a single-clone path (`RowContext::with_row`) made seq scans 33%
+faster (342.6 -> 229.7ms) and PK ranges 14% faster as a general speedup.
+
+**Verification:** fmt and `clippy -D warnings` clean; protected-path audit
+(`src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`) zero diff.
+Full regression is FAIL only on pre-existing, unrelated items re-verified on
+the Increment 17 tree: WAL throughput M1.2/M1.3 and the debug-only CLI test
+`two_instances_simultaneous_...` (debug 1,106 passed / 3 failed; release 1,107
+passed / 2 failed). **Observed, not investigated:** fetch-heavy reads plateau
+at ~72-100 op/s from ~4 threads with idle CPU (outside the four items; recorded
+with data). Not claimed: production-readiness of the access-path optimizer,
+secondary-index executor, transactional scans or statistics subsystem, nor of
+RubixDB as a whole. Stopped after Increment 18 per the mandate.
