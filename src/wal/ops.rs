@@ -86,6 +86,40 @@ pub enum WalOpOwned {
     Group(Vec<GroupMemberOwned>),
 }
 
+impl WalOp<'_> {
+    /// Copies this borrowed op into its owned form. Used by the group-commit
+    /// flat-combining append path, where one thread (the combiner) must
+    /// encode ops that belong to other, blocked threads.
+    pub fn to_owned_op(&self) -> WalOpOwned {
+        match self {
+            WalOp::Put { key, value } => WalOpOwned::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+            WalOp::Delete { key } => WalOpOwned::Delete { key: key.to_vec() },
+            WalOp::CheckpointMarker {
+                flushed_through_seq,
+            } => WalOpOwned::CheckpointMarker {
+                flushed_through_seq: *flushed_through_seq,
+            },
+            WalOp::Group { members } => WalOpOwned::Group(
+                members
+                    .iter()
+                    .map(|m| match m {
+                        GroupMember::Put { key, value } => GroupMemberOwned::Put {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                        },
+                        GroupMember::Delete { key } => {
+                            GroupMemberOwned::Delete { key: key.to_vec() }
+                        }
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
 impl WalOpOwned {
     /// Re-borrows this owned op as a `WalOp<'_>` — the form `GroupCommitter::
     /// append`/`append_durable` actually take. No copy: the returned

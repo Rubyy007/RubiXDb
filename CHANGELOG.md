@@ -2392,3 +2392,45 @@ the original Phase 1 throughput targets.
   just the one thread that died. Verified the system still fails safely
   (bounded, no hang, no false acknowledgment) under this condition.
   See `PHASE2B_FAILURE_MODEL.md` §3.
+
+## 2026-10-02 -- Final single-node certification (ENGINE-BLOCKED; not declared production ready)
+
+### Fixed
+- **SQL parser (D-1):** the pre-parse operator-chain guard no longer counts operator characters that
+  occur inside string literals, quoted identifiers or comments. Previously valid statements (e.g. a
+  single INSERT of 260+ ISO-date rows, or a 40 KB hyphenated text value) were rejected with
+  `413 RESOURCE_LIMIT`. Genuine operator chains (incl. the 20,000-term stack-overflow case) are still
+  rejected. Zero-allocation fast path unchanged.
+- **CLI (D-2):** terminal sanitizer now also escapes C1 control characters (U+0080-U+009F, e.g. 8-bit
+  CSI/OSC), as its documentation always claimed.
+- **Test harness (D-0):** `two_instances_simultaneous_...` no longer panics in debug and no longer
+  leaks spawned server processes. Assertions unchanged.
+
+### Security
+- Frontend `react-router-dom` 6.30 -> 7.18 (closes GHSA-wrjc-x8rr-h8h6, GHSA-337j-9hxr-rhxg); production
+  `npm audit` now reports 0 vulnerabilities. `cargo audit`: 0 vulnerabilities.
+
+### Added
+- `frontend/e2e/xss_safety.spec.ts` (real browser, untrusted database content), 4 SQL and 2 CLI
+  regression tests, and the certification documents `PHASE_RUBIXDB_FINAL_SINGLE_NODE_*.md` and
+  `PHASE_RUBIXDB_ENGINE_PERFORMANCE_ADR.md`.
+
+### Known / unchanged
+- WAL throughput M1.2/M1.3 remain ENGINE-BLOCKED (fsync-latency bound); `src/wal/` untouched.
+- Same-table SQL commit throughput ~270/s (per-table commit lock held across fsync) -- characterized only.
+
+## 2026-10-03 -- WAL performance resolution (branch `wal-batch-buffer-fillq`, not merged)
+
+### Changed
+- **WAL group commit:** the leader's batch window now closes early once the open batch has reached the previous batch's size
+  (cohorts <= 256) and arrivals have been quiet for `clamp(400 ns x cohort, 100 us, 1 ms)`. Only ever earlier than the existing
+  deadline. No change to durability, ordering, recovery, on-disk format or failure handling. 2 new tests.
+  Measured: M1.2 +13.6%; 2-16 writers +44% to +85%; M1.3 neutral; product-level SQL write throughput unchanged.
+
+### Added (analysis tools, not on any production path)
+- `examples/{fsync_lanes_probe,fsync_overlap_probe,commit_pipeline_proto,wal_commit_latency,wal_ack_oracle}.rs`,
+  `scripts/wal_bench_runner.ps1`, and the `PHASE_RUBIXDB_WAL_*.md` documents.
+
+### Known / unchanged
+- M1.2 / M1.3 still below target (ENGINE-BLOCKED); no NVMe available (experiment open); leader-written batch buffer NOT implemented
+  pending a failure-semantics decision.

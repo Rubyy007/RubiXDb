@@ -1,0 +1,31 @@
+oracle cycle   1 OK  acks_received=117917 recovered_this_cycle=118325 total_recovered=118325
+oracle cycle   2 OK  acks_received= 43803 recovered_this_cycle= 43832 total_recovered=162157
+oracle cycle   3 OK  acks_received= 57630 recovered_this_cycle= 58114 total_recovered=220271
+oracle cycle   4 OK  acks_received= 11049 recovered_this_cycle= 11497 total_recovered=231768
+oracle cycle   5 OK  acks_received= 21228 recovered_this_cycle= 21674 total_recovered=253442
+oracle cycle   6 OK  acks_received= 24315 recovered_this_cycle= 24745 total_recovered=278187
+oracle cycle   7 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=278187
+oracle cycle   8 OK  acks_received= 22086 recovered_this_cycle= 22486 total_recovered=300673
+oracle cycle   9 OK  acks_received=  5377 recovered_this_cycle=  5816 total_recovered=306489
+oracle cycle  10 OK  acks_received=  2040 recovered_this_cycle=  2143 total_recovered=308632
+oracle cycle  11 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=308632
+oracle cycle  12 OK  acks_received=  8340 recovered_this_cycle=  8740 total_recovered=317372
+oracle cycle  13 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=317372
+oracle cycle  14 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=317372
+oracle cycle  15 OK  acks_received= 33840 recovered_this_cycle= 34240 total_recovered=351612
+oracle cycle  16 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=351612
+oracle cycle  17 OK  acks_received= 15419 recovered_this_cycle= 15897 total_recovered=367509
+oracle cycle  18 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=367509
+oracle cycle  19 OK  acks_received=   670 recovered_this_cycle=   987 total_recovered=368496
+oracle cycle  20 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=368496
+oracle cycle  21 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=368496
+oracle cycle  22 OK  acks_received=  5348 recovered_this_cycle=  5748 total_recovered=374244
+oracle cycle  23 OK  acks_received=  4914 recovered_this_cycle=  5314 total_recovered=379558
+oracle cycle  24 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=379558
+oracle cycle  25 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=379558
+oracle cycle  26 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=379558
+oracle cycle  27 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=379558
+oracle cycle  28 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=379558
+oracle cycle  29 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=379558
+oracle cycle  30 OK  acks_received=     0 recovered_this_cycle=     0 total_recovered=379558
+SUMMARY cycles=30 writers=400 failures=0 total_acks_verified=373976 final_recovered=9673317

@@ -45,15 +45,16 @@
 //!   that a caller on the hot path (rather than at startup) should not
 //!   construct a fresh `GroupCommitter` per request.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::error::{EngineError, Result};
 use crate::wal::metrics::FsyncLatencyTracker;
-use crate::wal::{FileWal, SyncMode, Wal, WalOp, WalPosition};
+use crate::wal::{FileWal, SyncMode, Wal, WalOp, WalOpOwned, WalPosition};
 
 /// Default backpressure bound (§11) for `GroupCommitter::new` — see
 /// `with_max_pending_waiters`'s doc comment. Chosen to be far above any
@@ -97,6 +98,10 @@ const WINDOW_EMA_DIVISOR: u64 = 1;
 /// notices paying it.
 const PROBE_WINDOW: Duration = Duration::from_micros(200);
 
+/// The probe exit applies only while the previous batch held at most this many
+/// records (i.e. a lone writer or a cold start); see `spin_wait_for_batch_window`.
+const PROBE_ONLY_UP_TO_COHORT: u64 = 1;
+
 /// How often `spin_wait_for_batch_window`'s production wait mechanism
 /// calls `yield_now()` instead of `spin_loop()` — see that function's doc
 /// comment. Shared with `phase1_waitmode_experiment`'s `Spin` mode (the
@@ -104,6 +109,100 @@ const PROBE_WINDOW: Duration = Duration::from_micros(200);
 /// the two can never silently drift apart the way an independently
 /// hardcoded divisor once did (`PHASE1_TEST_RESULTS.md` §17 finding #8).
 const YIELD_EVERY: u32 = 10_000;
+
+/// Count-aware, quiescence-guarded early close of the leader's batch window
+/// (`PHASE_RUBIXDB_WAL_PERFORMANCE_ARCHITECTURE.md`). Once the open batch
+/// holds at least as many records as the previous batch did (the "cohort"
+/// that is expected to re-arrive in a closed loop of waiting writers) AND no
+/// new record has been appended for this long, the leader stops waiting
+/// instead of idling out the rest of a window sized for fsync latency.
+///
+/// The quiescence guard is what prevents a ratchet: a target taken from the
+/// previous batch alone would close as soon as it is met, so a batch that
+/// started small could never grow back. With the guard, arrivals that are
+/// still flowing keep the batch open. Measured (M1.2/M1.3 workload shapes,
+/// warm, strictly interleaved): throughput is flat across floors of 50-200 us
+/// (M1.2 16.7-18.7k, M1.3 82-100k), with no cliff; 25 us was unstable in an
+/// earlier prototype (OS timer jitter). 100 us sits in the middle of the flat
+/// region, so the choice is not sensitive. This only ever closes the window EARLIER than the existing
+/// deadline; it never extends it, and it changes nothing about which records
+/// a given `fsync` covers (decided later, at `snapshot_sync_target`).
+const QUIESCENCE_WINDOW: Duration = Duration::from_micros(100);
+
+/// The batch size the leader waits for before an early close, derived from the
+/// previous batch (`100%` of it unless the experiment hook says otherwise;
+/// `0%` means "any arrival", i.e. pure quiescence).
+fn cohort_target_from_prev(prev: u64) -> u64 {
+    #[cfg(feature = "phase1-window-experiment")]
+    {
+        let pct = quiesce_experiment::target_pct();
+        if prev == 0 {
+            return 0;
+        }
+        return ((prev * pct) / 100).max(1);
+    }
+    #[cfg(not(feature = "phase1-window-experiment"))]
+    prev
+}
+
+/// `true` when the open batch should close early: a cohort target exists
+/// (`target > 0`), the open batch has reached it, and arrivals have been
+/// quiet for at least `QUIESCENCE_WINDOW`. Pure so its decision table can be
+/// tested exhaustively.
+fn cohort_arrived_and_quiet(open: u64, target: u64, quiet_for: Duration) -> bool {
+    target > 0 && open >= target && quiet_for >= quiescence_for_cohort(target)
+}
+
+/// The quiescence interval required before an early close, scaled with the
+/// cohort size: with more concurrent writers the natural gaps between
+/// arrivals grow (more thread wake-ups per core), so a fixed short interval
+/// would occasionally fire before stragglers arrive and add tail latency
+/// (measured at 1,000 writers: p99 +20% with a fixed 100 us). `400 ns` per
+/// expected record, floored at `QUIESCENCE_WINDOW` and capped at 1 ms (so it
+/// is always far below the fsync-latency-sized window it shortens).
+fn quiescence_for_cohort(target: u64) -> Duration {
+    #[cfg(feature = "phase1-window-experiment")]
+    let (floor, per_record, max) = quiesce_experiment::params();
+    #[cfg(not(feature = "phase1-window-experiment"))]
+    let (floor, per_record, max) = (QUIESCENCE_WINDOW, QUIESCENCE_NS_PER_RECORD, QUIESCENCE_MAX);
+    let scaled = Duration::from_nanos(target.saturating_mul(per_record));
+    scaled.clamp(floor, max)
+}
+
+/// **Experiment-only** (compiled only with `phase1-window-experiment`; fully
+/// removable): env overrides for the early-close constants, used to choose
+/// them with a measured sweep rather than by guess.
+/// `PHASE1_EXPERIMENT_QUIET_FLOOR_US`, `PHASE1_EXPERIMENT_QUIET_NS_PER_RECORD`,
+#[cfg(feature = "phase1-window-experiment")]
+mod quiesce_experiment {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    fn env(name: &str) -> Option<u64> {
+        std::env::var(name).ok().and_then(|v| v.parse().ok())
+    }
+    pub(super) fn params() -> (Duration, u64, Duration) {
+        static P: OnceLock<(Duration, u64, Duration)> = OnceLock::new();
+        *P.get_or_init(|| {
+            (
+                Duration::from_micros(
+                    env("PHASE1_EXPERIMENT_QUIET_FLOOR_US")
+                        .unwrap_or(super::QUIESCENCE_WINDOW.as_micros() as u64),
+                ),
+                env("PHASE1_EXPERIMENT_QUIET_NS_PER_RECORD")
+                    .unwrap_or(super::QUIESCENCE_NS_PER_RECORD),
+                super::QUIESCENCE_MAX,
+            )
+        })
+    }
+    pub(super) fn target_pct() -> u64 {
+        static T: OnceLock<u64> = OnceLock::new();
+        *T.get_or_init(|| env("PHASE1_EXPERIMENT_TARGET_PCT").unwrap_or(100))
+    }
+}
+
+const QUIESCENCE_NS_PER_RECORD: u64 = 400;
+
+const QUIESCENCE_MAX: Duration = Duration::from_millis(1);
 
 /// The production wait step: `spin_loop()` every iteration except every
 /// `YIELD_EVERY`th, which yields instead. Factored out of `spin_wait_for_
@@ -277,6 +376,155 @@ struct BatchState {
 /// only ever trusts bytes a `fsync` actually completed) — no new recovery
 /// mechanism is introduced here, per this project's own standing rule
 /// that `GroupCommitter` must not duplicate `FileWal`'s recovery logic.
+/// Upper bound on frames written by one combiner round. A safety bound on
+/// per-round work and on the transient run buffer (frames are bounded by
+/// `max_record_len` each), not a tuning parameter: the number of queued
+/// appenders can never exceed the number of caller threads, since each
+/// blocks until its own frame is written.
+const APPEND_COMBINE_MAX_OPS: usize = 4096;
+
+/// One appender's completion slot (flat combining). The appender blocks on
+/// it until a combiner has either WRITTEN its frame (`Done(Ok)`), failed to
+/// (`Done(Err)`), or handed it the combiner role (`Combine`). Per-slot state
+/// -- never a shared watermark -- is what makes a failed batched write
+/// impossible to mistake for success.
+struct AppendSlot {
+    /// 0 waiting, 1 done, 2 combine: a lock-free mirror of `state` for the
+    /// bounded spin in `wait`.
+    flag: AtomicU8,
+    state: Mutex<SlotState>,
+    cv: Condvar,
+}
+
+enum SlotState {
+    Waiting,
+    Combine,
+    Done(Option<Result<WalPosition>>),
+}
+
+enum SlotWake {
+    Done(Result<WalPosition>),
+    Combine,
+}
+
+impl AppendSlot {
+    fn new() -> Arc<Self> {
+        Arc::new(AppendSlot {
+            flag: AtomicU8::new(0),
+            state: Mutex::new(SlotState::Waiting),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Idempotent: a slot completes at most once.
+    fn complete(&self, result: Result<WalPosition>) {
+        let mut st = self.lock_state();
+        if matches!(*st, SlotState::Done(_)) {
+            return;
+        }
+        *st = SlotState::Done(Some(result));
+        self.flag.store(1, Ordering::Release);
+        self.cv.notify_one();
+    }
+
+    fn promote(&self) {
+        let mut st = self.lock_state();
+        if matches!(*st, SlotState::Waiting) {
+            *st = SlotState::Combine;
+            self.flag.store(2, Ordering::Release);
+            self.cv.notify_one();
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.flag.load(Ordering::Acquire) == 1
+    }
+
+    /// Bounded spin (a completed batched write takes tens of microseconds),
+    /// then a blocking condvar wait -- never an unbounded busy-wait.
+    fn wait(&self) -> SlotWake {
+        for i in 0..256u32 {
+            if self.flag.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            if i < 128 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        let mut st = self.lock_state();
+        loop {
+            match &mut *st {
+                SlotState::Waiting => {
+                    st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+                }
+                SlotState::Combine => return SlotWake::Combine,
+                SlotState::Done(r) => {
+                    return SlotWake::Done(r.take().expect("a Done slot's result is taken once"))
+                }
+            }
+        }
+    }
+
+    fn take_done(&self) -> Option<Result<WalPosition>> {
+        match &mut *self.lock_state() {
+            SlotState::Done(r) => r.take(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AppendQueue {
+    items: VecDeque<(Arc<AppendSlot>, WalOpOwned)>,
+    /// `true` while some thread holds (or has been handed) the combiner role.
+    combining: bool,
+}
+
+/// Panic safety for the combiner: if a combiner unwinds, every appender it
+/// had taken -- and every one still queued -- is completed with `Err` (never
+/// left blocked), the role is released, and the committer is poisoned
+/// (whether the interrupted write reached the file is unknowable, so
+/// continuing would not fail closed).
+struct CombinerGuard<'a> {
+    committer: &'a GroupCommitter,
+    in_flight: Vec<Arc<AppendSlot>>,
+    armed: bool,
+}
+
+impl Drop for CombinerGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let err = || {
+            EngineError::Io(io::Error::other(
+                "WAL append combiner panicked before completing this append; the committer is \
+                 poisoned and must be discarded",
+            ))
+        };
+        for slot in self.in_flight.drain(..) {
+            slot.complete(Err(err()));
+        }
+        let mut q = self.committer.lock_append_q();
+        for (slot, _) in q.items.drain(..) {
+            slot.complete(Err(err()));
+        }
+        q.combining = false;
+        drop(q);
+        {
+            let mut b = self.committer.lock_batch();
+            b.poisoned = Some(PoisonReason::LeaderPanicked);
+        }
+        self.committer.condvar.notify_all();
+    }
+}
+
 struct LeaderFailureGuard<'a> {
     committer: &'a GroupCommitter,
     armed: bool,
@@ -375,6 +623,17 @@ pub struct GroupCommitter {
     /// `0` whenever a new leader is elected). A heuristic only — see
     /// `estimate_frame_len`'s doc comment for why it need not be exact.
     batch_bytes: AtomicUsize,
+    /// Flat-combining queue for `append` (see `AppendSlot`).
+    append_q: Mutex<AppendQueue>,
+    /// Highest `seq` published by any completed `append()` (monotonic via
+    /// `fetch_max`). With contiguous seqs, `appended_seq - durable_through`
+    /// is the number of records appended but not yet covered by a completed
+    /// `fsync` -- the size of the open batch -- readable without any lock.
+    appended_seq: AtomicU64,
+    /// Number of records in the most recently completed successful batch.
+    /// Seeds `spin_wait_for_batch_window`'s cohort target; `0` (no early
+    /// close) until a batch has completed.
+    prev_batch_records: AtomicU64,
     /// Backpressure (§11): the number of callers currently inside
     /// `await_durable` (leader or follower), bounded by
     /// `max_pending_waiters`. See `acquire_waiter_permit`.
@@ -529,6 +788,9 @@ impl GroupCommitter {
             max_wait_cap: max_wait,
             max_batch_bytes,
             batch_bytes: AtomicUsize::new(0),
+            append_q: Mutex::new(AppendQueue::default()),
+            appended_seq: AtomicU64::new(initial_durable_through),
+            prev_batch_records: AtomicU64::new(0),
             pending_waiters: AtomicUsize::new(0),
             max_pending_waiters,
             shutting_down: AtomicBool::new(false),
@@ -613,13 +875,87 @@ impl GroupCommitter {
                 detail: "GroupCommitter is shutting down; new appends are rejected".to_string(),
             });
         }
-        let approx_len = estimate_frame_len(&op);
-        let position = {
-            let mut wal = self.lock_wal();
-            wal.append(op)?
+        // Flat combining. The caller returns only after its OWN frame has
+        // been written to the segment (so `Ok` still means "written", and a
+        // failed batched write fails every writer in it BEFORE any of them
+        // holds an `Ok`). Durability is still established only by
+        // `await_durable`'s fsync -- unchanged.
+        let slot = AppendSlot::new();
+        let owned = op.to_owned_op();
+        let leads = {
+            let mut q = self.lock_append_q();
+            q.items.push_back((Arc::clone(&slot), owned));
+            let leads = !q.combining;
+            q.combining = true;
+            leads
         };
-        self.batch_bytes.fetch_add(approx_len, Ordering::Relaxed);
-        Ok(position)
+        if !leads {
+            match slot.wait() {
+                SlotWake::Done(r) => return r,
+                SlotWake::Combine => {}
+            }
+        }
+        self.combine_until_done(&slot)
+    }
+
+    fn lock_append_q(&self) -> MutexGuard<'_, AppendQueue> {
+        self.append_q.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Runs combiner rounds until `own` has been completed, then hands the
+    /// role to the oldest queued appender (or releases it).
+    fn combine_until_done(&self, own: &Arc<AppendSlot>) -> Result<WalPosition> {
+        let mut guard = CombinerGuard {
+            committer: self,
+            in_flight: Vec::new(),
+            armed: true,
+        };
+        while !own.is_done() {
+            let batch: Vec<(Arc<AppendSlot>, WalOpOwned)> = {
+                let mut q = self.lock_append_q();
+                let take = q.items.len().min(APPEND_COMBINE_MAX_OPS);
+                q.items.drain(..take).collect()
+            };
+            if batch.is_empty() {
+                // `own` was queued before this role was taken or handed over,
+                // so an empty queue with `own` not done cannot happen; fail
+                // closed rather than spin if it ever did.
+                own.complete(Err(EngineError::Io(io::Error::other(
+                    "WAL append combiner found an empty queue for a queued append",
+                ))));
+                break;
+            }
+            guard.in_flight = batch.iter().map(|(s, _)| Arc::clone(s)).collect();
+            let results = {
+                let mut wal = self.lock_wal();
+                wal.append_group(batch.iter().map(|(_, o)| o.as_wal_op()).collect())
+            };
+            let mut approx_bytes = 0usize;
+            let mut max_seq = 0u64;
+            for ((slot, owned), result) in batch.iter().zip(results) {
+                if let Ok(pos) = &result {
+                    approx_bytes += estimate_frame_len(&owned.as_wal_op());
+                    max_seq = max_seq.max(pos.seq);
+                }
+                slot.complete(result);
+            }
+            self.batch_bytes.fetch_add(approx_bytes, Ordering::Relaxed);
+            if max_seq > 0 {
+                self.appended_seq.fetch_max(max_seq, Ordering::Relaxed);
+            }
+            guard.in_flight.clear();
+        }
+        {
+            let mut q = self.lock_append_q();
+            if let Some((head, _)) = q.items.front() {
+                head.promote();
+            } else {
+                q.combining = false;
+            }
+        }
+        guard.armed = false;
+        own.take_done()
+            .expect("the combiner's own slot is completed before it returns")
     }
 
     /// The brief's algorithm, verbatim (WAL Spec §4's `GroupCommit`
@@ -893,7 +1229,7 @@ impl GroupCommitter {
         self.timing.record_batch_start(t_window_started);
 
         let window_started = Instant::now();
-        self.spin_wait_for_batch_window();
+        self.spin_wait_for_batch_window(durable_through_before_batch);
         let window_elapsed_ns =
             u64::try_from(window_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.stat_window_wait_ns_total
@@ -940,6 +1276,8 @@ impl GroupCommitter {
                 super::fire_abort_hook(super::AbortPoint::AfterWatermarkBeforeWake);
 
                 let batch_records = batch_max_seq.saturating_sub(durable_through_before_batch);
+                self.prev_batch_records
+                    .store(batch_records, Ordering::Relaxed);
                 self.stat_sync_successes.fetch_add(1, Ordering::Relaxed);
                 self.stat_records_total
                     .fetch_add(batch_records, Ordering::Relaxed);
@@ -1016,7 +1354,7 @@ impl GroupCommitter {
     /// 100–1,000-writer contention a follower reliably joins well within
     /// the first 200µs, so this probe essentially never shortens a batch
     /// that real contention would have grown.
-    fn spin_wait_for_batch_window(&self) {
+    fn spin_wait_for_batch_window(&self, batch_base_seq: u64) {
         super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPre);
         let ema_ns = self.latency.current_ns();
         #[cfg(feature = "phase1-window-experiment")]
@@ -1026,6 +1364,7 @@ impl GroupCommitter {
             .max_wait_cap
             .min(Duration::from_nanos(ema_ns / WINDOW_EMA_DIVISOR));
         if window.is_zero() {
+            self.timing.note_close(0);
             super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
             return;
         }
@@ -1058,20 +1397,58 @@ impl GroupCommitter {
         // whenever the feature is off or its env var is unset/invalid.
         #[cfg(feature = "phase1-waitmode-experiment")]
         let wait_mode = phase1_waitmode_experiment::effective_wait_mode();
+        // Cohort target and quiescence tracking (see `QUIESCENCE_WINDOW`).
+        // `target == 0` (no completed batch yet) disables the early close.
+        let prev_cohort = self.prev_batch_records.load(Ordering::Relaxed);
+        let target = cohort_target_from_prev(prev_cohort);
+        let mut last_seen = self
+            .appended_seq
+            .load(Ordering::Relaxed)
+            .saturating_sub(batch_base_seq);
+        // The lone-writer probe ("nobody else appended within PROBE_WINDOW, so
+        // stop waiting") is only meaningful when the previous batch was a lone
+        // writer. After a multi-writer batch there demonstrably are other
+        // writers; probing then closes the batch while they are still waking
+        // up (measured: ~49% of batches at 100 writers closed by the probe
+        // with ~70 of 100 records, leaving stragglers to form extra batches).
+        // If the other writers really have gone, the batch still ends at the
+        // normal deadline and the next batch's cohort shrinks accordingly.
+        let probe_active = prev_cohort <= PROBE_ONLY_UP_TO_COHORT;
+        let mut last_change = Instant::now();
         let mut iterations: u32 = 0;
         loop {
             if self.batch_bytes.load(Ordering::Relaxed) >= self.max_batch_bytes {
+                self.timing.note_close(1);
                 super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
                 return;
             }
             let now = Instant::now();
             if now >= deadline {
+                self.timing.note_close(2);
                 super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
                 return;
             }
-            if now >= probe_deadline && self.batch_bytes.load(Ordering::Relaxed) == 0 {
+            if probe_active
+                && now >= probe_deadline
+                && self.batch_bytes.load(Ordering::Relaxed) == 0
+            {
+                self.timing.note_close(3);
                 super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
                 return;
+            }
+            if target > 0 {
+                let open = self
+                    .appended_seq
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(batch_base_seq);
+                if open != last_seen {
+                    last_seen = open;
+                    last_change = now;
+                } else if cohort_arrived_and_quiet(open, target, now.duration_since(last_change)) {
+                    self.timing.note_close(4);
+                    super::fire_abort_hook(super::AbortPoint::DuringBatchWaitPost);
+                    return;
+                }
             }
             iterations += 1;
             #[cfg(feature = "phase1-waitmode-experiment")]
@@ -1527,11 +1904,20 @@ mod batch_timing {
         /// two fields carry no meaningful write contention despite being
         /// shared state.
         prev_notify_sent_ns: AtomicU64,
+        /// Why each leader window ended: [zero-window, byte-cap, deadline, probe, cohort].
+        close_reasons: [AtomicU64; 5],
     }
 
     impl BatchTiming {
         pub(super) fn new() -> Self {
             BatchTiming {
+                close_reasons: [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ],
                 epoch: Instant::now(),
                 batches: AtomicU64::new(0),
                 window_ns_total: AtomicU64::new(0),
@@ -1545,6 +1931,10 @@ mod batch_timing {
 
         pub(super) fn now_ns(&self) -> u64 {
             u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        }
+
+        pub(super) fn note_close(&self, reason: usize) {
+            self.close_reasons[reason].fetch_add(1, Ordering::Relaxed);
         }
 
         /// Called at the very start of `run_as_leader`, before the window
@@ -1609,7 +1999,8 @@ mod batch_timing {
             eprintln!(
                 "[RGC_TIMING_REPORT] batches={batches} \
                  mean_window_us={:.1} mean_snapshot_us={:.1} mean_fsync_us={:.1} \
-                 mean_coordination_us={:.1} coordination_samples={coordination_samples}",
+                 mean_coordination_us={:.1} coordination_samples={coordination_samples} \
+                 closes[zero,bytes,deadline,probe,cohort]={:?}",
                 mean_us(self.window_ns_total.load(Ordering::Relaxed), batches),
                 mean_us(self.snapshot_ns_total.load(Ordering::Relaxed), batches),
                 mean_us(self.fsync_ns_total.load(Ordering::Relaxed), batches),
@@ -1617,6 +2008,10 @@ mod batch_timing {
                     self.coordination_ns_total.load(Ordering::Relaxed),
                     coordination_samples
                 ),
+                self.close_reasons
+                    .iter()
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .collect::<Vec<_>>(),
             );
         }
     }
@@ -1634,6 +2029,7 @@ mod batch_timing {
         pub(super) fn now_ns(&self) -> u64 {
             0
         }
+        pub(super) fn note_close(&self, _reason: usize) {}
         pub(super) fn record_batch_start(&self, _t_window_started: u64) {}
         pub(super) fn record_batch_stages(&self, _: u64, _: u64, _: u64, _: u64, _: u64) {}
         pub(super) fn print_report_if_requested(&self) {}
@@ -2503,5 +2899,269 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(estimate_frame_len(&op), real);
+    }
+
+    /// Decision table of the count-aware, quiescence-guarded early close.
+    #[test]
+    fn cohort_close_decision_table() {
+        let quiet = QUIESCENCE_WINDOW;
+        let busy = QUIESCENCE_WINDOW - Duration::from_micros(1);
+        // No completed batch yet (target 0): never close early.
+        assert!(!cohort_arrived_and_quiet(1_000, 0, quiet));
+        // Cohort not yet complete: never close, however quiet.
+        assert!(!cohort_arrived_and_quiet(9, 10, quiet));
+        // Cohort complete but arrivals still flowing: keep the batch open
+        // (this is the guard that prevents the "ratchet").
+        assert!(!cohort_arrived_and_quiet(10, 10, busy));
+        assert!(!cohort_arrived_and_quiet(500, 10, busy));
+        // Cohort complete AND quiet: close.
+        assert!(cohort_arrived_and_quiet(10, 10, quiet));
+        assert!(cohort_arrived_and_quiet(500, 10, quiet));
+        // Quiescence scales with the cohort (floor 100 us, cap 1 ms) ...
+        assert_eq!(quiescence_for_cohort(1), QUIESCENCE_WINDOW);
+        assert_eq!(quiescence_for_cohort(100), QUIESCENCE_WINDOW);
+        assert_eq!(quiescence_for_cohort(1_000), Duration::from_micros(400));
+        assert_eq!(quiescence_for_cohort(1_000_000), QUIESCENCE_MAX);
+        // ... so a 256-record cohort needs 102.4 us of quiet, not 100 us.
+        assert!(!cohort_arrived_and_quiet(256, 256, quiet));
+        assert!(cohort_arrived_and_quiet(
+            256,
+            256,
+            quiescence_for_cohort(256)
+        ));
+        // There is no upper cohort cutoff: the early close applies at every size.
+        assert!(cohort_arrived_and_quiet(
+            1_000,
+            1_000,
+            quiescence_for_cohort(1_000)
+        ));
+        assert!(!cohort_arrived_and_quiet(
+            1_000,
+            1_000,
+            quiescence_for_cohort(1_000) - Duration::from_micros(1)
+        ));
+    }
+
+    /// The early close must never lose, reorder or falsely acknowledge a
+    /// record, and a batch that started small must be able to grow back when
+    /// a larger cohort arrives (no ratchet). Simulated 3 ms `fsync` keeps
+    /// the scenario independent of the host disk.
+    #[test]
+    fn small_prior_batch_does_not_ratchet_batches_small() {
+        let dir = temp_dir("cohort_no_ratchet");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = Arc::new(GroupCommitter::new(wal).unwrap());
+        committer.install_fsync_fault_hook(|| {
+            thread::sleep(Duration::from_millis(3));
+            Ok(())
+        });
+        // Phase 1: a single writer, so the prior batch is tiny (target ~1).
+        for i in 0..20u32 {
+            let key = format!("solo{i}");
+            committer
+                .append_durable(WalOp::Put {
+                    key: key.as_bytes(),
+                    value: b"v",
+                })
+                .unwrap();
+        }
+        assert!(committer.prev_batch_records.load(Ordering::Relaxed) <= 2);
+        let before = committer.stats();
+        // Phase 2: 64 concurrent writers, 15 records each.
+        let handles: Vec<_> = (0..64u32)
+            .map(|w| {
+                let c = Arc::clone(&committer);
+                thread::spawn(move || {
+                    for i in 0..15u32 {
+                        let key = format!("w{w}-{i}");
+                        c.append_durable(WalOp::Put {
+                            key: key.as_bytes(),
+                            value: b"v",
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let after = committer.stats();
+        let records = after.records_total - before.records_total;
+        let syncs = after.sync_successes - before.sync_successes;
+        assert_eq!(records, 64 * 15, "every acknowledged record is covered");
+        assert!(
+            records / syncs.max(1) >= 4,
+            "batches must grow back from a small prior batch, not ratchet:              {records} records over {syncs} syncs"
+        );
+        assert_eq!(after.durable_through, after.highest_sequence);
+    }
+
+    /// Flat combining must preserve per-thread order, gap-free sequence
+    /// numbers and every acknowledged record, under real concurrency.
+    #[test]
+    fn flat_combining_many_writers_every_ack_is_recovered_in_order() {
+        const THREADS: usize = 48;
+        const PER: usize = 40;
+        let dir = temp_dir("fc_many");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = Arc::new(GroupCommitter::new(wal).unwrap());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let c = Arc::clone(&committer);
+                thread::spawn(move || {
+                    let mut acked = Vec::new();
+                    for i in 0..PER {
+                        let key = format!("t{t}-{i}");
+                        let pos = c
+                            .append(WalOp::Put {
+                                key: key.as_bytes(),
+                                value: b"v",
+                            })
+                            .unwrap();
+                        await_durable_retrying_on_timeout(&c, pos.seq);
+                        acked.push((pos.seq, key));
+                    }
+                    acked
+                })
+            })
+            .collect();
+        let mut all: Vec<(u64, String)> = Vec::new();
+        for h in handles {
+            let acked = h.join().unwrap();
+            // a thread's own seqs strictly increase (its ops were applied in order)
+            assert!(acked.windows(2).all(|w| w[0].0 < w[1].0));
+            all.extend(acked);
+        }
+        drop(committer);
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        assert!(replay.corrupted_segments.is_empty());
+        assert_eq!(replay.records.len(), THREADS * PER);
+        for (i, (seq, _)) in replay.records.iter().enumerate() {
+            assert_eq!(*seq, i as u64 + 1, "gap-free, in order");
+        }
+        let by_seq: std::collections::HashMap<u64, String> = replay
+            .records
+            .iter()
+            .map(|(s, op)| match op {
+                WalOpOwned::Put { key, .. } => (*s, String::from_utf8(key.clone()).unwrap()),
+                _ => panic!("unexpected op"),
+            })
+            .collect();
+        for (seq, key) in all {
+            assert_eq!(
+                by_seq.get(&seq),
+                Some(&key),
+                "acked record must be at its acked seq"
+            );
+        }
+    }
+
+    /// A failed batched write must fail the writers in that batch (before any
+    /// of them holds `Ok`), must not disturb writers outside it, and must
+    /// leave the committer fully usable with no sequence gap or false ack.
+    #[test]
+    fn a_failed_combined_write_fails_its_writers_and_the_committer_keeps_working() {
+        let dir = temp_dir("fc_fail");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = Arc::new(GroupCommitter::new(wal).unwrap());
+        committer.lock_wal().fail_group_write_on_nth = Some((1, io::ErrorKind::StorageFull));
+        let handles: Vec<_> = (0..16usize)
+            .map(|t| {
+                let c = Arc::clone(&committer);
+                thread::spawn(move || {
+                    let key = format!("w{t}");
+                    let r = c.append(WalOp::Put {
+                        key: key.as_bytes(),
+                        value: b"v",
+                    });
+                    match r {
+                        Ok(pos) => {
+                            await_durable_retrying_on_timeout(&c, pos.seq);
+                            (key, Some(pos.seq))
+                        }
+                        Err(_) => (key, None),
+                    }
+                })
+            })
+            .collect();
+        let results: Vec<(String, Option<u64>)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            results.iter().any(|(_, s)| s.is_none()),
+            "at least the first combined write failed"
+        );
+        // The committer keeps working after the failure.
+        let pos = committer
+            .append(WalOp::Put {
+                key: b"after",
+                value: b"v",
+            })
+            .unwrap();
+        committer.await_durable(pos.seq).unwrap();
+        assert!(
+            !committer.is_poisoned(),
+            "a rolled-back write must not poison the committer"
+        );
+        drop(committer);
+
+        let (_wal, replay) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        for (i, (seq, _)) in replay.records.iter().enumerate() {
+            assert_eq!(*seq, i as u64 + 1, "no gap and no reused live seq");
+        }
+        let recovered: std::collections::HashSet<String> = replay
+            .records
+            .iter()
+            .filter_map(|(_, op)| match op {
+                WalOpOwned::Put { key, .. } => Some(String::from_utf8(key.clone()).unwrap()),
+                _ => None,
+            })
+            .collect();
+        for (key, seq) in &results {
+            match seq {
+                Some(_) => assert!(recovered.contains(key), "acked {key} must be recovered"),
+                None => assert!(!recovered.contains(key), "failed {key} must leave no trace"),
+            }
+        }
+        assert!(recovered.contains("after"));
+    }
+
+    /// If a combiner panics, no appender may be left blocked: every queued
+    /// writer completes with an error and the committer is poisoned.
+    #[test]
+    fn a_panicking_combiner_never_leaves_an_appender_blocked() {
+        let dir = temp_dir("fc_panic");
+        let (wal, _) = FileWal::open_for_recovery(&dir, group_commit_config()).unwrap();
+        let committer = Arc::new(GroupCommitter::new(wal).unwrap());
+        committer.lock_wal().panic_on_next_group_write = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in 0..12usize {
+            let c = Arc::clone(&committer);
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let key = format!("p{t}");
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    c.append(WalOp::Put {
+                        key: key.as_bytes(),
+                        value: b"v",
+                    })
+                    .is_ok()
+                }));
+                let _ = tx.send(r.is_ok());
+            });
+        }
+        drop(tx);
+        let mut finished = 0;
+        while let Ok(_completed) = rx.recv_timeout(Duration::from_secs(20)) {
+            finished += 1;
+        }
+        assert_eq!(
+            finished, 12,
+            "every appender must return (Ok, Err or unwind), none may hang"
+        );
+        assert!(
+            committer.is_poisoned(),
+            "a combiner panic poisons the committer"
+        );
     }
 }
