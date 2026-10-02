@@ -16,7 +16,9 @@
 //! `GenericDialect` already provides it.
 
 use sqlparser::dialect::GenericDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::ast::Statement;
 use crate::error::{Result, SqlError};
@@ -113,17 +115,67 @@ fn reject_pathological_operator_chains(sql: &str, limits: &SqlLimits) -> Result<
     let upper = sql.to_ascii_uppercase();
     let keyword_count =
         count_word(&upper, "AND") + count_word(&upper, "OR") + count_word(&upper, "NOT");
-    if symbol_count.saturating_add(keyword_count) > budget {
-        return Err(SqlError::ResourceLimit {
-            detail: format!(
-                "too many chained operators for max_expression_depth ({}); a long flat chain of \
-                 binary/unary operators can build a stack-overflow-prone expression tree even \
-                 when nesting is otherwise shallow",
-                limits.max_expression_depth
-            ),
-        });
+    // Fast path (zero allocation): the raw text is within budget, so no
+    // chain in it can exceed the budget either.
+    if symbol_count.saturating_add(keyword_count) <= budget {
+        return Ok(());
     }
-    Ok(())
+    // The raw count is only an over-approximation: it also counts operator
+    // characters that live inside string literals and comments (ISO dates,
+    // URLs, hyphenated prose, markup...), which build no expression tree.
+    // Refine with the parser's own tokenizer so only real operator *tokens*
+    // count; a genuine flat chain still exceeds the budget.
+    if operator_token_weight(sql, budget).is_some_and(|w| w <= budget) {
+        return Ok(());
+    }
+    Err(SqlError::ResourceLimit {
+        detail: format!(
+            "too many chained operators for max_expression_depth ({}); a long flat chain of              binary/unary operators can build a stack-overflow-prone expression tree even              when nesting is otherwise shallow",
+            limits.max_expression_depth
+        ),
+    })
+}
+
+/// Counts operator tokens (outside string literals, quoted identifiers and
+/// comments), weighted like the raw character scan (a two-character
+/// operator counts 2). Returns `None` when the text does not tokenize
+/// (e.g. an unterminated literal); the caller then keeps the conservative
+/// rejection. Stops early once `budget` is exceeded.
+///
+/// Tokenizing is linear and non-recursive, so it cannot itself reproduce
+/// the stack-overflow hazard, and its transient allocation is bounded by
+/// `max_statement_bytes` -- the same bound the parser's own tokenization of
+/// any accepted statement already has; the two never overlap in time.
+fn operator_token_weight(sql: &str, budget: usize) -> Option<usize> {
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
+    let mut weight = 0usize;
+    for token in &tokens {
+        weight = weight.saturating_add(match token {
+            Token::Plus
+            | Token::Minus
+            | Token::Mul
+            | Token::Div
+            | Token::Mod
+            | Token::Eq
+            | Token::Lt
+            | Token::Gt
+            | Token::Assignment => 1,
+            Token::DoubleEq | Token::Neq | Token::LtEq | Token::GtEq | Token::DuckIntDiv => 2,
+            Token::Spaceship => 3,
+            Token::Word(w)
+                if w.quote_style.is_none()
+                    && matches!(w.keyword, Keyword::AND | Keyword::OR | Keyword::NOT) =>
+            {
+                1
+            }
+            _ => 0,
+        });
+        if weight > budget {
+            break;
+        }
+    }
+    Some(weight)
 }
 
 fn count_word(haystack: &str, word: &str) -> usize {

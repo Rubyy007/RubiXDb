@@ -7,19 +7,26 @@
 
 use serde_json::Value;
 
-/// Replaces every ASCII control character (`0x00..=0x1F`, `0x7F`) —
-/// this is exactly the range that includes `ESC` (`0x1B`, the start of
-/// every ANSI escape sequence) and every other terminal-control byte —
-/// with its `\xNN` hex escape, so adversarial row content can never
-/// move the cursor, change colors, or otherwise manipulate the
-/// terminal. Ordinary printable text and multi-byte UTF-8 sequences
-/// (which never contain a byte in this range as a continuation byte,
-/// by UTF-8's own design) pass through completely unchanged.
+/// Replaces every C0 control character (`0x00..=0x1F`, which includes
+/// `ESC`, the start of every 7-bit ANSI escape sequence), `DEL` (`0x7F`)
+/// and every C1 control character (`U+0080..=U+009F`) with its `\xNN` hex
+/// escape, so adversarial row content can never move the cursor, change
+/// colors, set the window title, or otherwise manipulate the terminal.
+///
+/// C1 matters because, encoded in UTF-8 as `C2 80..C2 9F`, the 8-bit
+/// introducers (notably `U+009B` CSI and `U+009D` OSC) are interpreted as
+/// control characters by xterm-class terminals in UTF-8 mode -- the same
+/// injection as ESC, with no ESC byte at all. (Final single-node
+/// certification defect D-2: this function previously documented C1
+/// coverage but handled only C0/DEL.) Ordinary printable text and all
+/// other non-ASCII Unicode (letters, emoji, CJK, ...) pass through
+/// completely unchanged.
 pub fn sanitize_for_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if (c as u32) < 0x20 || c as u32 == 0x7F {
-            out.push_str(&format!("\\x{:02X}", c as u32));
+        let cp = c as u32;
+        if cp < 0x20 || cp == 0x7F || (0x80..=0x9F).contains(&cp) {
+            out.push_str(&format!("\\x{cp:02X}"));
         } else {
             out.push(c);
         }
@@ -159,6 +166,25 @@ mod tests {
         let safe = sanitize_for_terminal(s);
         assert!(!safe.contains('\r'));
         assert!(!safe.contains('\x07'));
+    }
+
+    #[test]
+    fn sanitizes_c1_control_characters_including_8bit_csi_and_osc() {
+        // U+009B (CSI), U+009D (OSC), U+0085 (NEL), plus both range ends.
+        let malicious = "a\u{9b}31mRED\u{9d}0;title\u{7}\u{85}\u{80}\u{9f}z";
+        let safe = sanitize_for_terminal(malicious);
+        assert!(
+            !safe.chars().any(|c| c.is_control()),
+            "no C0/C1 control character may survive: {safe:?}"
+        );
+        assert_eq!(safe, "a\\x9B31mRED\\x9D0;title\\x07\\x85\\x80\\x9Fz");
+    }
+
+    #[test]
+    fn c1_boundaries_are_exact_and_neighbours_are_untouched() {
+        // U+007E is just below DEL; U+00A0/U+00A1 are just above C1.
+        let s = "~\u{a0}\u{a1}\u{ff}\u{100}\u{20ac}\u{1F600}";
+        assert_eq!(sanitize_for_terminal(s), s);
     }
 
     #[test]

@@ -45,6 +45,17 @@ struct Instance {
     admin_key: String,
 }
 
+// A failed assertion or panic anywhere in the test must never leave a real
+// `rubixdb gui` child process (and its port/lock) running. Killing on drop
+// makes every exit path clean; the explicit `kill()` at the end of the test
+// is idempotent with this.
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn read_manifest_and_credentials(root: &Path, name: &str) -> Option<(u16, String)> {
     let manifest_path = root.join(name).join("instance.json");
     let creds_path = root.join(name).join("credentials.json");
@@ -63,7 +74,7 @@ fn read_manifest_and_credentials(root: &Path, name: &str) -> Option<(u16, String
 // the returned `Instance`, whose owner `kill()`s and `wait()`s it (see the
 // end of the test); the only other path kills and waits explicitly below.
 #[allow(clippy::zombie_processes)]
-fn start_instance(root: &Path, name: &'static str) -> Instance {
+async fn start_instance(root: &Path, name: &'static str) -> Instance {
     // `rubixdb gui` selects a named instance via the `--instance NAME`
     // flag (`cli/src/gui.rs`), not `RUBIXDB_INSTANCE_NAME` (that env
     // var is only read by the plain client role in `main.rs` --
@@ -84,13 +95,18 @@ fn start_instance(root: &Path, name: &'static str) -> Instance {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some((port, admin_key)) = read_manifest_and_credentials(root, name) {
-            let client = reqwest::blocking::Client::builder()
+            // Async client: a `reqwest::blocking` client owns its own runtime,
+            // and dropping that inside this `#[tokio::test]` async context
+            // panics ("Cannot drop a runtime in a context where blocking is
+            // not allowed"), which previously leaked the spawned child.
+            let client = reqwest::Client::builder()
                 .timeout(Duration::from_millis(500))
                 .build()
                 .unwrap();
             if let Ok(resp) = client
                 .get(format!("http://127.0.0.1:{port}/healthz"))
                 .send()
+                .await
             {
                 if resp.status().is_success() {
                     return Instance {
@@ -108,7 +124,7 @@ fn start_instance(root: &Path, name: &'static str) -> Instance {
             let _ = child.wait();
             panic!("instance {name} never became ready");
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -274,8 +290,8 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn two_instances_simultaneous_sustained_read_and_write_load_never_cross_contaminate() {
     let root = fresh_root("main");
-    let mut a = start_instance(&root, "instA");
-    let mut b = start_instance(&root, "instB");
+    let mut a = start_instance(&root, "instA").await;
+    let mut b = start_instance(&root, "instB").await;
     assert_ne!(
         a.base_url, b.base_url,
         "the two instances must be on independent ports, never colliding"
