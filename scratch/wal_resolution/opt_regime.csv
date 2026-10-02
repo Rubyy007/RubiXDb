@@ -1,0 +1,13 @@
+label,test,run,ops_s,verdict,batches,mean_window_us,mean_snapshot_us,mean_fsync_us,mean_coord_us,resources
+tgt100_floor50,hundred_writers_throughput,run1,16187,PASS,1318,336.1,36.6,4200.3,112.6,cpu_s=12.8,wall_s=7.4,rss_mb=6,threads=105,handles=159,disk_busy_avg=7.58,wlat_ms_avg=0.22,wlat_ms_max=0.33,qlen_avg=0.08
+tgt100_floor50,hundred_writers_throughput,run2,15394,PASS,1371,347.2,32.0,4241.7,114.9,cpu_s=17.3,wall_s=8.1,rss_mb=12,threads=105,handles=160,disk_busy_avg=7.46,wlat_ms_avg=0.22,wlat_ms_max=0.34,qlen_avg=0.07
+tgt100_floor50,hundred_writers_throughput,run3,15824,PASS,1354,333.1,36.5,4183.6,111.6,cpu_s=12,wall_s=7.1,rss_mb=6,threads=105,handles=160,disk_busy_avg=7.98,wlat_ms_avg=0.2,wlat_ms_max=0.24,qlen_avg=0.08
+tgt100_floor50,hundred_writers_throughput,run4,15223,PASS,1387,346.2,34.2,4234.4,119.6,cpu_s=14.8,wall_s=8.1,rss_mb=11,threads=105,handles=160,disk_busy_avg=8.18,wlat_ms_avg=0.24,wlat_ms_max=0.4,qlen_avg=0.08
+tgt100_floor50,hundred_writers_throughput,run5,15866,PASS,1336,325.2,30.6,4242.2,117.8,cpu_s=13.2,wall_s=7.1,rss_mb=6,threads=105,handles=160,disk_busy_avg=12.01,wlat_ms_avg=0.28,wlat_ms_max=0.78,qlen_avg=0.12
+tgt100_floor50,hundred_writers_throughput,run6,15935,PASS,1342,333.4,35.5,4185.6,120.0,cpu_s=14,wall_s=7.1,rss_mb=6,threads=105,handles=160,disk_busy_avg=7.97,wlat_ms_avg=0.2,wlat_ms_max=0.24,qlen_avg=0.08
+tgt100_floor50,hundred_writers_throughput,run7,15010,PASS,1397,360.5,32.9,4253.0,120.8,cpu_s=16.9,wall_s=8.1,rss_mb=9,threads=105,handles=160,disk_busy_avg=12.42,wlat_ms_avg=0.31,wlat_ms_max=1.02,qlen_avg=0.12
+tgt100_floor50,hundred_writers_throughput,run8,15835,PASS,1350,381.4,34.6,4141.9,118.0,cpu_s=12.7,wall_s=7.1,rss_mb=6,threads=105,handles=160,disk_busy_avg=8.29,wlat_ms_avg=0.22,wlat_ms_max=0.3,qlen_avg=0.08
+tgt100_floor50,hundred_writers_throughput,run9,15604,PASS,1359,334.2,38.8,4221.8,119.0,cpu_s=13.3,wall_s=8.1,rss_mb=6,threads=105,handles=160,disk_busy_avg=11.1,wlat_ms_avg=0.31,wlat_ms_max=0.83,qlen_avg=0.11
+tgt100_floor50,hundred_writers_throughput,run10,15258,PASS,1395,338.1,34.4,4203.3,120.6,cpu_s=16.5,wall_s=8.1,rss_mb=11,threads=105,handles=160,disk_busy_avg=7.8,wlat_ms_avg=0.22,wlat_ms_max=0.33,qlen_avg=0.08
+tgt100_floor50,hundred_writers_throughput,run11,15850,PASS,1346,351.9,38.4,4180.1,115.4,cpu_s=13.8,wall_s=7.1,rss_mb=6,threads=105,handles=160,disk_busy_avg=12.23,wlat_ms_avg=0.29,wlat_ms_max=0.76,qlen_avg=0.12
+tgt100_floor50,hundred_writers_throughput,run12,15289,PASS,1371,338.8,33.3,4278.2,118.5,cpu_s=17,wall_s=8.1,rss_mb=11,threads=105,handles=160,disk_busy_avg=7.93,wlat_ms_avg=0.23,wlat_ms_max=0.36,qlen_avg=0.08

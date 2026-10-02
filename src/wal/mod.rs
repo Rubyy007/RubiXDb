@@ -684,6 +684,14 @@ pub struct FileWal {
     _lock: File,
     /// Deliberately `!Sync` marker — see this module's "# Safety" section.
     _not_sync: PhantomData<std::cell::Cell<()>>,
+    /// Test-only seam: the Nth (1-based) `flush_run` from now behaves as if
+    /// its write failed and was rolled back, with this error kind -- no file
+    /// I/O is performed. Exercises `append_group`'s failure bookkeeping.
+    #[cfg(test)]
+    pub(crate) fail_group_write_on_nth: Option<(usize, std::io::ErrorKind)>,
+    /// Test-only seam: the next `flush_run` panics (combiner panic safety).
+    #[cfg(test)]
+    pub(crate) panic_on_next_group_write: bool,
 }
 
 impl FileWal {
@@ -754,6 +762,159 @@ impl FileWal {
     }
 }
 
+impl FileWal {
+    /// Appends `ops` in order with the semantics of N sequential `append`
+    /// calls, but with **one write syscall per contiguous run of frames that
+    /// land in the same segment** (group-commit flat combining,
+    /// `PHASE_RUBIXDB_WAL_IMPLEMENTATION.md`).
+    ///
+    /// Returns one result per op, in order:
+    /// * an op whose *encoding* fails (e.g. over `max_record_len`) fails
+    ///   alone -- no sequence number is consumed for it;
+    /// * a failed *write* of a run is rolled back by `SegmentIo::append`
+    ///   exactly as for a single record (truncate to the pre-run length;
+    ///   poison if the rollback fails), `next_seq` is left at the run's
+    ///   first seq, and **every op in that run -- and every later op in
+    ///   this call -- gets `Err`**. No caller of this method has received
+    ///   `Ok` for any of those seqs, so reusing them is safe (no waiter can
+    ///   hold a dead seq);
+    /// * ops in earlier, successfully written runs (before a rotation)
+    ///   keep their `Ok(position)` -- "prefix succeeded, rest failed", the
+    ///   same outcome as sequential appends stopping at the failure.
+    ///
+    /// Rotation follows `append`'s rule exactly: a segment that already has
+    /// content (including frames pending in the current run) is rotated
+    /// before a frame that would push it past `max_segment_size`.
+    pub(crate) fn append_group(&mut self, ops: Vec<WalOp<'_>>) -> Vec<Result<WalPosition>> {
+        let n = ops.len();
+        let mut results: Vec<Option<Result<WalPosition>>> = (0..n).map(|_| None).collect();
+        let mut run: Vec<u8> = Vec::new();
+        // (op index, seq, byte offset inside `run`)
+        let mut members: Vec<(usize, u64, u64)> = Vec::new();
+        let mut seq = self.next_seq;
+        let mut failure: Option<std::io::ErrorKind> = None;
+
+        for (i, op) in ops.into_iter().enumerate() {
+            if let Some(kind) = failure {
+                results[i] = Some(Err(Self::group_write_error(kind)));
+                continue;
+            }
+            let frame = match ops::encode_wal_frame(seq, op, self.config.max_record_len) {
+                Ok(f) => f,
+                Err(e) => {
+                    results[i] = Some(Err(e));
+                    continue;
+                }
+            };
+            let frame_total = self.active.size() + run.len() as u64 + frame.len() as u64;
+            if (self.active_segment_has_records || !run.is_empty())
+                && frame_total > self.config.max_segment_size
+            {
+                if let Err(kind) = self.flush_run(&mut run, &mut members, &mut results) {
+                    seq = self.next_seq;
+                    failure = Some(kind);
+                    results[i] = Some(Err(Self::group_write_error(kind)));
+                    continue;
+                }
+                if let Err(e) = self.rotate() {
+                    // Nothing about this frame was written; later ops fail too.
+                    let kind = match &e {
+                        EngineError::Io(io) => io.kind(),
+                        _ => std::io::ErrorKind::Other,
+                    };
+                    failure = Some(kind);
+                    results[i] = Some(Err(e));
+                    continue;
+                }
+            }
+            members.push((i, seq, run.len() as u64));
+            run.extend_from_slice(&frame);
+            seq += 1;
+        }
+        if failure.is_none() && !run.is_empty() {
+            let _ = self.flush_run(&mut run, &mut members, &mut results);
+        }
+        results
+            .into_iter()
+            .map(|r| r.expect("every op in append_group has an outcome"))
+            .collect()
+    }
+
+    fn group_write_error(kind: std::io::ErrorKind) -> EngineError {
+        EngineError::Io(std::io::Error::new(
+            kind,
+            "batched WAL write failed and was rolled back; this record was not written",
+        ))
+    }
+
+    /// Writes the pending run with one `SegmentIo::append`. On success fills
+    /// the members' `Ok(position)` and advances `next_seq`; on failure fills
+    /// them with `Err` and leaves `next_seq` untouched (the run was rolled
+    /// back, or the segment is poisoned -- in which case every later write
+    /// fails closed exactly as it does for single appends).
+    fn flush_run(
+        &mut self,
+        run: &mut Vec<u8>,
+        members: &mut Vec<(usize, u64, u64)>,
+        results: &mut [Option<Result<WalPosition>>],
+    ) -> std::result::Result<(), std::io::ErrorKind> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            if self.panic_on_next_group_write {
+                self.panic_on_next_group_write = false;
+                panic!("test seam: panic inside a batched WAL write");
+            }
+            if let Some((n, kind)) = self.fail_group_write_on_nth.as_mut().map(|(n, k)| {
+                *n -= 1;
+                (*n, *k)
+            }) {
+                if n == 0 {
+                    self.fail_group_write_on_nth = None;
+                    for &(i, _, _) in members.iter() {
+                        results[i] = Some(Err(Self::group_write_error(kind)));
+                    }
+                    run.clear();
+                    members.clear();
+                    return Err(kind);
+                }
+            }
+        }
+        match self.active.append(run) {
+            Ok(base) => {
+                for &(i, s, off) in members.iter() {
+                    results[i] = Some(Ok(WalPosition {
+                        segment_id: self.active_id,
+                        offset: base + off,
+                        seq: s,
+                    }));
+                }
+                if let Some(&(_, last_seq, _)) = members.last() {
+                    self.next_seq = last_seq + 1;
+                }
+                self.active_segment_has_records = true;
+                for _ in members.iter() {
+                    fire_abort_hook(AbortPoint::MidAppend);
+                }
+                run.clear();
+                members.clear();
+                Ok(())
+            }
+            Err(io_err) => {
+                let kind = io_err.kind();
+                for &(i, _, _) in members.iter() {
+                    results[i] = Some(Err(Self::group_write_error(kind)));
+                }
+                run.clear();
+                members.clear();
+                Err(kind)
+            }
+        }
+    }
+}
+
 impl Wal for FileWal {
     fn open_for_recovery(dir: &Path, config: WalConfig) -> Result<(Self, WalReplayResult)> {
         // Phase 1 (Group Commit): `SyncMode::GroupCommit` is no longer
@@ -799,6 +960,10 @@ impl Wal for FileWal {
             active_segment_has_records,
             _lock: lock,
             _not_sync: PhantomData,
+            #[cfg(test)]
+            fail_group_write_on_nth: None,
+            #[cfg(test)]
+            panic_on_next_group_write: false,
         };
         Ok((wal, result))
     }
@@ -1928,3 +2093,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod group_append_tests;

@@ -1,0 +1,109 @@
+# PHASE RUBIXDB — WAL ARCHITECTURE OPTIONS (comparative report)
+
+**Date:** 2026-10-03 · **Base:** `7b7aaaa` · **Branch:** `wal-batch-buffer-fillq` (uncommitted) · Machine: i7-7700 (4C/8T), 15.9 GB, Windows 10, **two SATA SSDs, no NVMe**.
+Prior history (`PHASE_RUBIXDB_ENGINE_PERFORMANCE_ADR.md`, `FINAL_WAL_ANALYSIS.md`, `PHASE_RUBIXDB_WAL_*.md` from the previous phase) is unchanged and cited, not rewritten.
+Evidence tags: **[RUN]** measured on production code, **[MODEL]** measured on the isolated prototype `examples/commit_pipeline_proto.rs` (real `FlushFileBuffers`, not production code), **[SRC]** read from current source, **[WEB]** external documentation (see §2 for how it was read).
+
+## 0. Result in brief
+| Option | Verdict |
+|---|---|
+| CURRENT (group commit as certified) | baseline; **fails** M1.2/M1.3 |
+| A. Early-close only (previous phase's stage 1) | safe, **insufficient** (+13%) |
+| B. Deferred-write double buffer / leader-written buffer | **REJECTED** — acknowledges `append` before bytes are written; failure semantics unprovable without poisoning |
+| C. Pipelined flush (overlap next batch with in-flight fsync) | **REJECTED** (measured: no gain, more fsyncs, worse tails) |
+| D. Sharded WAL | **REJECTED for this hardware** (one SATA device serializes flushes); NOT IMPLEMENTED |
+| **E. Flat-combining append + count-aware early close + probe fix** | **SELECTED, implemented, re-certified.** `append()` keeps its contract (returns only after its frame is written). M1.2 **17.4k** (min 16.4k), M1.3 **85-92k** (min 76k in 1 of 12 warm runs) |
+| F. Windows write-through / unbuffered I/O | **REJECTED** (durability unprovable, tails worse, format impact) |
+| G. Other wake mechanisms (per-waiter park, striped condvars) | **REJECTED** (measured worse) |
+| H. Sleep / hybrid wait instead of spin | **REJECTED** (fails M1.2, 4x CPU) |
+
+## 1. What actually limits throughput (Rule 4: proved, not asserted)
+Instrumentation: `RGC_TIMING_REPORT` (`--features test-util`) + close-reason counters added this phase (`closes[zero,bytes,deadline,probe,cohort]`, test-util only, zero cost in production), per-second process/disk counters (`scripts/wal_bench_runner.ps1`), and isolated probes. M1.2 at 100 writers, unmodified current code (E:, release, 5-8 runs):
+
+| Stage | Time | Evidence |
+|---|---|---|
+| writer arrival / re-arrival cascade after each ack | ~3.3 ms | window sweep: shortening the window shortens batches; ~100 threads must wake, build a record and append |
+| batch window (fixed, = fsync EMA) | ~4.3 ms | mean window; closes only on byte cap |
+| per-record `seek_write` under the WAL lock | ~20 µs x 100 serialized | prototype: batching the writes was worth ~+30% beyond early close |
+| snapshot / coordination | 0.15-0.23 / ~0.1 ms | negligible |
+| `FlushFileBuffers` | 4.3-4.5 ms | raw probe 4.85 ms; **cannot be parallelized on one SATA device** |
+| disk utilization | **~6%**, queue length 0.06 | the device idles ~94% of the cycle |
+**Conclusion (proved):** the system is *latency-bound with a mostly idle disk*; the dominant controllable constraints are (1) a fixed-duration window, (2) serialized per-record writes, and (3) a **premature "probe" exit**, found this phase: with flat combining, ~49% of batches at 100 writers were being closed by the lone-writer probe (`closes[...]=[0,0,12,630,707]`) with ~70 of 100 records, leaving stragglers to form extra batches (1,330 fsyncs instead of 1,000). The fsync latency is a hardware constant; the rest is algorithm.
+Throughput model (validated): `ops/s ≈ records_per_batch / (window + snapshot + fsync + wake)`. Model vs measurement, M1.2/E:: 94.6 / (4.3+0.17+4.4+0.1) ms = 10.5k predicted vs 10.5k measured; final design: 100 / (~0.9+0.01+4.6+~0.2) ms ≈ 17.5k predicted vs 17.4k measured.
+
+## 2. External research (Rule 2)
+**How it was read (limitation):** pages were retrieved with a fetch tool that returns a *model-generated summary* of each page, not verbatim text, and some pages (RocksDB wiki) lacked the detail asked for. Statements below are therefore marked by what the summary supported; nothing here was taken from memory as authoritative. Primary papers (Aether, "Group Commit Self-Clocks") were read through search/fetch summaries only.
+
+| SOURCE | DESIGN | BENEFIT | DURABILITY MODEL | FAILURE MODEL | TRADEOFF | APPLICABLE? |
+|---|---|---|---|---|---|---|
+| RocksDB wiki, *WAL Performance* [WEB] | With `sync=true`, all outstanding writes that qualify are **combined into one WAL write and one fsync**; group capped at 1 MB; "does not proactively delay writes to increase batch size" (opportunistic, no wait window) | amortizes fsync across concurrent writers | writer is acknowledged after the group's fsync | group write failure fails the group's writers | different write options disqualify combining | **Yes, and it is the closest to the selected design**: one leader writes everyone's frames in one syscall. RocksDB has no deliberate delay; rubiXDb's measured data say *some* wait is needed (window sweep), hence the cohort/quiescence close |
+| RocksDB wiki, *Pipelined Write* [WEB] | WAL write and memtable write become pipeline stages so the next writer group starts its WAL write while the previous group is in its memtable stage | ~20-30% write throughput (ramfs, 8 threads) | unchanged: ack after WAL (and memtable) stage | doc silent | benefit documented mainly when the DB is on ramfs and compaction is not the bottleneck | **Not the same problem.** It overlaps *WAL* with *memtable*, not WAL fsync with the next batch's fill. rubiXDb's engine layer already applies to the memtable after durability; our measured pipelining of fsync-vs-fill (Option C) did not help |
+| RocksDB wiki, *WAL* [WEB] | WAL flushed to the OS after every user write by default (`manual_wal_flush` = buffer in user space until `FlushWAL`) | `manual_wal_flush` reduces CPU | `manual_wal_flush` + no sync = **not durable** | – | user must call `FlushWAL`/`SyncWAL` | **Rejected pattern** for acknowledgment: buffering writes in user space before they reach the OS is exactly Option B's hazard |
+| PostgreSQL docs, *Asynchronous Commit* [WEB] | synchronous commit waits for WAL flush; async returns before it | async: large throughput gain for small txns | async: **weaker** (a crash can lose recent commits; no corruption); risk window ~3x `wal_writer_delay` | recovery replays in commit order | explicitly trades durability | **Forbidden** by the mandate (ack-before-durability) |
+| PostgreSQL docs, *Server Configuration: WAL* [WEB] | `commit_delay` (default 0 µs) delays the flush only if >= `commit_siblings` (default 5) other transactions are open; `wal_buffers` (auto ≈ 1/32 shared buffers, 64 kB-16 MB) holds unwritten WAL; `wal_sync_method` incl. `fsync_writethrough`; `wal_writer_flush_after` | group commit amortization; "several MB of wal_buffers can improve write performance on busy servers" | sync commit: flush before ack | n/a | commit_delay adds latency up to the delay | **Yes (conceptually).** `commit_siblings` is precisely a "are there other writers?" test, the same role the probe plays, and our probe's misfire (§1) is the failure mode of applying it when siblings are demonstrably present |
+| SQLite, *WAL mode* [WEB] | single writer; commit appends to WAL; `synchronous=FULL` fsyncs the WAL on every commit, `NORMAL` only at checkpoints | simple, readers never block | FULL: durable; NORMAL: **not durable** after power loss | – | serial writers | Informative only: single-writer serializes commits; confirms `NORMAL`-style relaxations are non-durable |
+| Microsoft, *FlushFileBuffers* [WEB] | writes all buffered data for the file to the device; "can be inefficient when used after every write... when many writes are performed separately"; suggests `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH` for multiple writes | amortize by batching writes | the documented request for the device to persist | returns failure on error | the page's own discussion of caching "does not consider any hardware caching on the physical disk itself" (file-buffering page) | **Measured (Option F)**; durability under the drive's volatile cache cannot be shown without power-loss testing |
+| Microsoft, *File Buffering* [WEB] | unbuffered I/O needs sector-multiple sizes/offsets and aligned buffers | direct control | see above | writes fail if misaligned | alignment burden | Would force padding/format changes |
+| Johnson et al., *Aether* (VLDB 2010) [WEB: search summary only] | **flush pipelining** (workers continue after commit; a flush daemon waits for I/O), **consolidation array** for the log buffer, early lock release | removes scheduler overhead of many threads waiting on flushes; scales log insertion | commit is acknowledged only when durable | – | assumes in-memory log buffer insertion | Concept of **consolidating many inserters into one buffer insert** is the essence of the selected flat combining. *Early lock release* is the same idea as the (separate, out-of-scope) relational per-table lock item |
+| *Group Commit Self-Clocks* (arXiv 2606.18187) [WEB: fetch summary] | closed-loop model: with greedy pipelined flushing, batch size self-clocks; tuning timers is unnecessary above a device-set load threshold λ* = 2/F0; measured F0 0.90 ms (EBS gp3) and 0.036 ms (instance NVMe) | explains why deployed systems use `commit_delay=0` | – | – | threshold depends on flush cost F0 | **Relevant and cautionary.** With F0 ≈ 4.4 ms here, λ* ≈ 455 commits/s is far below M1.2/M1.3 loads, so the paper predicts "greedy" would suffice. **My measurements disagree for this workload:** the cascade (all writers blocked in the in-flight batch) means pipelined/greedy flushing splits the cohort (Option C: 1.65x fsyncs, no gain). The paper's model assumes think time Z; here Z≈0 plus a wake cascade. Not claimed to contradict the paper in general |
+
+## 3. Options scored (Rule 28)
+Scale: ✔ good / ~ acceptable / ✘ bad. Throughput = M1.2 / M1.3 median ops/s, E:, warm, interleaved, release.
+
+| | CURRENT | A early-close | B deferred buffer | C pipeline | D sharded | **E flat-combining (selected)** |
+|---|---|---|---|---|---|---|
+| Correctness / `append` contract | ✔ | ✔ | **✘ Ok before bytes are written** | ✔ (if safe) | needs global-prefix protocol | ✔ `Ok` ⇒ frame written; failures reach writers before any `Ok` |
+| Durability | ✔ | ✔ | ✘/~ (needs poison-on-flush-failure) | ~ (unproven ordering) | ~ (watermark protocol) | ✔ unchanged (ack after fsync) |
+| Recovery | ✔ | ✔ | ✔ | ~ | ~ (merge by seq, stop at gap) | ✔ unchanged (same format) |
+| Failure semantics | per-record | same | **changes** (ENOSPC → poison) | same | new | per-run rollback, all-or-nothing per write; recoverable like before |
+| Complexity | – | low | high | high | very high | medium (+~420 lines incl. tests) |
+| CPU | 13 / 84 s | 11 / 82 s | n/a | n/a | n/a | **8.4 / 67 s** (lower: fewer syscalls and fsyncs) |
+| Memory | – | – | buffer | buffer | buffers | transient run buffer ≤ 4096 frames; queue ≤ #threads |
+| Throughput M1.2 / M1.3 | 10.3k / 63.2k | 11.4k / 62.5k | [MODEL] 17-18k / 93-101k | [MODEL] 9.6-9.9k (= current) | ✘ no gain on 1 device | **17.4k / 85.3k warm; 17.3k / 91.6k cold** |
+| Tail latency | – | ~ | – | ✘ worse | – | see performance doc (improves p50/p95 at 2-256 writers; disclosed items) |
+| Hardware dependence | high | high | high | high | ✘ needs ≥2 devices | low-moderate: gain comes from removing syscall/herd serialization, helps any device; absolute numbers still device-bound |
+| Implementation risk | – | low | **unacceptable w/o decision** | high | very high | medium, mitigated by differential/property/oracle/crash tests |
+
+## 4. Candidate details
+
+### CURRENT — certified group commit [SRC]
+`FileWal::append` writes each frame immediately (one `seek_write`) under the WAL lock; the leader elects, waits a window = `min(max_wait, fsync EMA)` (closes early only on `max_batch_bytes`), snapshots, `fsync`s with no lock held, publishes `durable_through`, `notify_all`. Followers re-check under the `batch` mutex.
+
+### A — early close (previous phase) [RUN]
+Leader exits when the open batch ≥ previous cohort and arrivals are quiet. M1.2 11.4k, M1.3 62.5k. Retained *and generalized* in the selected design (see §E).
+
+### B — double-buffered / leader-written batch buffer [MODEL] — REJECTED
+Design: appenders `memcpy` into buffer A (no syscall under the lock); the leader swaps buffers at the cut, writes A once, fsyncs; new writers fill B meanwhile. Prototype `buf-fillq`: **17-18k at 100 writers, 93-101k at 1,000** (MODEL), lower latency. **Why it cannot be production code as designed:** `append()` returns `Ok(position)` *before* the bytes exist in the file. If the leader's later write fails (ENOSPC/IO), the caller was already told "success". Safe responses are only: (i) poison the committer on any flush failure (turns today's *recoverable* per-record ENOSPC into fail-stop; changes the Write Engine's failure contract), (ii) rewind sequence numbers (**unsafe**: a straggler holding a rewound seq could be falsely acknowledged by a later batch's watermark), (iii) a failed-range commit protocol (a new protocol the mandate forbids improvising). Option E obtains the same amortization **without** acknowledging early.
+
+### C — pipelined flush [MODEL + history] — REJECTED
+`pipe`: new leader collects while the previous fsync is in flight (one fsync at a time). 9.6-9.9k (= current), batches shrink to ~60, **1.65x fsyncs**, worse p95/p99; `pipe-fill` 7.1-7.7k. Historical commit `a2c2dc0` (63k → 37-40k, fsync ~2x slower) was **not** rebuilt; a raw probe shows concurrent writes to a *different* file do not slow a flush, so the old 2x was not a pure hardware property. Safety was not pursued (no gain to justify the proof burden): ordering would require in-order completion of overlapping batches and a prefix-closed acknowledgment rule.
+
+### D — sharded WAL [probe] — REJECTED (not implemented)
+`fsync_lanes_probe` (3 reps): 1 lane 193-197 flushes/s (4.85 ms); **2 lanes on one disk 224-228/s at 8.1-8.3 ms per flush (+15% rate, 1.7x latency)**; 4 lanes 210-219/s; two lanes on two *different* physical disks 419-437/s (2.2x). One SATA device serializes flushes. A single-node local product cannot assume a second device. Required design if ever pursued (global seq, contiguous-prefix durability watermark, single-lane transactions, merge-by-seq recovery stopping at the first gap) is recorded in the previous phase's architecture doc §7 and in §6 of this report. **Cross-shard atomicity is avoided by construction (one frame = one transaction = one lane), not proven for multi-lane transactions, which are disallowed.**
+
+### **E — flat-combining append + early close + probe fix (SELECTED)**
+Three cooperating changes in `src/wal/`:
+1. **`FileWal::append_group`** — N sequential appends with **one write syscall per same-segment run** (reuses `encode_wal_frame`, `SegmentIo::append` rollback, rotation rule). Per-op results.
+2. **`GroupCommitter::append`** — flat combining: the appender enqueues an owned copy of its op and blocks on its own slot until a combiner has written its frame; whoever finds no combiner becomes it and writes everyone queued in one `append_group` call, then hands the role to the oldest queued appender. Slots (not a shared watermark) carry each outcome.
+3. **Early close (retained, generalized)** — cohort + quiescence close with **no size cutoff**, and the **lone-writer probe restricted to "previous batch ≤ 1 record"**.
+
+Why it is the strongest *safe* design: it keeps the existing durability contract (`await_durable`/fsync/watermark untouched, same on-disk format, same recovery), keeps `append`'s meaning ("Ok ⇒ the frame is written"), and fails writers *before* any of them holds `Ok`, so rewinding the sequence on a rolled-back write cannot cause a false acknowledgment. It removes both measured algorithmic costs (per-record syscalls under the lock; a fixed window longer than the cohort needs) and fixed a latent probe misfire.
+
+**Parameters and defensibility (Rule 27).** `QUIESCENCE_WINDOW` = 100 µs floor, 400 ns per cohort record, 1 ms cap; cohort target = 100% of the previous batch; probe applies only while the previous batch had ≤ 1 record; `APPEND_COMBINE_MAX_OPS` = 4,096 (a per-round safety bound, not a tuning knob). Evidence: with the probe fix, throughput is **flat for floors of 50-200 µs** (M1.2 16.7-18.7k, M1.3 82-100k) — the earlier "cliff" disappeared once the probe stopped truncating batches; target 90% vs 100% indistinguishable; no hardware constants are baked in beyond these, and the per-record scaling makes the quiet interval grow with cohort size. The earlier 256-writer cutoff (a measured workaround for the *old* append path) was **removed**: with combining it cost M1.3 ~13k. The experiment hooks (`phase1-window-experiment`) used to choose these remain feature-gated and removable.
+
+### F — Windows I/O modes [RUN probe] — REJECTED
+`windows_io_modes_probe` (32 KiB per durable write, 2 reps, E:): buffered+`sync_all` 4.80-4.86 ms p50 (194-196/s); write-through+sync 5.40-5.42 (151-174/s); **write-through only 2.15-2.17 ms (505-516/s)**; unbuffered+write-through 2.12-2.13 ms p50 but **p95 2.6-74 ms, max 166-1,016 ms**; unbuffered+WT+sync 5.35-5.41 (66-168/s, p95 up to 70 ms). Write-through-only is 2.2x faster *per write*, but (a) nothing in the documentation reviewed guarantees it reaches non-volatile media past the device's volatile cache (the file-buffering page explicitly excludes it), (b) a process kill cannot distinguish page-cache from device-cache persistence, and power-loss testing is unavailable, (c) tails are worse, (d) unbuffered I/O requires sector-aligned sizes (padding/format change). **Not adopted; no flag changes were made.**
+
+### G — wake and wait mechanisms [MODEL / RUN] — REJECTED
+Per-waiter `park/unpark` (no herd): 9.0-9.6k vs 9.8k (previous prototype) and 12.9k vs 16.4k on the combining prototype. **Striped condvars** (8 stripes): 9.0-9.3k vs 15.4-17.1k at 100 writers; erratic at 1,000. A single-mutex `notify_all` stages wake-ups efficiently. **Wait mode on the final design (5 warm interleaved runs):** spin M1.2 16.8-18.4k (8.3 CPU-s), sleep 13.8-15.3k (31.8 CPU-s), hybrid 13.8-14.5k (31.2 CPU-s); M1.3 spin 89.5-97.1k, sleep 99.9-102.7k, hybrid 93.8-102.7k (+10%, +15% CPU). No mode wins both targets; bounded spin retained.
+
+## 5. Safety arguments for the selected design (Rules 8, 9, 14, 15)
+* **ACK contract.** Success of `append` = `SegmentIo::append` returned `Ok` for a run containing the frame (data handed to the OS). Success of `await_durable(seq)` = a `sync_all` that began after that write completed returned `Ok` (`durable_through` published only then). Both unchanged in meaning from today.
+* **Ordering.** One combiner at a time (`combining` flag, hand-off only to the queue head); the WAL lock is held across sequence assignment *and* the write, so sequence order = on-file order = queue order = arrival order; a thread's next `append` is enqueued only after its previous returned, so program order is preserved. The fsync/watermark path is untouched, so `durable_through` covers a contiguous prefix exactly as before.
+* **Atomicity.** A multi-record transaction is one `Group` frame (one op) ⇒ one frame in one run; a run is one `write_all_at`. A torn write leaves whole frames plus a partial tail; recovery (unchanged) keeps whole CRC-valid frames and truncates the tail. Those frames' writers never received `Ok`. 0 partial groups in the oracle campaign.
+* **Failure.** Encode error → that op alone. Write error → `SegmentIo::append` rolls the run back (truncate to pre-run length; poison if the rollback itself fails — unchanged) ⇒ all ops of the run and later ops of the call get `Err`, `next_seq` rewound; **no caller holds `Ok` for those seqs** so reuse is safe. Rotation inside a call: earlier runs keep `Ok` (rotation fsyncs the sealed segment), the failed run and later ops fail ("prefix succeeded, rest failed"). fsync failure → poisoned committer (unchanged). Combiner panic → guard completes every taken and queued slot with `Err`, releases the role, poisons the committer.
+* **Liveness.** Role hand-off under the queue lock; `promote` and `wait` use a per-slot mutex so no wake-up is lost; an empty queue with the combiner's own slot incomplete fails closed instead of spinning.
+* **Resource bounds.** Queue length ≤ number of caller threads (each blocks until written); per-round work ≤ 4,096 frames; run buffer ≤ 4,096 x `max_record_len`; no new threads, channels or unbounded buffers; waits are bounded spin then condvar (no unbounded busy-wait).
+
+## 6. Not selected, retained for the record (global-ordering notes for any future pipelined/sharded design — Rule 15)
+Global sequence = the WAL's existing `seq` (assigned under one lock); batch sequence = fsync completion order; durability watermark = highest `seq` covered by a completed fsync *and* with every lower `seq` durable. A pipelined or sharded design must (1) acknowledge only the contiguous durable prefix, (2) make recovery stop at the first missing `seq` (records after a gap were never acknowledged), (3) keep each transaction within one frame/lane. Because Options C and D showed no benefit on this hardware, none of this was implemented.
