@@ -33,6 +33,7 @@ const NO_HANG_BOUND: Duration = Duration::from_secs(15);
 
 #[test]
 fn leader_failure_propagation() {
+    let _shared = crate::support::shared();
     let dir = support::temp_dir("m1_4");
     let (wal, _) = FileWal::open_for_recovery(&dir, support::group_commit_config())
         .expect("opening a fresh WAL must succeed");

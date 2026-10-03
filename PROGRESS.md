@@ -4623,3 +4623,37 @@ clean; protected paths (`manifest/ sstable/ compaction/`) zero diff. Real proces
 independent ack oracle (`examples/wal_ack_oracle.rs`, self-tested with a mutant) 240 cycles / 1,479,155 acknowledged records, 0
 losses, 0 partial groups. Method limit: process kill cannot detect ack-before-fsync (page cache survives); power-loss not testable.
 **Open:** stage-2 decision; NVMe; power-loss testing; branch uncommitted/unmerged; kill-during-recovery not targeted.
+
+---
+
+## 2026-10-03 -- WAL production performance optimization (flat-combining group commit), branch `wal-batch-buffer-fillq`
+
+**Outcome:** M1.2 / M1.3 targets are now MET on this SATA hardware in isolated release runs (M1.2 17.1k warm / 18.1k cold,
+M1.3 99.0k warm / 100.0k cold; 18 of 18 interleaved runs pass, worst margins +9% / +15%; 3/3 canonical `cargo test --release
+--test group_commit -- --test-threads=1`) with the same tests and thresholds. **The WAL is still NOT PRODUCTION READY under
+the mandate's Rule 38**: FULL REGRESSION is not clean (the two throughput tests fail under the default concurrent/debug
+harness; one pre-existing load-sensitive unit test failed once in debug). A human decision is needed on how the regression
+gate should run M1.2/M1.3 (see `PHASE_RUBIXDB_WAL_CERTIFICATION.md` §4). NVMe: HARDWARE UNAVAILABLE.
+
+**Design (src/wal/ only):** `FileWal::append_group` (one write syscall per same-segment run, reusing `encode_wal_frame` and
+`SegmentIo::append` rollback) + flat-combining `GroupCommitter::append` (each appender returns only after its OWN frame is
+written, so `append`'s contract and the durability/failure model are preserved; per-slot outcomes; panic-safe combiner) +
+generalized early window close (cohort/quiescence with a bounded straggler fallback; lone-writer probe restricted to the
+lone-writer regime). The earlier leader-written batch buffer was rejected (acknowledges before write). Sharded WAL (one SATA
+device serializes flushes), pipelining, write-through/unbuffered I/O (durability unprovable), per-waiter/striped wake and
+sleep/hybrid wait were measured and rejected.
+
+**Found by measuring, not assumed:** the lone-writer probe closed ~49% of batches prematurely; a count-only cohort target
+regressed the real product multi-table write path by 30% (invisible to M1.x) -> straggler fallback x4 chosen on both workloads;
+a suspected "degraded mode" in a soak was a bug in my soak tool (retracted; the mechanism built for it was reverted).
+Product SQL write throughput is at parity (+/-5%); the relational per-table commit lock is untouched. p99.9/max are worse at
+256-512 writers (disclosed); p50/p95/p99 better everywhere; sustained 64-writer throughput +72% (6.5k -> 11.2k).
+
+**Verification:** fmt/clippy -D warnings/check clean; debug 1,121 passed / 3 failed, release 1,122 / 2 failed (26 ignored);
+failures = m1_2/m1_3 under the concurrent/debug harness + a baseline-reproducible (11/12 under CPU load) load-sensitive test.
+New tests: differential proptest of `append_group` vs sequential append, failure/rotation/panic/concurrency tests. Real
+process-kill: independent ack oracle 300 cycles / 1,471,733 acks / 0 losses (final code; mutant detected 13-14 of 30), 140 WAL +
+70 engine kill cycles clean. Soak: 25 min x 64 writers flat (RSS 7 MB, threads 65-68, handles 110-112). Not tested: power loss.
+Protected paths (manifest/sstable/compaction/lsm/execution, SQL/API/CLI/GUI): zero diff. Documents: `PHASE_RUBIXDB_WAL_{ARCHITECTURE_OPTIONS,
+IMPLEMENTATION,CRASH_RECOVERY,PERFORMANCE_FINAL,CERTIFICATION}.md` (the mandate reused the CRASH_RECOVERY file name; the previous
+phase's version is in git history).

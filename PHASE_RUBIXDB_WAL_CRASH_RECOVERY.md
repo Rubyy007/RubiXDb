@@ -1,76 +1,67 @@
-# PHASE RUBIXDB — WAL CRASH, RECOVERY & DURABILITY EVIDENCE
+# PHASE RUBIXDB — WAL CRASH, RECOVERY & DURABILITY EVIDENCE (flat-combining build)
 
-**Date:** 2026-10-03 · **Subject:** the implemented change (stage 1: count-aware, quiescence-guarded window close in `src/wal/group_commit.rs`) on branch `wal-batch-buffer-fillq`.
-Because `src/wal/` was modified, the previous WAL certification is invalidated *for the changed behavior*; this document is the re-certification evidence. All runs below are on the **final** build unless stated.
-Legend: **[RUN]** executed on the final build · **[SUITE]** automated test that passed in the final debug+release regression.
+**Date:** 2026-10-03 · **Subject:** `src/wal/` on branch `wal-batch-buffer-fillq` (final source on top of `e557be8`), i.e. flat-combining `append` + `FileWal::append_group` + generalized early close. This file **replaces** the same-named document written for the previous phase's early-close-only change (the mandate reuses the file name); that change's evidence is preserved in git history (`e557be8^`, `PHASE_RUBIXDB_WAL_RESULTS.md`).
+Because `src/wal/` changed, the earlier WAL certification is invalid for the changed behavior; this is the re-certification evidence. Tags: **[RUN]** executed on the final build, **[SUITE]** automated test passed in the final debug+release regression.
 
-## 1. What the change can and cannot affect (reasoned before testing)
-| Property | Can the change affect it? | Why |
+## 1. What can and cannot go wrong (reasoned before testing)
+| Property | Changed? | Reasoning |
 |---|---|---|
-| Which records a given `fsync` covers | No | decided at `snapshot_sync_target`, after the window closes; unchanged |
-| When `durable_through` advances / acks | No | still published only after a successful `sync_all`; unchanged |
-| Ordering / sequence assignment | No | seq assigned under the WAL lock exactly as before; the new `appended_seq` is a read-only observer (`fetch_max`) |
-| On-disk format / recovery | No | no write-path or format change |
-| Failure handling / poisoning | No | no change to append, rollback or fsync-failure paths |
-| *When* the leader proceeds to fsync | **Yes (earlier only)** | the sole behavioral change; bounded by the existing deadline |
-So the risk surface is *timing*: early close could in principle produce smaller batches or starve a straggler, never lose or reorder an acknowledged record. The tests below are aimed at that and at regressions.
+| Ack of durability (`await_durable`) | **No** | fsync path, watermark publication, leader election, poisoning untouched (diff review: those functions are unmodified apart from the window-wait helper) |
+| Meaning of `append` Ok | **No** | still "the frame has been written to the segment"; a caller returns only after *its own* frame is written (own slot), never earlier |
+| Ordering | No | sequence assigned under the WAL lock, in queue order, in the same critical section as the write |
+| On-disk format / recovery | **No** | identical frames; recovery does not see batch boundaries |
+| Failure semantics of a write error | **Yes (documented)** | a failed *batched write* fails every writer in that run (previously only the failing record's writer); all get `Err` before any `Ok`; rolled back; WAL continues |
+| New hazard | Yes | a combiner dying mid-round (panic) while others wait; a lost wake-up; a false acknowledgment after a rolled-back batch |
+Each hazard has a dedicated mechanism *and* a test: per-slot outcomes + seq rewind only for ops that never received `Ok` (false ack); `CombinerGuard` (panic); slot mutex around state transitions (lost wake-up).
 
-## 2. Unit / integration / property / fuzz suites [SUITE]
-Final regression (`cargo test --workspace --no-fail-fast`), **debug and release identical:** 1,115 passed / 2 failed / 26 ignored. The 2 failures are the ENGINE-BLOCKED throughput targets `m1_2`/`m1_3`; **every correctness test passes.** Relevant binaries (both modes): `rubixdb` lib **549/549** (includes the WAL unit suite, `wal::fuzz_tests`, group-commit abort-point tests and 2 new tests), `tests/wal_tests` 12/12, `tests/pathological_recovery_matrix` 9/9, `tests/crash_consistency` 2/2, `tests/group_commit` 6 passed (M1.1 single-writer latency, M1.4 leader-failure propagation, M1.5 rotation mid-batch, M1.6 `crash_consistency_across_abort_points`, watermark monotonicity) + the 2 throughput failures. 101 crash/abort/recovery/shutdown/watermark-named tests passed in each mode.
-New tests: `cohort_close_decision_table` (exhaustive pure-function table incl. cutoff and scaling) and `small_prior_batch_does_not_ratchet_batches_small` (64 concurrent writers after a single-writer phase, simulated 3 ms fsync: all records covered, `durable_through == highest_sequence`, batches average >= 4 — i.e. no ratchet).
-**Abort-point windows covered by existing suites [SUITE]:** BeforeLeader, AfterLeaderElection, DuringBatchWaitPre/Post (the code I modified), MidAppend, BeforeSync, AfterSync, AfterWatermarkBeforeWake, rotation pre/post, abort inside batch (11 points, `crash_consistency_across_abort_points`, real child process per point).
+## 2. Crash window matrix (Rule 12) — new `append` path
+For a record R of writer W. "Client-visible" is what W's call returned; "durable" = on stable media; "recovered" = after restart; "expected" = what the contract allows.
+| # | Crash window | Client-visible | Durable | Recovered | Expected / allowed | Evidence |
+|---|---|---|---|---|---|---|
+| 1 | before R is enqueued | nothing | no | absent | absent | oracle kills (random) |
+| 2 | R queued, not yet written | nothing (W blocked in `append`) | no | absent | absent | random kills; seam tests |
+| 3 | during the combined write (torn run) | nothing (W blocked) | partial | whole CRC-valid frames kept, partial tail truncated by the unchanged recovery | any whole-frame prefix of the run; **none acknowledged** | random kills incl. mid-syscall; `append_group` property test; pathological-recovery matrix [SUITE] |
+| 4 | run written, slots not yet completed (`MidAppend` abort point) | nothing | in page cache | present | present allowed (unacknowledged records may survive) | abort-point suite [SUITE] |
+| 5 | `append` returned Ok, before fsync | `append` Ok, **no durability ack** | page cache only | present (process kill) / may be absent (power loss) | allowed; not acknowledged | oracle; power loss **not testable** |
+| 6 | during fsync | no ack | in flight | present or absent | allowed | `BeforeSync`/`AfterSync` abort points [SUITE] |
+| 7 | after fsync, before the ack is delivered | no ack yet | yes | present | present (allowed) | `AfterWatermarkBeforeWake` [SUITE] |
+| 8 | after the ack was delivered | ack | yes | **present, byte-exact, at its acked seq** | **required** | oracle: 1.52 M acks, 0 losses |
+| 9 | many concurrent writers | per above | per above | per above | per above | oracle (up to 400 writers), crash-cycle harness (up to 600) |
+| 10 | transaction commit (multi-record `Group` frame) | ack only after fsync | all-or-nothing (one frame) | whole or absent | **no partial group** | oracle `Group` writers: 0 partial groups; engine kill cycles |
+| 11 | shutdown during flush | writers get `Aborted`/Err or complete | per above | per above | no acknowledged record lost | M1.4-M1.6 / shutdown suites [SUITE] |
+| 12 | **kill during recovery** | – | – | next reopen succeeds | idempotent, no corruption | on the preceding build **74 of 300 oracle cycles** killed the child before it wrote anything (it was still opening a multi-million-record WAL) and every reopen verified clean; the final-code campaign repeats the same pattern (late cycles reopen WALs of 3.5-10 M records) but the zero-ack count was not recomputed. A targeted kill-inside-recovery at a fixed offset was not built. |
+Client-visible nuance introduced by the design (not a durability change): between `append` returning and `await_durable` returning, a writer holds a *written but not durable* position — exactly as before.
 
-## 3. Real external process-kill cycles [RUN] (final build)
-`Child::kill()` = `TerminateProcess`: abrupt, no cooperation, may land mid-syscall.
-| Harness | Config | Cycles | Result |
-|---|---|---|---|
-| `crash_cycle_test` (WAL layer) | 16 writers, seed 142 | 40 | all gap-free, 0 corrupted segments |
-| | 100 writers, seed 107 | 40 | all gap-free, 0 corrupted segments |
-| | 256 writers, seed 1334 | 30 | all gap-free, 0 corrupted segments |
-| `lsm_crash_cycle_test` (full engine: WAL -> memtable -> reopen) | 16 writers, seed 142 | 30 | **30/30 OK**, 0 read mismatches, `durable_through` never regressed |
-Earlier-build runs of the same harnesses (before the final cutoff/scaling tweak; not counted): 110 + 30 cycles, all clean.
-**Limitation (stated honestly):** these two harnesses verify prefix consistency (gap-free, no corruption, watermark monotone). They do **not** by themselves prove that every *acknowledged* record survived — the child's acks are explicitly "not load-bearing" in their own comments. Hence §4.
+## 3. Real external process-kill campaign [RUN] (final build, `TerminateProcess`, no cooperation)
+### 3.1 Independent acknowledgement oracle (`examples/wal_ack_oracle.rs`)
+Not derived from the WAL: the child prints an ack to a pipe **only after** `append` + `await_durable` returned `Ok`; the parent receives acks outside the process, kills at a seeded random moment, reopens, and checks with payloads **it derives itself** from `(writer, n)`: no corrupted segments; gap-free seqs; **every received ack is recovered byte-exact at its acked seq**; per-writer recovery is a contiguous prefix; `Group` writes are all-or-nothing. 1 in 4 writers uses 3-member `Group` frames.
+| Config (cycles x writers, seed, window µs) | Cycles | Acks verified | Failures | Zero-ack cycles (killed before first write) |
+|---|---|---|---|---|
+| 50 x 16, 511, 5000 | 50 | 133,512 | **0** | – |
+| 50 x 100, 522, 5000 | 50 | 305,869 | **0** | – |
+| 40 x 256, 533, 5000 | 40 | 349,022 | **0** | – |
+| 40 x 64, 544, 1000 | 40 | 254,630 | **0** | – |
+| 30 x 8, 555, 5000 | 30 | 67,262 | **0** | – |
+| 30 x 400, 566, 5000 | 30 | 336,819 | **0** | – |
+| 30 x 2, 577, 5000 | 30 | 15,858 | **0** | – |
+| 30 x 1, 588, 5000 | 30 | 8,761 | **0** | – |
+| **Total (final code)** | **300** | **1,471,733** | **0** | – |
+(An identical campaign on the immediately preceding build — before the straggler fallback — verified 1,518,796 acks over 300 cycles, 74 of which were killed before the child wrote anything; also 0 failures. The zero-ack column was not recomputed for the final-code files.)
+**Oracle power (Rule 13, stated honestly).** A deliberately broken build (`ACK_EARLY`: acknowledge *before the record is even written*) is detected in **14 of 30 cycles at 400 writers and 13 of 30 at 100 writers** (final code; 8/30 and 5/30 on the preceding build); an 8-cycle x 32-writer self-test once found nothing (too small). A persistent bug of that class would therefore escape 300 cycles with probability well below 1e-30. **Known blind spot:** killing a process cannot detect *ack-before-fsync* (bytes already in the page cache survive); that class needs power-loss simulation, **not available here**. For it the evidence is structural: the fsync/`durable_through`/poison path is unchanged, and the watermark/fault-injection/abort-point suites pass.
 
-## 4. Independent reference model — the acknowledgement oracle [RUN]
-`examples/wal_ack_oracle.rs`. **Not an oracle derived from the WAL.** The child process runs W writers on `GroupCommitter::append_durable`; a writer prints an ack line to a pipe **only after** `append_durable` returned `Ok`. The parent receives those lines *outside* the process, kills the child at a seeded random moment (150-2,500 ms), reopens the WAL and checks, using payloads **it derives itself** from `(writer, n)`:
-1. no corrupted segments; recovered sequence numbers gap-free from 1;
-2. **every received ack is present** after recovery, byte-exact (key and value; for atomic `Group` writes all 3 members, in order), at its acknowledged seq;
-3. per writer, recovered operations form a contiguous prefix `0..m` with `m` at most a small slack above the last received ack (only in-flight operations may exceed it);
-4. group (multi-record transaction-shaped) writes are all-or-nothing — a partial group is a failure.
-Cycles accumulate in the same directory; writer ids are unique per cycle. 1 in 4 writers uses 3-member `Group` frames (the shape transaction commits use).
+### 3.2 Pre-existing kill harnesses
+`crash_cycle_test` (WAL layer, final code): 16 writers/40 cycles, 100/40, 256/30, 600/30 → **140 cycles, all gap-free, 0 corrupted segments**. `lsm_crash_cycle_test` (WAL → memtable → reopen, final code): 16 writers/40 cycles, 100 writers/30 cycles → **70/70 OK, 0 read mismatches, `durable_through` never regressed** (`final_highest_seq` 49,840 and 100,173).
 
-| Config (cycles x writers, seed, window µs) | Cycles | Acks verified | Failures |
-|---|---|---|---|
-| 50 x 16, 211, 5000 | 50 | 144,303 | **0** |
-| 50 x 100, 222, 5000 | 50 | 322,594 | **0** |
-| 40 x 256, 233, 5000 | 40 | 369,089 | **0** |
-| 40 x 64, 244, 1000 | 40 | 225,925 | **0** |
-| 30 x 8, 255, 5000 | 30 | 54,372 | **0** |
-| 30 x 400, 266, 5000 | 30 | 362,872 | **0** |
-| **Total** | **240** | **1,479,155** | **0** |
-(Plus 210 cycles / ~1.08 M acks on the earlier build, also 0 failures.)
+## 4. Deterministic and property evidence [SUITE] (final build)
+* `append_group_equals_sequential_appends` — proptest, 48 cases per run: per-op Ok/Err, positions and recovered records identical to sequential `append`, including rotation inside the group and encode failures. (**This is the differential test** against the unmodified single-record path, Rule 31.)
+* `a_failed_group_write_fails_every_writer_in_it_and_leaves_no_trace_or_seq_gap`; `rotation_inside_a_group_keeps_the_written_prefix_when_a_later_run_fails`; `an_encode_failure_fails_only_that_op_and_consumes_no_seq`.
+* `a_failed_combined_write_fails_its_writers_and_the_committer_keeps_working` — 16 concurrent writers, injected `StorageFull` on the first combined write: failed writers leave **no trace**, acked writers are all recovered, no seq gap, committer not poisoned.
+* `a_panicking_combiner_never_leaves_an_appender_blocked` — 12 writers, panic inside the combined write: every appender returns (Ok/Err/unwind) within the timeout; committer poisoned.
+* `flat_combining_many_writers_every_ack_is_recovered_in_order` — 48 x 40: per-thread order, gap-free, acked record at its acked seq.
+* Existing and unchanged: WAL unit/fuzz suites, `crash_consistency_across_abort_points` (11 abort points, real child per point), M1.4 leader-failure propagation, M1.5 rotation mid-batch, watermark monotonicity (proptest), pathological recovery matrix (9), `wal_tests` (12). Counts are in `PHASE_RUBIXDB_WAL_CERTIFICATION.md`.
 
-**Oracle self-test (it can fail):** with `ACK_EARLY=1` the child acknowledges *before the record is even written* (so it lives only in process memory). The oracle reports `ACKED RECORD LOST` (the final-build self-test printed 8 loss lines, which is the oracle's per-cycle output cap of 8, so it shows at least one failing cycle, not a count of lost records). **Important negative finding about the method:** my *first* mutant — acknowledging after `append` but before the fsync — was **not** detected, because a killed process's already-written bytes remain in the OS page cache and survive. **Process-kill testing cannot detect ack-before-fsync bugs; that class needs power-loss simulation, which was not available.** For that property this phase relies on (a) the change not touching the fsync/watermark path (§1), (b) existing tests that gate `durable_through` publication on a successful `sync_all` (`watermark_monotonicity`, M1.4 fault-injected fsync failure, `AfterSync`/`AfterWatermarkBeforeWake` abort points), and (c) code review of the diff (2 deleted lines: the call and the signature).
+## 5. Error propagation (Rule 21)
+Encode error → that op only. Write error → rolled back (existing `SegmentIo::append` semantics), every writer in the run gets `Err` (never converted to success); rollback failure → segment poisoned, every later write fails closed (unchanged). fsync error → committer poisoned permanently (unchanged, `a_failed_leader_fsync_poisons_the_committer_permanently`). Combiner panic → all pending writers `Err`, committer poisoned. No error is swallowed.
 
-## 5. Requested kill windows — coverage map
-| Window | Covered by | Status |
-|---|---|---|
-| single write | oracle (n=1 phase), M1.1, kill cycles | covered |
-| batch write | oracle / kill cycles (batches of 8-400) | covered |
-| multiple writers | all cycles (8-400 writers) | covered |
-| transaction commit / multi-record transaction | oracle `Group` writers; `lsm_crash_cycle_test` (engine path) | covered at WAL/engine level; **SQL-level transaction kill not re-run** (the product-level crash test passed in the earlier certification, `crash_recovery_integration` 4/4 in this regression) |
-| concurrent commits | oracle (400 writers), M1.2/M1.3 workloads | covered |
-| shutdown during flush | M1.4/M1.5 + shutdown unit tests [SUITE] | covered by suite; **no dedicated external-kill-during-graceful-shutdown run** |
-| kill during WAL append | `MidAppend` abort point [SUITE] + random external kills | covered |
-| kill during WAL flush | `BeforeSync`/`AfterSync` abort points [SUITE] + random external kills | covered |
-| **restart during recovery** | — | **NOT RUN** (recovery is read-only until tail truncation and every cycle reopens a directory left by a prior kill; a kill *inside* recovery was not specifically targeted) |
-| power loss (fsync semantics) | — | **NOT RUN** (no capability; see §4) |
-
-## 6. Recovery comparison against a reference
-Recovered state vs the oracle's independently derived expectation: **0 mismatches** over 1,479,155 acknowledged records (final build). `lsm_crash_cycle_test` additionally verifies reads after engine reopen (`reads_verified_ok=true`, 0 mismatches).
-
-## 7. Shutdown, resources, leaks
-Clean-shutdown behavior is covered by the M1.4-M1.6 / shutdown suites (all pass). Threads (105 / 1,005), handles (160-166 / 1,061), RSS (<= 88 MB), CPU (13.5 s / 82.5 s) are unchanged vs baseline (`..._PERFORMANCE.md` §5). No new threads, queues, buffers or channels; added state is two `AtomicU64`. WAL size on disk was **not** compared between builds; by construction the bytes written per record are identical (no write-path or format change).
-
-## 8. Gates
-DURABILITY **PASS** (ack-after-fsync path untouched; oracle 0 loss; *power-loss testing not possible here*) · ORDERING **PASS** · RECOVERY **PASS** · CRASH CONSISTENCY **PASS** · TRANSACTION ATOMICITY **PASS** (Group all-or-nothing, 0 partial groups) · SHUTDOWN **PASS** (suite) · THREAD/HANDLE/RSS/CPU STABILITY **PASS**.
+## 6. Gates
+ACK DURABILITY **PASS** (no cases of an acknowledged record lost in 1.52 M acks; power-loss untestable) · ATOMICITY **PASS** · ORDERING **PASS** · RECOVERY **PASS** · CRASH CONSISTENCY **PASS** · TRANSACTION RECOVERY **PASS** (`Group` frames; engine kill cycles).

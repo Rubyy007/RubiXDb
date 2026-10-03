@@ -132,16 +132,18 @@ const QUIESCENCE_WINDOW: Duration = Duration::from_micros(100);
 /// The batch size the leader waits for before an early close, derived from the
 /// previous batch (`100%` of it unless the experiment hook says otherwise;
 /// `0%` means "any arrival", i.e. pure quiescence).
+#[cfg(feature = "phase1-window-experiment")]
 fn cohort_target_from_prev(prev: u64) -> u64 {
-    #[cfg(feature = "phase1-window-experiment")]
-    {
-        let pct = quiesce_experiment::target_pct();
-        if prev == 0 {
-            return 0;
-        }
-        return ((prev * pct) / 100).max(1);
+    let pct = quiesce_experiment::target_pct();
+    if prev == 0 {
+        0
+    } else {
+        ((prev * pct) / 100).max(1)
     }
-    #[cfg(not(feature = "phase1-window-experiment"))]
+}
+
+#[cfg(not(feature = "phase1-window-experiment"))]
+fn cohort_target_from_prev(prev: u64) -> u64 {
     prev
 }
 
@@ -150,8 +152,34 @@ fn cohort_target_from_prev(prev: u64) -> u64 {
 /// quiet for at least `QUIESCENCE_WINDOW`. Pure so its decision table can be
 /// tested exhaustively.
 fn cohort_arrived_and_quiet(open: u64, target: u64, quiet_for: Duration) -> bool {
-    target > 0 && open >= target && quiet_for >= quiescence_for_cohort(target)
+    if target == 0 || open == 0 {
+        return false;
+    }
+    let quiet = quiescence_for_cohort(target);
+    // (a) the expected cohort has arrived and arrivals have paused, or
+    // (b) the cohort is NOT completing (real workloads' concurrency
+    //     fluctuates; a batch smaller than the previous one would otherwise
+    //     wait out the whole fsync-sized deadline): arrivals have been quiet
+    //     for `STRAGGLER_QUIET_MULTIPLIER` x the normal interval.
+    (open >= target && quiet_for >= quiet) || quiet_for >= straggler_quiescence(quiet)
 }
+
+/// How long arrivals must be quiet before an INCOMPLETE cohort is abandoned.
+fn straggler_quiescence(quiet: Duration) -> Duration {
+    #[cfg(feature = "phase1-window-experiment")]
+    let mult = quiesce_experiment::straggler_multiplier();
+    #[cfg(not(feature = "phase1-window-experiment"))]
+    let mult = STRAGGLER_QUIET_MULTIPLIER;
+    quiet.saturating_mul(mult as u32).min(STRAGGLER_QUIET_MAX)
+}
+
+/// An incomplete cohort is abandoned after this multiple of the normal
+/// quiescence interval (see `cohort_arrived_and_quiet`). Chosen by a measured
+/// sweep on both the closed-loop WAL workloads and the real multi-table
+/// product write path (`PHASE_RUBIXDB_WAL_PERFORMANCE_FINAL.md`).
+const STRAGGLER_QUIET_MULTIPLIER: u64 = 4;
+/// Upper bound on that interval: always far below the fsync-sized window.
+const STRAGGLER_QUIET_MAX: Duration = Duration::from_millis(2);
 
 /// The quiescence interval required before an early close, scaled with the
 /// cohort size: with more concurrent writers the natural gaps between
@@ -173,6 +201,7 @@ fn quiescence_for_cohort(target: u64) -> Duration {
 /// removable): env overrides for the early-close constants, used to choose
 /// them with a measured sweep rather than by guess.
 /// `PHASE1_EXPERIMENT_QUIET_FLOOR_US`, `PHASE1_EXPERIMENT_QUIET_NS_PER_RECORD`,
+/// `PHASE1_EXPERIMENT_STRAGGLER_X`, `PHASE1_EXPERIMENT_TARGET_PCT`,
 #[cfg(feature = "phase1-window-experiment")]
 mod quiesce_experiment {
     use std::sync::OnceLock;
@@ -192,6 +221,12 @@ mod quiesce_experiment {
                     .unwrap_or(super::QUIESCENCE_NS_PER_RECORD),
                 super::QUIESCENCE_MAX,
             )
+        })
+    }
+    pub(super) fn straggler_multiplier() -> u64 {
+        static M: OnceLock<u64> = OnceLock::new();
+        *M.get_or_init(|| {
+            env("PHASE1_EXPERIMENT_STRAGGLER_X").unwrap_or(super::STRAGGLER_QUIET_MULTIPLIER)
         })
     }
     pub(super) fn target_pct() -> u64 {
@@ -2711,12 +2746,36 @@ mod tests {
                 let seq = pos.seq;
                 thread::spawn(move || {
                     callers_ready.fetch_add(1, AtomicOrdering::AcqRel);
-                    let started = Instant::now();
                     // `thread::spawn` already isolates a child panic —
                     // `join()` below observes it as `Err`, no explicit
                     // `catch_unwind` needed here.
-                    let result = committer.await_durable(seq);
-                    (result, started.elapsed())
+                    //
+                    // `Timeout` is the documented *recoverable* outcome of
+                    // one bounded `await_durable` wait (see
+                    // `tests/group_commit/support.rs`): its bound is a few
+                    // ms (derived from the fsync-latency EMA), so under CPU
+                    // saturation a follower's first wait can expire before
+                    // the starved leader thread has even run its hook. The
+                    // contract under test is therefore "retrying never
+                    // yields `Ok`, and the call that observes the poison
+                    // returns promptly with a clear `Io` error" — not "the
+                    // very first bounded wait is long enough". Reproduced
+                    // on the unmodified baseline (12 of 12 failures with 8
+                    // busy CPU processes, 0 of 12 unloaded) before this
+                    // change; see PHASE_RUBIXDB_WAL_CERTIFICATION_CLOSURE.md.
+                    let overall_deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let started = Instant::now();
+                        let result = committer.await_durable(seq);
+                        match result {
+                            Err(EngineError::Timeout { .. })
+                                if Instant::now() < overall_deadline =>
+                            {
+                                continue
+                            }
+                            other => break (other, started.elapsed()),
+                        }
+                    }
                 })
             })
             .collect();
@@ -2908,7 +2967,7 @@ mod tests {
         let busy = QUIESCENCE_WINDOW - Duration::from_micros(1);
         // No completed batch yet (target 0): never close early.
         assert!(!cohort_arrived_and_quiet(1_000, 0, quiet));
-        // Cohort not yet complete: never close, however quiet.
+        // Cohort not yet complete and arrivals only briefly quiet: keep waiting.
         assert!(!cohort_arrived_and_quiet(9, 10, quiet));
         // Cohort complete but arrivals still flowing: keep the batch open
         // (this is the guard that prevents the "ratchet").
@@ -2929,6 +2988,24 @@ mod tests {
             256,
             quiescence_for_cohort(256)
         ));
+        // Straggler fallback: an INCOMPLETE cohort is abandoned after 4x the
+        // normal quiet interval (so an unreachable target costs well under a
+        // millisecond instead of the whole fsync-sized deadline).
+        let q = quiescence_for_cohort(10);
+        assert!(!cohort_arrived_and_quiet(
+            3,
+            10,
+            q * 4 - Duration::from_micros(1)
+        ));
+        assert!(cohort_arrived_and_quiet(3, 10, q * 4));
+        assert!(
+            !cohort_arrived_and_quiet(0, 10, Duration::from_secs(1)),
+            "nothing arrived: no early close"
+        );
+        assert!(
+            !cohort_arrived_and_quiet(3, 0, Duration::from_secs(1)),
+            "no completed batch yet: no early close"
+        );
         // There is no upper cohort cutoff: the early close applies at every size.
         assert!(cohort_arrived_and_quiet(
             1_000,

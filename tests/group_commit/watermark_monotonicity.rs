@@ -45,6 +45,7 @@ proptest! {
         max_batch_bytes in 64usize..(64 * 1024),
         stagger_micros in 0u64..200,
     ) {
+        let _shared = support::shared();
         let dir = support::temp_dir("watermark_monotonicity");
         let config = WalConfig {
             sync_mode: SyncMode::GroupCommit {

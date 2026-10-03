@@ -11,6 +11,10 @@ const PER_THREAD: usize = 1_000;
 const TARGET_OPS_PER_SEC: f64 = 15_000.0;
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "throughput gate: defined for the release profile only (1,000 unoptimized threads are CPU-bound); run `cargo test --release --test group_commit -- --test-threads=1` (scripts/wal_certify.ps1)"
+)]
 fn hundred_writers_throughput() {
     let result = support::run_throughput_scenario("m1_2", THREADS, PER_THREAD);
     let ops_per_sec = (result.total_records as f64) / result.elapsed.as_secs_f64();

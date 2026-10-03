@@ -1,0 +1,10 @@
+test m1_2_hundred_writers_throughput::hundred_writers_throughput ... M1.2 hundred_writers_throughput: 100 threads x 1000 records = 100000 total in 4.919s => 20328 ops/sec (target >= 15000) (reproduce 
+test m1_3_thousand_writers_throughput::thousand_writers_throughput ... M1.3 thousand_writers_throughput: 1000 threads x 1000 records = 1000000 total in 8.985s => 111296 ops/sec (target >= 80000) (repr
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.48s
+test m1_2_hundred_writers_throughput::hundred_writers_throughput ... M1.2 hundred_writers_throughput: 100 threads x 1000 records = 100000 total in 5.061s => 19758 ops/sec (target >= 15000) (reproduce 
+test m1_3_thousand_writers_throughput::thousand_writers_throughput ... M1.3 thousand_writers_throughput: 1000 threads x 1000 records = 1000000 total in 11.820s => 84604 ops/sec (target >= 80000) (repr
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.51s
+test m1_2_hundred_writers_throughput::hundred_writers_throughput ... M1.2 hundred_writers_throughput: 100 threads x 1000 records = 100000 total in 5.048s => 19811 ops/sec (target >= 15000) (reproduce 
+test m1_3_thousand_writers_throughput::thousand_writers_throughput ... M1.3 thousand_writers_throughput: 1000 threads x 1000 records = 1000000 total in 9.695s => 103148 ops/sec (target >= 80000) (repr
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.25s
+runs=3 failed=0

@@ -81,7 +81,7 @@ fn main() {
                 }
                 local.push(t0.elapsed().as_micros() as u64);
                 i += 1;
-                if local.len() >= 2048 {
+                if local.len() >= 64 {
                     lat.lock().unwrap().append(&mut local);
                 }
             }
@@ -91,7 +91,10 @@ fn main() {
     let start = Instant::now();
     let mut last_tick = Instant::now();
     let mut next_checkpoint_seq = 0u64;
-    println!("t_s,ops_s,p50_ms,p95_ms,p99_ms,max_ms,wal_mb,segments,highest_seq,durable_through");
+    println!("t_s,ops_s,p50_ms,p95_ms,p99_ms,max_ms,wal_mb,segments,highest_seq,durable_through,rec_per_sync");
+    let mut prev_highest = 0u64;
+    let mut prev_syncs = 0u64;
+    let mut prev_recs = 0u64;
     while start.elapsed() < Duration::from_secs(seconds) {
         std::thread::sleep(Duration::from_secs(interval));
         let el = last_tick.elapsed().as_secs_f64();
@@ -111,11 +114,17 @@ fn main() {
             next_checkpoint_seq = s.durable_through - 100_000;
             let _ = committer.purge_before(next_checkpoint_seq);
         }
-        let (bytes, segs) = dir_stats(&dir);
+        let (bytes, segs) = dir_stats(&dir.join("wal"));
+        let d_high = s.highest_sequence - prev_highest;
+        let d_syncs = s.sync_successes - prev_syncs;
+        let d_recs = s.records_total - prev_recs;
+        prev_syncs = s.sync_successes;
+        prev_highest = s.highest_sequence;
+        prev_recs = s.records_total;
         println!(
-            "{:.0},{:.0},{:.2},{:.2},{:.2},{:.1},{:.1},{},{},{}",
+            "{:.0},{:.0},{:.2},{:.2},{:.2},{:.1},{:.1},{},{},{},{:.1}",
             start.elapsed().as_secs_f64(),
-            v.len() as f64 / el,
+            d_high as f64 / el,
             p(0.5),
             p(0.95),
             p(0.99),
@@ -123,7 +132,8 @@ fn main() {
             bytes as f64 / 1e6,
             segs,
             s.highest_sequence,
-            s.durable_through
+            s.durable_through,
+            d_recs as f64 / d_syncs.max(1) as f64
         );
     }
     stop.store(true, Ordering::Relaxed);

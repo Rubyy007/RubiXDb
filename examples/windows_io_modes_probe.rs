@@ -6,7 +6,7 @@
 //! * `wt_sync`         -- `FILE_FLAG_WRITE_THROUGH` + `FlushFileBuffers`
 //! * `wt_only`         -- `FILE_FLAG_WRITE_THROUGH`, no `FlushFileBuffers`
 //! * `unbuf_wt`        -- `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`, sector-aligned
-//!                        writes into a preallocated file, no `FlushFileBuffers`
+//!   writes into a preallocated file, no `FlushFileBuffers`
 //! * `unbuf_wt_sync`   -- as above plus `FlushFileBuffers`
 //!
 //! LATENCY ONLY. Whether `wt_only` / `unbuf_wt` is actually durable across power

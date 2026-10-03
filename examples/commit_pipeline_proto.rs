@@ -83,7 +83,10 @@ fn append(sh: &Shared) -> u64 {
 }
 
 fn stripes_n() -> usize {
-    std::env::var("STRIPES").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    std::env::var("STRIPES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
 }
 
 fn wait_slot(slot: &Slot) -> u8 {
@@ -410,7 +413,9 @@ fn main() {
         .unwrap();
     // warm-up fsync so EMA is seeded like production's warm-up probe
     let sh = Arc::new(Shared {
-        stripes: (0..stripes_n()).map(|_| (Mutex::new(()), Condvar::new())).collect(),
+        stripes: (0..stripes_n())
+            .map(|_| (Mutex::new(()), Condvar::new()))
+            .collect(),
         q: Mutex::new(Queue::default()),
         st: Mutex::new(State {
             next_seq: 0,

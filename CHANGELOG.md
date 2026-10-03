@@ -2434,3 +2434,22 @@ the original Phase 1 throughput targets.
 ### Known / unchanged
 - M1.2 / M1.3 still below target (ENGINE-BLOCKED); no NVMe available (experiment open); leader-written batch buffer NOT implemented
   pending a failure-semantics decision.
+
+## 2026-10-03 -- WAL flat-combining group commit (branch `wal-batch-buffer-fillq`, not merged)
+
+### Changed (`src/wal/`)
+- `GroupCommitter::append` now uses flat combining: concurrent appenders' frames are written by one combiner in a single
+  syscall (`FileWal::append_group`); each appender still returns only after its own frame is written. Durability, ordering,
+  recovery and on-disk format are unchanged; a failed batched write fails every writer in that run (all get `Err`, rolled back).
+- Leader batch window: closes early when the previous cohort has arrived and arrivals are quiet, or after 4x that quiet interval
+  if the cohort is not completing; the lone-writer probe applies only after a one-record batch.
+- Measured (isolated, interleaved, this SATA machine): M1.2 10.5k -> 17.1k, M1.3 62.7k -> 99.0k; 2-1,000 writers +60-120%; sustained
+  64-writer +72%; p50/p95/p99 lower at every concurrency, p99.9/max higher at 256-512 writers; product SQL write throughput unchanged.
+
+### Added (tools, not on any production path)
+- `examples/{commit_pipeline_proto,fsync_lanes_probe,fsync_overlap_probe,windows_io_modes_probe,wal_commit_latency,wal_soak,wal_ack_oracle}.rs`,
+  `scripts/{wal_bench_runner.ps1,cpu_warm.py,wal_soak_monitor.ps1}`, tests `src/wal/group_append_tests.rs` and new group-commit tests.
+
+### Known / open
+- Full regression not clean under the default concurrent/debug harness (M1.2/M1.3) and one load-sensitive pre-existing unit test; NVMe
+  unavailable; power-loss durability untested; p99.9/max regression at 256-512 writers.
