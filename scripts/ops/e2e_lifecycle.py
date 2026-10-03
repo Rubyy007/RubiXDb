@@ -36,8 +36,15 @@ def q(s):
 
 def cell(c):
     if isinstance(c, dict):
-        if c.get("null") or c.get("value") is None and c.get("kind") == "null":
+        t = c.get("type")
+        if t == "null":
             return None
+        if t == "decimal":
+            u, sc = int(c["unscaled"]), int(c["scale"])
+            neg = u < 0
+            d = str(abs(u)).rjust(sc + 1, "0")
+            out = d[:-sc] + "." + d[-sc:] if sc else d
+            return ("-" if neg else "") + out
         return c.get("value")
     return c
 
@@ -181,6 +188,11 @@ def main():
     insert_batches(inst, "orders", "id, customer_id, total, status, note", ords, m.order_sql)
     insert_batches(inst, "events", "id, kind, amount, day", evs, m.event_sql)
     m.customers.update(dict(custs)); m.orders.update(dict(ords)); m.events.update(dict(evs))
+    # bulk padding so the memtable flushes several times and automatic compaction triggers
+    inst.sql("CREATE TABLE blobs (id INTEGER PRIMARY KEY, payload TEXT)")
+    pad = "p" * 2000
+    for st in range(0, 12000, 100):
+        inst.sql("INSERT INTO blobs (id, payload) VALUES " + ", ".join(f"({i}, '{pad}')" for i in range(st, st + 100)))
     step("insert realistic data", True, f"{NC + NO + NE} rows in {time.perf_counter() - t:.1f}s")
     dump_equal(inst, m, "after load")
 
@@ -224,7 +236,7 @@ def main():
     dump_equal(inst, m, "after updates and deletes")
 
     # 8. compaction (automatic trigger is on in the product host)
-    for _ in range(40):
+    for _ in range(120):
         st = inst.status()
         if st["compaction"]["cycles_completed"] > 0:
             break

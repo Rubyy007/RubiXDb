@@ -773,3 +773,44 @@ fn as_bound(b: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<&[u8]> {
         std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
     }
 }
+
+#[tokio::test]
+async fn shutdown_requires_the_exact_confirmation() {
+    let app = build_app(&temp_dir("shutdown"), true);
+    for confirm in ["", "nope", "SHUTDOWN"] {
+        let (s, v, _) = call(
+            &app.router,
+            "POST",
+            "/v1/admin/shutdown",
+            Some(ADMIN_KEY),
+            Some(json!({"confirm": confirm})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{confirm:?}");
+        assert_eq!(v["error"]["code"], "CONFIRMATION_REQUIRED");
+    }
+    assert!(
+        !rubixdb_api::shutdown::requested(),
+        "a refused request must not arm the shutdown"
+    );
+    let (s, _, _) = call(
+        &app.router,
+        "POST",
+        "/v1/admin/shutdown",
+        Some(READER_KEY),
+        Some(json!({"confirm": "shutdown"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(!rubixdb_api::shutdown::requested());
+    let (s, v, _) = call(
+        &app.router,
+        "POST",
+        "/v1/admin/shutdown",
+        Some(ADMIN_KEY),
+        Some(json!({"confirm": "shutdown"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    assert_eq!(v["shutting_down"], true);
+}

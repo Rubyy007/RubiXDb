@@ -66,6 +66,19 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+/// `--instance NAME`, else `RUBIXDB_INSTANCE_NAME`, else `default` — the same
+/// resolution every other command uses.
+fn default_instance_name(args: &[String]) -> String {
+    flag_value(args, "--instance")
+        .map(|s| s.to_string())
+        .or_else(|| {
+            std::env::var("RUBIXDB_INSTANCE_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| rubixdb_instance::DEFAULT_INSTANCE_NAME.to_string())
+}
+
 fn utc_stamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -447,7 +460,8 @@ fn resolve_target(
     if let Some(d) = flag_value(args, "--data-dir") {
         return Ok((PathBuf::from(d), None, false));
     }
-    let name = flag_value(args, "--instance").unwrap_or(rubixdb_instance::DEFAULT_INSTANCE_NAME);
+    let name_owned = default_instance_name(args);
+    let name = name_owned.as_str();
     let dir = rubixdb_instance::paths::instance_dir(name)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create the instance directory: {e}"))?;
@@ -565,9 +579,7 @@ fn check(args: &[String]) -> i32 {
     let json = has_flag(args, "--json");
     // A running instance is checked through its API (no second engine).
     if !has_flag(args, "--data-dir") {
-        let name = flag_value(args, "--instance")
-            .unwrap_or(rubixdb_instance::DEFAULT_INSTANCE_NAME)
-            .to_string();
+        let name = default_instance_name(args);
         if let Ok(dir) = rubixdb_instance::paths::instance_dir(&name) {
             if dir.exists() {
                 if let Err(rubixdb_instance::LockAcquireError::AlreadyLocked) =

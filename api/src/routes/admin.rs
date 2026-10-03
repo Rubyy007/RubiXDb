@@ -625,3 +625,33 @@ pub async fn purge_orphans(
         "remaining": report.remaining,
     })))
 }
+
+#[derive(Deserialize)]
+pub struct ShutdownRequest {
+    /// Must equal this instance's name (or the literal `shutdown` for an
+    /// unnamed standalone server) — backend-validated.
+    confirm: String,
+}
+
+/// RECOVERY-class availability action: a graceful, bounded stop (in-flight
+/// requests drain, the engine shuts down cleanly). Nothing is lost; the
+/// service is unavailable until started again.
+pub async fn shutdown(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ShutdownRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let expected = state
+        .config
+        .instance_name
+        .clone()
+        .unwrap_or_else(|| "shutdown".to_string());
+    if req.confirm != expected {
+        return Err(admin_err(
+            StatusCode::BAD_REQUEST,
+            codes::NOT_CONFIRMED,
+            "stopping the server requires `confirm` to equal the instance name",
+        ));
+    }
+    crate::shutdown::request();
+    Ok((StatusCode::ACCEPTED, Json(json!({"shutting_down": true}))))
+}

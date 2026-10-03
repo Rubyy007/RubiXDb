@@ -136,6 +136,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::delete(admin::delete_backup),
         )
         .route("/v1/admin/check", post(admin::check))
+        .route("/v1/admin/shutdown", post(admin::shutdown))
         .route("/v1/admin/storage", get(admin::storage))
         .route(
             "/v1/admin/maintenance/purge-orphans",

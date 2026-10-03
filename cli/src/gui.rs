@@ -207,6 +207,7 @@ fn block_until_shutdown_signal() {
         tokio::select! {
             _ = ctrl_c => {},
             _ = terminate => {},
+            _ = rubixdb_api::shutdown::wait_requested() => {},
         }
     });
 }

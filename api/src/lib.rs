@@ -19,6 +19,7 @@ pub mod rate_limit;
 pub mod resources;
 pub mod routes;
 pub mod server;
+pub mod shutdown;
 pub mod sql_metrics;
 pub mod sql_params;
 pub mod sql_session;

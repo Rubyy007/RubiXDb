@@ -814,7 +814,9 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
                 || name == "wal"
                 || name == "sstables"
                 || name == crate::wal::LOCK_FILE_NAME
-                || name == "MANIFEST.tmp";
+                || name == "MANIFEST.tmp"
+                || name == crate::ops::format::DATA_FORMAT_FILE
+                || name == crate::ops::restore::MARKER_FILE;
             if !known {
                 sink.add(
                     Severity::Info,

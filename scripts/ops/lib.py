@@ -119,10 +119,11 @@ class Instance:
         self._close_log()
 
     def stop(self, timeout=90.0):
-        """Graceful stop: a real Ctrl+C to the instance's console. Returns the exit code."""
+        """Graceful stop through the supported admin operation
+        (POST /v1/admin/shutdown with the exact instance name). Returns the exit code."""
         if self.proc is None or self.proc.poll() is not None:
             return self.proc.returncode if self.proc else None
-        _send_ctrl_c(self.proc.pid)
+        self.api("POST", "/v1/admin/shutdown", {"confirm": self.name}, timeout=30)
         try:
             self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
