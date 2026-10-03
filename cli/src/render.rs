@@ -27,11 +27,23 @@ pub fn sanitize_for_terminal(s: &str) -> String {
         let cp = c as u32;
         if cp < 0x20 || cp == 0x7F || (0x80..=0x9F).contains(&cp) {
             out.push_str(&format!("\\x{cp:02X}"));
+        } else if is_bidi_spoofing_control(cp) {
+            out.push_str(&format!("\\u{{{cp:04X}}}"));
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// Bidirectional *embedding / override / isolate* controls (U+202A..U+202E,
+/// U+2066..U+2069). They reorder what a terminal displays ("Trojan Source"
+/// style spoofing of row content, e.g. a value that *shows* as one thing and
+/// copy-pastes as another), so they are made visible as `\u{XXXX}` exactly like
+/// control characters. The plain direction *marks* LRM/RLM/ALM and every letter
+/// of right-to-left scripts pass through untouched.
+fn is_bidi_spoofing_control(cp: u32) -> bool {
+    (0x202A..=0x202E).contains(&cp) || (0x2066..=0x2069).contains(&cp)
 }
 
 /// `SqlValueJson`'s wire shape -> a display string. Never guesses at an
@@ -145,6 +157,19 @@ pub fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bidi_override_embedding_and_isolate_controls_are_made_visible() {
+        for cp in (0x202Au32..=0x202E).chain(0x2066..=0x2069) {
+            let c = char::from_u32(cp).unwrap();
+            let safe = sanitize_for_terminal(&format!("a{c}b"));
+            assert!(!safe.contains(c), "U+{cp:04X} must not reach the terminal");
+            assert!(safe.contains(&format!("\\u{{{cp:04X}}}")), "{safe}");
+        }
+        // Right-to-left *text* and the plain marks are untouched.
+        let s = "\u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{200E}x\u{200F}";
+        assert_eq!(sanitize_for_terminal(s), s);
+    }
 
     #[test]
     fn sanitizes_ansi_escape_sequences() {

@@ -869,7 +869,7 @@ async fn admin_routes_survive_hostile_requests_without_server_errors() {
         } else {
             hostile[(next() % hostile.len() as u64) as usize].clone()
         };
-        let path = paths[(next() % paths.len() as u64) as usize].replace("{n}", &n);
+        let path = paths[(next() % paths.len() as u64) as usize].replace("{n}", &pct(&n));
         let body: Option<Value> = match next() % 5 {
             0 => None,
             1 => Some(
@@ -909,4 +909,19 @@ async fn admin_routes_survive_hostile_requests_without_server_errors() {
     // The server and the data are intact.
     let q = sql(&app.router, "SELECT COUNT(*) FROM people").await;
     assert_eq!(q["result"]["rows"][0][0]["value"], "60");
+}
+
+/// Percent-encodes everything outside the URI-safe set (the way a real HTTP
+/// client must) while leaving existing %XX escapes alone.
+fn pct(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'%' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }

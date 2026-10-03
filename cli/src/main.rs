@@ -64,6 +64,13 @@ Once connected, type \help for the list of meta-commands (\l \ls \lt \d \di
 \du \conninfo \c \q)."#;
 
 fn read_script_file(path: &str) -> Result<String, String> {
+    // Only regular files: opening a device (`CON`, `NUL`, a named pipe) as a
+    // "script" would block forever waiting for input that never comes.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(format!("{path} is not a regular file")),
+        Err(e) => return Err(format!("could not open {path}: {e}")),
+    }
     let mut f = std::fs::File::open(path).map_err(|e| format!("could not open {path}: {e}"))?;
     let mut s = String::new();
     f.read_to_string(&mut s)

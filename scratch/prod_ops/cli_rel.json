@@ -1,0 +1,92 @@
+[
+ {
+  "check": "startup with no instance: CLI becomes owner, executes, exits 0",
+  "ok": true,
+  "detail": "0.45s: OK"
+ },
+ {
+  "check": "owner fallback left no running rubixdb process",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "second invocation reuses the persistent database",
+  "ok": true,
+  "detail": "0.05s"
+ },
+ {
+  "check": "data persisted across CLI-owned instance restarts",
+  "ok": true,
+  "detail": "+-------+\n| count |\n+-------+\n| 2     |\n+-------+\n(1 rows)"
+ },
+ {
+  "check": "instance list shows the instance",
+  "ok": true,
+  "detail": "NAME                 PORT     INSTANCE ID\nc1                   302      a0fc00ab-e22c-4efb-8bc1-8f44"
+ },
+ {
+  "check": "instance status works while stopped",
+  "ok": true,
+  "detail": "name:        c1\ninstance_id: a0fc00ab-e22c-4efb-8bc1-8f441fbe41ed\ndirectory:   C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_cli_"
+ },
+ {
+  "check": "interactive session: \\lt and \\l (database/table discovery) work over piped stdin",
+  "ok": true,
+  "detail": "+----+------+-----------+\n| id | name | schema_id |\n+----+------+-----------+\n| 1  | t    | 1         |\n+----+------+---"
+ },
+ {
+  "check": "attach to a running instance",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "check": "malformed SQL: non-zero exit and a clear error",
+  "ok": true,
+  "detail": "ERROR: PARSE_ERROR: the SQL text could not be parsed (Expected: an SQL statement, found: SELEKT at Line: 1, Column: 1) ["
+ },
+ {
+  "check": "unknown table: non-zero exit and a clear error",
+  "ok": true,
+  "detail": "ERROR: NOT_FOUND: the referenced object was not found [HTTP 404]"
+ },
+ {
+  "check": "large output (100,000-row table): terminates, bounded memory",
+  "ok": true,
+  "detail": "exit 0, 100005 output lines, CLI peak RSS 192 MB, stderr="
+ },
+ {
+  "check": "terminal safety: no ESC/C1/BEL/NUL/bidi-override reaches stdout/stderr",
+  "ok": true,
+  "detail": "exit 0, offending=[]"
+ },
+ {
+  "check": "CLI killed mid-query: server releases the request (no leak) and keeps serving",
+  "ok": true,
+  "detail": "active_http=1 handles 110->110 threads 18->18"
+ },
+ {
+  "check": "instance killed, then CLI invoked: no hang, either recovers (becomes owner) or fails clearly",
+  "ok": true,
+  "detail": "exit 0 +--------+\n| count  |\n+--------+\n| 100000 |\n+--------+\n(1 ro "
+ },
+ {
+  "check": "reconnect to the restarted instance",
+  "ok": true,
+  "detail": "+--------+\n| count  |\n+--------+\n| 100000 |\n+--------+\n(1 rows)"
+ },
+ {
+  "check": "credentials never appear in process command lines, logs, data files or CLI output",
+  "ok": true,
+  "detail": "[]"
+ },
+ {
+  "check": "150 hostile argument vectors: no panic, no hang, working directory untouched",
+  "ok": true,
+  "detail": "[]"
+ },
+ {
+  "check": "graceful stop exits 0 and no rubixdb process remains",
+  "ok": true,
+  "detail": "exit 0, remaining=0"
+ }
+]
