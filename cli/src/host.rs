@@ -230,7 +230,24 @@ impl EmbeddedServer {
                             return;
                         }
                         let state = Arc::new(AppState::new(engine.clone(), lsm_config, config));
-                        recover_incomplete_index_operations(&state);
+                        // Recovery of an interrupted CREATE INDEX re-runs the
+                        // whole backfill. Measured: on a 600,000-row table that
+                        // is 21-35 s, which used to run BEFORE readiness and
+                        // made `rubixdb gui` give up at its 30 s readiness
+                        // bound even though the data was fine. The online build
+                        // protocol is concurrency-safe by design (a `Building`
+                        // index already receives live writes and is invisible to
+                        // the planner), so recovery runs on its own thread after
+                        // the server is serving; graceful shutdown joins it
+                        // before the engine stops (a kill simply retries at the
+                        // next start, exactly as before).
+                        let recovery = {
+                            let st = state.clone();
+                            std::thread::Builder::new()
+                                .name("rubixdb-index-recovery".to_string())
+                                .spawn(move || recover_incomplete_index_operations(&st))
+                                .ok()
+                        };
                         let router = build_router(state.clone());
                         // `tokio::net::TcpListener::from_std` requires
                         // the socket already be non-blocking -- a std
@@ -266,6 +283,12 @@ impl EmbeddedServer {
                             shutdown_drain,
                         )
                         .await;
+                        if let Some(handle) = recovery {
+                            if !handle.is_finished() {
+                                eprintln!("rubixdb: waiting for interrupted index recovery to finish before shutting down...");
+                            }
+                            let _ = handle.join();
+                        }
                         engine.shutdown();
                     });
                 })

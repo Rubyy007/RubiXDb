@@ -196,6 +196,10 @@ pub struct BackupOptions<'a> {
     /// Checked between chunks; when set the backup stops and removes its
     /// partial file (`CANCELLED`).
     pub cancel: Option<&'a AtomicBool>,
+    /// Fault-injection seam (tests, fault campaigns): once this many bytes
+    /// have been written, the next write fails with `StorageFull`, exactly
+    /// like a full volume. Never set by product code.
+    pub fail_write_after: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,10 +227,19 @@ fn partial_path(dest: &Path) -> PathBuf {
 struct CrcWriter<W: Write> {
     inner: W,
     written: u64,
+    fail_after: Option<u64>,
 }
 
 impl<W: Write> CrcWriter<W> {
     fn put(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(limit) = self.fail_after {
+            if self.written + bytes.len() as u64 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "injected: no space left on device",
+                ));
+            }
+        }
         self.inner.write_all(bytes)?;
         self.written += bytes.len() as u64;
         Ok(())
@@ -336,6 +349,7 @@ fn write_backup_file(
     let mut w = CrcWriter {
         inner: BufWriter::with_capacity(1 << 20, file),
         written: 0,
+        fail_after: opts.fail_write_after,
     };
 
     // The snapshot is held (registered) for the whole scan: compaction's

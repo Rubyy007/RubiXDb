@@ -1049,3 +1049,36 @@ fn index_rebuild_repairs_a_corrupted_index() {
     );
     db.close();
 }
+
+#[test]
+fn a_full_volume_during_backup_fails_cleanly_and_leaves_nothing() {
+    let db = Db::new("fullvol");
+    populate(&db, 300);
+    let dir = temp_dir("bk");
+    let dest = dir.join("b.rbxbackup");
+    for limit in [0u64, 100, 5_000, 600_000] {
+        let e = create_backup(
+            &db.engine,
+            &dest,
+            &BackupOptions {
+                fail_write_after: Some(limit),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, codes::IO, "limit {limit}: {e}");
+        assert!(e.detail.to_lowercase().contains("space"), "{e}");
+        assert!(
+            !dest.exists(),
+            "no published file after a failed backup (limit {limit})"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
+        assert!(
+            leftovers.is_empty(),
+            "no partial file may remain (limit {limit}): {leftovers:?}"
+        );
+    }
+    // The database is unharmed and a normal backup still works.
+    create_backup(&db.engine, &dest, &BackupOptions::default()).unwrap();
+    db.close();
+}

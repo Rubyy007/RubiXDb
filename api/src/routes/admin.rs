@@ -336,6 +336,7 @@ pub async fn create_backup(
             &BackupOptions {
                 source_instance_id: instance_id.as_deref(),
                 cancel: Some(&cancel2),
+                fail_write_after: None,
             },
         )
     })

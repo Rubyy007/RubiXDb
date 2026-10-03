@@ -366,3 +366,21 @@ fn engine_open_ignores_a_corrupt_wal_segment() {
         "engine behaviour changed: update the ADR and flip this test"
     );
 }
+
+/// A data block that fails its checksum is not noticed by `LsmEngine::open`
+/// (only footer/bloom/index are validated there) but MUST fail the backup
+/// scan — a backup must never silently omit or mangle data — and leave no file.
+#[test]
+fn a_corrupt_sstable_block_fails_the_backup_instead_of_producing_a_wrong_one() {
+    let t = template();
+    let d = fresh_copy(&t);
+    flip(&ssts(&d)[0], 100);
+    let engine = open_result(&d).expect("data-block corruption is not detected at open");
+    let out = temp_dir("bk").join("b.rbxbackup");
+    let e = crate::ops::backup::create_backup(&engine, &out, &Default::default())
+        .expect_err("a scan over a corrupt block must fail the backup");
+    assert!(!out.exists());
+    assert!(!out.with_file_name("b.rbxbackup.partial").exists());
+    eprintln!("backup over corrupt block failed with: {e}");
+    engine.shutdown();
+}

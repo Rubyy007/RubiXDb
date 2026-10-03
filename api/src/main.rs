@@ -90,7 +90,16 @@ async fn main() {
 
     let shutdown_drain = Duration::from_secs(config.shutdown_drain_secs);
     let state = Arc::new(AppState::new(engine, lsm_config, config));
-    recover_incomplete_index_operations(&state);
+    // See the identical block in `cli/src/host.rs`: index-build recovery runs
+    // after the server is serving (measured 21-35 s on 600k rows), and
+    // graceful shutdown joins it before the engine stops.
+    let recovery = {
+        let st = state.clone();
+        std::thread::Builder::new()
+            .name("rubixdb-index-recovery".to_string())
+            .spawn(move || recover_incomplete_index_operations(&st))
+            .ok()
+    };
     let listen_addr = state.config.listen_addr;
     let router = build_router(state.clone());
 
@@ -116,6 +125,12 @@ async fn main() {
     // Amendment 1 §A3: an in-progress compaction cycle always
     // completes; the flush thread's own sequence is unchanged).
     tracing::info!("draining complete, shutting down engine");
+    if let Some(handle) = recovery {
+        if !handle.is_finished() {
+            tracing::warn!("waiting for interrupted index recovery to finish before shutting down");
+        }
+        let _ = handle.join();
+    }
     let report = state.engine.shutdown();
     tracing::info!(?report.pool_state, fully_drained = report.fully_drained, "engine shutdown complete");
 }

@@ -1,0 +1,1 @@
+- 2026-10-03: CREATE INDEX on a 600,000-row table runs ~30 s and the API returns 504 TIMEOUT when it crosses the 30 s statement deadline while the build continues in the background (outcome of the index afterwards recorded in the fault campaign F9); the statement-deadline vs online-build interaction is relational/API behaviour, not changed here.

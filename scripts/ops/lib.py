@@ -146,8 +146,23 @@ class Instance:
         return self.proc is not None and self.proc.poll() is None
 
     # ---- HTTP ----
+    def _conn(self, timeout):
+        import http.client
+        import socket
+        import threading
+        tl = self.__dict__.setdefault("_tl", threading.local())
+        c = getattr(tl, "conn", None)
+        if c is None or getattr(tl, "port", None) != self.port:
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+            c.connect()
+            c.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            tl.conn, tl.port = c, self.port
+        c.sock.settimeout(timeout)
+        return c
+
     def _raw(self, method, path, body, timeout=60, key=True):
-        url = f"http://127.0.0.1:{self.port}{path}"
+        """Keep-alive HTTP (one persistent connection per thread, TCP_NODELAY,
+        headers+body in one send) — what a real client (browser, CLI pool) does."""
         data = None
         headers = {}
         if body is not None:
@@ -155,17 +170,27 @@ class Instance:
             headers["Content-Type"] = "application/json"
         if key and self.key:
             headers["Authorization"] = f"Bearer {self.key}"
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read()
-                return r.status, (json.loads(raw) if raw else None)
-        except urllib.error.HTTPError as e:
-            raw = e.read()
+        for attempt in (0, 1):
+            c = self._conn(timeout)
             try:
-                return e.code, json.loads(raw)
-            except Exception:
-                return e.code, {"raw": raw.decode("utf-8", "replace")}
+                c.request(method, path, body=data, headers=headers)
+                r = c.getresponse()
+                raw = r.read()
+                if r.getheader("Connection", "").lower() == "close":
+                    c.close()
+                    self._tl.conn = None
+                try:
+                    return r.status, (json.loads(raw) if raw else None)
+                except ValueError:
+                    return r.status, {"raw": raw.decode("utf-8", "replace")}
+            except (ConnectionError, OSError, __import__("http.client").client.HTTPException):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                self._tl.conn = None
+                if attempt == 1:
+                    raise
 
     def api(self, method, path, body=None, timeout=600):
         st, js = self._raw(method, path, body, timeout=timeout)

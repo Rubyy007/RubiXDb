@@ -814,3 +814,99 @@ async fn shutdown_requires_the_exact_confirmation() {
     assert_eq!(s, StatusCode::ACCEPTED);
     assert_eq!(v["shutting_down"], true);
 }
+
+#[tokio::test]
+async fn admin_routes_survive_hostile_requests_without_server_errors() {
+    let app = build_app(&temp_dir("fuzz"), true);
+    seed(&app.router).await;
+    let mut seed_state: u64 = 0xA11CE;
+    let mut next = || {
+        seed_state ^= seed_state << 13;
+        seed_state ^= seed_state >> 7;
+        seed_state ^= seed_state << 17;
+        seed_state
+    };
+    let methods = ["GET", "POST", "DELETE", "PUT", "PATCH"];
+    let paths = [
+        "/v1/admin/status",
+        "/v1/admin/backups",
+        "/v1/admin/backups/{n}",
+        "/v1/admin/backups/{n}/verify",
+        "/v1/admin/check",
+        "/v1/admin/storage",
+        "/v1/admin/maintenance/purge-orphans",
+        "/v1/admin/shutdownx",
+        "/v1/admin/",
+        "/v1/admin",
+    ];
+    let long = "x".repeat(300);
+    let hostile: Vec<String> = [
+        "..%2f..%2fetc",
+        "%00",
+        "a%20b",
+        "con",
+        "NUL",
+        "ä",
+        "name;drop",
+        "<script>",
+        "a/../../b",
+        "%",
+        "..",
+        ".",
+        "~",
+        "backup.rbxbackup",
+        "../../../Windows/System32",
+    ]
+    .iter()
+    .map(|x| x.to_string())
+    .chain(std::iter::once(long))
+    .collect();
+    let mut bad = Vec::new();
+    for i in 0..1500 {
+        let m = methods[(next() % methods.len() as u64) as usize];
+        let n = if next() % 3 == 0 {
+            format!("r{}", next() % 1000)
+        } else {
+            hostile[(next() % hostile.len() as u64) as usize].clone()
+        };
+        let path = paths[(next() % paths.len() as u64) as usize].replace("{n}", &n);
+        let body: Option<Value> = match next() % 5 {
+            0 => None,
+            1 => Some(
+                json!({"name": n, "apply": next() % 2 == 0, "expected_entries": next() % 100, "confirm": n}),
+            ),
+            2 => Some(json!({"name": 42, "apply": "yes"})),
+            3 => Some(json!([1, 2, 3])),
+            _ => Some(json!({"name": hostile[(next() % hostile.len() as u64) as usize].clone()})),
+        };
+        // `shutdown` with the right confirmation would arm the process-wide flag; the
+        // fuzz never sends that route (`shutdownx` is a 404 probe).
+        let key = if next() % 8 == 0 {
+            Some(READER_KEY)
+        } else {
+            Some(ADMIN_KEY)
+        };
+        let (s, v, text) = call(&app.router, m, &path, key, body).await;
+        if s.is_server_error() {
+            bad.push((
+                i,
+                m,
+                path.clone(),
+                s.as_u16(),
+                text.chars().take(120).collect::<String>(),
+            ));
+        }
+        assert!(
+            !text.contains(&app.dir.to_string_lossy().to_string()),
+            "path leaked by {m} {path}: {text}"
+        );
+        let _ = v;
+    }
+    assert!(
+        bad.is_empty(),
+        "server errors under hostile input: {bad:#?}"
+    );
+    // The server and the data are intact.
+    let q = sql(&app.router, "SELECT COUNT(*) FROM people").await;
+    assert_eq!(q["result"]["rows"][0][0]["value"], "60");
+}
