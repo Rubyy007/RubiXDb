@@ -103,6 +103,7 @@ fn base_config(data_dir: PathBuf) -> Config {
         instance_id: None,
         instance_name: None,
         frontend_dist: None,
+        backup_dir: None,
     }
 }
 

@@ -1,0 +1,97 @@
+   Compiling rubixdb v0.1.0 (E:\RubiXDb)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 47.89s
+     Running unittests src\lib.rs (target\debug\deps\rubixdb-a4a03cbe9d003f3d.exe)
+
+running 69 tests
+test ops::format::tests::legacy_directory_is_accepted_and_never_modified ... ok
+test ops::format::tests::fresh_then_stamped_then_marked ... ok
+test ops::format::tests::an_unsupported_or_garbled_marker_is_refused_without_writing ... ok
+test ops::fuzz_tests::catalog_records_never_panic_the_mirror ... ok
+test ops::fuzz_tests::name_validation_is_total_and_its_acceptances_are_safe ... ok
+test ops::fuzz_tests::a_chunk_claiming_a_gigantic_payload_is_rejected_without_allocating_it ... ok
+test ops::integration_tests::a_dangling_catalog_reference_is_detected ... ok
+test ops::integration_tests::a_corrupt_row_value_is_detected_even_though_no_query_touches_it ... ok
+test ops::integration_tests::a_failure_after_promotion_leaves_a_complete_verified_database ... ok
+test ops::integration_tests::a_dangling_index_entry_is_detected ... ok
+test ops::integration_tests::a_database_with_no_catalog_at_all_round_trips ... ok
+test ops::integration_tests::a_noncanonical_or_undecodable_row_key_is_detected ... ok
+test ops::integration_tests::a_missing_index_entry_is_detected ... ok
+test ops::integration_tests::an_undecodable_catalog_row_and_a_lagging_counter_are_detected ... ok
+test ops::integration_tests::a_unique_index_violation_is_detected ... ok
+test ops::integration_tests::a_stale_index_entry_is_detected ... ok
+test ops::integration_tests::backup_contains_no_paths_or_secrets ... ok
+test ops::integration_tests::backup_never_overwrites_and_leaves_no_partial_file ... ok
+test ops::integration_tests::empty_database_round_trips ... ok
+test ops::integration_tests::a_populated_database_checks_clean_but_reports_orphan_data_as_a_warning ... ok
+test ops::integration_tests::index_rebuild_repairs_a_corrupted_index ... ok
+test ops::fuzz_tests::any_mutation_of_a_valid_backup_is_rejected ... ok
+test ops::integration_tests::backup_restore_round_trip_matches_independent_model ... ok
+test ops::fuzz_tests::arbitrary_bytes_never_panic_or_hang_the_backup_reader ... ok
+test ops::integration_tests::purge_never_touches_live_tables_or_ids_above_the_counter ... ok
+test ops::integration_tests::purge_is_a_dry_run_by_default_and_requires_the_confirmed_count ... ok
+test ops::integration_tests::restore_refuses_a_non_empty_destination_and_changes_nothing ... ok
+test ops::integration_tests::restore_into_an_existing_empty_directory_works ... ok
+test ops::integration_tests::stale_staging_from_a_crashed_restore_is_cleaned_only_when_marked ... ok
+test ops::fuzz_tests::data_format_markers_never_panic ... ok
+test ops::integration_tests::wrong_magic_and_unknown_version_are_classified ... ok
+test ops::integration_tests::read_backup_visitor_sees_entries_in_strict_order ... ok
+test ops::integration_tests::a_failure_at_every_restore_phase_leaves_no_destination_and_no_staging ... ok
+test ops::integration_tests::cancelled_backup_leaves_nothing_behind ... ok
+test ops::integration_tests::the_checker_is_consistent_at_one_snapshot_while_writers_run ... ok
+test ops::physical_tests::a_clean_directory_has_no_physical_errors_and_opens ... ok
+test ops::physical_tests::a_flipped_byte_in_an_sstable_data_block_is_detected ... ok
+test ops::tests::names_accept_plain_and_reject_traversal ... ok
+test ops::tests::unique_ids_do_not_repeat ... ok
+test wal::ops::tests::checkpoint_marker_round_trip ... ok
+test wal::ops::tests::decode_rejects_checkpoint_marker_with_wrong_length ... ok
+test wal::ops::tests::decode_rejects_delete_with_trailing_byte ... ok
+test wal::ops::tests::decode_rejects_engine_switch ... ok
+test wal::ops::tests::decode_rejects_put_with_trailing_byte ... ok
+test wal::ops::tests::decode_rejects_unknown_op ... ok
+test wal::ops::tests::delete_round_trip ... ok
+test wal::ops::tests::empty_value_put_round_trips ... ok
+test wal::ops::tests::encode_rejects_oversized_key_with_capacity_exceeded ... ok
+test wal::ops::tests::frame_header_encodes_correct_length_and_crc ... ok
+test wal::ops::tests::group_decode_rejects_checkpoint_marker_tag_as_member ... ok
+test wal::ops::tests::group_decode_rejects_nested_group_tag ... ok
+test wal::ops::tests::group_decode_rejects_oversized_member_count_gracefully ... ok
+test wal::ops::tests::group_decode_rejects_oversized_member_count_with_leftover_garbage ... ok
+test wal::ops::tests::group_decode_rejects_trailing_bytes_after_members ... ok
+test wal::ops::tests::group_empty_members_round_trips_at_the_wal_layer ... ok
+test wal::ops::tests::group_encode_rejects_oversized_member_key_with_capacity_exceeded ... ok
+test wal::ops::tests::group_round_trip_at_ten_thousand_members ... ok
+test wal::ops::tests::group_round_trip_many_members_mixed_put_delete ... ok
+test wal::ops::tests::group_round_trip_single_member ... ok
+test wal::ops::tests::group_wire_format_is_exactly_count_then_tag_and_body_per_member ... ok
+test wal::ops::tests::put_round_trip ... ok
+test wal::ops::tests::wire_format_is_byte_for_byte_unchanged ... ok
+test ops::physical_tests::a_missing_live_sstable_is_detected_and_open_fails_closed_without_modifying ... ok
+test ops::physical_tests::a_torn_manifest_tail_is_a_warning_and_mid_manifest_corruption_is_an_error ... ok
+test ops::physical_tests::a_torn_wal_tail_is_a_warning_and_a_mid_segment_bad_frame_is_corruption ... ok
+test ops::physical_tests::a_truncated_sstable_is_detected ... ok
+test ops::physical_tests::an_unreferenced_sstable_is_a_warning_not_an_error ... FAILED
+test ops::physical_tests::wrong_format_versions_are_refused_and_the_directory_is_not_modified ... FAILED
+test ops::integration_tests::every_single_byte_flip_and_every_truncation_is_detected has been running for over 60 seconds
+test ops::integration_tests::every_single_byte_flip_and_every_truncation_is_detected ... ok
+
+failures:
+
+---- ops::physical_tests::an_unreferenced_sstable_is_a_warning_not_an_error stdout ----
+
+thread 'ops::physical_tests::an_unreferenced_sstable_is_a_warning_not_an_error' (13072) panicked at src\ops\physical_tests.rs:205:5:
+assertion failed: has(&r, fc::SSTABLE_ORPHAN, Severity::Warning)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- ops::physical_tests::wrong_format_versions_are_refused_and_the_directory_is_not_modified stdout ----
+
+thread 'ops::physical_tests::wrong_format_versions_are_refused_and_the_directory_is_not_modified' (16128) panicked at src\ops\physical_tests.rs:265:5:
+assertion failed: open_result(&d).is_err()
+
+
+failures:
+    ops::physical_tests::an_unreferenced_sstable_is_a_warning_not_an_error
+    ops::physical_tests::wrong_format_versions_are_refused_and_the_directory_is_not_modified
+
+test result: FAILED. 67 passed; 2 failed; 0 ignored; 0 measured; 534 filtered out; finished in 71.02s
+
+error: test failed, to rerun pass `--lib`

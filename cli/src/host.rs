@@ -170,6 +170,7 @@ impl EmbeddedServer {
             instance_id: Some(owned.manifest.instance_id),
             instance_name: Some(owned.manifest.name.clone()),
             frontend_dist,
+            backup_dir: Some(owned.dir.join("backups")),
         };
 
         let port = owned
@@ -202,6 +203,14 @@ impl EmbeddedServer {
                 .name("rubixdb-embedded-server".to_string())
                 .spawn(move || {
                     rt_handle.block_on(async move {
+                        let format_state =
+                            match rubixdb::ops::format::startup_guard(&data_dir_for_thread) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let _ = ready_tx.send(Err(format!("engine open refused: {e}")));
+                                    return;
+                                }
+                            };
                         let engine = match LsmEngine::open(
                             &data_dir_for_thread,
                             wal_config(),
@@ -214,6 +223,12 @@ impl EmbeddedServer {
                                 return;
                             }
                         };
+                        if let Err(e) =
+                            rubixdb::ops::format::stamp_if_fresh(&data_dir_for_thread, format_state)
+                        {
+                            let _ = ready_tx.send(Err(format!("data-format marker: {e}")));
+                            return;
+                        }
                         let state = Arc::new(AppState::new(engine.clone(), lsm_config, config));
                         recover_incomplete_index_operations(&state);
                         let router = build_router(state.clone());

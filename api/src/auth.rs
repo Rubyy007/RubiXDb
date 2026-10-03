@@ -83,6 +83,12 @@ fn required_role(req: &Request) -> Role {
     if req.uri().path() == "/v1/sql" {
         return Role::Reader;
     }
+    // Operator endpoints disclose or change operational state (backup
+    // names, integrity findings, resource and WAL internals): Admin for
+    // every method, including GET.
+    if req.uri().path().starts_with("/v1/admin/") {
+        return Role::Admin;
+    }
     match *req.method() {
         axum::http::Method::GET | axum::http::Method::HEAD => Role::Reader,
         _ => Role::Admin,

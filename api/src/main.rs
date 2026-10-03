@@ -59,6 +59,15 @@ async fn main() {
         listen_addr = %config.listen_addr,
         "opening engine"
     );
+    // Refuse a data directory written by an incompatible build BEFORE the
+    // engine (and therefore recovery) touches it.
+    let format_state = match rubixdb::ops::format::startup_guard(&config.data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rubixdb-api: startup failed: {e}");
+            std::process::exit(1);
+        }
+    };
     let engine = match LsmEngine::open(
         &config.data_dir,
         wal_config(),
@@ -73,6 +82,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if let Err(e) = rubixdb::ops::format::stamp_if_fresh(&config.data_dir, format_state) {
+        eprintln!("rubixdb-api: could not write the data-format marker: {e}");
+        std::process::exit(1);
+    }
     tracing::info!("engine opened OK");
 
     let shutdown_drain = Duration::from_secs(config.shutdown_drain_secs);

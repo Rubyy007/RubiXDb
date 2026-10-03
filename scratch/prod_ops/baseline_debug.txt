@@ -1,0 +1,1589 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling windows-link v0.2.1
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling once_cell v1.21.4
+   Compiling windows-sys v0.61.2
+   Compiling itoa v1.0.18
+   Compiling serde_core v1.0.229
+   Compiling memchr v2.8.3
+   Compiling serde v1.0.229
+   Compiling cc v1.4.6
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling getrandom v0.4.3
+   Compiling bitflags v2.13.2
+   Compiling regex-syntax v0.8.11
+   Compiling semver v1.0.28
+   Compiling xxhash-rust v0.8.18
+   Compiling rustc_version v0.4.1
+   Compiling zerocopy v0.8.57
+   Compiling syn v3.0.5
+   Compiling syn v2.0.119
+   Compiling crossbeam-utils v0.8.23
+   Compiling crc32c v0.6.8
+   Compiling getrandom v0.3.4
+   Compiling crossbeam-epoch v0.9.21
+   Compiling autocfg v1.5.1
+   Compiling rubixdb v0.1.0 (E:\wt_baseline)
+   Compiling num-traits v0.2.19
+   Compiling regex-automata v0.4.18
+   Compiling crossbeam-deque v0.8.8
+   Compiling rand_core v0.9.5
+   Compiling rayon-core v1.13.0
+   Compiling winapi v0.3.9
+   Compiling either v1.18.0
+   Compiling winapi-util v0.1.11
+   Compiling alloca v0.4.0
+   Compiling plotters-backend v0.3.7
+   Compiling anstyle v1.0.14
+   Compiling fastrand v2.5.0
+   Compiling clap_lex v1.1.0
+   Compiling ciborium-io v0.2.2
+   Compiling tempfile v3.27.0
+   Compiling clap_builder v4.6.6
+   Compiling plotters-svg v0.3.7
+   Compiling same-file v1.0.6
+   Compiling itertools v0.13.0
+   Compiling zerocopy-derive v0.8.57
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling wait-timeout v0.2.1
+   Compiling cast v0.3.0
+   Compiling fnv v1.0.7
+   Compiling serde_derive v1.0.229
+   Compiling rusty-fork v0.3.1
+   Compiling clap v4.6.6
+   Compiling bit-set v0.8.0
+   Compiling criterion-plot v0.8.2
+   Compiling page_size v0.6.0
+   Compiling rayon v1.12.0
+   Compiling walkdir v2.5.0
+   Compiling plotters v0.3.7
+   Compiling regex v1.13.1
+   Compiling rand v0.9.5
+   Compiling rand_xorshift v0.4.0
+   Compiling log v0.4.34
+   Compiling smallvec v1.16.1
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling unarray v0.1.4
+   Compiling synstructure v0.14.0
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.1
+   Compiling libc v0.2.189
+   Compiling futures-core v0.3.34
+   Compiling stable_deref_trait v1.2.1
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.3
+   Compiling static_assertions v1.1.0
+   Compiling tracing-core v0.1.36
+   Compiling futures-sink v0.3.34
+   Compiling tokio-macros v2.7.2
+   Compiling zerovec-derive v0.11.6
+   Compiling tinytemplate v1.2.1
+   Compiling mio v1.2.3
+   Compiling socket2 v0.6.5
+   Compiling http v1.5.0
+   Compiling zerofrom v0.1.8
+   Compiling yoke v0.8.3
+   Compiling tokio v1.53.1
+   Compiling displaydoc v0.2.7
+   Compiling tracing-attributes v0.1.31
+   Compiling half v2.7.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling zerovec v0.11.8
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling rand_chacha v0.9.0
+   Compiling object v0.39.1
+   Compiling proptest v1.11.0
+   Compiling criterion v0.8.2
+   Compiling http-body v1.1.0
+   Compiling futures-io v0.3.34
+   Compiling futures-task v0.3.34
+   Compiling percent-encoding v2.3.2
+   Compiling slab v0.4.12
+   Compiling tower-service v0.3.3
+   Compiling tracing v0.1.44
+   Compiling futures-util v0.3.34
+   Compiling tinystr v0.8.4
+   Compiling writeable v0.6.4
+   Compiling httparse v1.10.1
+   Compiling litemap v0.8.3
+   Compiling zerotrie v0.2.5
+   Compiling icu_locale_core v2.3.0
+   Compiling potential_utf v0.1.6
+   Compiling ring v0.17.14
+   Compiling try-lock v0.2.5
+   Compiling icu_normalizer_data v2.3.0
+   Compiling utf8_iter v1.0.4
+   Compiling httpdate v1.0.3
+   Compiling icu_properties_data v2.3.0
+   Compiling tower-layer v0.3.3
+   Compiling icu_collections v2.3.0
+   Compiling icu_provider v2.3.1
+   Compiling want v0.3.1
+   Compiling form_urlencoded v1.2.2
+   Compiling futures-channel v0.3.34
+   Compiling sync_wrapper v1.0.2
+   Compiling stacker v0.1.25
+   Compiling zeroize v1.9.0
+   Compiling atomic-waker v1.1.2
+   Compiling ar_archive_writer v0.5.3
+   Compiling rustls-pki-types v1.15.1
+   Compiling hyper v1.11.1
+   Compiling psm v0.1.32
+   Compiling http-body-util v0.1.5
+   Compiling getrandom v0.2.17
+   Compiling ipnet v2.12.2
+   Compiling base64 v0.22.1
+   Compiling untrusted v0.9.0
+   Compiling icu_normalizer v2.3.0
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling recursive-proc-macro-impl v0.1.1
+   Compiling ryu v1.0.23
+   Compiling rustls v0.23.45
+   Compiling recursive v0.1.1
+   Compiling serde_urlencoded v0.7.1
+   Compiling subtle v2.6.1
+   Compiling sqlparser v0.63.0
+   Compiling unicase v2.9.0
+   Compiling mime v0.3.17
+   Compiling icu_properties v2.3.0
+   Compiling rustversion v1.0.23
+   Compiling mime_guess v2.0.5
+   Compiling webpki-roots v1.0.9
+   Compiling rustls-webpki v0.103.15
+   Compiling uuid v1.26.1
+   Compiling lazy_static v1.5.0
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling async-trait v0.1.92
+   Compiling tower-http v0.6.11
+   Compiling sharded-slab v0.1.7
+   Compiling tokio-util v0.7.19
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-log v0.2.0
+   Compiling axum-core v0.4.5
+   Compiling matchers v0.2.0
+   Compiling serde_path_to_error v0.1.20
+   Compiling nu-ansi-term v0.50.3
+   Compiling thread_local v1.1.10
+   Compiling http-range-header v0.4.2
+   Compiling matchit v0.7.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling tower-http v0.5.2
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling rustc-demangle v0.1.28
+   Compiling rustc-hash v1.1.0
+   Compiling backtrace v0.3.76
+   Compiling parking_lot v0.12.5
+   Compiling mintex v0.1.4
+   Compiling thousands v0.2.0
+   Compiling windows_x86_64_msvc v0.52.6
+   Compiling dhat v0.3.3
+   Compiling tokio-rustls v0.26.5
+   Compiling axum v0.7.9
+   Compiling hyper-rustls v0.27.10
+   Compiling windows-targets v0.52.6
+   Compiling fs4 v1.1.0
+   Compiling windows-sys v0.52.0
+   Compiling reqwest v0.12.28
+   Compiling nibble_vec v0.1.0
+   Compiling endian-type v0.1.2
+   Compiling error-code v3.4.0
+   Compiling clipboard-win v5.4.1
+   Compiling radix_trie v0.2.1
+   Compiling fd-lock v4.0.4
+   Compiling rtoolbox v0.0.6
+   Compiling home v0.5.12
+   Compiling unicode-segmentation v1.13.3
+   Compiling unicode-width v0.1.14
+   Compiling rpassword v7.5.4
+   Compiling rustyline v14.0.0
+   Compiling rubixdb-instance v0.1.0 (E:\wt_baseline\instance)
+   Compiling rubixdb-sql v0.1.0 (E:\wt_baseline\sql)
+   Compiling rubixdb-api v0.1.0 (E:\wt_baseline\api)
+   Compiling rubixdb-cli v0.1.0 (E:\wt_baseline\cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 26s
+     Running unittests src\lib.rs (target\debug\deps\rubixdb-bbd391c1da01a678.exe)
+
+running 557 tests
+test catalog::encoding::tests::catalog_key_layout_is_namespace_then_table_id_then_pk ... ok
+test catalog::encoding::tests::decode_rejects_truncated_buffer_without_panicking ... ok
+test catalog::encoding::tests::decode_rejects_unsupported_format_version ... ok
+test catalog::encoding::tests::prefix_range_all_ff_falls_back_to_system_table_upper_bound ... ok
+test catalog::encoding::tests::row_round_trip_all_null ... ok
+test catalog::encoding::tests::null_bitmap_boundary_at_nine_columns_needs_two_bytes ... ok
+test catalog::encoding::tests::null_bitmap_boundary_at_exactly_eight_columns ... ok
+test catalog::encoding::tests::prefix_range_isolates_one_table_ids_columns ... ok
+test catalog::encoding::tests::row_round_trip_all_present_every_type ... ok
+test catalog::encoding::tests::row_round_trip_mixed_null_and_present ... ok
+test catalog::encoding::tests::system_table_range_at_u32_max_falls_back_to_unbounded ... ok
+test catalog::encoding::tests::system_table_range_excludes_the_next_table ... ok
+test catalog::encoding::tests::u16_list_round_trips_at_zero_one_and_many_elements ... ok
+test catalog::schema::tests::column_row_round_trips_type_params_for_decimal_and_without ... ok
+test catalog::schema::tests::column_row_round_trips_with_and_without_default ... ok
+test catalog::schema::tests::constraint_row_round_trips_check_and_non_check ... ok
+test catalog::schema::tests::database_row_round_trips ... ok
+test catalog::schema::tests::grant_row_round_trips ... ok
+test catalog::schema::tests::index_row_round_trips_every_kind ... ok
+test catalog::schema::tests::index_row_round_trips_every_state ... ok
+test catalog::schema::tests::schema_row_round_trips ... ok
+test catalog::schema::tests::table_row_round_trips_with_composite_pk ... ok
+test catalog::tests::concurrent_bootstrap_never_creates_duplicate_rows ... ok
+test catalog::tests::bootstrap_is_idempotent_no_op_on_second_call ... ok
+test catalog::tests::bootstrap_creates_default_database_and_public_schema ... ok
+test catalog::tests::concurrent_create_table_with_the_same_name_only_one_succeeds ... ok
+test catalog::tests::catalog_scans_never_observe_flat_kv_keys_outside_the_reserved_namespace ... ok
+test catalog::tests::catalog_survives_a_real_engine_restart ... ok
+test catalog::tests::create_table_against_missing_schema_is_not_found ... ok
+test catalog::tests::create_table_issues_exactly_one_write_batch_call ... ok
+test catalog::tests::create_table_rejects_empty_name_empty_columns_and_missing_pk ... ok
+test catalog::tests::create_index_rejects_primary_kind_and_out_of_range_column ... ok
+test catalog::tests::create_table_rejects_duplicate_column_names ... ok
+test catalog::tests::create_table_rejects_nullable_primary_key_column ... ok
+test catalog::tests::create_index_unique_and_non_unique_round_trip_and_drop ... ok
+test catalog::tests::concurrent_create_table_never_allocates_a_duplicate_table_id ... ok
+test catalog::tests::drop_table_on_missing_table_is_not_found ... ok
+test catalog::tests::create_table_round_trip_with_columns_and_default_primary_index ... ok
+test catalog::tests::concurrent_catalog_scan_never_observes_a_half_created_table ... ok
+test catalog::tests::drop_index_rejects_dropping_the_primary_index_directly ... ok
+test compaction::tests::retention_empty_input_is_empty_output ... ok
+test compaction::tests::retention_no_live_snapshot_keeps_only_the_newest ... ok
+test compaction::tests::retention_snapshot_at_1_keeps_everything_from_the_floor_forward ... ok
+test compaction::tests::retention_snapshot_at_2_keeps_everything_from_the_floor_forward ... ok
+test compaction::tests::retention_snapshot_at_3_keeps_the_tombstone_and_v4 ... ok
+test compaction::tests::retention_snapshot_at_4_keeps_only_v4 ... ok
+test compaction::tests::retention_snapshot_older_than_every_version_keeps_everything ... ok
+test compaction::tests::retention_snapshot_strictly_between_two_versions_keeps_the_floor ... ok
+test catalog::tests::duplicate_table_name_in_same_schema_is_rejected ... ok
+test compaction::tests::single_table_merge_reproduces_its_own_live_content ... ok
+test compaction::tests::merge_propagates_corruption_from_an_input_and_stops ... ok
+test catalog::tests::grant_revoke_round_trip_and_duplicate_rejected ... ok
+test catalog::tests::drop_schema_with_tables_is_rejected_without_tables_succeeds ... ok
+test compaction::tests::many_table_merge_tombstone_across_tables_suppresses_older_put ... ok
+test compaction::tests::two_table_merge_disjoint_ranges ... ok
+test catalog::tests::table_id_allocation_continues_from_its_durable_value_after_restart ... ok
+test catalog::tests::drop_table_removes_all_its_rows_and_leaves_other_tables_untouched ... ok
+test compaction::tests::two_table_merge_overlapping_keys_newer_table_wins ... ok
+test execution::batch_coordinator::tests::bytes_total_and_writes_timed_out_reflect_real_activity ... ok
+test execution::batch_coordinator::tests::coordinator_panic_after_drain_fails_safely ... ok
+test execution::batch_coordinator::tests::coordinator_panic_after_append_fails_safely ... ok
+test execution::batch_coordinator::tests::coordinator_panic_before_await_durable_fails_safely ... ok
+test execution::batch_coordinator::tests::coordinator_panic_during_shutdown_fails_safely_and_is_bounded ... ok
+test execution::batch_coordinator::tests::coordinator_panic_after_durable_fails_safely ... ok
+test execution::batch_coordinator::tests::coordinator_panic_before_batch_formation_fails_safely ... ok
+test execution::batch_coordinator::tests::fsync_failure_propagates_to_every_entry_in_the_batch ... ok
+test execution::batch_coordinator::tests::coordinator_panic_before_completion_fails_safely ... ok
+test execution::batch_coordinator::tests::coordinator_panicking_fails_safely_and_rejects_further_work ... ok
+test execution::batch_coordinator::tests::shutdown_is_idempotent ... ok
+test execution::batch_coordinator::tests::queue_full_rejects_with_timeout_not_silently ... ok
+test execution::batch_coordinator::tests::single_submit_completes_durably_and_recovers ... ok
+test execution::batch_coordinator::tests::shutdown_while_queue_is_actively_populated_still_drains_every_request ... ok
+test execution::leader_drain::tests::a_second_request_after_the_leader_panics_still_fails_safely_not_permanently_blocked ... ok
+test execution::leader_drain::tests::fsync_failure_propagates_to_every_entry_in_the_batch ... ok
+test execution::batch_coordinator::tests::large_payload_byte_accounting_is_accurate_and_respects_the_limit ... ok
+test execution::leader_drain::tests::one_worker_panicking_fails_only_its_own_request_and_does_not_lose_others ... ok
+test execution::leader_drain::tests::shutdown_is_idempotent ... ok
+test execution::leader_drain::tests::single_submit_completes_durably_and_recovers ... ok
+test execution::sharded_ingress::tests::fsync_failure_propagates_to_every_entry_in_the_batch ... ok
+test execution::leader_drain::tests::queue_full_rejects_with_timeout_not_silently ... ok
+test execution::sharded_ingress::tests::coordinator_panicking_fails_safely_and_rejects_further_work ... ok
+test execution::sharded_ingress::tests::shutdown_is_idempotent ... ok
+test execution::sharded_ingress::tests::single_submit_completes_durably_and_recovers ... ok
+test execution::sharded_ingress::tests::queue_full_rejects_with_timeout_not_silently ... ok
+test execution::write_pool::tests::drop_without_explicit_shutdown_still_drains_and_leaks_nothing ... ok
+test execution::write_pool::tests::fsync_failure_propagates_to_the_completion_not_silently ... ok
+test execution::write_pool::tests::into_inner_returns_the_committer_after_a_clean_shutdown ... ok
+test execution::write_pool::tests::one_worker_panicking_fails_only_its_own_request_and_does_not_lose_others ... ok
+test execution::write_pool::tests::shutdown_is_idempotent ... ok
+test execution::write_pool::tests::queue_full_rejects_with_timeout_not_silently ... ok
+test execution::write_pool::tests::single_submit_completes_durably_and_recovers ... ok
+test execution::write_pool::tests::shutdown_rejects_new_submissions_but_drains_existing_queue ... ok
+test lsm::tests::all_snapshots_dropped_leaves_no_live_snapshot ... ok
+test lsm::tests::an_entry_larger_than_the_configured_limit_does_not_hang_or_overflow ... ok
+test lsm::tests::basic_range_scan_returns_every_key_in_order ... ok
+test execution::batch_coordinator::tests::rapid_submit_shutdown_cycles_do_not_leak_or_hang ... ok
+test execution::sharded_ingress::tests::many_concurrent_submitters_all_land_a_gap_free_recoverable_prefix ... ok
+test execution::batch_coordinator::tests::many_concurrent_submitters_all_land_a_gap_free_recoverable_prefix ... ok
+test execution::leader_drain::tests::many_concurrent_submitters_all_land_a_gap_free_recoverable_prefix ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::auto_trigger_crash_mid_compaction_recovers_correctly_after_restart ... ok
+test execution::batch_coordinator::tests::frequent_rotation_under_sustained_concurrent_load_recovers_correctly ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::auto_trigger_eventually_retries_a_deferred_physical_deletion ... ok
+test execution::write_pool::tests::many_concurrent_submitters_all_land_a_gap_free_recoverable_prefix ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::auto_trigger_defers_while_storage_full_and_resumes_once_healthy ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::compaction_run_guard_permits_exactly_one_concurrent_holder ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::auto_trigger_retries_after_a_failed_attempt_via_the_next_fallback_tick ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::shutdown_lets_an_in_progress_automatic_compaction_finish_before_returning ... ok
+test lsm::tests::compaction_tests::compact_once_below_trigger_count_is_a_no_op ... ok
+test lsm::tests::compaction_tests::compact_once_merges_many_tables_and_updates_manifest_and_live_list ... ok
+test lsm::tests::compaction_tests::compact_once_returns_none_when_no_live_sstables ... ok
+test lsm::tests::compaction_tests::compact_once_with_a_single_table_reapplies_retention_correctly ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::auto_trigger_bounded_production_like_integration_matches_reference_model ... ok
+test lsm::tests::compaction_tests::compaction_crash_windows_leave_a_correct_recoverable_state ... ok
+test lsm::tests::compaction_tests::compaction_defers_while_storage_full_and_never_mutates_storage_state ... ok
+test lsm::tests::compaction_tests::compaction_metrics_accumulates_across_cycles_and_tracks_the_last_cycle ... ok
+test lsm::tests::compaction_tests::concurrent_flush_publishing_during_compaction_capture_is_not_lost ... ok
+test lsm::tests::compaction_tests::concurrent_readers_during_compaction_never_see_partial_or_wrong_state ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::auto_trigger_fires_at_and_above_threshold_never_below ... ok
+test lsm::tests::compaction_tests::long_lived_reader_survives_compaction_unlinking_its_table_and_cleanup_eventually_happens ... ok
+test lsm::tests::compaction_tests::orphan_recovery_after_crash_between_remove_durability_and_physical_deletion ... ok
+test lsm::tests::compaction_tests::should_compact_reports_true_only_at_or_above_trigger_count ... ok
+test lsm::tests::concurrency_hundred_writers ... ok
+test lsm::tests::concurrency_one_writer ... ok
+test lsm::tests::concurrency_ten_writers ... ok
+test lsm::tests::concurrency_thousand_logical_writers ... ok
+test lsm::tests::contains_across_a_corrupted_data_block_fails_closed_with_corruption ... ok
+test lsm::tests::contains_agrees_with_get_as_of_across_active_immutable_and_sstable_overlap ... ok
+test lsm::tests::contains_consults_multiple_sstables_and_agrees_with_get_as_of ... ok
+test lsm::tests::contains_matches_get_as_of_is_some_for_a_hit_and_a_miss ... ok
+test lsm::tests::checkpoint_advances_and_wal_segments_stay_bounded ... ok
+test lsm::tests::contains_respects_as_of_seq_across_multiple_versions ... ok
+test lsm::tests::contains_returns_false_for_a_visible_tombstone ... ok
+test lsm::tests::contains_true_after_delete_then_recreate ... ok
+test lsm::tests::contains_when_the_underlying_file_shrinks_mid_lifetime_fails_closed_with_io_error ... ok
+test lsm::tests::corruption_injected_mid_session_between_reads_is_caught_on_the_very_next_read ... ok
+test lsm::tests::delete_then_get_returns_not_found ... ok
+test lsm::tests::data_block_corruption_is_detected_lazily_at_read_time_not_at_open ... ok
+test lsm::tests::dropping_snapshots_newest_first_reports_correctly_at_every_step ... ok
+test lsm::tests::dropping_snapshots_oldest_first_reports_correctly_at_every_step ... ok
+test lsm::tests::differential_reference_model_matches_across_active_immutable_and_sstable ... ok
+test lsm::tests::flush_moves_data_into_a_published_sstable_that_remains_readable ... ok
+test lsm::tests::freeze_triggers_at_the_configured_threshold_and_data_remains_visible ... ok
+test lsm::tests::garbage_orphan_sstable_file_fails_closed_not_silently_handled ... ok
+test lsm::tests::get_and_range_scan_agree_for_every_key_and_sequence ... ok
+test lsm::tests::get_as_of_and_range_scan_when_the_underlying_file_shrinks_mid_lifetime_fail_closed_with_io_error ... ok
+test lsm::tests::get_on_a_key_that_was_never_written_returns_none ... ok
+test lsm::tests::immutable_backpressure_rejects_further_freezes_past_the_limit ... ok
+test lsm::tests::large_key_and_value_are_handled_without_overflow_or_panic ... ok
+test lsm::tests::manifest_corruption_fails_closed_on_open ... ok
+test lsm::tests::memory_accounting_remains_correct_across_freeze ... ok
+test lsm::tests::memtable_size_accounting_never_overflows_with_many_large_entries ... ok
+test lsm::tests::flush_thread_panic_is_caught_and_retried_without_data_loss_or_duplication ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::bounded_write_read_latency_under_concurrent_automatic_compaction ... ok
+test lsm::tests::one_snapshot_registers_and_releases ... ok
+test lsm::tests::plain_overwrite_without_a_delete_returns_the_newest_value ... ok
+test lsm::tests::point_lookup_during_the_sstable_published_immutable_not_yet_removed_window_never_misses ... ok
+test lsm::tests::put_delete_put_resolves_to_the_newest_write ... ok
+test lsm::tests::put_then_get_round_trips ... ok
+test lsm::tests::missing_live_sstable_fails_closed_on_open ... ok
+test lsm::tests::range_scan_delete_then_recreate_shows_only_the_recreated_value ... ok
+test lsm::tests::open_fails_closed_when_a_published_sstable_is_corrupt ... ok
+test lsm::tests::range_scan_across_a_corrupted_data_block_fails_closed_and_ends ... ok
+test lsm::tests::range_scan_empty_cases ... ok
+test lsm::tests::range_scan_excluded_bounds ... ok
+test lsm::tests::range_scan_included_bounds ... ok
+test lsm::tests::range_scan_multiple_versions_of_a_key_resolve_to_the_newest_visible ... ok
+test lsm::tests::range_scan_during_concurrent_flush_sees_a_coherent_snapshot ... ok
+test lsm::tests::range_scan_merges_active_immutable_and_sstable_sources_correctly ... ok
+test lsm::tests::range_scan_snapshot_observes_historical_state_and_registry_stays_correct ... ok
+test lsm::tests::range_scan_spans_multiple_sstables_correctly_merged ... ok
+test lsm::tests::range_scan_suppresses_tombstoned_keys_entirely ... ok
+test lsm::tests::range_scan_unbounded_start_or_end ... ok
+test lsm::tests::range_scan_version_resolution_matches_adr_worked_examples ... ok
+test lsm::tests::read_stats_counts_a_bloom_negative_miss_with_zero_block_reads ... ok
+test lsm::tests::read_stats_counts_a_contains_bloom_negative_miss_with_zero_block_reads ... ok
+test lsm::tests::read_stats_counts_a_memtable_hit_without_touching_sstables ... ok
+test lsm::tests::read_stats_counts_a_miss ... ok
+test lsm::tests::read_stats_counts_contains_the_same_way_as_get_as_of_on_an_sstable_hit ... ok
+test lsm::tests::read_stats_counts_range_scan_calls_and_sstable_consultation_correctly ... ok
+test lsm::tests::read_stats_counts_sstable_consultation_and_block_reads_on_an_sstable_hit ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::auto_trigger_never_drops_a_live_snapshot_or_changes_its_reads ... ok
+test lsm::tests::read_view_captures_reference_counts_matching_the_live_engine_at_capture_time ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::repeated_automatic_compaction_cycles_leave_no_leaked_files_or_stuck_deletions ... ok
+test lsm::tests::read_view_active_range_is_bounded_to_the_requested_range_not_the_whole_memtable ... ok
+test lsm::tests::recovery_reconstructs_multiple_versions_correctly_across_a_restart ... ok
+test lsm::tests::recovery_across_multiple_wal_segments_and_rotation ... ok
+test lsm::tests::recovery_reconstructs_the_memtable_from_the_wal_after_restart ... ok
+test lsm::tests::snapshot_reads_remain_stable_across_later_writes ... ok
+test lsm::tests::snapshot_seq_remains_stable_after_later_writes_and_is_usable_with_get_as_of ... ok
+test lsm::tests::range_scan_source_cursor_persists_across_keys_instead_of_reconstructing_per_key ... ok
+test lsm::tests::recovery_matches_a_reference_model_after_restart ... ok
+test lsm::tests::storage_pressure_state_machine_recovers_after_injected_enospc ... ok
+test lsm::tests::two_snapshots_at_different_sequence_numbers_report_the_older_as_oldest ... ok
+test lsm::tests::sstable_count_and_immutable_memory_track_flushes_exactly_no_extra_retention ... ok
+test lsm::tests::two_snapshots_at_the_same_sequence_are_counted_independently ... ok
+test lsm::tests::wal_durability_ordering_is_respected_not_just_memtable_visibility ... ok
+test lsm::tests::sstables_are_rediscovered_after_restart_and_reads_remain_correct ... ok
+test lsm::tests::write_batch_tests::write_batch_at_exactly_max_batch_ops_succeeds ... ok
+test lsm::tests::write_batch_tests::write_batch_empty_is_rejected_with_invalid_argument ... ok
+test lsm::tests::write_batch_tests::write_batch_mixed_put_delete_round_trips ... ok
+test lsm::tests::write_batch_tests::write_batch_multi_put_all_visible_at_returned_seq_none_before ... ok
+test lsm::tests::write_batch_tests::write_batch_over_max_batch_ops_fails_with_capacity_exceeded_and_writes_nothing ... ok
+test lsm::tests::write_batch_tests::write_batch_recovery_preserves_same_key_last_wins_resolution ... ok
+test lsm::tests::write_batch_tests::write_batch_same_key_delete_then_put_ends_live ... ok
+test lsm::tests::write_batch_tests::write_batch_same_key_put_put_last_wins ... ok
+test lsm::tests::write_batch_tests::write_batch_same_key_put_then_delete_ends_tombstoned ... ok
+test lsm::tests::write_batch_tests::write_batch_single_delete_behaves_like_delete ... ok
+test lsm::tests::write_batch_tests::write_batch_single_put_behaves_like_put ... ok
+test lsm::tests::write_batch_tests::write_batch_survives_restart_all_members_present ... ok
+test manifest::format::tests::add_sstable_round_trip ... ok
+test manifest::format::tests::frame_header_matches_wal_frame_header_shape ... ok
+test manifest::format::tests::rejects_empty_body ... ok
+test manifest::format::tests::rejects_min_seq_greater_than_max_seq ... ok
+test manifest::format::tests::rejects_unknown_edit_type ... ok
+test manifest::format::tests::rejects_wrong_length_for_add_sstable ... ok
+test manifest::format::tests::remove_sstable_round_trip ... ok
+test manifest::format::tests::set_checkpoint_round_trip ... ok
+test manifest::recovery::tests::checkpoint_regression_in_file_is_corruption ... ok
+test manifest::recovery::tests::clean_multi_edit_file_replays_fully ... ok
+test manifest::recovery::tests::cursor_position_does_not_matter_on_entry ... ok
+test manifest::recovery::tests::empty_file_replays_to_empty_state ... ok
+test manifest::recovery::tests::implausible_length_is_corruption ... ok
+test manifest::recovery::tests::non_tail_checksum_mismatch_is_corruption ... ok
+test manifest::recovery::tests::remove_never_added_in_file_is_corruption ... ok
+test manifest::recovery::tests::torn_tail_mid_body_is_truncated_not_corrupt ... ok
+test manifest::recovery::tests::torn_tail_mid_header_is_truncated_not_corrupt ... ok
+test manifest::recovery::tests::trailing_checksum_mismatch_is_torn_not_corrupt ... ok
+test manifest::state::tests::add_then_remove_removes_from_live_set ... ok
+test manifest::state::tests::checkpoint_advance_is_accepted ... ok
+test manifest::state::tests::checkpoint_regression_is_corruption ... ok
+test manifest::state::tests::checkpoint_repeat_is_idempotent ... ok
+test manifest::state::tests::duplicate_add_is_idempotent ... ok
+test manifest::state::tests::duplicate_remove_is_idempotent ... ok
+test manifest::state::tests::no_checkpoint_yet_defaults_to_zero ... ok
+test manifest::state::tests::remove_never_added_is_corruption ... ok
+test lsm::tests::write_batch_tests::concurrent_reader_never_observes_a_partial_batch ... ok
+test manifest::tests::non_tail_corruption_fails_closed_on_open ... ok
+test manifest::tests::open_creates_the_file_and_append_sync_round_trips_through_replay ... ok
+test manifest::tests::multiple_flushes_accumulate_correctly ... ok
+test manifest::tests::reopen_after_exclusive_lock_truncates_a_torn_tail_and_can_still_append ... ok
+test manifest::tests::replay_readonly_on_absent_manifest_is_empty_not_an_error ... ok
+test memtable::property_tests::freeze_preserves_every_query_answer ... ok
+test lsm::tests::write_batch_tests::differential::write_batch_matches_independent_serialized_reference_model ... ok
+test memtable::tests::as_of_seq_before_first_write_returns_none ... ok
+test memtable::tests::delete_returns_tombstone_not_silently_absent ... ok
+test memtable::tests::empty_memtable_behaves_correctly_without_panicking ... ok
+test memtable::tests::freeze_produces_a_shared_immutable_handle_preserving_state ... ok
+test memtable::tests::is_full_flips_at_the_configured_threshold ... ok
+test memtable::tests::multiple_versions_get_as_of_returns_the_version_current_at_that_point ... ok
+test memtable::tests::put_delete_put_resolves_correctly_at_every_boundary ... ok
+test memtable::tests::put_n_keys_get_them_all_back_with_correct_values ... ok
+test memtable::tests::range_excluded_end_bound_excludes_every_version_of_the_boundary_key ... ok
+test memtable::tests::range_excluded_start_bound_excludes_every_version_of_the_boundary_key ... ok
+test memtable::tests::range_returns_strictly_sorted_key_seq_order ... ok
+test memtable::tests::remaining_capacity_and_entry_count_are_accurate ... ok
+test memtable::tests::seq_range_tracks_min_and_max_across_out_of_order_inserts ... ok
+test memtable::tests::size_bytes_grows_by_exactly_entry_size_per_insert ... ok
+test memtable::tests::tombstone_entry_size_has_zero_payload_len ... ok
+test relational::index_key::tests::composite_indexed_columns_round_trip ... ok
+test relational::index_key::tests::decode_rejects_invalid_presence_tag ... ok
+test relational::index_key::tests::decode_rejects_truncated_buffer_without_panicking ... ok
+test relational::index_key::tests::index_entry_key_layout ... ok
+test relational::index_key::tests::indexed_column_ordering_property ... ok
+test relational::index_key::tests::null_sorts_before_any_real_value ... ok
+test relational::index_key::tests::oversized_key_is_rejected ... ok
+test relational::index_key::tests::prefix_range_isolates_matching_entries ... ok
+test relational::index_key::tests::round_trips_null_and_present_composite ... ok
+test relational::index_tests::bounded_index_scans_fail_closed_at_the_limit_and_count_work ... ok
+test relational::index_tests::building_index_is_not_query_usable ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::bounded_compaction_performance_and_storage_budget_baseline has been running for over 60 seconds
+test relational::index_tests::composite_index_prefix_lookup_and_range_scan ... ok
+test memtable::property_tests::memtable_matches_naive_reference_model ... ok
+test relational::index_tests::create_index_online_backfills_pre_existing_rows ... ok
+test relational::index_tests::create_index_online_on_empty_table_activates_ready ... ok
+test relational::index_tests::delete_removes_index_entry_atomically ... ok
+test relational::index_tests::drop_index_online_removes_catalog_row_and_entries ... ok
+test relational::index_tests::dropping_index_stops_receiving_new_writes ... ok
+test lsm::tests::compaction_tests::property::compaction_never_changes_logical_reads ... ok
+test relational::index_tests::index_and_entries_survive_restart ... ok
+test relational::index_tests::index_lookup_as_of_is_stable_against_a_later_write ... ok
+test relational::index_tests::index_range_scan_as_of_is_stable_against_a_later_delete ... ok
+test relational::index_tests::index_ready_sequence_survives_restart ... ok
+test relational::index_tests::malformed_index_entry_key_is_rejected_without_panicking ... ok
+test relational::index_tests::null_indexed_value_is_indexed_and_looked_up_as_null ... ok
+test relational::index_tests::ordinary_insert_after_ready_is_maintained_atomically ... ok
+test relational::index_tests::recover_incomplete_builds_restarts_from_scratch_and_activates ... ok
+test relational::index_tests::recover_incomplete_drops_completes_the_sweep ... ok
+test lsm::tests::compaction_tests::compaction_preserves_logical_reads_for_every_prior_snapshot_seq has been running for over 60 seconds
+test relational::index_tests::reinsert_during_backfill_reflects_final_state_only ... ok
+test relational::index_tests::row_deleted_during_backfill_leaves_no_phantom_entry ... ok
+test relational::index_tests::too_many_indexes_is_rejected ... ok
+test relational::index_tests::upsert_changing_indexed_value_moves_the_entry ... ok
+test relational::key::tests::bigint_ordering_property ... ok
+test relational::key::tests::blob_ordering_property ... ok
+test relational::key::tests::blob_with_high_bytes_and_embedded_zero_round_trips ... ok
+test relational::key::tests::composite_key_orders_by_first_column_then_second ... ok
+test relational::key::tests::composite_key_round_trips_mixed_types ... ok
+test relational::key::tests::composite_key_with_text_not_in_last_position_is_unambiguous ... ok
+test relational::key::tests::date_ordering_property ... ok
+test relational::key::tests::decimal_ordering_across_sign_boundary ... ok
+test relational::key::tests::decimal_ordering_property ... ok
+test relational::key::tests::decode_rejects_malformed_escape_sequence ... ok
+test relational::key::tests::decode_rejects_missing_terminator_without_panicking ... ok
+test relational::key::tests::double_ordering_property ... ok
+test relational::key::tests::integer_ordering_at_boundaries_and_zero ... ok
+test relational::key::tests::integer_ordering_property ... ok
+test relational::key::tests::nan_is_rejected_in_key_position ... ok
+test relational::key::tests::negative_time_is_rejected ... ok
+test relational::key::tests::negative_zero_and_positive_zero_encode_identically ... ok
+test relational::key::tests::real_and_double_boundaries_including_zero_and_negative ... ok
+test relational::key::tests::real_ordering_property ... ok
+test relational::key::tests::text_ordering_property ... ok
+test relational::key::tests::text_prefix_sorts_before_its_extension ... ok
+test relational::key::tests::text_with_embedded_null_byte_round_trips_and_orders_correctly ... ok
+test relational::key::tests::time_ordering_property ... ok
+test relational::key::tests::timestamp_ordering_property ... ok
+test relational::stats::hook_bench::note_mutations_cost ... ignored
+test relational::stats::tests::cost_estimates_stay_clamped_and_ignore_tiny_samples ... ok
+test relational::stats::tests::estimate_drift_and_reset ... ok
+test relational::stats::tests::tracked_tables_are_bounded ... ok
+test relational::tests::concurrent_put_row_distinct_keys_all_succeed_and_are_visible ... ok
+test lsm::tests::range_scan_property_tests::lsm_engine_range_scan_matches_independent_reference_model ... ok
+test relational::tests::delete_read_race_never_produces_a_decode_error ... ok
+test relational::tests::concurrent_scan_during_writes_never_returns_a_torn_row ... ok
+test relational::tests::delete_then_get_returns_none ... ok
+test relational::tests::deletion_survives_restart ... ok
+test relational::tests::get_row_against_missing_table_is_not_found ... ok
+test relational::tests::get_row_as_of_is_stable_against_a_later_write ... ok
+test relational::tests::oversized_row_is_rejected_before_any_write ... ok
+test relational::tests::put_get_round_trip_composite_primary_key ... ok
+test relational::index_tests::index_survives_automatic_compaction_across_insert_delete_and_backfill ... ok
+test relational::tests::put_get_round_trip_simple_table ... ok
+test relational::tests::put_row_issues_exactly_one_write_batch_call ... ok
+test relational::tests::put_get_round_trip_with_null_values ... ok
+test relational::tests::put_row_rejects_decimal_exceeding_declared_precision ... ok
+test relational::tests::put_row_rejects_null_for_not_null_column ... ok
+test relational::tests::put_row_rejects_value_type_mismatch ... ok
+test relational::tests::put_row_rejects_null_primary_key ... ok
+test relational::tests::put_row_rejects_wrong_value_count ... ok
+test relational::tests::put_rows_multi_row_write_batch_all_visible_together ... ok
+test relational::tests::row_survives_restart_insert_then_get ... ok
+test relational::tests::rows_survive_restart_insert_then_scan ... ok
+test relational::tests::scan_table_boundaries_at_min_and_max_and_neighboring_table_ids ... ok
+test relational::tests::scan_table_as_of_is_stable_against_a_later_write ... ok
+test relational::tests::scan_table_returns_only_its_own_rows_never_another_tables ... ok
+test relational::tests::table_scan_never_observes_catalog_rows_or_flat_kv_keys ... ok
+test relational::tests::scan_table_rows_as_of_lazy_iterator_matches_the_eager_vec_variant ... ok
+test relational::index_tests::concurrent_writes_during_backfill_are_never_missed ... ok
+test relational::txn_tests::authorization_boundary_is_unaffected_by_the_transaction_layer ... ok
+test relational::txn_tests::autocommit_put_and_delete ... ok
+test relational::txn_tests::commit_and_rollback_cannot_be_called_twice_a_compile_time_guarantee ... ok
+test relational::txn_tests::begin_commit_rollback_basic_lifecycle ... ok
+test relational::txn_tests::commit_issues_exactly_one_write_batch_regardless_of_row_count ... ok
+test relational::txn_tests::committed_multi_row_indexed_transaction_survives_restart_atomically ... ok
+test relational::txn_tests::concurrent_write_is_not_visible_before_commit ... ok
+test relational::txn_tests::concurrent_writers_same_key_deterministic_barrier ... ok
+test relational::txn_tests::concurrent_writers_different_keys_both_succeed_barrier ... ok
+test relational::txn_tests::crash_before_commit_leaves_nothing_visible_after_restart ... ok
+test relational::txn_tests::delete_then_reinsert_same_unique_value_in_one_transaction_succeeds ... ok
+test lsm::tests::restart_replays_only_post_checkpoint_records_and_all_data_remains_correct ... ok
+test relational::txn_tests::differential::matches_reference_model_for_a_fixed_sequential_scenario ... ok
+test relational::txn_tests::dropping_an_active_transaction_is_an_implicit_rollback ... ok
+test relational::txn_tests::intra_transaction_duplicate_unique_value_is_rejected ... ok
+test relational::txn_tests::index_entries_visible_atomically_with_the_row ... ok
+test relational::txn_tests::max_concurrent_transactions_boundary ... ok
+test relational::txn_tests::active_transaction_count_returns_to_zero_after_many_cycles ... ok
+test relational::txn_tests::max_write_set_bytes_boundary ... ok
+test relational::txn_tests::long_open_read_only_transaction_does_not_block_unrelated_commits ... ok
+test relational::txn_tests::max_write_set_ops_boundary ... ok
+test relational::txn_tests::metrics_record_start_commit_rollback_and_conflict ... ok
+test relational::txn_tests::oldest_live_snapshot_seq_returns_to_none_after_finish ... ok
+test relational::txn_tests::multiple_unique_indexes_each_enforced_independently ... ok
+test relational::txn_tests::read_only_transaction_commits_trivially_with_no_engine_write ... ok
+test relational::txn_tests::read_your_own_writes_delete_then_read ... ok
+test relational::txn_tests::read_your_own_writes_put_then_delete_then_put ... ok
+test relational::txn_tests::primary_key_conflict_exactly_one_insert_wins_both_orderings ... ok
+test relational::txn_tests::read_your_own_writes_put_then_read ... ok
+test relational::txn_tests::rollback_discards_writes_after_one_and_many_and_delete ... ok
+test relational::txn_tests::differential::matches_reference_model_for_randomized_interleaved_transactions ... ok
+test relational::txn_tests::rollback_racing_another_transactions_commit ... ok
+test relational::txn_tests::snapshot_read_is_stable_against_a_later_external_commit ... ok
+test relational::txn_tests::two_writers_same_key_second_committer_conflicts ... ok
+test relational::txn_tests::two_writers_different_keys_both_succeed ... ok
+test relational::txn_tests::unique_different_values_both_commit ... ok
+test relational::txn_tests::unique_conflict_exactly_one_committer_wins_both_orderings ... ok
+test relational::txn_tests::unique_null_values_do_not_conflict_with_each_other ... ok
+test relational::value::tests::decode_rejects_truncated_buffer_without_panicking ... ok
+test relational::value::tests::row_round_trip_all_null ... ok
+test relational::value::tests::row_round_trip_every_type_present ... ok
+test relational::value::tests::validate_decimal_accepts_in_range_rejects_out_of_range ... ok
+test sstable::bloom::tests::empty_filter_never_panics ... ok
+test sstable::bloom::tests::false_positive_rate_within_reasonable_bound_of_target ... ok
+test sstable::bloom::tests::num_hash_functions_matches_spec_formula_for_default ... ok
+test sstable::bloom::tests::repeated_insertion_of_same_key_is_harmless ... ok
+test sstable::bloom::tests::zero_false_negatives_over_every_inserted_key ... ok
+test sstable::format::tests::block_detects_corrupted_body ... ok
+test sstable::format::tests::block_detects_corrupted_checksum ... ok
+test sstable::format::tests::block_round_trip_multiple_records ... ok
+test sstable::format::tests::bloom_block_detects_corruption ... ok
+test sstable::format::tests::bloom_block_round_trip ... ok
+test sstable::format::tests::footer_rejects_bad_checksum ... ok
+test sstable::format::tests::footer_rejects_bad_magic ... ok
+test sstable::format::tests::footer_rejects_short_file ... ok
+test sstable::format::tests::footer_rejects_unsupported_version ... ok
+test sstable::format::tests::footer_round_trip ... ok
+test sstable::format::tests::index_block_rejects_gap ... ok
+test sstable::format::tests::index_block_rejects_non_ascending_last_key ... ok
+test sstable::format::tests::index_block_rejects_range_past_data_region ... ok
+test sstable::format::tests::index_block_round_trip ... ok
+test sstable::format::tests::record_rejects_oversized_key_before_allocating ... ok
+test sstable::format::tests::record_round_trip_delete_has_empty_value ... ok
+test sstable::format::tests::record_round_trip_put ... ok
+test sstable::reader::tests::open_rejects_truncated_file ... ok
+test sstable::reader::tests::point_lookup_across_versions ... ok
+test sstable::reader::tests::range_scan_matches_memtable_content ... ok
+test relational::txn_tests::write_skew_is_possible_under_snapshot_isolation ... ok
+test relational::txn_tests::writer_and_reader_deterministic_barrier ... ok
+test sstable::reader::tests::range_scan_respects_bounds ... ok
+test sstable::tests::corruption_bad_bloom_checksum_detected_at_open ... ok
+test sstable::tests::corruption_bad_data_block_checksum_detected_lazily_on_read ... ok
+test sstable::tests::corruption_bad_footer_checksum ... ok
+test sstable::tests::corruption_bad_footer_magic ... ok
+test sstable::tests::corruption_bad_index_checksum_detected_at_open ... ok
+test sstable::tests::corruption_index_offset_out_of_bounds ... ok
+test sstable::tests::corruption_truncated_file_below_footer_size ... ok
+test sstable::tests::discover_on_empty_or_absent_directory_is_empty_not_an_error ... ok
+test sstable::tests::discover_fails_closed_on_a_corrupt_published_table ... ok
+test sstable::tests::corruption_unsupported_version_is_reported_distinctly ... ok
+test sstable::tests::discover_sweeps_tmp_files_and_opens_valid_tables_newest_first ... ok
+test sstable::tests::large_sstable_hundred_plus_blocks_index_has_one_entry_per_block ... ok
+test sstable::tests::record_larger_than_target_block_size_gets_its_own_block ... ok
+test sstable::tests::multi_block_lookup_first_middle_last_and_missing ... ok
+test sstable::tests::round_trip_matches_memtable_for_every_key_and_every_as_of_seq ... ok
+test sstable::tests::version_and_tombstone_boundary_split_across_blocks ... ok
+test sstable::tests::write_from_sorted_records_propagates_the_first_error_and_aborts ... ok
+test wal::file_io::tests::append_poisons_when_rollback_also_fails ... ok
+test wal::file_io::tests::append_rolls_back_a_partial_write_then_fail ... ok
+test wal::file_io::tests::dir_fsync_hook_intercepts_and_resets ... ok
+test wal::file_io::tests::mem_file_corrupt_byte ... ok
+test wal::file_io::tests::mem_file_set_len_truncates ... ok
+test wal::file_io::tests::mem_file_shared_handle_sees_writes ... ok
+test wal::file_io::tests::mem_file_write_read_round_trip ... ok
+test wal::file_io::tests::write_all_at_writes_the_correct_bytes_at_the_correct_offset ... ok
+test wal::format::tests::frame_encode_propagates_op_body_error ... ok
+test wal::format::tests::frame_encode_rejects_oversized_body ... ok
+test wal::format::tests::len_prefixed_rejects_overclaimed_length ... ok
+test wal::format::tests::len_prefixed_round_trip ... ok
+test wal::format::tests::read_u32_le_rejects_short_slice ... ok
+test wal::format::tests::read_u32_le_round_trips ... ok
+test wal::format::tests::read_u64_le_rejects_short_slice ... ok
+test wal::format::tests::read_u64_le_round_trips ... ok
+test wal::format::tests::segment_header_rejects_bad_magic ... ok
+test wal::format::tests::segment_header_rejects_id_mismatch ... ok
+test wal::format::tests::segment_header_rejects_non_zero_flags ... ok
+test wal::format::tests::segment_header_rejects_short_buffer ... ok
+test wal::format::tests::segment_header_rejects_unsupported_format_version ... ok
+test wal::format::tests::segment_header_round_trip ... ok
+test sstable::tests::write_from_memtable_and_write_from_sorted_records_produce_byte_identical_output ... ok
+test wal::fuzz_tests::recovery_never_panics_on_arbitrary_noise ... ok
+test wal::fuzz_tests::recovery_returns_prefix_under_partial_write ... ok
+test wal::fuzz_tests::recovery_returns_exactly_the_durable_prefix ... ok
+test wal::group_append_tests::a_failed_group_write_fails_every_writer_in_it_and_leaves_no_trace_or_seq_gap ... ok
+test wal::group_append_tests::an_encode_failure_fails_only_that_op_and_consumes_no_seq ... ok
+test wal::fuzz_tests::recovery_returns_prefix_under_random_corruption ... ok
+test wal::group_append_tests::rotation_inside_a_group_keeps_the_written_prefix_when_a_later_run_fails ... ok
+test wal::group_commit::tests::a_failed_combined_write_fails_its_writers_and_the_committer_keeps_working ... ok
+test wal::group_commit::tests::a_failed_leader_fsync_poisons_the_committer_permanently ... ok
+test wal::group_commit::tests::a_panicking_combiner_never_leaves_an_appender_blocked ... ok
+test wal::group_commit::tests::an_unsynced_raw_append_before_wrapping_is_not_treated_as_durable ... ok
+test wal::group_commit::tests::append_durable_is_equivalent_to_append_then_await ... ok
+test wal::group_commit::tests::append_then_await_durable_round_trips_single_threaded ... ok
+test wal::group_commit::tests::backpressure_rejects_beyond_max_pending_waiters ... ok
+test wal::group_commit::tests::cohort_close_decision_table ... ok
+test wal::group_commit::tests::concurrent_appends_all_become_durable_and_recoverable ... ok
+test wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics ... ok
+test wal::group_commit::tests::durable_through_starts_from_what_recovery_already_proved_durable ... ok
+test wal::group_commit::tests::estimate_frame_len_matches_the_real_encoder_for_group ... ok
+test wal::group_commit::tests::estimate_frame_len_matches_the_real_encoder_for_put ... ok
+test sstable::tests::property::sstable_matches_memtable_reference ... ok
+test wal::group_commit::tests::leader_panic_clears_leader_active_poisons_and_recovers_cleanly_on_reopen ... ok
+test wal::group_commit::tests::flat_combining_many_writers_every_ack_is_recovered_in_order ... ok
+test wal::group_commit::tests::new_rejects_a_wal_opened_with_immediate_sync_mode ... ok
+test wal::group_commit::tests::rotate_between_batches_does_not_disrupt_durability ... ok
+test wal::group_commit::tests::shutdown_prevents_new_batches_and_reports_pending_state ... ok
+test wal::group_commit::tests::small_prior_batch_does_not_ratchet_batches_small ... ok
+test relational::txn_tests::transaction_snapshot_remains_valid_across_automatic_compaction ... ok
+test wal::metrics::tests::current_ns_uses_acquire_and_observes_a_release_store_from_another_thread ... ok
+test wal::metrics::tests::default_also_starts_at_zero ... ok
+test wal::metrics::tests::ema_update_matches_the_formula_directly ... ok
+test wal::metrics::tests::first_sample_applies_the_plain_formula_against_a_zero_old_value ... ok
+test wal::metrics::tests::monotonically_converges_downward_toward_a_smaller_constant_sample ... ok
+test wal::metrics::tests::monotonically_converges_upward_toward_a_larger_constant_sample ... ok
+test wal::metrics::tests::record_is_safe_under_concurrent_calls_from_multiple_threads ... ok
+test wal::metrics::tests::second_sample_matches_hand_computed_ema ... ok
+test wal::metrics::tests::starts_at_zero ... ok
+test wal::ops::tests::checkpoint_marker_round_trip ... ok
+test wal::ops::tests::decode_rejects_checkpoint_marker_with_wrong_length ... ok
+test wal::ops::tests::decode_rejects_delete_with_trailing_byte ... ok
+test wal::ops::tests::decode_rejects_engine_switch ... ok
+test wal::ops::tests::decode_rejects_put_with_trailing_byte ... ok
+test wal::ops::tests::decode_rejects_unknown_op ... ok
+test wal::ops::tests::delete_round_trip ... ok
+test wal::ops::tests::empty_value_put_round_trips ... ok
+test wal::ops::tests::encode_rejects_oversized_key_with_capacity_exceeded ... ok
+test wal::ops::tests::frame_header_encodes_correct_length_and_crc ... ok
+test wal::ops::tests::group_decode_rejects_checkpoint_marker_tag_as_member ... ok
+test wal::ops::tests::group_decode_rejects_nested_group_tag ... ok
+test wal::ops::tests::group_decode_rejects_oversized_member_count_gracefully ... ok
+test wal::ops::tests::group_decode_rejects_oversized_member_count_with_leftover_garbage ... ok
+test wal::ops::tests::group_decode_rejects_trailing_bytes_after_members ... ok
+test wal::ops::tests::group_empty_members_round_trips_at_the_wal_layer ... ok
+test wal::ops::tests::group_encode_rejects_oversized_member_key_with_capacity_exceeded ... ok
+test wal::ops::tests::group_round_trip_at_ten_thousand_members ... ok
+test wal::ops::tests::group_round_trip_many_members_mixed_put_delete ... ok
+test wal::ops::tests::group_round_trip_single_member ... ok
+test wal::ops::tests::group_wire_format_is_exactly_count_then_tag_and_body_per_member ... ok
+test wal::ops::tests::put_round_trip ... ok
+test wal::ops::tests::wire_format_is_byte_for_byte_unchanged ... ok
+test wal::recovery::tests::clean_multi_record_segment ... ok
+test wal::recovery::tests::empty_segment_after_header ... ok
+test wal::recovery::tests::max_record_len_violation_at_tail_is_torn_not_corrupt ... ok
+test wal::recovery::tests::max_record_len_violation_not_at_tail_is_corrupt ... ok
+test wal::recovery::tests::non_tail_corruption_is_never_silently_truncated ... ok
+test wal::recovery::tests::short_file_is_corruption_not_panic ... ok
+test wal::recovery::tests::torn_exactly_at_frame_boundary_is_not_flagged_truncated_incorrectly ... ok
+test wal::recovery::tests::torn_mid_body ... ok
+test wal::recovery::tests::torn_mid_frame_header ... ok
+test wal::testing::tests::fsync_failure_is_surfaced_and_a_later_sync_still_works ... ok
+test wal::testing::tests::injected_short_write_reports_fewer_bytes ... ok
+test wal::testing::tests::injected_sync_failure_is_surfaced_and_counted ... ok
+test wal::testing::tests::injected_write_failure_is_surfaced ... ok
+test wal::testing::tests::uninjected_calls_pass_through ... ok
+test wal::tests::concurrent_open_for_recovery_is_rejected_until_the_first_is_dropped ... ok
+test wal::tests::file_wal_is_send ... ok
+test wal::tests::group_commit_sync_mode_is_accepted_and_usable_directly ... ok
+test wal::tests::inspect_is_excluded_by_an_active_writer_but_not_by_another_inspect ... ok
+test wal::tests::inspect_never_creates_a_missing_directory ... ok
+test wal::tests::inspect_succeeds_with_no_writer_ever_having_opened_the_directory ... ok
+test wal::tests::next_segment_id_rejects_overflow ... ok
+test wal::tests::parse_rejects_non_matching_names ... ok
+test wal::group_commit::tests::stats_reflect_real_batching_activity ... ok
+test wal::tests::purge_before_combined_remove_and_fsync_failure_mentions_both ... ok
+test wal::tests::purge_before_surfaces_a_remove_failure_alone ... ok
+test wal::tests::purge_before_surfaces_dir_fsync_failure_and_leaves_state_consistent ... ok
+test lsm::tests::compaction_tests::compaction_preserves_logical_reads_for_every_prior_snapshot_seq ... ok
+test wal::tests::replay_streaming_on_a_never_created_directory_is_empty_not_an_error ... ok
+test wal::tests::replay_streaming_on_empty_wal_delivers_nothing_without_panicking ... ok
+test wal::tests::replay_streaming_propagates_a_callback_error_and_stops ... ok
+test wal::tests::replay_streaming_stops_at_first_corruption_matching_scan_directory ... ok
+test wal::tests::rotate_surfaces_dir_fsync_failure_and_leaves_state_unchanged ... ok
+test wal::tests::scan_stops_at_first_corruption_and_ignores_everything_after ... ok
+test wal::tests::segment_file_name_round_trip ... ok
+test wal::group_commit::tests::purge_before_bounds_wal_footprint_under_concurrent_writes ... ok
+test wal::tests::replay_streaming_delivers_every_record_in_order ... ok
+test relational::tests::differential::table_store_matches_independent_serialized_reference_model ... ok
+test wal::tests::replay_streaming_never_accumulates_more_than_one_segment_at_a_time ... ok
+test manifest::tests::property::manifest_replay_matches_independent_reference_model ... ok
+test wal::group_append_tests::append_group_equals_sequential_appends ... ok
+test lsm::tests::compaction_tests::auto_trigger_tests::bounded_compaction_performance_and_storage_budget_baseline ... ok
+
+test result: ok. 556 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 142.38s
+
+     Running tests\crash_consistency.rs (target\debug\deps\crash_consistency-ef6523424b550927.exe)
+
+running 2 tests
+test child_worker ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test crash_consistency_across_abort_points ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+
+     Running tests\group_commit.rs (target\debug\deps\group_commit-0f037da8737fade7.exe)
+
+running 8 tests
+test m1_2_hundred_writers_throughput::hundred_writers_throughput ... ignored, throughput gate: defined for the release profile only (1,000 unoptimized threads are CPU-bound); run `cargo test --release --test group_commit -- --test-threads=1` (scripts/wal_certify.ps1)
+test m1_3_thousand_writers_throughput::thousand_writers_throughput ... ignored, throughput gate: defined for the release profile only (1,000 unoptimized threads are CPU-bound); run `cargo test --release --test group_commit -- --test-threads=1` (scripts/wal_certify.ps1)
+test m1_6_crash_consistency::child_worker ... ok
+
+running 1 test
+test m1_4_leader_failure_propagation::leader_failure_propagation ... ok
+
+running 1 test
+
+running 1 test
+test m1_5_rotation_mid_batch::rotation_mid_batch ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test m1_6_crash_consistency::crash_consistency_across_abort_points ... ok
+test watermark_monotonicity::durable_through_is_monotone_and_acknowledged_waiters_are_genuinely_durable ... ok
+test m1_1_single_writer_latency_unchanged::single_writer_latency_unchanged ... ok
+
+test result: ok. 6 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 7.71s
+
+     Running tests\pathological_recovery_matrix.rs (target\debug\deps\pathological_recovery_matrix-efce1bb5087232d1.exe)
+
+running 9 tests
+test fixture_partial_final_body ... ok
+test fixture_malformed_frame_unrecognized_op_tag ... ok
+test fixture_invalid_length_field_non_tail ... ok
+test fixture_crc_corruption_non_tail ... ok
+test fixture_mixed_valid_and_corrupt_segments ... ok
+test fixture_partial_final_header ... ok
+test fixture_many_batches ... ok
+test fixture_many_segments_all_valid ... ok
+test fixture_valid_durable_tail ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.47s
+
+     Running tests\wal_tests.rs (target\debug\deps\wal_tests-99831ecb26771d47.exe)
+
+running 12 tests
+test lock_probe_child ... ok
+test max_record_len_is_enforced_before_any_write ... ok
+test empty_wal_recovers_cleanly ... ok
+
+running 1 test
+
+running 1 test
+test cross_process_lock_prevents_concurrent_writers ... ok
+test round_trip_multiple_records_and_op_types ... ok
+test sequence_number_resumes_across_reopen ... ok
+test inspect_never_mutates_the_directory ... ok
+test corrupted_header_on_non_last_segment_stops_the_scan ... ok
+test purge_before_only_removes_fully_superseded_sealed_segments ... ok
+test corrupted_non_first_non_last_segment_keeps_earlier_records_only ... ok
+test torn_tail_only_in_last_segment_is_truncated_not_flagged_corrupt ... ok
+test multi_segment_replay_reconstructs_full_order ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+     Running unittests src\lib.rs (target\debug\deps\rubixdb_api-9cb300062a9f32b8.exe)
+
+running 46 tests
+test config::tests::role_hierarchy_admin_satisfies_reader_requirement ... ok
+test config::tests::rejects_empty_key_list ... ok
+test config::tests::rejects_missing_admin_key ... ok
+test config::tests::rejects_short_key ... ok
+test config::tests::parses_valid_api_keys ... ok
+test auth::tests::authenticates_known_key ... ok
+test auth::tests::rejects_unknown_key ... ok
+test encoding::tests::rejects_invalid_base64 ... ok
+test encoding::tests::round_trips_arbitrary_bytes ... ok
+test error::tests::engine_aborted_maps_to_500 ... ok
+test error::tests::engine_capacity_exceeded_maps_to_413 ... ok
+test error::tests::engine_corruption_maps_to_500_and_carries_detail ... ok
+test error::tests::engine_invalid_argument_maps_to_400_and_carries_detail ... ok
+test error::tests::engine_invalid_path_maps_to_500_and_never_returns_the_path ... ok
+test error::tests::engine_io_maps_to_502_and_never_returns_raw_os_detail ... ok
+test error::tests::engine_not_found_maps_to_404 ... ok
+test error::tests::engine_storage_exhausted_maps_to_507 ... ok
+test error::tests::engine_timeout_maps_to_504 ... ok
+test error::tests::engine_unsupported_maps_to_400 ... ok
+test error::tests::engine_wal_unavailable_maps_to_503 ... ok
+test error::tests::handler_not_found_maps_to_404 ... ok
+test error::tests::unauthorized_and_forbidden_and_rate_limited ... ok
+test error::tests::validation_maps_to_400 ... ok
+test metrics::tests::active_requests_tracks_in_flight_count ... ok
+test metrics::tests::records_count_and_error_count_per_route ... ok
+test rate_limit::tests::allows_up_to_burst_then_rejects ... ok
+test rate_limit::tests::buckets_are_independent_per_principal ... ok
+test routes::sql::serialization_benchmark::serialization_cost_by_result_size ... ignored
+test sql_metrics::tests::counters_accumulate_independently ... ok
+test sql_params::tests::bigint_round_trips_through_string_without_precision_loss ... ok
+test sql_params::tests::blob_round_trips_via_base64 ... ok
+test sql_params::tests::date_formatting_matches_known_values ... ok
+test sql_params::tests::date_round_trips_through_parser ... ok
+test sql_params::tests::decimal_round_trips_via_unscaled_and_scale ... ok
+test sql_params::tests::invalid_bigint_string_is_a_validation_error ... ok
+test sql_params::tests::null_param_produces_none ... ok
+test rate_limit::tests::refills_over_time ... ok
+test server::tests::serve_returns_promptly_after_trigger_with_no_in_flight_requests ... ok
+test sql_session::tests::create_take_round_trip_returns_the_same_transaction ... ok
+test sql_session::tests::shutdown_rolls_back_every_open_session ... ok
+test sql_session::tests::take_with_unknown_id_fails ... ok
+test sql_session::tests::per_principal_session_limit_is_enforced ... ok
+test sql_session::tests::take_of_an_idle_expired_session_also_reaps_it ... ok
+test sql_session::tests::expired_session_is_reaped_and_rolled_back ... ok
+test server::tests::in_flight_request_completes_during_graceful_drain ... ok
+test sql_session::tests::take_with_wrong_principal_fails_and_does_not_remove_the_session ... ok
+
+test result: ok. 45 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running unittests src\main.rs (target\debug\deps\rubixdb_api-95209c594051f723.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\api_cancellation.rs (target\debug\deps\api_cancellation-7cd23831ef71e106.exe)
+
+running 1 test
+test http_disconnect_cancels_an_expensive_query_without_wedging_the_server ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.14s
+
+     Running tests\api_commit_ack_loss.rs (target\debug\deps\api_commit_ack_loss-672303a6cba27225.exe)
+
+running 1 test
+test commit_durably_succeeds_even_when_the_client_never_reads_the_response ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests\api_delete_safety.rs (target\debug\deps\api_delete_safety-9a8644d649ef12ff.exe)
+
+running 12 tests
+test reader_role_cannot_delete_a_table ... ok
+test schema_delete_wrong_confirmation_is_rejected ... ok
+test schema_delete_refuses_when_schema_still_has_tables ... ok
+test schema_delete_exact_confirmation_succeeds ... ok
+test stale_ui_delete_of_an_already_deleted_table_is_safely_rejected ... ok
+test index_delete_wrong_confirmation_is_rejected ... ok
+test stale_ui_delete_of_an_already_deleted_index_is_safely_rejected ... ok
+test index_delete_exact_confirmation_succeeds_and_query_correctness_holds ... ok
+test table_delete_empty_confirmation_is_rejected ... ok
+test table_delete_partial_confirmation_is_rejected ... ok
+test table_delete_exact_confirmation_succeeds_and_is_durable ... ok
+test table_delete_wrong_confirmation_is_rejected_and_table_survives ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests\api_http_fuzz.rs (target\debug\deps\api_http_fuzz-50b0f57df38ece54.exe)
+
+running 4 tests
+test abrupt_connection_termination_never_wedges_the_server ... ok
+test malformed_headers_and_authorization_never_crash_the_server ... ok
+test http_json_fuzz_never_crashes_or_hangs_the_server ... ok
+test sql_fuzz_through_the_real_http_pipeline_never_crashes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests\api_instance_and_frontend.rs (target\debug\deps\api_instance_and_frontend-355f8d8878ae211e.exe)
+
+running 6 tests
+test without_frontend_dist_unmatched_routes_still_404_exactly_as_before ... ok
+test instance_route_reports_none_when_not_launched_by_the_instance_manager ... ok
+test frontend_fallback_never_shadows_a_real_protected_api_route ... ok
+test with_frontend_dist_unmatched_client_route_falls_back_to_index_html ... ok
+test instance_route_reports_real_identity_and_needs_no_auth ... ok
+test with_frontend_dist_static_assets_are_served ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests\api_integration.rs (target\debug\deps\api_integration-715e244b0564b83f.exe)
+
+running 15 tests
+test empty_key_on_put_is_rejected ... ok
+test healthz_requires_no_auth ... ok
+test get_as_of_returns_the_historical_value_after_a_later_delete ... ok
+test cors_allows_only_the_configured_origin_and_never_wildcards ... ok
+test malformed_base64_is_rejected_before_touching_the_engine ... ok
+test compaction_status_and_metrics_reflect_the_real_engine ... ok
+test exists_reflects_contains_semantics ... ok
+test put_get_delete_flow_against_the_real_engine ... ok
+test readyz_requires_auth_and_reports_storage_state ... ok
+test storage_full_maps_to_507_and_never_corrupts_state ... ok
+test oversized_value_is_rejected ... ok
+test whoami_reports_the_authenticated_principal_and_role ... ok
+test snapshot_lifecycle_protects_historical_reads ... ok
+test range_preserves_ordering_and_reports_truncation ... ok
+test persists_across_a_real_restart_get_get_as_of_contains_and_range ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests\api_security_validation.rs (target\debug\deps\api_security_validation-570170a6028a3384.exe)
+
+running 11 tests
+test oversized_key_is_rejected_by_the_handler_not_the_framework ... ok
+test method_mismatch_on_a_real_route_is_405 ... ok
+test malformed_snapshot_id_is_rejected_not_500 ... ok
+test malformed_json_body_is_rejected_cleanly ... ok
+test malformed_range_parameters_are_rejected ... ok
+test missing_and_invalid_credentials_are_rejected_without_leaking_anything ... ok
+test reader_cannot_create_or_release_snapshots_admin_can ... ok
+test storage_pressure_is_a_signal_not_a_write_rejection ... ok
+test unknown_routes_404_without_requiring_auth ... ok
+test payload_beyond_the_configured_body_size_limit_is_rejected ... ok
+test rate_limiter_returns_429_after_burst_and_isolates_principals ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.68s
+
+     Running tests\api_sql_integration.rs (target\debug\deps\api_sql_integration-ee2882f54c63325b.exe)
+
+running 25 tests
+test authz_route_never_exposes_credentials ... ok
+test catalog_routes_still_require_authentication ... ok
+test client_b_cannot_use_client_a_session_id ... ok
+test databases_lists_exactly_the_one_real_bootstrapped_database ... ok
+test describe_table_matches_real_columns_and_primary_key ... ok
+test concurrent_transaction_is_invisible_to_a_simultaneous_autocommit_read ... ok
+test commit_or_rollback_without_a_session_id_is_a_validation_error ... ok
+test explain_returns_structured_plan_text_without_executing ... ok
+test end_to_end_ddl_dml_select_through_the_real_api ... ok
+test parse_error_never_leaks_internal_detail_shape ... ok
+test nonexistent_and_unauthorized_tables_are_indistinguishable ... ok
+test nested_begin_on_an_open_session_is_rejected_without_losing_the_transaction ... ok
+test group_by_having_and_aggregates_through_the_real_api ... ok
+test indexes_reflects_create_index ... ok
+test per_principal_session_limit_is_enforced_through_the_real_api ... ok
+test reader_can_select_but_not_insert_through_sql ... ok
+test statement_exceeding_its_deadline_is_a_controlled_timeout ... ok
+test schemas_lists_the_real_public_schema_and_reflects_create_schema ... ok
+test rollback_discards_the_transaction_local_write ... ok
+test transaction_spans_multiple_http_requests_and_isolates_other_clients ... ok
+test many_concurrent_independent_transactions_never_cross_contaminate ... ok
+test tables_reflects_create_and_drop_table ... ok
+test unauthenticated_sql_request_is_rejected ... ok
+test typed_parameters_reach_the_query_without_string_interpolation ... ok
+test unsupported_grammar_is_a_stable_error_not_silently_accepted ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+
+     Running unittests src\main.rs (target\debug\deps\rubixdb-e71b57ac0c84aa76.exe)
+
+running 17 tests
+test render::tests::c1_boundaries_are_exact_and_neighbours_are_untouched ... ok
+test render::tests::decimal_formatting_places_the_decimal_point_correctly ... ok
+test render::tests::preserves_ordinary_unicode_text ... ok
+test render::tests::null_renders_as_null_text ... ok
+test render::tests::sanitizes_c1_control_characters_including_8bit_csi_and_osc ... ok
+test render::tests::sanitizes_carriage_return_and_bell ... ok
+test render::tests::table_rendering_aligns_columns ... ok
+test render::tests::sanitizes_ansi_escape_sequences ... ok
+test render::tests::text_value_with_embedded_escape_is_sanitized ... ok
+test runner::tests::rows_result_renders_table_and_count ... ok
+test runner::tests::write_result_renders_statement_and_count ... ok
+test sql_split::tests::does_not_split_inside_a_string_literal ... ok
+test sql_split::tests::drops_empty_statements_and_trims_whitespace ... ok
+test sql_split::tests::handles_escaped_quote_inside_a_literal ... ok
+test sql_split::tests::has_complete_statement_respects_quoting ... ok
+test sql_split::tests::splits_simple_statements ... ok
+test sql_split::tests::statement_without_trailing_semicolon_is_still_captured ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\cli_endurance_integration.rs (target\debug\deps\cli_endurance_integration-d80e9806f1e027da.exe)
+
+running 1 test
+test five_hundred_real_cli_invocations_show_no_monotonic_resource_growth ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.26s
+
+     Running tests\cli_integration.rs (target\debug\deps\cli_integration-29fb49c9d19c7775.exe)
+
+running 10 tests
+test missing_api_key_in_a_non_interactive_run_fails_cleanly ... ok
+test c_mode_fatal_error_exits_non_zero_and_stops ... ok
+test invalid_api_key_is_rejected_not_a_panic ... ok
+test conninfo_never_prints_the_api_key ... ok
+test c_mode_runs_ddl_dml_select_and_exits_zero ... ok
+test f_mode_runs_a_real_script_file_and_reports_exit_code ... ok
+test script_transaction_shares_one_session_across_statements ... ok
+test group_by_having_and_aggregates_render_correctly_via_cli ... ok
+test meta_commands_reflect_real_backend_state_changes ... ok
+test server_unreachable_fails_cleanly_never_hangs ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+     Running tests\crash_recovery_integration.rs (target\debug\deps\crash_recovery_integration-4a5e2f9f7a414f7f.exe)
+
+running 4 tests
+test committed_write_survives_a_real_process_kill_and_restart ... ok
+test uncommitted_transaction_write_never_survives_a_real_process_kill ... ok
+test committed_ddl_survives_a_real_process_kill_and_restart ... ok
+test concurrent_write_load_leaves_no_partial_state_after_a_real_kill ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.97s
+
+     Running tests\gui_instance_integration.rs (target\debug\deps\gui_instance_integration-000380e0eccd74a9.exe)
+
+running 7 tests
+test first_run_with_no_explicit_config_becomes_owner_and_succeeds ... ok
+test concurrent_first_run_processes_race_safely_to_one_owner ... ok
+test port_collision_with_an_unrelated_process_falls_back_safely ... ok
+test data_persists_across_separate_owner_invocations ... ok
+test cli_client_attaches_to_a_running_gui_instance_and_shares_its_data ... ok
+test two_concurrent_gui_invocations_never_create_two_owners ... ok
+test instance_list_and_status_reflect_real_state ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+
+     Running tests\index_backfill_crash_integration.rs (target\debug\deps\index_backfill_crash_integration-334c89cdbb5e14a8.exe)
+
+running 1 test
+test create_index_killed_mid_backfill_recovers_correctly_on_restart has been running for over 60 seconds
+test create_index_killed_mid_backfill_recovers_correctly_on_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 92.76s
+
+     Running tests\instance_drop_integration.rs (target\debug\deps\instance_drop_integration-1899c527892f798c.exe)
+
+running 8 tests
+test drop_of_unknown_instance_name_is_refused ... ok
+test drop_with_no_confirmation_flag_is_refused ... ok
+test drop_with_partial_confirmation_is_refused ... ok
+test drop_with_wrong_confirmation_is_refused_and_data_survives ... ok
+test drop_with_empty_confirmation_is_refused ... ok
+test drop_with_exact_confirmation_permanently_deletes_a_stopped_instance ... ok
+test drop_never_touches_a_different_instance ... ok
+test drop_refuses_a_currently_running_instance_even_with_correct_confirmation ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests\multi_instance_sustained_load.rs (target\debug\deps\multi_instance_sustained_load-ccb403a8e7b94bbc.exe)
+
+running 1 test
+test two_instances_simultaneous_sustained_read_and_write_load_never_cross_contaminate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 42.43s
+
+     Running unittests src\lib.rs (target\debug\deps\rubixdb_instance-a83a601a9a11d23d.exe)
+
+running 34 tests
+test lock::tests::hold_lock_forever_helper ... ignored
+test credentials::tests::generated_keys_are_high_entropy_and_unique ... ok
+test lock::tests::first_acquire_succeeds ... ok
+test lock::tests::lock_is_released_when_owner_is_dropped ... ok
+test lock::tests::second_acquire_while_first_is_held_fails_with_already_locked ... ok
+test manifest::tests::missing_manifest_is_none_not_error ... ok
+test paths::tests::accepts_normal_names ... ok
+test paths::tests::instance_dir_rejects_traversal_even_with_root_override ... ok
+test paths::tests::instances_root_with_override_ignores_empty_override ... ok
+test paths::tests::instance_dir_is_confined_under_root ... ok
+test paths::tests::instances_root_with_override_prefers_override ... ok
+test paths::tests::rejects_overlong_name ... ok
+test paths::tests::rejects_path_traversal_names ... ok
+test port::tests::binds_preferred_port_when_free ... ok
+test port::tests::default_port_binds_to_the_documented_socket_when_free ... ok
+test port::tests::falls_back_to_ephemeral_port_on_collision ... ok
+test port::tests::default_port_is_302_decimal_not_octal ... ok
+test port::tests::only_ever_binds_loopback ... ok
+test credentials::tests::round_trips_through_disk ... ok
+test manifest::tests::corrupt_manifest_is_a_typed_error_not_a_panic ... ok
+
+running 1 test
+test manifest::tests::round_trips_through_disk ... ok
+test tests::discover_returns_manifest_after_owner_writes_it ... ok
+test tests::discover_returns_none_before_any_acquire ... ok
+test tests::first_acquire_creates_manifest_and_credentials ... ok
+test tests::list_instances_reflects_real_directories ... ok
+test tests::remove_instance_deletes_the_directory_once_unlocked ... ok
+test tests::remove_instance_never_touches_a_different_instance ... ok
+test tests::remove_instance_refuses_while_lock_is_held ... ok
+test tests::remove_instance_rejects_unknown_name ... ok
+test handshake::tests::verify_identity_reports_unreachable_against_nothing_listening ... ok
+test lock::tests::lock_is_released_when_owner_process_is_killed ... ok
+test handshake::tests::wait_until_ready_times_out_against_nothing_listening ... ok
+test tests::second_acquire_in_same_process_tree_sees_already_running ... ok
+test tests::two_named_instances_get_independent_ports ... ok
+
+test result: ok. 33 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 3.13s
+
+     Running unittests src\lib.rs (target\debug\deps\rubixdb_sql-51f5726deee386a9.exe)
+
+running 357 tests
+test aggregate::tests::avg_semantics_empty_null_and_precision ... ok
+test aggregate::tests::float_grouping_canonical_zero_and_nan ... ok
+test aggregate::tests::min_max_semantics ... ok
+test aggregate::tests::count_semantics_empty_zero_and_null ... ok
+test aggregate::tests::composite_grouping_keys_do_not_collide ... ok
+test aggregate::tests::sum_semantics_empty_null_overflow ... ok
+test auth::tests::admin_default_access_bypasses_explicit_grants ... ok
+test auth::tests::reader_default_access_only_covers_select ... ok
+test bind_tests::aggregate_without_group_by_is_a_single_implicit_group ... ok
+test auth::tests::explicit_grant_at_any_ancestor_level_is_sufficient ... ok
+test bind_tests::aggregate_in_where_is_rejected ... ok
+test bind_tests::ambiguous_unqualified_column_across_a_join_is_rejected ... ok
+test bind_tests::authorization_denial_on_an_aggregated_query_is_the_same_unknown_object_shape ... ok
+test bind_tests::avg_of_decimal_is_a_controlled_unsupported_error ... ok
+test bind_tests::between_and_in_list_require_a_shared_type ... ok
+test bind_tests::composite_group_by_binds_every_expression ... ok
+test bind_tests::count_distinct_remains_explicitly_unsupported ... ok
+test bind_tests::count_star_and_count_expr_are_distinguished ... ok
+test bind_tests::count_star_does_not_support_other_wildcards_and_min_max_reject_wildcard ... ok
+test bind_tests::create_index_binds_column_ordinals ... ok
+test bind_tests::create_table_binds_columns_and_primary_key ... ok
+test bind_tests::create_table_composite_primary_key ... ok
+test bind_tests::create_table_without_primary_key_is_rejected ... ok
+test bind_tests::drop_table_if_exists_on_missing_table_is_a_clean_noop ... ok
+test bind_tests::drop_table_without_if_exists_on_missing_table_errors ... ok
+test bind_tests::drop_index_resolves_by_table_scoped_name ... ok
+test bind_tests::delete_binds_table_and_where ... ok
+test bind_tests::explain_binds_the_inner_statement ... ok
+test bind_tests::explicit_grant_authorizes_an_otherwise_default_access_none_principal ... ok
+test bind_tests::function_call_binds_and_unknown_function_is_rejected ... ok
+test bind_tests::group_by_all_and_rollup_remain_explicitly_unsupported ... ok
+test bind_tests::group_by_binds_and_aggregate_calls_are_extracted_to_a_shared_indexed_list ... ok
+test bind_tests::group_by_expression_itself_may_be_selected_directly ... ok
+test bind_tests::group_by_without_any_aggregate_is_supported ... ok
+test bind_tests::having_binds_aggregate_calls_and_is_boolean_typed ... ok
+test bind_tests::identical_aggregate_calls_are_deduplicated_to_one_shared_index ... ok
+test bind_tests::inner_join_preserves_the_underlying_not_null_flag ... ok
+test bind_tests::insert_explicit_null_into_not_null_column_is_rejected ... ok
+test bind_tests::insert_multi_row_values_binds_every_row ... ok
+test bind_tests::insert_missing_not_null_column_without_default_is_rejected ... ok
+test bind_tests::insert_omitted_column_with_default_binds_to_the_defaults_own_value ... ok
+test bind_tests::integer_literal_compared_against_bigint_column_binds_as_bigint ... ok
+test bind_tests::insert_with_explicit_columns_binds_one_row_per_catalog_column ... ok
+test bind_tests::left_join_marks_the_right_side_nullable_even_for_not_null_columns ... ok
+test bind_tests::long_or_chain_binds_in_linear_not_exponential_time ... ok
+test bind_tests::join_binds_two_tables_and_resolves_qualified_columns ... ok
+test aggregate_reference_model::matches_reference_model_across_a_fixed_scenario_matrix ... ok
+test bind_tests::metrics_record_bind_success_and_denial ... ok
+test bind_tests::mismatched_comparison_types_are_rejected ... ok
+test bind_tests::min_max_and_sum_and_avg_on_orders_amount_resolve_expected_types ... ok
+test bind_tests::nested_aggregate_is_rejected ... ok
+test bind_tests::non_admin_cannot_create_database ... ok
+test bind_tests::nonexistent_table_and_forbidden_table_produce_the_identical_error_shape ... ok
+test bind_tests::null_is_assignable_to_any_typed_context ... ok
+test bind_tests::order_by_nulls_default_matches_d5 ... ok
+test bind_tests::order_by_may_reference_an_aggregate_result_once_aggregated ... ok
+test bind_tests::reader_cannot_insert ... ok
+test bind_tests::parameter_index_exceeding_max_parameters_is_rejected ... ok
+test bind_tests::select_qualified_wildcard_on_join_expands_only_that_table ... ok
+test bind_tests::select_plain_column_resolves_correct_ordinal_and_type ... ok
+test bind_tests::select_wildcard_expands_every_column_in_ordinal_order ... ok
+test bind_tests::select_unknown_column_is_rejected ... ok
+test bind_tests::select_unknown_table_is_rejected ... ok
+test bind_tests::shared_type_unification_still_conforms_a_flexible_literal_to_a_rigid_column_type ... ok
+test bind_tests::shared_type_unification_still_rejects_mismatched_rigid_types ... ok
+test bind_tests::ungrouped_column_in_an_aggregated_select_list_is_rejected ... ok
+test bind_tests::sum_of_text_column_is_a_type_mismatch ... ok
+test bind_tests::transaction_statements_bind_as_trivial_markers ... ok
+test bind_tests::ungrouped_column_with_no_group_by_at_all_is_rejected ... ok
+test bind_tests::update_binds_assignment_ordinals_and_where ... ok
+test bind_tests::unknown_function_name_is_rejected_not_treated_as_an_aggregate ... ok
+test bind_tests::update_of_primary_key_column_is_rejected ... ok
+test cost_model_tests::drifted_estimates_resolve_toward_the_index ... ok
+test cost_model_tests::forced_modes_select_the_requested_path ... ok
+test cost_model_tests::pk_paths_are_unaffected_by_the_cost_model ... ok
+test cost_model_tests::ordered_scans_never_switch_candidates ... ok
+test cost_model_tests::small_results_never_pay_for_statistics ... ok
+test cost_model_tests::selective_predicate_keeps_the_index_and_unselective_one_scans ... ok
+test cost_model_tests::pk_range_and_secondary_index_are_priced_by_exact_row_counts ... ok
+test exec::cost::tests::a_tiny_or_empty_estimate_never_yields_zero ... ok
+test exec::cost::tests::break_even_scales_with_table_size_and_cost_ratio ... ok
+test exec::cost::tests::drift_widens_the_bound_toward_the_index ... ok
+test exec::cost::tests::no_estimate_probes_to_the_floor_only ... ok
+test exec::cost::tests::prediction_matches_the_break_even ... ok
+test exec::cost::tests::reliability_requires_bounded_drift ... ok
+test cost_model_tests::statistics_registry_is_bounded ... ok
+test exec_tests::aggregate_metrics_are_recorded_correctly ... ok
+test cost_model_tests::the_more_selective_of_two_secondary_indexes_is_chosen ... ok
+test exec_tests::aggregate_query_honors_transaction_snapshot ... ok
+test exec_tests::aggregation_over_a_pk_range_matches_the_same_query_expressed_as_seq_scan_plus_filter ... ok
+test cost_model_tests::estimate_error_never_exceeds_the_drift_bound_under_random_mutation ... ok
+test exec_tests::and_or_three_valued_truth_tables ... ok
+test exec_tests::composite_group_by_produces_one_group_per_distinct_pair ... ok
+test exec_tests::concurrent_aggregate_queries_never_cross_contaminate ... ok
+test exec_tests::concurrent_independent_queries_never_cross_contaminate ... ok
+test exec_tests::count_star_over_empty_table_returns_one_row_with_zero ... ok
+test exec_tests::deadline_exceeded_is_a_controlled_error ... ok
+test exec_tests::differential::matches_reference_model_across_a_generated_dataset ... ok
+test exec_tests::distinct_deduplicates_by_projected_value_including_null ... ok
+test exec_tests::explain_wraps_and_still_executes_the_inner_query ... ok
+test exec_tests::grouped_aggregate_over_empty_table_returns_zero_rows ... ok
+test exec_tests::aggregate_cancellation_and_deadline_are_controlled_errors ... ok
+test exec_tests::having_filters_groups_using_three_valued_logic ... ok
+test exec_tests::aggregate_queries_remain_correct_during_automatic_compaction ... ok
+test exec_tests::index_equality_scan_uses_the_index_not_a_full_scan ... ok
+test exec_tests::index_narrowed_residual_predicate_is_still_evaluated ... ok
+test exec_tests::index_nested_loop_join_produces_the_same_result_as_plain_nested_loop ... ok
+test cost_model_tests::path_independence_fixed_seeds ... ok
+test exec_tests::index_range_scan_respects_inclusive_and_exclusive_bounds ... ok
+test exec_tests::inner_join_emits_exact_multiplicity ... ok
+test exec_tests::inner_join_with_a_pk_range_on_the_outer_side_still_emits_exact_multiplicity ... ok
+test exec_tests::left_join_one_and_many_matches ... ok
+test exec_tests::left_join_where_on_nullable_side_correctly_excludes_unmatched_rows ... ok
+test exec_tests::left_join_zero_matches_emits_one_null_extended_row ... ok
+test exec_tests::having_evaluates_once_per_group_not_once_per_input_row ... ok
+test exec_tests::max_aggregate_state_bytes_resource_limit_fails_closed ... ok
+test exec_tests::max_materialized_rows_bounds_sort_and_distinct ... ok
+test exec_tests::max_result_rows_is_enforced ... ok
+test exec_tests::max_group_count_resource_limit_fails_closed_never_ooms ... ok
+test exec_tests::metrics_record_access_path_choices ... ok
+test exec_tests::missing_parameter_is_a_controlled_error_not_a_panic ... ok
+test exec_tests::non_query_plan_is_an_explicit_unsupported_error_never_silent ... ok
+test exec_tests::null_grouping_key_forms_exactly_one_group ... ok
+test exec_tests::null_parameter_in_equality_matches_nothing ... ok
+test exec_tests::null_semantics_full_matrix_count_sum_avg_min_max ... ok
+test exec_tests::null_semantics_truth_table ... ok
+test exec_tests::order_by_and_limit_apply_after_aggregation ... ok
+test exec_tests::offset_skips_without_materializing_all_prior_rows_in_the_result ... ok
+test exec_tests::pk_lookup_on_missing_key_returns_no_rows ... ok
+test exec_tests::parameter_in_pk_lookup_and_filter ... ok
+test exec_tests::pk_lookup_returns_exactly_the_matching_row_typed ... ok
+test exec_tests::pk_range_scan_on_composite_primary_key_prefix_returns_every_matching_row ... ok
+test exec_tests::pk_range_scan_reflects_delete_then_reinsert_not_a_stale_or_duplicate_version ... ok
+test exec_tests::pk_range_scan_never_returns_an_adjacent_tables_rows ... ok
+test exec_tests::pk_range_scan_residual_predicate_is_still_evaluated ... ok
+test exec_tests::pk_range_scan_respects_transaction_snapshot_isolation ... ok
+test exec_tests::pk_range_scan_respects_inclusive_and_exclusive_bounds_at_domain_edges ... ok
+test exec_tests::planner_records_aggregate_plan_metric ... ok
+test exec_tests::projection_preserves_select_list_order_and_aliases ... ok
+test exec_tests::pk_range_scan_returns_exactly_the_matching_rows_via_the_right_access_path ... ok
+test exec_tests::read_your_own_writes_within_an_explicit_transaction ... ok
+test exec_tests::seq_scan_and_index_scan_both_honor_the_transaction_snapshot ... ok
+test exec_tests::seq_scan_returns_every_row_never_materializing_a_partial_table ... ok
+test cost_model_tests::query_results_are_independent_of_access_path_and_statistics ... ok
+test exec_tests::snapshot_is_stable_against_a_later_external_commit ... ok
+test exec_tests::sort_ascending_and_descending_with_nulls_first_and_last ... ok
+test exec_tests::sort_may_reference_a_column_outside_the_projection ... ok
+test exec_tests::sum_avg_min_max_over_empty_table_are_null_count_is_zero ... ok
+test functions::tests::lookup_is_case_sensitive_to_the_canonical_lowercase_form ... ok
+test functions::tests::registry_names_are_unique_and_lowercase ... ok
+test fuzz_tests::arbitrary_bytes_as_lossy_utf8_never_panics ... ok
+test exec_tests::wildcard_projection_matches_catalog_column_order ... ok
+test fuzz_tests::arbitrary_parameter_indices_never_panic ... ok
+test fuzz_tests::arbitrary_utf8_never_panics ... ok
+test fuzz_tests::deeply_nested_binary_expression_is_rejected_not_a_stack_overflow ... ok
+test fuzz_tests::empty_and_whitespace_only_input_is_a_controlled_error ... ok
+test exec_tests::cancellation_token_stops_execution ... ok
+test fuzz_tests::keyword_biased_noise_never_panics ... ok
+test fuzz_tests::malformed_numeric_literals_never_panic ... ok
+test fuzz_tests::null_bytes_and_control_characters_never_panic ... ok
+test inc17_overhead_bench::inc17_overhead_execution ... ignored
+test inc17_overhead_bench::inc17_overhead_planner ... ignored
+test inc17_overhead_bench::inc17_overhead_writes ... ignored
+test inc18_compare_bench::inc18_compare_concurrency ... ignored
+test inc18_compare_bench::inc18_compare_index_ddl ... ignored
+test index_read_benchmark::candidate_costs ... ignored
+test index_read_benchmark::concurrency_matrix ... ignored
+test index_read_benchmark::count_rows_cost ... ignored
+test index_read_benchmark::endurance_shape_replay ... ignored
+test index_read_benchmark::materialization_baseline ... ignored
+test index_read_benchmark::memory_by_result_size ... ignored
+test index_read_benchmark::pk_range_vs_index_baseline ... ignored
+test index_read_benchmark::regression_matrix ... ignored
+test index_read_benchmark::restart_statistics_experiment ... ignored
+test index_read_benchmark::scaling_matrix ... ignored
+test index_read_benchmark::selectivity_crossover_sweep ... ignored
+test index_read_benchmark::stage_decomposition ... ignored
+test index_read_benchmark::txn_overlay_overhead ... ignored
+test fuzz_tests::malformed_typed_literals_never_panic ... ok
+test fuzz_tests::deep_unary_not_nesting_never_overflows_the_stack ... ok
+test exec_tests::queries_remain_correct_during_automatic_compaction ... ok
+test index_read_differential_tests::index_reads_match_model_across_selectivities_and_result_sizes ... ok
+test index_read_differential_tests::index_scan_row_limit_is_enforced_while_collecting ... ok
+test index_read_differential_tests::snapshot_started_before_index_rebuild_sees_all_rows_f2_regression ... ok
+test index_read_differential_tests::upper_bound_only_index_range_excludes_null_indexed_values ... ok
+test index_snapshot_tests::begin_during_create_index_build ... ok
+test index_snapshot_tests::create_index_with_old_snapshot ... ok
+test exec_tests::limit_stops_scanning_early ... ok
+test index_snapshot_tests::fallback_is_taken_exactly_when_the_snapshot_predates_the_index ... ok
+test index_snapshot_tests::drop_then_create_index_with_old_snapshot ... ok
+test index_snapshot_tests::insert_update_delete_during_build_three_snapshots ... ok
+test index_snapshot_tests::join_aggregate_and_dml_under_an_old_snapshot ... ok
+test index_snapshot_tests::ordered_index_scan_fallback_preserves_order ... ok
+test limits_tests::an_untokenizable_over_budget_statement_is_still_rejected_conservatively ... ok
+test limits_tests::deeply_nested_parens_are_rejected_not_a_stack_overflow ... ok
+test limits_tests::expression_nesting_depth_boundary_never_panics_or_hangs ... ok
+test limits_tests::identifier_length_boundary ... ok
+test limits_tests::in_list_element_count_boundary ... ok
+test limits_tests::insert_column_count_boundary ... ok
+test index_snapshot_tests::update_between_snapshot_and_rebuild_neither_missing_nor_extra ... ok
+test limits_tests::operator_characters_inside_string_literals_do_not_trip_the_chain_guard ... ok
+test limits_tests::real_operator_chains_are_still_rejected_even_when_mixed_with_literals ... ok
+test limits_tests::statement_byte_size_boundary ... ok
+test limits_tests::statements_per_script_boundary ... ok
+test limits_tests::values_row_count_boundary ... ok
+test limits_tests::literal_heavy_statement_just_under_the_byte_limit_parses_within_bounded_time ... ok
+test materialization_tests::a_deadline_stops_the_fetch ... ok
+test materialization_tests::a_slow_consumer_never_causes_read_ahead ... ok
+test materialization_tests::limit_composes_with_the_transaction_overlay ... ok
+test materialization_tests::cancellation_stops_the_fetch_and_leaves_the_transaction_correct ... ok
+test materialization_tests::the_entry_buffer_is_bounded_by_max_index_scan_rows ... ok
+test materialization_tests::limit_fetches_only_the_rows_it_returns ... ok
+test parse_tests::escaped_single_quote_in_string_literal_round_trips ... ok
+test parse_tests::comments_are_ignored ... ok
+test parse_tests::hex_string_blob_literal_parses ... ok
+test parse_tests::invalid_syntax_is_rejected_not_panicked ... ok
+test parse_tests::every_supported_statement_family_parses ... ok
+test parse_tests::multiple_statements_via_parse_script ... ok
+test parse_tests::nested_parens_and_precedence ... ok
+test parse_tests::null_boolean_and_number_literals ... ok
+test parse_tests::parameter_placeholders_parse_as_one_based_indices ... ok
+test parse_tests::parse_statement_rejects_empty_input ... ok
+test parse_tests::parse_statement_rejects_more_than_one_statement ... ok
+test parse_tests::quoted_identifiers_preserve_case_unquoted_fold_to_lowercase ... ok
+test parse_tests::schema_qualified_table_name ... ok
+test parse_tests::table_and_column_aliases ... ok
+test parse_tests::typed_date_time_timestamp_literals_parse ... ok
+test parse_tests::unsupported_grammar_is_a_typed_error_not_a_panic ... ok
+test parse_tests::whitespace_and_case_variations_parse_identically ... ok
+test pk_range_benchmark::concurrent_pk_range_readers ... ignored
+test pk_range_benchmark::range_position_at_fixed_table_size_and_width ... ignored
+test pk_range_benchmark::range_width_scaling_at_fixed_table_size ... ignored
+test pk_range_benchmark::table_size_scaling_pk_range_vs_seq_scan ... ignored
+test parse_tests::truncated_sql_is_a_controlled_error ... ok
+test plan_reference_model::matches_reference_model_across_a_fixed_scenario_matrix ... ok
+test plan_tests::concurrent_planning_of_independent_statements_is_race_free ... ok
+test plan_tests::deeply_nested_or_predicate_within_sql_limits_does_not_overflow_the_planner ... ok
+test plan_tests::delete_target_row_falls_back_to_seq_scan_when_unindexed ... ok
+test plan_tests::delete_target_row_uses_a_matching_secondary_index ... ok
+test plan_tests::distinct_is_represented_as_its_own_explicit_node ... ok
+test plan_tests::equality_on_indexed_column_selects_index_scan ... ok
+test plan_tests::explain_output_is_deterministic_and_contains_no_filesystem_path ... ok
+test plan_tests::explain_wraps_the_inner_statements_own_plan ... ok
+test plan_tests::from_less_select_is_an_empty_relation ... ok
+test plan_tests::full_pk_equality_becomes_pk_lookup ... ok
+test plan_tests::identical_input_produces_an_identical_plan_every_time ... ok
+test plan_tests::index_narrows_but_residual_predicate_is_preserved ... ok
+test plan_tests::inner_and_left_join_kinds_are_preserved ... ok
+test plan_tests::inner_join_predicate_on_either_side_may_be_pushed ... ok
+test plan_tests::insert_ddl_and_transaction_control_are_carried_through_unchanged ... ok
+test plan_tests::is_null_predicate_is_never_treated_as_an_equality_lookup_key ... ok
+test plan_tests::join_on_inner_pk_selects_index_nested_loop ... ok
+test plan_tests::join_with_no_usable_inner_index_selects_plain_nested_loop ... ok
+test plan_tests::left_join_predicate_on_nullable_side_is_never_pushed_into_its_scan ... ok
+test plan_tests::limit_above_a_join_is_never_marked_pushable ... ok
+test plan_tests::limit_above_sort_is_never_marked_pushable ... ok
+test plan_tests::limit_directly_above_a_scan_is_marked_pushable ... ok
+test plan_reference_model::matches_reference_model_for_randomized_predicate_and_index_shapes ... ok
+test plan_tests::logical_required_columns_excludes_unreferenced_column ... ok
+test plan_tests::many_and_conjuncts_within_default_limits_plan_successfully ... ok
+test plan_tests::max_joins_limit_is_enforced ... ok
+test plan_tests::max_predicate_conjuncts_limit_is_enforced ... ok
+test plan_tests::metrics_record_plan_shape_choices ... ok
+test plan_tests::partial_composite_pk_equality_becomes_a_prefix_pk_range_scan ... ok
+test plan_tests::partial_composite_pk_equality_never_becomes_a_point_lookup ... ok
+test plan_tests::pk_lookup_preserves_parameter_reference_unevaluated ... ok
+test plan_tests::pk_range_on_single_column_primary_key_builds_pk_range_scan ... ok
+test plan_tests::pk_range_with_only_a_lower_bound_leaves_the_upper_bound_unbounded ... ok
+test plan_tests::primary_kind_catalog_index_is_never_selected_as_an_index_scan ... ok
+test plan_tests::range_predicate_on_indexed_column_builds_index_range_scan ... ok
+test plan_tests::required_columns_include_projection_and_filter_but_not_unused_columns ... ok
+test plan_tests::single_table_predicate_is_fully_pushed_no_residual_filter_node ... ok
+test plan_tests::sort_is_eliminated_when_index_scan_already_provides_matching_ascending_order ... ok
+test plan_tests::sort_is_eliminated_when_pk_lookup_returns_at_most_one_row ... ok
+test plan_tests::sort_is_retained_for_descending_order_no_reverse_scan_primitive_exists ... ok
+test plan_tests::sort_is_retained_for_the_sql_standard_default_nulls_last_ascending ... ok
+test plan_tests::sort_is_retained_when_no_matching_index_exists ... ok
+test plan_tests::unindexed_predicate_falls_back_to_seq_scan_never_a_partial_index_plan ... ok
+test plan_tests::update_target_row_uses_the_same_pk_lookup_detection_as_select ... ok
+test reference_model::matrix_of_qualified_unqualified_ambiguous_and_unknown_references ... ok
+test security_tests::case_folding_cannot_be_used_to_bypass_authorization ... ok
+test security_tests::identifier_injection_is_isolated_by_quoting_never_executed ... ok
+test security_tests::injection_payloads_as_literal_values_are_inert_text_never_reparsed ... ok
+test security_tests::injection_payloads_as_parameters_never_reach_sql_grammar ... ok
+test security_tests::joining_an_authorized_table_cannot_leak_an_unauthorized_ones_columns ... ok
+test security_tests::physical_ids_are_never_accepted_as_client_input ... ok
+test security_tests::quoted_identifier_naming_the_same_table_cannot_bypass_authorization ... ok
+test security_tests::schema_qualification_cannot_bypass_authorization ... ok
+test security_tests::semicolon_stacked_queries_are_rejected_by_parse_statement ... ok
+test security_tests::table_alias_cannot_bypass_authorization ... ok
+test security_tests::wildcard_expansion_cannot_bypass_authorization ... ok
+test temporal::tests::epoch_date_is_day_zero ... ok
+test temporal::tests::known_dates_round_trip_to_expected_day_counts ... ok
+test temporal::tests::rejects_invalid_calendar_dates_without_panicking ... ok
+test temporal::tests::rejects_invalid_times_without_panicking ... ok
+test temporal::tests::rejects_malformed_timestamp_without_panicking ... ok
+test temporal::tests::time_round_trips_with_and_without_fraction ... ok
+test temporal::tests::timestamp_combines_date_and_time ... ok
+test txn_scan_tests::autocommit_and_other_snapshots_never_see_uncommitted_writes ... ok
+test txn_scan_tests::deleted_row_disappears_from_every_scan ... ok
+test txn_scan_tests::insert_update_delete_sequences_collapse_correctly ... ok
+test txn_scan_tests::inserted_row_is_visible_to_every_scan ... ok
+test reference_model::production_binder_matches_independent_model_for_generated_queries ... ok
+test aggregate_reference_model::matches_reference_model_for_random_tables ... ok
+test txn_scan_tests::update_and_delete_find_rows_inserted_by_the_same_transaction ... ok
+test txn_scan_tests::updated_row_is_visible_to_every_scan_under_its_new_value_only ... ok
+test write_tests::concurrent_delete_same_row_exactly_one_wins_barrier ... ok
+test write_tests::concurrent_insert_distinct_pks_all_succeed ... ok
+test write_tests::concurrent_insert_same_pk_exactly_one_wins_barrier ... ok
+test write_tests::concurrent_update_same_row_exactly_one_wins_barrier ... ok
+test write_tests::create_database_is_a_controlled_unsupported_error_not_a_fake_success ... ok
+test write_tests::create_index_via_ddl_reuses_the_online_index_builder ... ok
+test write_tests::create_schema_create_table_insert_select_end_to_end ... ok
+test write_tests::create_table_if_not_exists_on_duplicate_is_a_clean_noop ... ok
+test write_tests::create_table_without_if_not_exists_on_duplicate_errors ... ok
+test write_tests::ddl_and_dml_survive_restart_together ... ok
+test write_tests::delete_multiplicity_matches_exactly_the_predicate ... ok
+test write_tests::delete_over_a_pk_range_never_under_or_over_deletes ... ok
+test write_tests::delete_single_row_removes_it_and_its_index_entries ... ok
+test write_tests::delete_zero_matches_reports_zero_and_changes_nothing ... ok
+test write_tests::differential::matches_reference_model_for_a_generated_insert_update_delete_sequence ... ok
+test write_tests::drop_index_removes_entries_and_stops_maintenance ... ok
+test write_tests::drop_table_makes_it_immediately_inaccessible ... ok
+test write_tests::insert_column_subset_reordered_maps_to_correct_ordinals ... ok
+test write_tests::insert_multi_row_is_atomic_and_all_visible ... ok
+test write_tests::insert_null_into_nullable_column_stores_null ... ok
+test write_tests::insert_null_primary_key_is_rejected ... ok
+test write_tests::insert_omitted_default_column_gets_its_declared_default_end_to_end ... ok
+test write_tests::insert_secondary_index_entry_is_maintained_atomically ... ok
+test write_tests::insert_single_row_is_visible_to_a_later_select ... ok
+test write_tests::mass_delete_beyond_max_dml_target_rows_fails_closed ... ok
+test write_tests::metrics_record_statement_and_row_counts ... ok
+test write_tests::metrics_record_write_conflict_not_a_silent_success ... ok
+test write_tests::other_transaction_does_not_see_uncommitted_insert ... ok
+test write_tests::primary_key_conflict_exactly_one_committer_wins ... ok
+test write_tests::read_only_plan_is_rejected_by_the_write_executor ... ok
+test write_tests::read_your_own_writes_insert_then_select_same_transaction ... ok
+test write_tests::rollback_insert_leaves_no_trace ... ok
+test write_tests::rollback_update_and_delete_leave_no_trace ... ok
+test write_tests::unauthorized_insert_is_rejected_at_bind_time_never_reaches_execution ... ok
+test write_tests::unique_conflict_exactly_one_committer_wins ... ok
+test write_tests::update_indexed_column_moves_the_index_entry ... ok
+test write_tests::update_matching_multiple_rows_via_predicate ... ok
+test write_tests::update_no_op_when_value_unchanged_still_counts_as_matched ... ok
+test write_tests::update_non_indexed_column ... ok
+test write_tests::update_over_a_pk_range_never_under_or_over_updates ... ok
+test write_tests::update_primary_key_column_is_rejected_end_to_end ... ok
+test write_tests::update_residual_predicate_is_still_applied ... ok
+test write_tests::update_unique_column_to_an_existing_value_conflicts ... ok
+test aggregate_reference_model::matches_reference_model_for_high_cardinality_groups ... ok
+test write_tests::writes_remain_correct_during_automatic_compaction ... ok
+test exec_tests::high_cardinality_group_by_produces_correct_group_count_and_sums has been running for over 60 seconds
+test exec_tests::high_cardinality_group_by_produces_correct_group_count_and_sums ... ok
+test index_read_differential_tests::f2_property_heavy_rebuild_churn_with_open_snapshots has been running for over 60 seconds
+test index_read_differential_tests::f2_property_heavy_rebuild_churn_with_open_snapshots ... ok
+test index_read_differential_tests::index_reads_match_reference_model has been running for over 60 seconds
+test index_read_differential_tests::index_reads_match_reference_model ... ok
+test index_read_differential_tests::index_reads_match_reference_model_fixed_seeds_long has been running for over 60 seconds
+test index_read_differential_tests::index_reads_match_reference_model_fixed_seeds_long ... ok
+test txn_scan_tests::transaction_scan_property_fixed_seeds_long ... ok
+test txn_scan_tests::transaction_scans_equal_base_plus_local_writes ... ok
+
+test result: ok. 335 passed; 0 failed; 22 ignored; 0 measured; 0 filtered out; finished in 97.16s
+
+     Running tests\write_crash_consistency.rs (target\debug\deps\write_crash_consistency-4aa3e61c159549ce.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rubixdb
+
+running 1 test
+test src\wal\mod.rs - wal (line 23) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rubixdb_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rubixdb_instance
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rubixdb_sql
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,118 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src\lib.rs (target\debug\deps\rubixdb-a4a03cbe9d003f3d.exe)
+
+running 50 tests
+test ops::integration_tests::a_dangling_catalog_reference_is_detected ... ok
+test ops::integration_tests::a_noncanonical_or_undecodable_row_key_is_detected ... ok
+test ops::integration_tests::a_corrupt_row_value_is_detected_even_though_no_query_touches_it ... FAILED
+test ops::integration_tests::a_dangling_index_entry_is_detected ... ok
+test ops::integration_tests::a_missing_index_entry_is_detected ... ok
+test ops::integration_tests::an_undecodable_catalog_row_and_a_lagging_counter_are_detected ... ok
+test ops::integration_tests::a_unique_index_violation_is_detected ... FAILED
+test ops::integration_tests::a_database_with_no_catalog_at_all_round_trips ... FAILED
+test ops::integration_tests::empty_database_round_trips ... FAILED
+test ops::integration_tests::backup_contains_no_paths_or_secrets ... FAILED
+test ops::integration_tests::backup_never_overwrites_and_leaves_no_partial_file ... ok
+test ops::integration_tests::a_stale_index_entry_is_detected ... ok
+test ops::integration_tests::every_single_byte_flip_and_every_truncation_is_detected ... FAILED
+test ops::integration_tests::restore_into_an_existing_empty_directory_works ... ok
+test ops::integration_tests::purge_never_touches_live_tables_or_ids_above_the_counter ... ok
+test ops::integration_tests::read_backup_visitor_sees_entries_in_strict_order ... ok
+test ops::integration_tests::restore_refuses_a_non_empty_destination_and_changes_nothing ... ok
+test ops::integration_tests::purge_is_a_dry_run_by_default_and_requires_the_confirmed_count ... ok
+test ops::tests::names_accept_plain_and_reject_traversal ... ok
+test ops::tests::unique_ids_do_not_repeat ... ok
+test wal::ops::tests::checkpoint_marker_round_trip ... ok
+test wal::ops::tests::decode_rejects_checkpoint_marker_with_wrong_length ... ok
+test wal::ops::tests::decode_rejects_delete_with_trailing_byte ... ok
+test wal::ops::tests::decode_rejects_engine_switch ... ok
+test wal::ops::tests::decode_rejects_put_with_trailing_byte ... ok
+test wal::ops::tests::decode_rejects_unknown_op ... ok
+test wal::ops::tests::delete_round_trip ... ok
+test wal::ops::tests::empty_value_put_round_trips ... ok
+test wal::ops::tests::encode_rejects_oversized_key_with_capacity_exceeded ... ok
+test wal::ops::tests::frame_header_encodes_correct_length_and_crc ... ok
+test wal::ops::tests::group_decode_rejects_checkpoint_marker_tag_as_member ... ok
+test wal::ops::tests::group_decode_rejects_nested_group_tag ... ok
+test wal::ops::tests::group_decode_rejects_oversized_member_count_gracefully ... ok
+test wal::ops::tests::group_decode_rejects_oversized_member_count_with_leftover_garbage ... ok
+test wal::ops::tests::group_decode_rejects_trailing_bytes_after_members ... ok
+test wal::ops::tests::group_empty_members_round_trips_at_the_wal_layer ... ok
+test wal::ops::tests::group_encode_rejects_oversized_member_key_with_capacity_exceeded ... ok
+test wal::ops::tests::group_round_trip_at_ten_thousand_members ... ok
+test wal::ops::tests::group_round_trip_many_members_mixed_put_delete ... ok
+test wal::ops::tests::group_round_trip_single_member ... ok
+test wal::ops::tests::group_wire_format_is_exactly_count_then_tag_and_body_per_member ... ok
+test wal::ops::tests::put_round_trip ... ok
+test wal::ops::tests::wire_format_is_byte_for_byte_unchanged ... ok
+test ops::integration_tests::stale_staging_from_a_crashed_restore_is_cleaned_only_when_marked ... FAILED
+test ops::integration_tests::a_populated_database_checks_clean_but_reports_orphan_data_as_a_warning ... ok
+test ops::integration_tests::wrong_magic_and_unknown_version_are_classified ... ok
+test ops::integration_tests::the_checker_is_consistent_at_one_snapshot_while_writers_run ... ok
+test ops::integration_tests::backup_restore_round_trip_matches_independent_model ... ok
+test ops::integration_tests::cancelled_backup_leaves_nothing_behind ... FAILED
+test ops::integration_tests::a_failure_at_every_restore_phase_leaves_no_destination_and_no_staging ... FAILED
+
+failures:
+
+---- ops::integration_tests::a_corrupt_row_value_is_detected_even_though_no_query_touches_it stdout ----
+
+thread 'ops::integration_tests::a_corrupt_row_value_is_detected_even_though_no_query_touches_it' (25964) panicked at src\ops\integration_tests.rs:623:5:
+assertion failed: codes_of(&db.engine).contains(&fc::ROW_VALUE_UNDECODABLE)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- ops::integration_tests::a_unique_index_violation_is_detected stdout ----
+
+thread 'ops::integration_tests::a_unique_index_violation_is_detected' (12364) panicked at src\ops\integration_tests.rs:695:5:
+["ORPHAN_TABLE_DATA"]
+
+---- ops::integration_tests::a_database_with_no_catalog_at_all_round_trips stdout ----
+
+thread 'ops::integration_tests::a_database_with_no_catalog_at_all_round_trips' (14876) panicked at src\ops\integration_tests.rs:346:59:
+called `Result::unwrap()` on an `Err` value: OpsError { code: "DESTINATION_EXISTS", detail: "backup destination C:\\Users\\Ruby\\AppData\\Local\\Temp\\raw_15.rbxbackup already exists" }
+
+---- ops::integration_tests::empty_database_round_trips stdout ----
+
+thread 'ops::integration_tests::empty_database_round_trips' (16540) panicked at src\ops\integration_tests.rs:268:65:
+called `Result::unwrap()` on an `Err` value: OpsError { code: "DESTINATION_EXISTS", detail: "backup destination C:\\Users\\Ruby\\AppData\\Local\\Temp\\empty_17.rbxbackup already exists" }
+
+---- ops::integration_tests::backup_contains_no_paths_or_secrets stdout ----
+
+thread 'ops::integration_tests::backup_contains_no_paths_or_secrets' (23468) panicked at src\ops\integration_tests.rs:268:65:
+called `Result::unwrap()` on an `Err` value: OpsError { code: "DESTINATION_EXISTS", detail: "backup destination C:\\Users\\Ruby\\AppData\\Local\\Temp\\sec_19.rbxbackup already exists" }
+
+---- ops::integration_tests::every_single_byte_flip_and_every_truncation_is_detected stdout ----
+
+thread 'ops::integration_tests::every_single_byte_flip_and_every_truncation_is_detected' (4436) panicked at src\ops\integration_tests.rs:268:65:
+called `Result::unwrap()` on an `Err` value: OpsError { code: "DESTINATION_EXISTS", detail: "backup destination C:\\Users\\Ruby\\AppData\\Local\\Temp\\flip_24.rbxbackup already exists" }
+
+---- ops::integration_tests::stale_staging_from_a_crashed_restore_is_cleaned_only_when_marked stdout ----
+
+thread 'ops::integration_tests::stale_staging_from_a_crashed_restore_is_cleaned_only_when_marked' (9820) panicked at src\ops\integration_tests.rs:268:65:
+called `Result::unwrap()` on an `Err` value: OpsError { code: "DESTINATION_EXISTS", detail: "backup destination C:\\Users\\Ruby\\AppData\\Local\\Temp\\st_36.rbxbackup already exists" }
+
+---- ops::integration_tests::cancelled_backup_leaves_nothing_behind stdout ----
+
+thread 'ops::integration_tests::cancelled_backup_leaves_nothing_behind' (18084) panicked at src\ops\integration_tests.rs:441:108:
+called `Result::unwrap_err()` on an `Ok` value: BackupReport { path: "C:\\Users\\Ruby\\AppData\\Local\\Temp\\cancel_43.rbxbackup", backup_id: "30df58fd1445ac4c9be207b35e761f53", snapshot_seq: 1217, entries: 2487, chunks: 1, payload_bytes: 1044549, file_bytes: 1044843, content_digest: 5566646073922086082, duration: 119.0986ms }
+
+---- ops::integration_tests::a_failure_at_every_restore_phase_leaves_no_destination_and_no_staging stdout ----
+
+thread 'ops::integration_tests::a_failure_at_every_restore_phase_leaves_no_destination_and_no_staging' (14416) panicked at src\ops\integration_tests.rs:520:9:
+staging must be cleaned after a failure at MarkerRemoved: [DirEntry("C:\\Users\\Ruby\\AppData\\Local\\Temp\\rubixdb_ops_phase_dst_1791040294777015300_51\\.r.restoring-bd735cd0e745a07c334c471900e11b17")]
+
+
+failures:
+    ops::integration_tests::a_corrupt_row_value_is_detected_even_though_no_query_touches_it
+    ops::integration_tests::a_database_with_no_catalog_at_all_round_trips
+    ops::integration_tests::a_failure_at_every_restore_phase_leaves_no_destination_and_no_staging
+    ops::integration_tests::a_unique_index_violation_is_detected
+    ops::integration_tests::backup_contains_no_paths_or_secrets
+    ops::integration_tests::cancelled_backup_leaves_nothing_behind
+    ops::integration_tests::empty_database_round_trips
+    ops::integration_tests::every_single_byte_flip_and_every_truncation_is_detected
+    ops::integration_tests::stale_staging_from_a_crashed_restore_is_cleaned_only_when_marked
+
+test result: FAILED. 41 passed; 9 failed; 0 ignored; 0 measured; 534 filtered out; finished in 22.83s
+
+error: test failed, to rerun pass `--lib`

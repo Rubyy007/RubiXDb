@@ -192,6 +192,53 @@ impl Connection {
         }
     }
 
+    /// One authenticated JSON request to an operator endpoint (`/v1/admin/*`).
+    /// Long-running operations (backup, check) get a one-hour client-side
+    /// backstop; the server enforces its own bounds.
+    pub fn admin_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, CliError> {
+        let mut req = self
+            .http
+            .request(method, format!("{}{path}", self.base_url))
+            .bearer_auth(&self.api_key)
+            .timeout(std::time::Duration::from_secs(3600));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let response = req.send().map_err(|e| CliError::Transport(e.to_string()))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .map_err(|e| CliError::Transport(e.to_string()))?;
+        if status.is_success() {
+            serde_json::from_str(&text).map_err(|e| CliError::Decode(e.to_string()))
+        } else {
+            match serde_json::from_str::<ApiErrorBody>(&text) {
+                Ok(ApiErrorBody {
+                    error:
+                        ApiErrorDetail {
+                            code,
+                            message,
+                            detail,
+                        },
+                }) => Err(CliError::Api {
+                    status: status.as_u16(),
+                    code,
+                    message,
+                    detail,
+                }),
+                Err(_) => Err(CliError::MalformedErrorBody {
+                    status: status.as_u16(),
+                    raw: text,
+                }),
+            }
+        }
+    }
+
     pub fn whoami(&self) -> Result<Value, CliError> {
         self.get_json("/v1/whoami")
     }

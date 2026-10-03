@@ -22,6 +22,7 @@ mod gui;
 mod host;
 mod instance_cmd;
 mod meta;
+mod ops_cmd;
 mod protocol;
 mod render;
 mod repl;
@@ -41,6 +42,7 @@ USAGE:
     rubixdb cli                 same as bare `rubixdb` below (explicit alias)
     rubixdb instance list       list known local instances
     rubixdb instance status     show one instance's state
+    rubixdb status|check|backup|restore|storage|maintenance   operator commands (rubixdb backup --help)
 
     rubixdb                     interactive SQL client (auto-connects to the
                                  local instance, starting one if none exists)
@@ -198,6 +200,7 @@ fn main() {
     match args.first().map(|s| s.as_str()) {
         Some("gui") => std::process::exit(gui::run(&args[1..])),
         Some("instance") => std::process::exit(instance_cmd::run(&args[1..])),
+        first if ops_cmd::is_ops_command(first) => std::process::exit(ops_cmd::run(&args)),
         Some("cli") => std::process::exit(run_client(&args[1..])),
         _ => std::process::exit(run_client(&args)),
     }

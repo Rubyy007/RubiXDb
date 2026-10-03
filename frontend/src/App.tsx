@@ -8,6 +8,7 @@ import { ExplorerPage } from "./pages/ExplorerPage";
 import { SnapshotsPage } from "./pages/SnapshotsPage";
 import { CompactionPage } from "./pages/CompactionPage";
 import { HealthPage } from "./pages/HealthPage";
+import { OperationsPage } from "./pages/OperationsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { SqlConsolePage } from "./pages/SqlConsolePage";
 
@@ -34,6 +35,7 @@ export function App() {
         <Route path="/snapshots" element={<SnapshotsPage />} />
         <Route path="/compaction" element={<CompactionPage />} />
         <Route path="/health" element={<HealthPage />} />
+        <Route path="/operations" element={<OperationsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

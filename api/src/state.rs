@@ -104,6 +104,21 @@ impl SqlContext {
     }
 }
 
+/// One-at-a-time guards and last-result memory for administrative
+/// operations (`/v1/admin/*`). Bounded: a fixed number of flags, counters and
+/// two small result records — nothing grows with request volume.
+#[derive(Default)]
+pub struct AdminOps {
+    pub backup_running: std::sync::atomic::AtomicBool,
+    pub check_running: std::sync::atomic::AtomicBool,
+    pub maintenance_running: std::sync::atomic::AtomicBool,
+    pub backups_ok: std::sync::atomic::AtomicU64,
+    pub backups_failed: std::sync::atomic::AtomicU64,
+    pub checks_run: std::sync::atomic::AtomicU64,
+    pub last_backup: Mutex<Option<serde_json::Value>>,
+    pub last_check: Mutex<Option<serde_json::Value>>,
+}
+
 pub struct AppState {
     pub engine: Arc<LsmEngine>,
     pub config: Config,
@@ -118,6 +133,7 @@ pub struct AppState {
     pub metrics: ServiceMetrics,
     pub sql: SqlContext,
     pub started_at: SystemTime,
+    pub admin: AdminOps,
 }
 
 impl AppState {
@@ -174,6 +190,7 @@ impl AppState {
             metrics: ServiceMetrics::default(),
             sql,
             started_at: SystemTime::now(),
+            admin: AdminOps::default(),
         }
     }
 }

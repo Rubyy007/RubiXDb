@@ -1,5 +1,11 @@
 import type {
+  AdminStatusBody,
   ApiErrorBody,
+  BackupCreated,
+  BackupEntry,
+  BackupVerified,
+  CheckResult,
+  PurgeResult,
   CompactionMetricsBody,
   CompactionStatusBody,
   DatabaseInfo,
@@ -220,5 +226,46 @@ export class ApiClient {
       `/v1/catalog/indexes/${indexId}`,
       { schema_name: schemaName, table_name: tableName, index_name: indexName },
     );
+  }
+
+  // ---- operator endpoints (admin role) ----
+
+  adminStatus() {
+    return this.request<AdminStatusBody>("GET", "/v1/admin/status");
+  }
+
+  adminBackups() {
+    return this.request<{ backups: BackupEntry[] }>("GET", "/v1/admin/backups");
+  }
+
+  adminCreateBackup(name: string) {
+    return this.request<BackupCreated>("POST", "/v1/admin/backups", { name });
+  }
+
+  adminVerifyBackup(name: string) {
+    return this.request<BackupVerified>(
+      "POST",
+      `/v1/admin/backups/${encodeURIComponent(name)}/verify`,
+    );
+  }
+
+  /** DESTRUCTIVE. The server requires `confirm` to equal the backup's exact name. */
+  adminDeleteBackup(name: string, confirm: string) {
+    return this.request<{ deleted: string }>(
+      "DELETE",
+      `/v1/admin/backups/${encodeURIComponent(name)}?confirm=${encodeURIComponent(confirm)}`,
+    );
+  }
+
+  adminCheck() {
+    return this.request<CheckResult>("POST", "/v1/admin/check");
+  }
+
+  /** Dry run unless `apply`; `apply` needs the entry count the dry run reported. */
+  adminPurgeOrphans(apply: boolean, expectedEntries?: number) {
+    return this.request<PurgeResult>("POST", "/v1/admin/maintenance/purge-orphans", {
+      apply,
+      expected_entries: expectedEntries ?? null,
+    });
   }
 }

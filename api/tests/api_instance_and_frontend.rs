@@ -64,6 +64,7 @@ fn base_config(data_dir: PathBuf) -> Config {
         instance_id: None,
         instance_name: None,
         frontend_dist: None,
+        backup_dir: None,
     }
 }
 
@@ -161,6 +162,7 @@ async fn with_frontend_dist_static_assets_are_served() {
 
     let config = Config {
         frontend_dist: Some(dist.clone()),
+        backup_dir: None,
         ..base_config(dir.clone())
     };
     let (_state, router) = build_app(&dir, config);
@@ -179,6 +181,7 @@ async fn with_frontend_dist_unmatched_client_route_falls_back_to_index_html() {
 
     let config = Config {
         frontend_dist: Some(dist.clone()),
+        backup_dir: None,
         ..base_config(dir.clone())
     };
     let (_state, router) = build_app(&dir, config);
@@ -200,6 +203,7 @@ async fn frontend_fallback_never_shadows_a_real_protected_api_route() {
 
     let config = Config {
         frontend_dist: Some(dist.clone()),
+        backup_dir: None,
         ..base_config(dir.clone())
     };
     let (_state, router) = build_app(&dir, config);
