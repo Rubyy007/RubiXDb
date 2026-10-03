@@ -1,0 +1,17 @@
+oracle 50 16 511 5000 exit=0 SUMMARY cycles=50 writers=16 failures=0 total_acks_verified=133512 final_recovered=3909486
+oracle 50 100 522 5000 exit=0 SUMMARY cycles=50 writers=100 failures=0 total_acks_verified=305869 final_recovered=10516525
+oracle 40 256 533 5000 exit=0 SUMMARY cycles=40 writers=256 failures=0 total_acks_verified=349022 final_recovered=10464928
+oracle 40 64 544 1000 exit=0 SUMMARY cycles=40 writers=64 failures=0 total_acks_verified=254630 final_recovered=5448193
+oracle 30 8 555 5000 exit=0 SUMMARY cycles=30 writers=8 failures=0 total_acks_verified=67262 final_recovered=1071552
+oracle 30 400 566 5000 exit=0 SUMMARY cycles=30 writers=400 failures=0 total_acks_verified=336819 final_recovered=7364597
+oracle 30 2 577 5000 exit=0 SUMMARY cycles=30 writers=2 failures=0 total_acks_verified=15858 final_recovered=245278
+oracle 30 1 588 5000 exit=0 SUMMARY cycles=30 writers=1 failures=0 total_acks_verified=8761 final_recovered=136090
+crash_cycle_test 40 16 642 exit=0 cycles=40 gap_free_false=0 corrupt_nonzero=0
+crash_cycle_test 40 100 607 exit=0 cycles=40 gap_free_false=0 corrupt_nonzero=0
+crash_cycle_test 30 256 1534 exit=0 cycles=30 gap_free_false=0 corrupt_nonzero=0
+crash_cycle_test 30 600 199 exit=0 cycles=30 gap_free_false=0 corrupt_nonzero=0
+lsm16 exit=0 lsm_crash_cycle_test: SUMMARY cycles=40 successful=40 failed=0 final_highest_seq=49840 final_durable_through=49840 total_read_mismatches=0
+lsm100 exit=0 lsm_crash_cycle_test: SUMMARY cycles=30 successful=30 failed=0 final_highest_seq=100173 final_durable_through=100173 total_read_mismatches=0
+mutant 30 400 61: failing cycles=14 of 30
+mutant 30 100 62: failing cycles=13 of 30
+DONE

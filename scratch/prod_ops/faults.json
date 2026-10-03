@@ -1,0 +1,97 @@
+[
+ {
+  "scenario": "F1 backup into a directory the process cannot write: safe error, nothing left",
+  "ok": true,
+  "detail": "HTTP 500 IO leftovers=[]"
+ },
+ {
+  "scenario": "F1b backup works again after the permission is restored",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "scenario": "F2 restore into a directory the process cannot write: non-zero exit, no destination, no staging",
+  "ok": true,
+  "detail": "exit 2: RECOVERY  restoring C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_fault_mz17mtb0\\perm\\backups\\good.rbxbackup into a fresh database (never overwrites)"
+ },
+ {
+  "scenario": "F3a offline check reports a missing SSTable (exit 2, SSTABLE_MISSING)",
+  "ok": true,
+  "detail": "exit 2"
+ },
+ {
+  "scenario": "F3b startup refuses (fails closed) and leaves the directory untouched",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "scenario": "F4 corrupt WAL segment: check reports WAL_CORRUPT, startup refuses, directory untouched",
+  "ok": true,
+  "detail": "check exit 2"
+ },
+ {
+  "scenario": "F5a recovery path: restore the verified backup over the destroyed instance directory (fresh data dir)",
+  "ok": true,
+  "detail": "egrity: 0 error(s), 0 warning(s)\n  credentials are not part of a backup: a new instance generates its own on first start"
+ },
+ {
+  "scenario": "F5b data directory from a newer format: startup refuses and the directory is untouched",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "scenario": "F5c after removing the foreign marker the restored database serves all its rows",
+  "ok": true,
+  "detail": "rows=10000"
+ },
+ {
+  "scenario": "F6 restore from a corrupted backup: non-zero exit, nothing created",
+  "ok": true,
+  "detail": "exit 2: RECOVERY  restoring C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_fault_mz17mtb0\\bad.rbxbackup into a fresh database (never overw"
+ },
+ {
+  "scenario": "F7 restore from a missing backup file: non-zero exit, nothing created",
+  "ok": true,
+  "detail": "exit 2: RECOVERY  restoring C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_fault_mz17mtb0\\nope.rbxbackup into a fresh "
+ },
+ {
+  "scenario": "F8 kill during compaction/flush pressure x8: no acknowledged write lost, integrity clean",
+  "ok": true,
+  "detail": "bad=[] acked_total=44097"
+ },
+ {
+  "scenario": "F9 kill during CREATE INDEX x6: never corrupt; leftovers recoverable; a final build completes and checks clean",
+  "ok": true,
+  "detail": "problems=[] final_check=0 cat-7 rows=12000 kills_mid_build=4/4"
+ },
+ {
+  "scenario": "F13 backup taken during CREATE INDEX restores into a consistent database (index recovered or complete; reads agree)",
+  "ok": true,
+  "detail": "backup_caught_index_Building=True at_start={'big_pkey': 'ready', 'big_cat_final': 'ready', 'big_grp': 'building'} final={'big_pkey': 'ready', 'big_cat_final': 'ready', 'big_grp': 'ready'} check_exit=0 count=600000 grp7=6000"
+ },
+ {
+  "scenario": "F10 graceful stop under 6 writers: exit code 0, bounded time, every acknowledged write present after restart",
+  "ok": true,
+  "detail": "exit=0 stop=0.09s acked=962 lost=0 unknown=6"
+ },
+ {
+  "scenario": "F11 statement deadline expires: TIMEOUT error (not success), server stays healthy, memory bounded",
+  "ok": true,
+  "detail": "(504, 'TIMEOUT') after 30.0s; timeouts counter=1; rss 18->20 MB"
+ },
+ {
+  "scenario": "F12 invalid configuration: non-zero exit with a clear message and the existing directory untouched",
+  "ok": true,
+  "detail": "bad=[]"
+ },
+ {
+  "scenario": "F12b an invalid configuration does not create the data directory",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "scenario": "F14 real disk-full (ENOSPC) during backup/restore",
+  "ok": null,
+  "detail": "NOT TESTED: no elevation/VHD available; covered only by the injected StorageFull seam (unit test a_full_volume_during_backup...) and the engine's certified ENOSPC handling"
+ }
+]

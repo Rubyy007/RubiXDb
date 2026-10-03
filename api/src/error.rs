@@ -45,6 +45,14 @@ pub enum ApiError {
     /// race (`routes::sql`'s cancellation-on-drop guard), not only from
     /// the executor's internal check.
     SqlDeadlineExceeded,
+    /// Operator/administrative operations (`/v1/admin/*`): a stable code
+    /// chosen by the handler, with a message that never carries a filesystem
+    /// path, credential or user data.
+    Admin {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl From<EngineError> for ApiError {
@@ -185,6 +193,11 @@ impl ApiError {
                 Some(detail.clone()),
             ),
             ApiError::Sql(sql_err) => sql_error_parts(sql_err),
+            ApiError::Admin {
+                status,
+                code,
+                message,
+            } => (*status, code, message.clone(), None),
             ApiError::SqlSessionNotFound => (
                 StatusCode::NOT_FOUND,
                 "SESSION_NOT_FOUND",

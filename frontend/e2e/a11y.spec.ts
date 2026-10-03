@@ -35,6 +35,7 @@ const SCREENS: { path: string; label: string }[] = [
   { path: "/snapshots", label: "Snapshots" },
   { path: "/compaction", label: "Compaction" },
   { path: "/health", label: "Health / Storage" },
+  { path: "/operations", label: "Operations" },
   { path: "/settings", label: "Settings" },
 ];
 

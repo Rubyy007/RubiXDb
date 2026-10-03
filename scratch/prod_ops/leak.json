@@ -1,0 +1,116 @@
+{
+ "queries_final_active_txns": 0,
+ "queries_and_transactions": {
+  "n_samples": 15,
+  "ops": 30000,
+  "rss_mb": {
+   "first": 11.390976,
+   "last": 12.967936,
+   "max": 12.967936,
+   "min": 11.390976,
+   "slope_per_1000_ops": 0.05507657142857144
+  },
+  "threads": {
+   "first": 18,
+   "last": 15,
+   "max": 18,
+   "min": 15,
+   "slope_per_1000_ops": -0.13392857142857142
+  },
+  "handles": {
+   "first": 111,
+   "last": 111,
+   "max": 111,
+   "min": 111,
+   "slope_per_1000_ops": 0.0
+  },
+  "sockets": {
+   "first": 2,
+   "last": 2,
+   "max": 2,
+   "min": 2,
+   "slope_per_1000_ops": 0.0
+  }
+ },
+ "cli_leftover_rubixdb_processes_max": 0,
+ "cli_sessions": {
+  "n_samples": 12,
+  "ops": 300,
+  "rss_mb": {
+   "first": 10.702848,
+   "last": 10.77248,
+   "max": 10.77248,
+   "min": 10.702848,
+   "slope_per_1000_ops": 0.2835692307692304
+  },
+  "threads": {
+   "first": 18,
+   "last": 18,
+   "max": 18,
+   "min": 18,
+   "slope_per_1000_ops": 0.0
+  },
+  "handles": {
+   "first": 109,
+   "last": 111,
+   "max": 111,
+   "min": 109,
+   "slope_per_1000_ops": 10.06993006993007
+  },
+  "sockets": {
+   "first": 2,
+   "last": 2,
+   "max": 2,
+   "min": 2,
+   "slope_per_1000_ops": 0.0
+  }
+ },
+ "start_stop": {
+  "cycles": 25,
+  "ready_s_first": 0.07892340002581477,
+  "ready_s_last": 0.506026899907738,
+  "ready_s_max": 0.5316436000866815,
+  "files_first": 7,
+  "files_last": 7,
+  "files_max": 7,
+  "leftover_processes_max": 0,
+  "listening_ports_after_stop_max": 0,
+  "dir_mb_first": 0.000754,
+  "dir_mb_last": 0.002122
+ },
+ "backup_restore_stray_staging_or_partial_max": 0,
+ "backup_restore_backups_left": 0,
+ "backup_restore_cycles": {
+  "n_samples": 15,
+  "ops": 15,
+  "rss_mb": {
+   "first": 12.619776,
+   "last": 12.611584,
+   "max": 12.619776,
+   "min": 12.427264,
+   "slope_per_1000_ops": 5.909942857142925
+  },
+  "threads": {
+   "first": 18,
+   "last": 18,
+   "max": 18,
+   "min": 18,
+   "slope_per_1000_ops": 0.0
+  },
+  "handles": {
+   "first": 109,
+   "last": 109,
+   "max": 109,
+   "min": 109,
+   "slope_per_1000_ops": 0.0
+  },
+  "sockets": {
+   "first": 2,
+   "last": 2,
+   "max": 2,
+   "min": 2,
+   "slope_per_1000_ops": 0.0
+  }
+ },
+ "duration_s": 68.13271164894104
+}

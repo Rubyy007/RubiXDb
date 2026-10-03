@@ -59,6 +59,15 @@ async fn main() {
         listen_addr = %config.listen_addr,
         "opening engine"
     );
+    // Refuse a data directory written by an incompatible build BEFORE the
+    // engine (and therefore recovery) touches it.
+    let format_state = match rubixdb::ops::format::startup_guard(&config.data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rubixdb-api: startup failed: {e}");
+            std::process::exit(1);
+        }
+    };
     let engine = match LsmEngine::open(
         &config.data_dir,
         wal_config(),
@@ -73,11 +82,24 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if let Err(e) = rubixdb::ops::format::stamp_if_fresh(&config.data_dir, format_state) {
+        eprintln!("rubixdb-api: could not write the data-format marker: {e}");
+        std::process::exit(1);
+    }
     tracing::info!("engine opened OK");
 
     let shutdown_drain = Duration::from_secs(config.shutdown_drain_secs);
     let state = Arc::new(AppState::new(engine, lsm_config, config));
-    recover_incomplete_index_operations(&state);
+    // See the identical block in `cli/src/host.rs`: index-build recovery runs
+    // after the server is serving (measured 21-35 s on 600k rows), and
+    // graceful shutdown joins it before the engine stops.
+    let recovery = {
+        let st = state.clone();
+        std::thread::Builder::new()
+            .name("rubixdb-index-recovery".to_string())
+            .spawn(move || recover_incomplete_index_operations(&st))
+            .ok()
+    };
     let listen_addr = state.config.listen_addr;
     let router = build_router(state.clone());
 
@@ -103,6 +125,12 @@ async fn main() {
     // Amendment 1 §A3: an in-progress compaction cycle always
     // completes; the flush thread's own sequence is unchanged).
     tracing::info!("draining complete, shutting down engine");
+    if let Some(handle) = recovery {
+        if !handle.is_finished() {
+            tracing::warn!("waiting for interrupted index recovery to finish before shutting down");
+        }
+        let _ = handle.join();
+    }
     let report = state.engine.shutdown();
     tracing::info!(?report.pool_state, fully_drained = report.fully_drained, "engine shutdown complete");
 }
@@ -156,6 +184,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = rubixdb_api::shutdown::wait_requested() => {},
     }
     tracing::info!("shutdown signal received, draining in-flight requests");
 }

@@ -1,0 +1,144 @@
+{
+ "steps": [
+  {
+   "step": "start fresh instance",
+   "ok": true,
+   "detail": "0.43s to first authenticated query"
+  },
+  {
+   "step": "create schemas, tables, indexes",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "step": "insert realistic data",
+   "ok": true,
+   "detail": "24000 rows in 6.0s"
+  },
+  {
+   "step": "after load: every row of every table equals the independent model",
+   "ok": true,
+   "detail": "0 mismatches []"
+  },
+  {
+   "step": "queries (count, index lookup, join, group by) match the model",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "step": "transactions: commit applied, rollback discarded",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "step": "after updates and deletes: every row of every table equals the independent model",
+   "ok": true,
+   "detail": "0 mismatches []"
+  },
+  {
+   "step": "compaction ran",
+   "ok": true,
+   "detail": "cycles=1"
+  },
+  {
+   "step": "backup #1 (CLI)",
+   "ok": true,
+   "detail": "SAFE  backup \"first\" created\n      id=af58a095901581e154006c7aad1c6115 snapshot_seq=1796 entries=53858 size=25.3 MiB digest=27911c0bad1d20d4 in 176 ms"
+  },
+  {
+   "step": "backup #1 verifies",
+   "ok": true,
+   "detail": "INSPECTION  backup \"first\" verified OK\n      format v1 id=af58a095901581e154006c7aad1c6115 snapshot_seq=1796 entries=53858 chunks=26 tables=5"
+  },
+  {
+   "step": "killed the instance mid-write",
+   "ok": true,
+   "detail": "758 acknowledged, 6 outcome-unknown"
+  },
+  {
+   "step": "restart after kill -9",
+   "ok": true,
+   "detail": "0.52s to first authenticated query"
+  },
+  {
+   "step": "after crash recovery (every acknowledged write present, nothing else): every row of every table equals the independent model",
+   "ok": true,
+   "detail": "0 mismatches []"
+  },
+  {
+   "step": "integrity check after crash recovery",
+   "ok": true,
+   "detail": "INSPECTION  online logical check at one snapshot (instance prod is running)\nresult: 0 error(s), 0 warning(s), check complete"
+  },
+  {
+   "step": "backup #2 (CLI)",
+   "ok": true,
+   "detail": "SAFE  backup \"second\" created\n      id=2c7e483b43d0f9ffe46fd19d80ca3226 snapshot_seq=2555 entries=55376 size=25.4 MiB digest=de7fd2cd761b94e1 in 208 ms"
+  },
+  {
+   "step": "backup #2 verifies",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "step": "graceful shutdown",
+   "ok": true,
+   "detail": "exit code 0"
+  },
+  {
+   "step": "restore backup #2 into a fresh instance",
+   "ok": true,
+   "detail": " OK: backup id 2c7e483b43d0f9ffe46fd19d80ca3226 (snapshot seq 2555), 55376 entries, digest de7fd2cd761b94e1\n  verify 25 ms, load 3136 ms, integrity check 596 ms, total 4127 ms; integrity: 0 error(s), 0 warning(s)\n  credentials are not part of a backup: a new instance generates its own on first start"
+  },
+  {
+   "step": "start the restored instance",
+   "ok": true,
+   "detail": "0.12s"
+  },
+  {
+   "step": "restored instance equals the model: every row of every table equals the independent model",
+   "ok": true,
+   "detail": "0 mismatches []"
+  },
+  {
+   "step": "restored instance graceful shutdown",
+   "ok": true,
+   "detail": "exit code 0"
+  },
+  {
+   "step": "offline integrity check (original)",
+   "ok": true,
+   "detail": " of C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_e2e_qyd5so3m\\prod\\data\nINFO     UNEXPECTED_FILE            data directory     unrecognised entry \"DATA_FORMAT\"\nresult: 0 error(s), 0 warning(s), check complete"
+  },
+  {
+   "step": "offline integrity check (restored)",
+   "ok": true,
+   "detail": "C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_e2e_qyd5so3m\\restored\\data\nINFO     UNEXPECTED_FILE            data directory     unrecognised entry \"DATA_FORMAT\"\nresult: 0 error(s), 0 warning(s), check complete"
+  },
+  {
+   "step": "original after clean restart: every row of every table equals the independent model",
+   "ok": true,
+   "detail": "0 mismatches []"
+  },
+  {
+   "step": "restored after clean restart: every row of every table equals the independent model",
+   "ok": true,
+   "detail": "0 mismatches []"
+  },
+  {
+   "step": "restore backup #1 (older state)",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "step": "backup #1 restores to exactly the state at its snapshot: every row of every table equals the independent model",
+   "ok": true,
+   "detail": "0 mismatches []"
+  }
+ ],
+ "start_fresh_s": 0.4293172999750823,
+ "restart_after_kill_s": 0.5182757000438869,
+ "restore_cli_s": 4.152565700002015,
+ "total_s": 54.623581500025466,
+ "failures": []
+}

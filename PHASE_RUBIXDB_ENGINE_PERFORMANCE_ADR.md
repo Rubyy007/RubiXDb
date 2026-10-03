@@ -100,3 +100,24 @@ measurements (single-writer baseline `fsync` path is again 2.84 - 2.99 ms, match
 * Product-level write performance is nevertheless characterised honestly in
   `PHASE_RUBIXDB_FINAL_SINGLE_NODE_PERFORMANCE.md` (single-statement INSERT/UPDATE/DELETE/txn latency under 1 - 64 clients).
 * Reopening requires: (a) NVMe re-measurement with the unmodified binary, or (b) an authorized ADR for candidate D.
+
+
+---
+
+# ADR-ENG-OPS-001 — WAL corruption does not halt `LsmEngine::open`; MANIFEST has no format version
+**Date:** 2026-10-03 · **Phase:** Production operations + disaster recovery · **Status:** FOUND, REPRODUCED, MITIGATED AT THE PRODUCT LAYER, ENGINE FIX NOT MADE (engine boundary: STOP).
+
+## 1. Finding A — a corrupt WAL segment does not stop startup
+**Reproduction** (`src/ops/physical_tests.rs::engine_open_ignores_a_corrupt_wal_segment`, plus `wrong_format_versions_are_refused…`): take a real data directory (2 WAL segments, live SSTables), set the *newest* segment's header `format_version` to 2 (or flip a byte inside its first frame), call `LsmEngine::open`. Result: **`Ok`**; the directory is modified (a fresh segment is created, obsolete ones purged). `check_physical` reports `WAL_CORRUPT` for the same directory.
+**Root cause (source):** `src/lsm/mod.rs` `LsmEngine::open` — `let _summary = wal::replay_streaming(dir, &wal_config, …)?;` and `let (file_wal, _replay) = FileWal::open_for_recovery(dir, wal_config)?;` — both results carrying `corrupted_segments(_count)` are discarded. `src/wal/mod.rs` (`scan_directory`, comment at the end) states "the caller is already required to halt on non-empty corrupted_segments", and `scan_directory` stops at the first corrupted segment and drops its records and every later segment's records. So a damaged segment ⇒ silent loss of all records from that segment onward; startup succeeds; acknowledged data is gone with no error.
+**Measurement:** the checker's physical pass classifies the case (`WAL_CORRUPT`); the guarded product open refuses it and leaves the directory byte-identical (snapshot hash test).
+**Candidate designs:** (1) in `LsmEngine::open`, return `EngineError::Corruption` when either result reports a corrupted segment (≈4 lines; the WAL layer already supplies everything). (2) Same, but offer an explicit operator opt-in to open "salvage mode" that reports exactly what was dropped. (3) Leave the engine; guard each product entry point (**done**).
+**Risk/correctness/durability/recovery of (1):** strictly safer — converts silent data loss into a loud refusal; recovery semantics for *torn tails* are unchanged (they are `truncated`, not `corrupted`). Needs the pathological-recovery matrix and `crash_consistency` re-run, and a decision on salvage mode. Performance: none.
+**Decision here:** NOT changed (mission rule: stop before modifying the engine). **Mitigation shipped:** `ops::format::startup_guard` runs a read-only `wal::replay_streaming` preflight and the directory-format check before the engine opens, at every product entry point (`rubixdb-api` `main`, `rubixdb gui`/CLI host, `ops::open`). Cost: one extra streaming read of the WAL at startup (measured in the performance document). **Recommended next step (needs authorisation):** design (1).
+
+## 2. Finding B — the MANIFEST file has no magic and no format version
+`src/manifest/format.rs`: frames of `len/crc/body` only; `edit_type` is the only discriminator. A future incompatible manifest is rejected only as an unknown edit type or checksum failure (fail-closed, but unversioned and not self-describing). WAL segments (`RBXWALv1` + version) and SSTables (`RBXSST01` + version) are versioned.
+**Mitigation shipped:** directory-level `DATA_FORMAT` marker (`ops::format`) written when a product entry point creates a directory, checked before open; legacy directories (no marker) are accepted unmodified. **Engine change (not made):** add a versioned header to the manifest; requires a migration rule for existing files.
+
+## 3. Finding C (informational) — an obsolete WAL segment with an invalid header is tolerated and deleted at open
+Segments entirely below the checkpoint are not needed; the engine removes them as normal housekeeping. Consistent with the design; recorded so nobody mistakes it for Finding A.

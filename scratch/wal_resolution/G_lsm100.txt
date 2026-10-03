@@ -1,0 +1,32 @@
+lsm_crash_cycle_test: dir=C:\Users\Ruby\AppData\Local\Temp\rubixdb_lsm_crash_cycle_run_1790965198449684500 num_cycles=30 writer_count=100 seed=443
+lsm_crash_cycle_test: cycle 1 OK kill_delay_ms=1354 highest_seq=18439 durable_through=18439 active_entries=18439 immutable_count=0 recovery_ms=267.3 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 2 OK kill_delay_ms=919 highest_seq=27689 durable_through=27689 active_entries=27689 immutable_count=0 recovery_ms=365.4 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 3 OK kill_delay_ms=451 highest_seq=29052 durable_through=29052 active_entries=29052 immutable_count=0 recovery_ms=427.2 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 4 OK kill_delay_ms=457 highest_seq=30447 durable_through=30447 active_entries=30447 immutable_count=0 recovery_ms=392.2 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 5 OK kill_delay_ms=653 highest_seq=34200 durable_through=34200 active_entries=34200 immutable_count=0 recovery_ms=438.2 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 6 OK kill_delay_ms=338 highest_seq=34200 durable_through=34200 active_entries=34200 immutable_count=0 recovery_ms=468.2 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 7 OK kill_delay_ms=1400 highest_seq=46470 durable_through=46470 active_entries=46470 immutable_count=0 recovery_ms=602.6 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 8 OK kill_delay_ms=653 highest_seq=47446 durable_through=47446 active_entries=47446 immutable_count=0 recovery_ms=630.1 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 9 OK kill_delay_ms=1339 highest_seq=56488 durable_through=56488 active_entries=56488 immutable_count=0 recovery_ms=740.5 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 10 OK kill_delay_ms=492 highest_seq=56488 durable_through=56488 active_entries=56488 immutable_count=0 recovery_ms=748.4 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 11 OK kill_delay_ms=1061 highest_seq=59820 durable_through=59820 active_entries=59820 immutable_count=0 recovery_ms=806.0 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 12 OK kill_delay_ms=1141 highest_seq=63753 durable_through=63753 active_entries=63753 immutable_count=0 recovery_ms=849.4 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 13 OK kill_delay_ms=1454 highest_seq=71382 durable_through=71382 active_entries=71382 immutable_count=0 recovery_ms=923.9 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 14 OK kill_delay_ms=816 highest_seq=71382 durable_through=71382 active_entries=71382 immutable_count=0 recovery_ms=934.9 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 15 OK kill_delay_ms=1094 highest_seq=73461 durable_through=73461 active_entries=2077 immutable_count=0 recovery_ms=927.1 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 16 OK kill_delay_ms=920 highest_seq=73998 durable_through=73998 active_entries=2614 immutable_count=0 recovery_ms=907.3 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 17 OK kill_delay_ms=294 highest_seq=73998 durable_through=73998 active_entries=2614 immutable_count=0 recovery_ms=935.6 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 18 OK kill_delay_ms=227 highest_seq=73998 durable_through=73998 active_entries=2614 immutable_count=0 recovery_ms=913.9 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 19 OK kill_delay_ms=604 highest_seq=73998 durable_through=73998 active_entries=2614 immutable_count=0 recovery_ms=1000.7 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 20 OK kill_delay_ms=114 highest_seq=73998 durable_through=73998 active_entries=2614 immutable_count=0 recovery_ms=992.4 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 21 OK kill_delay_ms=870 highest_seq=73998 durable_through=73998 active_entries=2614 immutable_count=0 recovery_ms=939.4 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 22 OK kill_delay_ms=261 highest_seq=73998 durable_through=73998 active_entries=2614 immutable_count=0 recovery_ms=933.7 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 23 OK kill_delay_ms=1100 highest_seq=77147 durable_through=77147 active_entries=5763 immutable_count=0 recovery_ms=982.4 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 24 OK kill_delay_ms=864 highest_seq=77147 durable_through=77147 active_entries=5763 immutable_count=0 recovery_ms=967.6 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 25 OK kill_delay_ms=740 highest_seq=77147 durable_through=77147 active_entries=5763 immutable_count=0 recovery_ms=958.3 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 26 OK kill_delay_ms=589 highest_seq=77147 durable_through=77147 active_entries=5763 immutable_count=0 recovery_ms=975.0 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 27 OK kill_delay_ms=328 highest_seq=77147 durable_through=77147 active_entries=5763 immutable_count=0 recovery_ms=937.0 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 28 OK kill_delay_ms=221 highest_seq=77147 durable_through=77147 active_entries=5763 immutable_count=0 recovery_ms=945.3 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 29 OK kill_delay_ms=791 highest_seq=77147 durable_through=77147 active_entries=5763 immutable_count=0 recovery_ms=958.2 reads_verified_ok=true
+lsm_crash_cycle_test: cycle 30 OK kill_delay_ms=944 highest_seq=77148 durable_through=77148 active_entries=5764 immutable_count=0 recovery_ms=968.5 reads_verified_ok=true
+lsm_crash_cycle_test: SUMMARY cycles=30 successful=30 failed=0 final_highest_seq=77148 final_durable_through=77148 total_read_mismatches=0

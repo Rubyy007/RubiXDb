@@ -12,6 +12,7 @@ const NAV_ITEMS = [
   { to: "/snapshots", label: "Snapshots", icon: "⧉" },
   { to: "/compaction", label: "Compaction", icon: "⚙" },
   { to: "/health", label: "Health / Storage", icon: "♥" },
+  { to: "/operations", label: "Operations", icon: "⛭" },
   { to: "/settings", label: "Settings", icon: "⚙︎" },
 ];
 

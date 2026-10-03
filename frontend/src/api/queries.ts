@@ -253,3 +253,65 @@ export function useDeleteIndexMutation() {
     onSuccess: () => invalidateCatalogQueries(queryClient),
   });
 }
+
+// ---- operator endpoints (admin role) ----
+
+export function useAdminStatusQuery(enabled = true) {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["admin", "status"],
+    queryFn: () => client!.adminStatus(),
+    enabled: client !== null && enabled,
+    refetchInterval: 5_000,
+    retry: false,
+  });
+}
+
+export function useBackupsQuery(enabled = true) {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["admin", "backups"],
+    queryFn: () => client!.adminBackups(),
+    enabled: client !== null && enabled,
+    retry: false,
+  });
+}
+
+export function useCreateBackupMutation() {
+  const client = useApiClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => client!.adminCreateBackup(name),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin"] }),
+  });
+}
+
+export function useVerifyBackupMutation() {
+  const client = useApiClient();
+  return useMutation({ mutationFn: (name: string) => client!.adminVerifyBackup(name) });
+}
+
+export function useDeleteBackupMutation() {
+  const client = useApiClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, confirm }: { name: string; confirm: string }) =>
+      client!.adminDeleteBackup(name, confirm),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin", "backups"] }),
+  });
+}
+
+export function useCheckMutation() {
+  const client = useApiClient();
+  return useMutation({ mutationFn: () => client!.adminCheck() });
+}
+
+export function usePurgeOrphansMutation() {
+  const client = useApiClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ apply, expected }: { apply: boolean; expected?: number }) =>
+      client!.adminPurgeOrphans(apply, expected),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin"] }),
+  });
+}

@@ -91,6 +91,11 @@ pub struct Config {
     /// (`PHASE_RUBIXDB_GUI_ARCHITECTURE.md` §3), never required for
     /// the API crate's own existing certified deployment shape.
     pub frontend_dist: Option<PathBuf>,
+    /// Where `/v1/admin/backups` writes and lists backups (`RUBIXDB_BACKUP_
+    /// DIR`; the local instance manager sets `<instance>/backups`). `None`
+    /// disables the backup endpoints (they answer `NOT_CONFIGURED`): the API
+    /// never accepts a caller-chosen directory.
+    pub backup_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -220,6 +225,7 @@ impl Config {
                 .transpose()?,
             instance_name: env_var("RUBIXDB_INSTANCE_NAME"),
             frontend_dist: env_var("RUBIXDB_FRONTEND_DIST").map(PathBuf::from),
+            backup_dir: env_var("RUBIXDB_BACKUP_DIR").map(PathBuf::from),
         })
     }
 }

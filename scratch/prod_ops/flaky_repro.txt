@@ -1,0 +1,23 @@
+baseline loaded=0 runs=12 pass=12 fail=0
+      1 
+branch loaded=0 runs=12 pass=11 fail=1
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (5548) panicked at src\wal\group_commit.rs:2769:21:
+      1 thread '<unnamed>' (24064) panicked at src\wal\group_commit.rs:2724:17:
+      1 a caller that lost the leader race must see a clear poisoned-committer error, not a bare timeout: Timeout { detail: "await_durable(seq=2) timed out after 5.5609ms waiting for a group-commit leader to publish durable_through (durable_through=0, ema_fsync_latency_ns=556090)" }
+      1 
+baseline loaded=1 runs=12 pass=0 fail=12
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (9924) panicked at src\wal\group_commit.rs:2338:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (9492) panicked at src\wal\group_commit.rs:2338:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (8740) panicked at src\wal\group_commit.rs:2338:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (7808) panicked at src\wal\group_commit.rs:2338:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (26276) panicked at src\wal\group_commit.rs:2338:21:
+branch loaded=1 runs=12 pass=0 fail=12
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (9664) panicked at src\wal\group_commit.rs:2769:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (8084) panicked at src\wal\group_commit.rs:2769:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (7640) panicked at src\wal\group_commit.rs:2769:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (23836) panicked at src\wal\group_commit.rs:2769:21:
+      1 thread 'wal::group_commit::tests::concurrent_followers_all_fail_fast_when_the_leader_panics' (2028) panicked at src\wal\group_commit.rs:2769:21:
+branch_fixed_test loaded=0 runs=20 pass=20 fail=0
+      1 
+branch_fixed_test loaded=1 runs=20 pass=20 fail=0
+      1 

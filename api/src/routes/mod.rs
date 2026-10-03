@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod catalog;
 pub mod compaction;
 pub mod health;
@@ -124,6 +125,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::delete(catalog::delete_index),
         )
         .route("/v1/catalog/authz", get(catalog::authz))
+        .route("/v1/admin/status", get(admin::status))
+        .route(
+            "/v1/admin/backups",
+            get(admin::list_backups).post(admin::create_backup),
+        )
+        .route("/v1/admin/backups/:name/verify", post(admin::verify_backup))
+        .route(
+            "/v1/admin/backups/:name",
+            axum::routing::delete(admin::delete_backup),
+        )
+        .route("/v1/admin/check", post(admin::check))
+        .route("/v1/admin/shutdown", post(admin::shutdown))
+        .route("/v1/admin/storage", get(admin::storage))
+        .route(
+            "/v1/admin/maintenance/purge-orphans",
+            post(admin::purge_orphans),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,

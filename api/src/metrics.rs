@@ -20,6 +20,9 @@ struct RouteStats {
     error_count: u64,
     latencies_ms: Vec<f64>,
     next_slot: usize,
+    /// Lifetime maximum (never evicted by the reservoir) — the tail the
+    /// percentiles cannot show.
+    max_ms: f64,
 }
 
 pub struct ServiceMetrics {
@@ -49,6 +52,9 @@ impl<'a> RequestGuard<'a> {
             .unwrap_or_else(|p| p.into_inner());
         let stats = routes.entry(self.route.clone()).or_default();
         stats.count += 1;
+        if elapsed_ms > stats.max_ms {
+            stats.max_ms = elapsed_ms;
+        }
         if is_error {
             stats.error_count += 1;
         }
@@ -71,6 +77,7 @@ pub struct RouteMetricsSnapshot {
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
+    pub max_ms: f64,
 }
 
 impl Default for ServiceMetrics {
@@ -117,6 +124,7 @@ impl ServiceMetrics {
                     p50_ms: pct(0.50),
                     p95_ms: pct(0.95),
                     p99_ms: pct(0.99),
+                    max_ms: stats.max_ms,
                 }
             })
             .collect()

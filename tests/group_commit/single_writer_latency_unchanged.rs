@@ -16,6 +16,7 @@ const ITERATIONS: usize = 1_000;
 
 #[test]
 fn single_writer_latency_unchanged() {
+    let _shared = crate::support::shared();
     // Baseline: Immediate mode, append_sync — exactly the existing,
     // pre-Phase-1 code path, untouched by this phase.
     let baseline_dir = support::temp_dir("m1_1_baseline");

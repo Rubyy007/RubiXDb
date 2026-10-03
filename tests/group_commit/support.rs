@@ -16,6 +16,18 @@ use rubixdb::EngineError;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Binary-wide benchmark isolation lock: throughput scenarios hold it
+/// exclusively, every other test holds `shared()`.
+static BINARY_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Held by every non-throughput test of this binary for its whole body so
+/// a throughput scenario never overlaps it (see `run_throughput_scenario`).
+pub fn shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    BINARY_LOCK
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A fresh, unique temp directory for one test's WAL — never shared
 /// between tests (avoids any cross-test directory-lock contention, since
 /// `FileWal::open_for_recovery` takes an exclusive OS lock per directory).
@@ -102,6 +114,17 @@ pub struct ThroughputResult {
 /// verify recoverability before removing it). Used by M1.2 and M1.3, which
 /// differ only in `threads`/`per_thread`/the throughput target.
 pub fn run_throughput_scenario(tag: &str, threads: usize, per_thread: usize) -> ThroughputResult {
+    // Execution contract (PHASE_RUBIXDB_WAL_CERTIFICATION_CLOSURE.md): the
+    // M1.2/M1.3 throughput targets are defined for ONE scenario at a time on
+    // an otherwise idle device. Every scenario fsyncs the same disk; run
+    // concurrently with each other or with the other tests of this binary
+    // (the default `cargo test` thread pool) they measure those, not the
+    // WAL. The throughput scenarios therefore take the binary-wide lock
+    // exclusively and every other test of this binary holds it shared
+    // (`shared()`); the targets themselves are untouched.
+    let _exclusive = BINARY_LOCK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = temp_dir(tag);
     let (wal, _) = rubixdb::wal::FileWal::open_for_recovery(&dir, group_commit_config())
         .expect("opening a fresh WAL must succeed");

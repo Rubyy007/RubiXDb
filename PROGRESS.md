@@ -4549,3 +4549,132 @@ at ~72-100 op/s from ~4 threads with idle CPU (outside the four items; recorded
 with data). Not claimed: production-readiness of the access-path optimizer,
 secondary-index executor, transactional scans or statistics subsystem, nor of
 RubixDB as a whole. Stopped after Increment 18 per the mandate.
+
+---
+
+## 2026-10-02 -- Final single-node production certification + regression closure
+
+**Outcome: ENGINE-BLOCKED -- RubiXDB is NOT declared production ready.** Every product-surface gate
+that could be evidenced is PASS; the certified WAL cannot meet the Phase 1 throughput targets
+M1.2 (>=15,000 ops/s) / M1.3 (>=80,000 ops/s) on this hardware. `src/wal/` was not modified; no
+threshold changed; no PASS claimed. See `PHASE_RUBIXDB_ENGINE_PERFORMANCE_ADR.md` and
+`PHASE_RUBIXDB_FINAL_SINGLE_NODE_{ARCHITECTURE,PERFORMANCE,SECURITY,RELIABILITY,CERTIFICATION}.md`.
+
+**Reproduced on HEAD b7f0e8b:** M1.2/M1.3 fail debug+release (isolated release 8.6-11.7k / 63-64k;
+5.6-6.0k / 32-39k inside parallel `cargo test`); the debug-only multi-instance CLI test was a
+test-harness defect (D-0): `reqwest::blocking` in a tokio test panicked and, with no `Drop`, leaked real
+server processes. Fixed without touching assertions; passes debug+release.
+
+**Defects found and fixed (each reproduced -> root-caused -> fixed -> regression-tested):**
+D-1 `sql/src/parse.rs`: the pre-parse operator-chain guard counted operators inside string literals
+(a 260-row ISO-date INSERT or a 40 KB hyphenated text was refused with 413); now refined with the
+parser's own tokenizer behind the unchanged zero-alloc fast path; real chains still rejected.
+D-2 `cli/src/render.rs`: sanitizer handled C0/DEL but not C1 (U+009B CSI) despite documenting it.
+Frontend: react-router-dom 6 -> 7 closes 2 production npm advisories (reachability: not exploitable,
+fixed anyway). New real-browser XSS spec. Post-fix regression: debug 1,113 / 2 failed / 26 ignored,
+release 1,113 / 2 / 26; the only failures are the two ENGINE-BLOCKED WAL tests. fmt, clippy -D warnings,
+check clean. cargo audit: 0 vulnerabilities (1 yanked-crate warning). cargo-deny absent: no license scan.
+
+**Localized (not changed):** read plateau = CPU-saturated index-entry enumeration + per-row fetch
+(~54 us/row), not HTTP/serialization; storage not proven responsible. Write ceiling ~270 commits/s per
+table = relational per-table epoch lock held across the WAL fsync (`txn.rs` commit), NOT the engine:
+270 -> 1,995 commits/s over 1 -> 16 tables. Snapshot Isolation demonstrated incl. write skew (documented).
+Increment 18's idle-CPU plateau was not reproduced.
+
+**Endurance:** prior 5.76 h run predated Increments 16-18, so it was fully re-run (3 x 6,900 s, hard-kill
+between segments) on current code: 0 non-Healthy samples, SSTables <= 3, flat handles/threads, exact
+row counts (142,467 / 212,689 / 266,363), 0 orphans; 293 snapshot-isolation conflicts (all segment 1),
+none after; no timeouts/5xx. Binary predates D-1/D-2 (not on the workload path); developer activity
+overlapped the first hour of segment 1.
+
+**Open / flagged:** tracked throwaway credential in `frontend/.e2e-crossbrowser-data/` (commit 2afa0e1);
+no license scan; no new heap-ownership profile (no "no leak" claim). Protected paths (`src/wal/`,
+`src/manifest/`, `src/sstable/`, `src/compaction/`) zero diff. Stopped per the mandate; subqueries, CTEs,
+set operations, window functions, Router, Replication, Partitioning NOT started.
+
+---
+
+## 2026-10-03 -- WAL performance resolution + engine re-certification (branch `wal-batch-buffer-fillq`, uncommitted)
+
+**Outcome: WRITE ENGINE remains ENGINE-BLOCKED on the performance target; the one change made is RE-CERTIFIED for
+correctness.** M1.2 (>=15,000) and M1.3 (>=80,000) still FAIL: after the change M1.2 ~11.5k (baseline 10.1-10.5k),
+M1.3 ~62.6k (baseline ~61.5-63.4k). Targets were NOT lowered; durability NOT traded. See `PHASE_RUBIXDB_WAL_*.md`.
+
+**Hardware:** both physical disks are SATA SSDs (Disk 0 "SSD 128GB" = E:, Disk 1 "LAPCARE" = C:+D:). **No NVMe** => the NVMe
+experiment is OPEN / HARDWARE-GATED; no claim depends on it. Correction to prior practice: the M1 tests write under %TEMP% (C:)
+unless TMP/TEMP are overridden; all comparisons here state their disk and use E:\waltmp.
+
+**Findings (measured):** latency-bound cycle (~4.3 ms window + ~4.4 ms fsync + ~0.3 ms), disk only ~6% busy. Parallel flushes on one
+SATA device serialize (2 lanes: +15% flush rate at 1.7x per-flush latency); two physical disks scale ~2.2x => sharded WAL has no
+benefit on a single device (not implemented). Window sweep: M1.2 best at 2-4 ms, M1.3 best at 8 ms => no single fixed window.
+Spin retained (sleep/hybrid: 2-3x CPU at 100 writers, no separable gain). Pipelining rejected (prototype reproduces non-adoption).
+
+**Implemented (stage 1, `src/wal/group_commit.rs`, +192/-2):** count-aware, quiescence-guarded early close of the leader's batch
+window (cohort = previous batch size, quiescence = clamp(400 ns x cohort, 100 us, 1 ms), only for cohorts <= 256 -- empirical,
+hardware-dependent). Durability/ordering/recovery/format/failure semantics unchanged. M1.2 +13.6%; 2/4/8/16/32/64 writers
++85/+76/+62/+44/+29/+14%, p50 -32..-46% at 2-16 writers; M1.3 neutral; single writer unchanged. Disclosed: 64-writer max/p95 worse,
+one unexplained 100-writer p99.9 outlier. **Product-level SQL write throughput unchanged** (relational per-table commit lock).
+
+**Stage 2 NOT implemented -- DECISION REQUIRED:** a leader-written batch buffer (prototype: 17-18k / 93-101k on the same SATA disk)
+changes failure semantics (a failed flush must poison the committer; today a failed write fails one caller). See architecture §6.
+
+**Re-certification:** debug and release 1,115 passed / 2 failed (exactly M1.2/M1.3) / 26 ignored; fmt, clippy -D warnings, check
+clean; protected paths (`manifest/ sstable/ compaction/`) zero diff. Real process-kill: 110 WAL + 30 engine cycles clean; new
+independent ack oracle (`examples/wal_ack_oracle.rs`, self-tested with a mutant) 240 cycles / 1,479,155 acknowledged records, 0
+losses, 0 partial groups. Method limit: process kill cannot detect ack-before-fsync (page cache survives); power-loss not testable.
+**Open:** stage-2 decision; NVMe; power-loss testing; branch uncommitted/unmerged; kill-during-recovery not targeted.
+
+---
+
+## 2026-10-03 -- WAL production performance optimization (flat-combining group commit), branch `wal-batch-buffer-fillq`
+
+**Outcome:** M1.2 / M1.3 targets are now MET on this SATA hardware in isolated release runs (M1.2 17.1k warm / 18.1k cold,
+M1.3 99.0k warm / 100.0k cold; 18 of 18 interleaved runs pass, worst margins +9% / +15%; 3/3 canonical `cargo test --release
+--test group_commit -- --test-threads=1`) with the same tests and thresholds. **The WAL is still NOT PRODUCTION READY under
+the mandate's Rule 38**: FULL REGRESSION is not clean (the two throughput tests fail under the default concurrent/debug
+harness; one pre-existing load-sensitive unit test failed once in debug). A human decision is needed on how the regression
+gate should run M1.2/M1.3 (see `PHASE_RUBIXDB_WAL_CERTIFICATION.md` §4). NVMe: HARDWARE UNAVAILABLE.
+
+**Design (src/wal/ only):** `FileWal::append_group` (one write syscall per same-segment run, reusing `encode_wal_frame` and
+`SegmentIo::append` rollback) + flat-combining `GroupCommitter::append` (each appender returns only after its OWN frame is
+written, so `append`'s contract and the durability/failure model are preserved; per-slot outcomes; panic-safe combiner) +
+generalized early window close (cohort/quiescence with a bounded straggler fallback; lone-writer probe restricted to the
+lone-writer regime). The earlier leader-written batch buffer was rejected (acknowledges before write). Sharded WAL (one SATA
+device serializes flushes), pipelining, write-through/unbuffered I/O (durability unprovable), per-waiter/striped wake and
+sleep/hybrid wait were measured and rejected.
+
+**Found by measuring, not assumed:** the lone-writer probe closed ~49% of batches prematurely; a count-only cohort target
+regressed the real product multi-table write path by 30% (invisible to M1.x) -> straggler fallback x4 chosen on both workloads;
+a suspected "degraded mode" in a soak was a bug in my soak tool (retracted; the mechanism built for it was reverted).
+Product SQL write throughput is at parity (+/-5%); the relational per-table commit lock is untouched. p99.9/max are worse at
+256-512 writers (disclosed); p50/p95/p99 better everywhere; sustained 64-writer throughput +72% (6.5k -> 11.2k).
+
+**Verification:** fmt/clippy -D warnings/check clean; debug 1,121 passed / 3 failed, release 1,122 / 2 failed (26 ignored);
+failures = m1_2/m1_3 under the concurrent/debug harness + a baseline-reproducible (11/12 under CPU load) load-sensitive test.
+New tests: differential proptest of `append_group` vs sequential append, failure/rotation/panic/concurrency tests. Real
+process-kill: independent ack oracle 300 cycles / 1,471,733 acks / 0 losses (final code; mutant detected 13-14 of 30), 140 WAL +
+70 engine kill cycles clean. Soak: 25 min x 64 writers flat (RSS 7 MB, threads 65-68, handles 110-112). Not tested: power loss.
+Protected paths (manifest/sstable/compaction/lsm/execution, SQL/API/CLI/GUI): zero diff. Documents: `PHASE_RUBIXDB_WAL_{ARCHITECTURE_OPTIONS,
+IMPLEMENTATION,CRASH_RECOVERY,PERFORMANCE_FINAL,CERTIFICATION}.md` (the mandate reused the CRASH_RECOVERY file name; the previous
+phase's version is in git history).
+
+## 2026-10-04 -- Production operations + disaster recovery + final single-node hardening (branch `wal-batch-buffer-fillq`)
+
+**Outcome: RUBIXDB = NOT PRODUCTION READY** (see `PHASE_RUBIXDB_FINAL_SINGLE_NODE_PRODUCTION_CERTIFICATION.md`). Implemented and measured: snapshot-consistent
+logical backup (`RUBXBKUP` v1) and crash-safe restore, logical+physical integrity checker, orphan-data maintenance, operator status
+(API/CLI/GUI), graceful stop, bounded HTTP front end, data-format marker + WAL preflight guard, reproducible release procedure.
+End-to-end lifecycle on the real binary: ALL PASS. Disk-intact kills: 23,386 acknowledged writes, 0 lost, 0 torn transaction pairs.
+Restore of 1 M rows 72-146 s; crash restart 0.52 s. Upgrade from two previous builds PASS.
+
+**Found by measuring and fixed:** startup after a kill during CREATE INDEX (600 K rows) took 21-35 s and `rubixdb gui` gave up at 30 s
+(recovery now runs after readiness; the certified Increment 14 test was updated for the contract change and gained a
+correct-reads-while-building assertion); the API front end held stalled connections forever (now capped and timed out);
+CLI let bidi override characters through; `-f` blocked on devices; no graceful stop existed on Windows.
+**Found, NOT fixed (engine boundary, ADR-ENG-OPS-001):** `LsmEngine::open` ignores corrupt WAL segments; MANIFEST has no format version
+(mitigated at every product entry point).
+
+**Not production ready because:** M1.3 FAILS intermittently on this SATA hardware (bimodal 61-79 k vs 101-113 k; fails in every full
+release run), M1.2 OPEN (one 12.3 k outlier), power loss NOT TESTED, real disk-full NOT TESTED, PITR NOT IMPLEMENTED, downgrade UNSUPPORTED.
+Full regression: debug 1,191/0/28 clean; release 1,192/1/26 (m1_3). Protected engine paths: zero diff this phase apart from one corrected WAL unit test.
+Documents: `PHASE_RUBIXDB_{PRODUCTION_BASELINE,PRODUCTION_OPERATIONS_ARCHITECTURE,BACKUP_RESTORE_ARCHITECTURE,DISASTER_RECOVERY,INTEGRITY_ARCHITECTURE,
+OBSERVABILITY_ARCHITECTURE,MAINTENANCE_ARCHITECTURE,PRODUCTION_OPERATIONS_RESULTS,WAL_CERTIFICATION_CLOSURE,FINAL_SINGLE_NODE_RELEASE,FINAL_SINGLE_NODE_PRODUCTION_CERTIFICATION}.md`.

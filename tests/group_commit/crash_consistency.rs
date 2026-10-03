@@ -167,6 +167,7 @@ fn read_acknowledged_seqs(ack_dir: &Path) -> Vec<u64> {
 /// which point to target and which directories to use.
 #[test]
 fn crash_consistency_across_abort_points() {
+    let _shared = crate::support::shared();
     let exe = std::env::current_exe().expect("current_exe must be resolvable under cargo test");
 
     for point in ALL_ABORT_POINTS {

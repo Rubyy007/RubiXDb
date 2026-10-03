@@ -11,6 +11,8 @@ const HELP_TEXT: &str = r#"rubixdb instance -- inspect and manage local rubiXDb 
 USAGE:
     rubixdb instance list                        list every known instance
     rubixdb instance status [NAME]                show one instance's state (default: "default")
+    rubixdb instance stop [NAME]                  gracefully stop a running instance (bounded drain,
+                                                    clean engine shutdown); waits until it has exited
     rubixdb instance drop <NAME> --confirm <NAME>  permanently delete an instance's on-disk
                                                     data (refused unless --confirm repeats NAME
                                                     exactly, and refused while NAME is running)
@@ -21,6 +23,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("list") => list(),
         Some("status") => status(args.get(1).map(|s| s.as_str())),
         Some("drop") => drop_instance(&args[1..]),
+        Some("stop") => stop_instance(args.get(1).map(|s| s.as_str())),
         Some("--help") | Some("-h") | None => {
             println!("{HELP_TEXT}");
             0
@@ -147,4 +150,47 @@ fn status(name: Option<&str>) -> i32 {
             1
         }
     }
+}
+
+/// Graceful stop through the instance's own admin API (`POST /v1/admin/
+/// shutdown`, exact instance-name confirmation validated by the server), then
+/// wait until the instance lock is released — i.e. the process has really
+/// finished its drain and engine shutdown.
+fn stop_instance(name: Option<&str>) -> i32 {
+    let name = name.unwrap_or(rubixdb_instance::DEFAULT_INSTANCE_NAME);
+    let (manifest, creds, dir) = match rubixdb_instance::discover(name) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            eprintln!("rubixdb instance stop: no such instance: {name:?}");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("rubixdb instance stop: {e}");
+            return 1;
+        }
+    };
+    if rubixdb_instance::InstanceLock::try_acquire(&dir).is_ok() {
+        println!("instance {name:?} is not running");
+        return 0;
+    }
+    let conn = crate::client::Connection::new(
+        format!("http://127.0.0.1:{}", manifest.api_port),
+        creds.admin_key,
+        std::time::Duration::from_secs(30),
+    );
+    let body = serde_json::json!({"confirm": name});
+    if let Err(e) = conn.admin_request(reqwest::Method::POST, "/v1/admin/shutdown", Some(&body)) {
+        eprintln!("rubixdb instance stop: {e}");
+        return 1;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        if rubixdb_instance::InstanceLock::try_acquire(&dir).is_ok() {
+            println!("instance {name:?} stopped cleanly");
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    eprintln!("rubixdb instance stop: {name:?} did not exit within 120 s");
+    1
 }

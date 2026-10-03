@@ -1,0 +1,68 @@
+{
+ "inc18": {
+  "label": "inc18",
+  "exe": "E:\\wt_prev1\\target\\release\\rubixdb.exe",
+  "previous_build_acked_after_load": 579,
+  "data_dir_files_written_by_previous": [
+   "MANIFEST",
+   "sstables\\00000000000000000005.sst",
+   "sstables\\00000000000000000006.sst",
+   "wal\\LOCK",
+   "wal\\wal-00000000000000000005.log",
+   "wal\\wal-00000000000000000006.log"
+  ],
+  "current_offline_check_exit": 0,
+  "current_offline_check_tail": "INSPECTION  offline check of C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_up_inc18_z2apvtlh\\up\\data\nresult: 0 error(s), 0 warning(s), check complete",
+  "current_start_s": 0.51,
+  "rows_equal_model_after_upgrade": true,
+  "index_read_correct_after_upgrade": true,
+  "recovery_ms": 46.5,
+  "online_check_after_upgrade": {
+   "clean": true,
+   "errors": 0,
+   "warnings": 0
+  },
+  "legacy_directory_got_a_format_marker": false,
+  "backup_of_upgraded_db_entries": 43162,
+  "restore_exit": 0,
+  "restored_rows_equal_model": true,
+  "downgrade_probe": {
+   "start_s": 0.51,
+   "rows_equal_model": true,
+   "outcome": "previous binary opened the directory written by the current binary"
+  }
+ },
+ "inc17": {
+  "label": "inc17",
+  "exe": "E:\\wt_prev2\\target\\release\\rubixdb.exe",
+  "previous_build_acked_after_load": 586,
+  "data_dir_files_written_by_previous": [
+   "MANIFEST",
+   "sstables\\00000000000000000005.sst",
+   "sstables\\00000000000000000006.sst",
+   "wal\\LOCK",
+   "wal\\wal-00000000000000000005.log",
+   "wal\\wal-00000000000000000006.log"
+  ],
+  "current_offline_check_exit": 0,
+  "current_offline_check_tail": "INSPECTION  offline check of C:\\Users\\Ruby\\AppData\\Local\\Temp\\rbx_up_inc17_mfx618qz\\up\\data\nresult: 0 error(s), 0 warning(s), check complete",
+  "current_start_s": 0.52,
+  "rows_equal_model_after_upgrade": true,
+  "index_read_correct_after_upgrade": true,
+  "recovery_ms": 48.3,
+  "online_check_after_upgrade": {
+   "clean": true,
+   "errors": 0,
+   "warnings": 0
+  },
+  "legacy_directory_got_a_format_marker": false,
+  "backup_of_upgraded_db_entries": 43176,
+  "restore_exit": 0,
+  "restored_rows_equal_model": true,
+  "downgrade_probe": {
+   "start_s": 0.54,
+   "rows_equal_model": true,
+   "outcome": "previous binary opened the directory written by the current binary"
+  }
+ }
+}

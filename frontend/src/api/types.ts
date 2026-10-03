@@ -271,3 +271,158 @@ export class ApiRequestError extends Error {
     this.detail = body.error.detail;
   }
 }
+
+// ---------------------------------------------------------------------
+// Operator endpoints (/v1/admin/*) -- PHASE_RUBIXDB_PRODUCTION_OPERATIONS_
+// ARCHITECTURE.md. Every route requires the admin role.
+// ---------------------------------------------------------------------
+
+export interface AdminStatusBody {
+  instance: { id: string | null; name: string | null; uptime_secs: number; version: string };
+  storage: {
+    state: string;
+    storage_pressure_events: number;
+    capacity_pressure_events: number;
+    sstable_count: number;
+    checkpoint_seq: number;
+    memtable_active_bytes: number;
+    memtable_active_entries: number;
+    memtable_immutable_count: number;
+    memtable_immutable_bytes: number;
+    manifest_records: number;
+    manifest_bytes: number | null;
+    oldest_live_snapshot_seq: number | null;
+  };
+  recovery: {
+    duration_ms: number;
+    wal_records_visited: number;
+    wal_records_applied: number;
+    manifest_edits_replayed: number;
+  };
+  wal: {
+    pool_state: string;
+    coordinator_alive: boolean;
+    durable_through: number;
+    highest_sequence: number;
+    pending_waiters: number;
+    queue_depth: number;
+    queue_capacity: number;
+    queued_bytes: number;
+    submitted: number;
+    completed_ok: number;
+    completed_err: number;
+    writes_timed_out: number;
+    rejected_backpressure: number;
+    sync_attempts: number;
+    sync_failures: number;
+    avg_batch_records: number;
+    max_batch_records: number;
+    avg_batch_bytes: number;
+    avg_batch_processing_ms: number;
+    segment_rotations: number;
+    poisoned: boolean;
+  };
+  compaction: {
+    auto_trigger_enabled: boolean;
+    trigger_count: number;
+    live_sstable_count: number;
+    cycles_completed: number;
+    input_bytes_total: number;
+    output_bytes_total: number;
+    tombstones_dropped_total: number;
+    duration_max_ms: number;
+    last_cycle_ms: number | null;
+  };
+  reads: { requests: number; hits: number; misses: number; bloom_negatives: number; blocks_read: number };
+  queries: {
+    requests: number;
+    success: number;
+    errors: number;
+    cancellations: number;
+    timeouts: number;
+    rows_returned: number;
+    rows_affected: number;
+    parse_errors: number;
+    bind_errors: number;
+    authorization_denials: number;
+    latency_ms: { p50: number; p95: number; p99: number; max: number } | null;
+    active_http_requests: number;
+  };
+  sessions: { active_transactions: number };
+  resources: { rss_bytes: number; threads: number; handles: number; cpu_seconds: number };
+  disk: {
+    data_dir_bytes: number;
+    wal_bytes: number;
+    sstable_bytes: number;
+    manifest_bytes: number;
+    volume_free_bytes: number | null;
+  };
+  backups: {
+    configured: boolean;
+    running: boolean;
+    ok_total: number;
+    failed_total: number;
+    last: Record<string, unknown> | null;
+  };
+  background: {
+    backup_running: boolean;
+    check_running: boolean;
+    maintenance_running: boolean;
+    last_check: Record<string, unknown> | null;
+  };
+}
+
+export interface BackupEntry {
+  name: string;
+  bytes: number;
+  modified_unix_ms: number | null;
+}
+
+export interface BackupCreated {
+  name: string;
+  backup_id: string;
+  snapshot_seq: number;
+  entries: number;
+  chunks: number;
+  file_bytes: number;
+  content_digest: string;
+  duration_ms: number;
+}
+
+export interface BackupVerified {
+  name: string;
+  ok: boolean;
+  format_version: number;
+  backup_id: string;
+  snapshot_seq: number;
+  entries: number;
+  chunks: number;
+  file_bytes: number;
+  catalog: { tables: number; indexes: number; schemas: number };
+  orphan_table_entries: number;
+  duration_ms: number;
+}
+
+export interface CheckFinding {
+  severity: "info" | "warning" | "error";
+  code: string;
+  object: string;
+  detail: string;
+}
+
+export interface CheckResult {
+  complete: boolean;
+  clean: boolean;
+  errors: number;
+  warnings: number;
+  findings: CheckFinding[];
+  stats: { rows_checked: number; index_entries_checked: number; duration_ms: number };
+}
+
+export interface PurgeResult {
+  applied: boolean;
+  class: "INSPECTION" | "DESTRUCTIVE";
+  plan: { entries: number; orphan_table_ids: number[] };
+  deleted: number;
+  remaining: number;
+}
