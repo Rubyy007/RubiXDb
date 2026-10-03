@@ -254,16 +254,57 @@ fn create_index_killed_mid_backfill_recovers_correctly_on_restart() {
         .build()
         .unwrap();
 
-    // By the time /healthz answers, `recover_incomplete_index_operations`
-    // has already run synchronously at startup (before the router is
-    // even built) -- the index must already be fully recovered, not
-    // still stuck `building` and not exposed as a false `ready` before
-    // recovery actually happened.
-    let indexes = list_indexes(&verify_client, &restarted.base_url, &restarted.admin_key);
-    let idx_val = indexes
-        .iter()
-        .find(|i| i["name"] == "idx_val")
-        .expect("idx_val must still exist in the catalog after restart");
+    // CONTRACT CHANGE (production-operations phase): recovery of an interrupted
+    // CREATE INDEX re-runs the whole backfill, which measured 21-35 s on a
+    // 600,000-row table. It used to run synchronously BEFORE readiness, so
+    // after such a kill `rubixdb gui` could exceed its 30 s readiness bound and
+    // refuse to start. It now runs on its own thread once the server is
+    // serving (graceful shutdown joins it; a kill retries at the next start).
+    // The properties this test protects are unchanged and still asserted:
+    //   (1) a recovered index must END `ready` -- never stuck `building`
+    //       (bounded wait below; a hang or `failed` fails the test),
+    //   (2) it must never be exposed while partial: reads are correct at every
+    //       moment, including while it is still `building` (the planner must
+    //       not use it),
+    //   (3) once `ready` it must be complete (probes + counts below).
+    let recovery_deadline = Instant::now() + Duration::from_secs(180);
+    let mut served_while_building = 0u32;
+    let idx_val = loop {
+        let indexes = list_indexes(&verify_client, &restarted.base_url, &restarted.admin_key);
+        let idx_val = indexes
+            .iter()
+            .find(|i| i["name"] == "idx_val")
+            .expect("idx_val must still exist in the catalog after restart")
+            .clone();
+        if idx_val["state"] == "ready" {
+            break idx_val;
+        }
+        assert_eq!(
+            idx_val["state"], "building",
+            "a recovering index may only be `building` or `ready`, never `failed`/absent: {idx_val}"
+        );
+        // Correct answer while the index is still being rebuilt.
+        let probe = ROW_COUNT / 3;
+        let result = exec_sql(
+            &verify_client,
+            &restarted.base_url,
+            &restarted.admin_key,
+            &format!("SELECT id FROM bigidx WHERE val = {probe}"),
+        );
+        assert_eq!(
+            result["result"]["row_count"], 1,
+            "a partial `building` index must never change query results: {result}"
+        );
+        served_while_building += 1;
+        assert!(
+            Instant::now() < recovery_deadline,
+            "a recovered index must reach Ready, never stay stuck Building: {idx_val}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!(
+        "queries answered correctly while the index was still building: {served_while_building}"
+    );
     assert_eq!(
         idx_val["state"], "ready",
         "a recovered index must reach Ready, never stay stuck Building or be exposed while partial: {idx_val}"

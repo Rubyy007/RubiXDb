@@ -53,3 +53,11 @@ Identical failure on both sources: `a caller that lost the leader race must see 
 
 ## 5. Gates
 WAL CERTIFICATION CLOSURE = **PASS for the execution-mode and test-semantics items**; **OPEN for power loss (NOT TESTED)** · M1.2 = **PASS** (normative command, 3/3) · M1.3 = **PASS** (normative command, 3/3, lowest +5.8 %) · NVMe = HARDWARE UNAVAILABLE.
+
+---
+## Addendum 2026-10-04 — throughput variance found after the closure (supersedes the PASS wording in §5 for M1.3; the original text above is kept)
+Later in the production-operations phase the normative command was run ~30 more times on the same machine:
+* **M1.2:** 17–23 k in every run but one **12.3 k outlier** (degraded window). Baseline `master`, interleaved, same window: 9.3–12.0 k (6/6 below target).
+* **M1.3 is bimodal:** a *fast mode* 101–113 k and a *slow mode* 61–79 k. A sampler of system CPU + top processes during six consecutive runs (two slow: 78.9 k, 76.6 k; four fast: 108–113 k) showed **no external competitor** in either mode (the test binary ≈ 54 s CPU, everything else ≈ 5 %); the slow mode just takes ~14 s instead of ~10.5 s. Baseline `master`: 48–63 k in 6/6. The 80 k line sits between the two modes, so the target is crossed in roughly 70–75 % of quiet runs and **in every full-workspace release run (61,202 / 35,531 [with a leaked server process from a failing test] / 48,298)**.
+* Earlier observations of "18/18" and "3/3" (21:xx runs 84.6–111 k) were in the fast regime; they are not retracted, but they do not establish reproducibility.
+**Reclassification:** M1.3 = **FAIL (intermittent on this hardware)**, M1.2 = **OPEN**, WAL CERTIFICATION CLOSURE = **OPEN**. The design comparison against the baseline is unaffected (current ≥ 1.6× baseline on M1.2 and ≥ 1.2× on M1.3 even in the slow mode); the shortfall is a hardware-regime issue (SATA SSD) that needs the NVMe re-measurement or an authorised ADR, not a threshold change. Raw data: `scratch/prod_ops/wal_certify_10runs.txt`, `wal_ab_interleaved.txt`, `m13_runs_with_sampler.txt`, `m13_sampler.csv`.

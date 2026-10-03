@@ -2453,3 +2453,21 @@ the original Phase 1 throughput targets.
 ### Known / open
 - Full regression not clean under the default concurrent/debug harness (M1.2/M1.3) and one load-sensitive pre-existing unit test; NVMe
   unavailable; power-loss durability untested; p99.9/max regression at 256-512 writers.
+
+## 2026-10-04 -- Production operations (branch `wal-batch-buffer-fillq`, not merged)
+
+### Added
+- `rubixdb backup create|list|verify|delete`, `restore`, `check`, `status`, `storage`, `maintenance purge-orphans`, `instance stop`; API `/v1/admin/*`
+  (status, backups, verify, check, storage, purge-orphans, shutdown; Admin role for every method); GUI **Operations** page.
+- Backup format `RUBXBKUP` v1; restore into a fresh directory only; integrity checker (logical online + physical offline); data-directory `DATA_FORMAT` marker.
+- `deny.toml`, `scripts/release.ps1` (bit-reproducible build + packaged smoke test), `scripts/wal_certify.ps1`, black-box campaigns in `scripts/ops/`.
+
+### Changed
+- Index-build recovery runs after the server is ready (graceful shutdown joins it). HTTP front end: 1,024-connection cap, 10 s header-read and 30 s body-idle timeouts.
+- CLI escapes bidi embedding/override/isolate characters; `-f` accepts regular files only.
+- WAL tests: throughput scenarios run exclusively inside their binary, debug-ignored; one load-sensitive unit test retries on `Timeout`. Increment 14 index-backfill crash test waits (bounded) for `ready` after restart.
+- `Cargo.lock`: `yoke-derive` 0.8.3 (yanked) -> 0.8.4.
+
+### Known / open
+- M1.3 intermittently below 80 k on this SATA machine (FAIL), M1.2 OPEN; power loss and real disk-full not tested; PITR not implemented; downgrade unsupported;
+  engine: corrupt WAL segments do not stop `LsmEngine::open` and the manifest is unversioned (ADR-ENG-OPS-001, guarded at the product layer).

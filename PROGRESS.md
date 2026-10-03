@@ -4657,3 +4657,24 @@ process-kill: independent ack oracle 300 cycles / 1,471,733 acks / 0 losses (fin
 Protected paths (manifest/sstable/compaction/lsm/execution, SQL/API/CLI/GUI): zero diff. Documents: `PHASE_RUBIXDB_WAL_{ARCHITECTURE_OPTIONS,
 IMPLEMENTATION,CRASH_RECOVERY,PERFORMANCE_FINAL,CERTIFICATION}.md` (the mandate reused the CRASH_RECOVERY file name; the previous
 phase's version is in git history).
+
+## 2026-10-04 -- Production operations + disaster recovery + final single-node hardening (branch `wal-batch-buffer-fillq`)
+
+**Outcome: RUBIXDB = NOT PRODUCTION READY** (see `PHASE_RUBIXDB_FINAL_SINGLE_NODE_PRODUCTION_CERTIFICATION.md`). Implemented and measured: snapshot-consistent
+logical backup (`RUBXBKUP` v1) and crash-safe restore, logical+physical integrity checker, orphan-data maintenance, operator status
+(API/CLI/GUI), graceful stop, bounded HTTP front end, data-format marker + WAL preflight guard, reproducible release procedure.
+End-to-end lifecycle on the real binary: ALL PASS. Disk-intact kills: 23,386 acknowledged writes, 0 lost, 0 torn transaction pairs.
+Restore of 1 M rows 72-146 s; crash restart 0.52 s. Upgrade from two previous builds PASS.
+
+**Found by measuring and fixed:** startup after a kill during CREATE INDEX (600 K rows) took 21-35 s and `rubixdb gui` gave up at 30 s
+(recovery now runs after readiness; the certified Increment 14 test was updated for the contract change and gained a
+correct-reads-while-building assertion); the API front end held stalled connections forever (now capped and timed out);
+CLI let bidi override characters through; `-f` blocked on devices; no graceful stop existed on Windows.
+**Found, NOT fixed (engine boundary, ADR-ENG-OPS-001):** `LsmEngine::open` ignores corrupt WAL segments; MANIFEST has no format version
+(mitigated at every product entry point).
+
+**Not production ready because:** M1.3 FAILS intermittently on this SATA hardware (bimodal 61-79 k vs 101-113 k; fails in every full
+release run), M1.2 OPEN (one 12.3 k outlier), power loss NOT TESTED, real disk-full NOT TESTED, PITR NOT IMPLEMENTED, downgrade UNSUPPORTED.
+Full regression: debug 1,191/0/28 clean; release 1,192/1/26 (m1_3). Protected engine paths: zero diff this phase apart from one corrected WAL unit test.
+Documents: `PHASE_RUBIXDB_{PRODUCTION_BASELINE,PRODUCTION_OPERATIONS_ARCHITECTURE,BACKUP_RESTORE_ARCHITECTURE,DISASTER_RECOVERY,INTEGRITY_ARCHITECTURE,
+OBSERVABILITY_ARCHITECTURE,MAINTENANCE_ARCHITECTURE,PRODUCTION_OPERATIONS_RESULTS,WAL_CERTIFICATION_CLOSURE,FINAL_SINGLE_NODE_RELEASE,FINAL_SINGLE_NODE_PRODUCTION_CERTIFICATION}.md`.
