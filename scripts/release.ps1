@@ -25,7 +25,11 @@ Push-Location frontend
 Run "npm ci" { npm ci }
 Run "frontend typecheck+build" { npm run build }
 Pop-Location
+# Bit-for-bit reproducible build: deterministic PE timestamp (/Brepro) and no build-machine paths in the binary.
+# Verified: two clean builds from the same commit give identical SHA-256 (PHASE_RUBIXDB_FINAL_SINGLE_NODE_RELEASE.md).
+$env:RUSTFLAGS = "-C link-arg=/Brepro --remap-path-prefix=$((Get-Location).Path)=/src --remap-path-prefix=$env:USERPROFILE\.cargo=/cargo"
 Run "cargo build --release --locked" { cargo build --release --locked -p rubixdb-cli -p rubixdb-api }
+Remove-Item Env:RUSTFLAGS
 
 $pkg = Join-Path $OutDir "rubixdb-$version"
 if (Test-Path $pkg) { throw "$pkg already exists; refusing to overwrite a release directory" }

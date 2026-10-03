@@ -79,9 +79,9 @@ test.describe("GUI operator console -- real rubixdb gui product path", () => {
     await row.getByRole("button", { name: "Delete" }).click();
     const confirm = page.getByRole("button", { name: "Delete backup" });
     await expect(confirm).toBeDisabled();
-    await page.getByLabel("Backup name").fill(name.slice(0, -1));
+    await page.getByLabel("Backup name", { exact: true }).fill(name.slice(0, -1));
     await expect(confirm).toBeDisabled();
-    await page.getByLabel("Backup name").fill(name);
+    await page.getByLabel("Backup name", { exact: true }).fill(name);
     await expect(confirm).toBeEnabled();
     await confirm.click();
     await expect(page.locator("tr", { hasText: name })).toHaveCount(0, { timeout: 30_000 });
