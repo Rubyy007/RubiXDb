@@ -11,8 +11,38 @@
 //! `%LOCALAPPDATA%\rubiXDb` (or the Unix/macOS equivalent).
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// Tests in this file run in parallel threads and each spawns real child processes with piped
+// stdio. On Windows a child can inherit the pipe handles another thread is creating at that
+// very moment; a long-lived `rubixdb gui` owner from one test then keeps a pipe open that a
+// different test's `.output()` waits on until EOF, so that test hangs (a 35 minute hang was
+// observed, and ended the instant the owner was killed) or sees the wrong process lifetime.
+// Creating the pipes and starting the child under one lock closes that window. Only the spawn
+// is serialized; waiting on the child is not.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+trait SpawnLocked {
+    fn spawn_locked(&mut self) -> std::io::Result<Child>;
+    fn output_locked(&mut self) -> std::io::Result<Output>;
+}
+
+impl SpawnLocked for Command {
+    fn spawn_locked(&mut self) -> std::io::Result<Child> {
+        let _guard = SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        self.spawn()
+    }
+
+    /// Same contract as `Command::output` (stdin closed, stdout/stderr captured).
+    fn output_locked(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.spawn_locked()?.wait_with_output()
+    }
+}
 
 fn fresh_root(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -37,7 +67,7 @@ fn run_c(root: &PathBuf, sql: &str) -> std::process::Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .output_locked()
         .unwrap()
 }
 
@@ -136,7 +166,7 @@ fn concurrent_first_run_processes_race_safely_to_one_owner() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .unwrap();
     let b = rubixdb_cmd(&root)
         .arg("-c")
@@ -144,7 +174,7 @@ fn concurrent_first_run_processes_race_safely_to_one_owner() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .unwrap();
 
     let out_a = a.wait_with_output().unwrap();
@@ -152,12 +182,16 @@ fn concurrent_first_run_processes_race_safely_to_one_owner() {
 
     assert!(
         out_a.status.success(),
-        "a: {}",
+        "a: status={:?} stdout={} stderr={}",
+        out_a.status,
+        String::from_utf8_lossy(&out_a.stdout),
         String::from_utf8_lossy(&out_a.stderr)
     );
     assert!(
         out_b.status.success(),
-        "b: {}",
+        "b: status={:?} stdout={} stderr={}",
+        out_b.status,
+        String::from_utf8_lossy(&out_b.stdout),
         String::from_utf8_lossy(&out_b.stderr)
     );
 
@@ -186,7 +220,7 @@ fn two_concurrent_gui_invocations_never_create_two_owners() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .unwrap();
 
     // Give `a` a real chance to win the race for the lock (bounded,
@@ -200,7 +234,7 @@ fn two_concurrent_gui_invocations_never_create_two_owners() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .output_locked()
         .unwrap();
 
     assert!(
@@ -242,7 +276,7 @@ fn cli_client_attaches_to_a_running_gui_instance_and_shares_its_data() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .unwrap();
 
     // Real readiness proof: poll `rubixdb instance status` (itself a
@@ -252,7 +286,7 @@ fn cli_client_attaches_to_a_running_gui_instance_and_shares_its_data() {
         let status = rubixdb_cmd(&root)
             .arg("instance")
             .arg("status")
-            .output()
+            .output_locked()
             .unwrap();
         if String::from_utf8_lossy(&status.stdout).contains("status:      running") {
             ready = true;
@@ -292,7 +326,7 @@ fn instance_list_and_status_reflect_real_state() {
     let list = rubixdb_cmd(&root)
         .arg("instance")
         .arg("list")
-        .output()
+        .output_locked()
         .unwrap();
     assert!(list.status.success());
     assert!(String::from_utf8_lossy(&list.stdout).contains("default"));
@@ -300,7 +334,7 @@ fn instance_list_and_status_reflect_real_state() {
     let status = rubixdb_cmd(&root)
         .arg("instance")
         .arg("status")
-        .output()
+        .output_locked()
         .unwrap();
     assert!(status.status.success());
     // The owner already exited (a `-c` invocation shuts itself down),
@@ -340,7 +374,7 @@ fn port_collision_with_an_unrelated_process_falls_back_safely() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .output_locked()
         .unwrap();
     assert!(
         out.status.success(),

@@ -189,10 +189,10 @@ fn resolve_connection() -> Result<(Connection, ConnectionSource), String> {
             // A real, handshake-verified live server already owns
             // this instance -- attach to it directly.
             let base_url = format!("http://127.0.0.1:{}", manifest.api_port);
-            Ok((
-                Connection::new(base_url, credentials.admin_key, Duration::from_secs(120)),
-                ConnectionSource::AttachedToExisting,
-            ))
+            let mut conn =
+                Connection::new(base_url, credentials.admin_key, Duration::from_secs(120));
+            conn.allow_reattach();
+            Ok((conn, ConnectionSource::AttachedToExisting))
         }
         rubixdb_instance::AcquireOutcome::LockedButUnverifiable { dir } => Err(format!(
             "instance {name:?} at {} is locked by another process that did not answer a real \
@@ -260,6 +260,7 @@ fn run_client(args: &[String]) -> i32 {
         repl::run(&mut conn)
     };
 
+    conn.shutdown_owned();
     if let ConnectionSource::BecameOwner(server) = source {
         server.shutdown();
     }

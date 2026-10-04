@@ -2535,3 +2535,7 @@ the original Phase 1 throughput targets.
 ### Changed
 - `rubixdb.exe` now carries the console inside the file; no `frontend-dist` folder is needed next to it, and a leftover one can no longer show an old UI.
 - The `default` instance goes back to port 302 whenever it is free (it no longer stays on a random port chosen during an earlier collision).
+
+## 2026-10-04 -- CLI race fix (under [Unreleased])
+### Fixed
+- Two `rubixdb -c` processes starting together on a fresh instance could fail: the one that attached to the other's server found it gone when the owner finished. A statement that cannot connect now re-resolves the instance (never mid-transaction, at most 3 times), so it runs exactly once.

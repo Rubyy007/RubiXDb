@@ -57,6 +57,9 @@ impl std::fmt::Display for CliError {
     }
 }
 
+/// How many times one connection may re-resolve a lost instance.
+const MAX_REATTACH: u8 = 3;
+
 pub struct Connection {
     http: reqwest::blocking::Client,
     base_url: String,
@@ -64,6 +67,12 @@ pub struct Connection {
     /// item 35: the active session, if any -- `None` means every
     /// following statement runs autocommit (the stateless default).
     session_id: Option<String>,
+    /// How many more times a lost server may be re-resolved (see `try_reattach`). Zero for
+    /// connections that did not attach to another process's instance.
+    reattach_budget: u8,
+    /// Set when a re-attach made THIS process the instance owner; it must be shut down
+    /// (`shutdown_owned`) before the process exits so the instance lock is released cleanly.
+    owned: Option<crate::host::EmbeddedServer>,
 }
 
 impl Connection {
@@ -82,7 +91,46 @@ impl Connection {
             base_url,
             api_key,
             session_id: None,
+            reattach_budget: 0,
+            owned: None,
         }
+    }
+
+    /// Marks this connection as attached to another process's instance. That owner can exit
+    /// at any moment (two `rubixdb -c` processes racing on a first run: the one that won
+    /// ownership may finish its script and shut the server down while the other is still
+    /// working), so a request that cannot even connect may re-resolve the instance a bounded
+    /// number of times.
+    pub fn allow_reattach(&mut self) {
+        self.reattach_budget = MAX_REATTACH;
+    }
+
+    /// Shuts down a server this process started by re-attaching (if any).
+    pub fn shutdown_owned(&mut self) {
+        if let Some(server) = self.owned.take() {
+            server.shutdown();
+        }
+    }
+
+    /// Safe only when the request provably never reached a server: a connect-level failure
+    /// (`is_connect`) sends no bytes, so no statement can have run and retrying cannot run one
+    /// twice. Never while a transaction is open (`session_id`): that transaction lived in the
+    /// server that is gone, and silently continuing outside it would be wrong.
+    fn try_reattach(&mut self, err: &reqwest::Error) -> bool {
+        if self.reattach_budget == 0 || self.session_id.is_some() || !err.is_connect() {
+            return false;
+        }
+        self.reattach_budget -= 1;
+        let Ok((fresh, source)) = crate::resolve_connection() else {
+            return false;
+        };
+        self.http = fresh.http;
+        self.base_url = fresh.base_url;
+        self.api_key = fresh.api_key;
+        if let crate::ConnectionSource::BecameOwner(server) = source {
+            self.owned = Some(server);
+        }
+        true
     }
 
     pub fn base_url(&self) -> &str {
@@ -103,14 +151,23 @@ impl Connection {
             params: Vec::new(),
             session_id: self.session_id.clone(),
         };
-        let response = self
-            .http
-            .post(format!("{}/v1/sql", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .map_err(|e| CliError::Transport(e.to_string()))?;
-
+        let send = |c: &Connection| {
+            c.http
+                .post(format!("{}/v1/sql", c.base_url))
+                .bearer_auth(&c.api_key)
+                .json(&body)
+                .send()
+        };
+        let response = match send(self) {
+            Ok(r) => r,
+            Err(e) => {
+                if self.try_reattach(&e) {
+                    send(self).map_err(|e| CliError::Transport(e.to_string()))?
+                } else {
+                    return Err(CliError::Transport(e.to_string()));
+                }
+            }
+        };
         let status = response.status();
         let text = response
             .text()
@@ -283,4 +340,103 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod reattach_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // These tests point the process-wide instances root at a private temp dir.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    fn dead_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn with_private_root<T>(f: impl FnOnce() -> T) -> T {
+        let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("rbx_reattach_{}", uuid::Uuid::new_v4()));
+        std::env::set_var("RUBIXDB_INSTANCES_ROOT", &root);
+        std::env::remove_var("RUBIXDB_API_URL");
+        std::env::remove_var("RUBIXDB_API_KEY");
+        let out = f();
+        std::env::remove_var("RUBIXDB_INSTANCES_ROOT");
+        std::fs::remove_dir_all(&root).ok();
+        out
+    }
+
+    /// The race `concurrent_first_run_processes_race_safely_to_one_owner` used to lose now and
+    /// then: this process attached to an owner that exited while it was still working. A
+    /// connect failure means nothing ran, so it re-resolves (here: becomes the owner itself)
+    /// and the statement runs exactly once -- including when an earlier statement already
+    /// succeeded against the owner that went away.
+    #[test]
+    fn a_vanished_owner_is_replaced_and_the_statement_runs_once() {
+        with_private_root(|| {
+            let mut c = Connection::new(
+                format!("http://127.0.0.1:{}", dead_port()),
+                "stale-key".into(),
+                std::time::Duration::from_secs(30),
+            );
+            c.allow_reattach();
+            let r = c.execute("SELECT 1").expect("should re-attach and succeed");
+            assert_eq!(r.result["kind"], "rows");
+            // The server we just started goes away again (as the original owner did): the next
+            // statement re-resolves again instead of failing.
+            c.shutdown_owned();
+            let r = c.execute("SELECT 2").expect("should re-attach again");
+            assert_eq!(r.result["kind"], "rows");
+            c.shutdown_owned();
+        });
+    }
+
+    #[test]
+    fn an_open_transaction_is_never_silently_continued_on_a_new_server() {
+        with_private_root(|| {
+            let mut c = Connection::new(
+                format!("http://127.0.0.1:{}", dead_port()),
+                "k".into(),
+                std::time::Duration::from_secs(30),
+            );
+            c.allow_reattach();
+            c.session_id = Some("txn-from-the-dead-server".into());
+            assert!(matches!(c.execute("SELECT 1"), Err(CliError::Transport(_))));
+            assert!(
+                c.owned.is_none(),
+                "no new server may be started for a lost transaction"
+            );
+        });
+    }
+
+    #[test]
+    fn re_attaching_is_bounded() {
+        with_private_root(|| {
+            let mut c = Connection::new(
+                format!("http://127.0.0.1:{}", dead_port()),
+                "k".into(),
+                std::time::Duration::from_secs(30),
+            );
+            c.allow_reattach();
+            for _ in 0..MAX_REATTACH {
+                c.execute("SELECT 1").expect("within budget");
+                c.shutdown_owned();
+            }
+            assert!(matches!(c.execute("SELECT 1"), Err(CliError::Transport(_))));
+        });
+    }
+
+    #[test]
+    fn without_the_flag_a_dead_server_is_still_an_ordinary_connection_error() {
+        with_private_root(|| {
+            let mut c = Connection::new(
+                format!("http://127.0.0.1:{}", dead_port()),
+                "k".into(),
+                std::time::Duration::from_secs(30),
+            );
+            assert!(matches!(c.execute("SELECT 1"), Err(CliError::Transport(_))));
+            assert!(c.owned.is_none());
+        });
+    }
 }
