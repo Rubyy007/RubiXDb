@@ -1,4 +1,14 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { ApiClient } from "../api/client";
 import type { Role } from "../api/types";
 
 export interface Session {
@@ -54,12 +64,23 @@ interface SessionContextValue {
   /** Cleared on logout and automatically on any 401 response
    * (PHASE_FRONTEND_ARCHITECTURE.md §5). */
   clearSession: () => void;
+  /** True while a `#token=` handoff from `rubixdb gui` is being verified. */
+  bootstrapping: boolean;
 }
 
 const SessionContext = createContext<SessionContextValue | null>(null);
 
-export function SessionProvider({ children }: { children: ReactNode }) {
+export function SessionProvider({
+  children,
+  handoffToken = null,
+}: {
+  children: ReactNode;
+  /** A token taken from the URL fragment at boot (see utils/tokenHandoff). */
+  handoffToken?: string | null;
+}) {
   const [session, setSessionState] = useState<Session | null>(() => readStored());
+  const [bootstrapping, setBootstrapping] = useState<boolean>(handoffToken !== null);
+  const started = useRef(false);
 
   const setSession = useCallback((next: Session, remember: boolean) => {
     setSessionState(next);
@@ -79,9 +100,37 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     clearStored();
   }, []);
 
+  // `rubixdb gui` hands the instance key over in the URL fragment: verify it
+  // against this origin, then keep it in sessionStorage only (never
+  // localStorage -- "Remember" stays an explicit opt-in on the Connect page).
+  // A token that fails verification is simply dropped.
+  useEffect(() => {
+    if (handoffToken === null || started.current) return;
+    started.current = true;
+    const baseUrl = window.location.origin;
+    const trial = new ApiClient(
+      { baseUrl, apiKey: handoffToken, role: "reader", principalName: "" },
+      () => {
+        /* a 401 here just means the token was not accepted */
+      },
+    );
+    trial
+      .whoami()
+      .then((who) => {
+        setSession(
+          { baseUrl, apiKey: handoffToken, role: who.role, principalName: who.principal_name },
+          false,
+        );
+      })
+      .catch(() => {
+        /* fall through to the normal Connect page */
+      })
+      .finally(() => setBootstrapping(false));
+  }, [handoffToken, setSession]);
+
   const value = useMemo(
-    () => ({ session, setSession, clearSession }),
-    [session, setSession, clearSession],
+    () => ({ session, setSession, clearSession, bootstrapping }),
+    [session, setSession, clearSession, bootstrapping],
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;

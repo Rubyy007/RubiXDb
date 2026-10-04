@@ -117,3 +117,70 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
+
+/* --- shell redesign tokens (Frontend Shell Redesign, Increment 1) ---
+   Additive: the --color-* tokens above stay the source for page content.
+   Text on these backgrounds uses --text-primary / --text-secondary
+   (>= 4.5:1). --text-muted (#8b929c, ~3:1 on white) is defined for the
+   design set but is NOT used for text, to keep WCAG AA. */
+:root {
+  --bg-app: #ffffff;
+  --bg-rail: #f7f8fa;
+  --bg-rail-hover: #eef0f4;
+  --bg-card: #ffffff;
+  --border: #e6e8eb;
+  --text-primary: #1a1d21;
+  --text-secondary: #5f6672;
+  --text-muted: #8b929c;
+  --accent: #1f6feb;
+  --accent-hover: #1a5fd0;
+  --success: #1a7f37;
+  --warning: #b8860b;
+  --danger: #cf222e;
+  --radius: 8px;
+  --radius-card: 12px;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg-app: #14161a;
+    --bg-rail: #1b1e24;
+    --bg-rail-hover: #262a32;
+    --bg-card: #1f232a;
+    --border: #2b2f38;
+    --text-primary: #e8e9ec;
+    --text-secondary: #a7acb8;
+    --text-muted: #757b88;
+    --accent: #4c8dff;
+    --accent-hover: #6aa0ff;
+    --success: #3fb950;
+    --warning: #d4a72c;
+    --danger: #f85149;
+  }
+  :root:not([data-theme="light"]) .rail-logo {
+    filter: invert(1);
+    mix-blend-mode: screen;
+  }
+}
+
+:root[data-theme="dark"] {
+  --success: #3fb950;
+  --warning: #d4a72c;
+  --danger: #f85149;
+  --bg-app: #14161a;
+  --bg-rail: #1b1e24;
+  --bg-rail-hover: #262a32;
+  --bg-card: #1f232a;
+  --border: #2b2f38;
+  --text-primary: #e8e9ec;
+  --text-secondary: #a7acb8;
+  --text-muted: #757b88;
+  --accent: #4c8dff;
+  --accent-hover: #6aa0ff;
+}
+
+:root[data-theme="dark"] .rail-logo {
+  filter: invert(1);
+  mix-blend-mode: screen;
+}

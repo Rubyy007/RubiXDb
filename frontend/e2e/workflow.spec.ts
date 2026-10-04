@@ -33,7 +33,7 @@ test.describe("RubiXDB console — full workflow, real backend", () => {
     });
 
     // 3. Write data via the Data Explorer.
-    await navTo(page, "Data Explorer");
+    await navTo(page, "Catalog");
     const keyText = `e2e-key-${Date.now()}`;
     await page.getByLabel("Key", { exact: true }).first().fill(keyText);
     await page.getByLabel("Value", { exact: true }).fill("hello from playwright");
@@ -70,19 +70,19 @@ test.describe("RubiXDB console — full workflow, real backend", () => {
     await expect(page.getByRole("table", { name: "Held snapshots" })).toBeVisible();
 
     // 8. Inspect compaction.
-    await navTo(page, "Compaction");
+    await navTo(page, "Compute");
     await expect(page.getByRole("heading", { name: "Automatic trigger" })).toBeVisible();
     await expect(page.getByText("Disabled")).toBeVisible(); // e2e config disables auto-trigger
 
     // 9. Inspect metrics (Health / Storage page).
-    await navTo(page, "Health / Storage");
+    await navTo(page, "Monitoring");
     await expect(page.getByText("Engine status")).toBeVisible();
     await expect(page.getByRole("table", { name: "Per-route request metrics" })).toBeVisible({
       timeout: 10_000,
     });
 
     // 10. Handle an error: look up a key that does not exist.
-    await navTo(page, "Data Explorer");
+    await navTo(page, "Catalog");
     await page.getByRole("tab", { name: "Point Lookup" }).click();
     await page.getByLabel("Key", { exact: true }).first().fill("definitely-does-not-exist");
     await page.getByRole("button", { name: "Look up" }).click();
@@ -92,7 +92,7 @@ test.describe("RubiXDB console — full workflow, real backend", () => {
     // engine) must both survive.
     await page.reload();
     await expect(page.getByText("e2e-admin", { exact: false })).toBeVisible({ timeout: 10_000 });
-    await navTo(page, "Data Explorer");
+    await navTo(page, "Catalog");
     await page.getByLabel("Key", { exact: true }).first().fill(keyText);
     await page.getByRole("button", { name: "Look up" }).click();
     await expect(page.locator("pre")).toHaveText("updated value", { timeout: 10_000 });
@@ -100,7 +100,7 @@ test.describe("RubiXDB console — full workflow, real backend", () => {
 
   test("a reader-role session cannot write, and sees no write controls at all", async ({ page }) => {
     await connect(page, READER_KEY);
-    await navTo(page, "Data Explorer");
+    await navTo(page, "Catalog");
     // The write Card is not rendered at all for a reader-role session
     // (PHASE_FRONTEND_ARCHITECTURE.md §3: role-gated actions).
     await expect(page.getByRole("button", { name: "Put" })).not.toBeVisible();

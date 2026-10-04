@@ -52,7 +52,7 @@ async function tableIdByName(request: APIRequestContext, apiKey: string, name: s
 }
 
 async function goToObjectsTab(page: Page) {
-  await page.getByRole("link", { name: "Data Explorer" }).click();
+  await page.getByRole("link", { name: "Catalog" }).click();
   await expect(page.getByRole("heading", { name: "Data Explorer" })).toBeVisible();
   await page.getByRole("tab", { name: "Objects" }).click();
 }

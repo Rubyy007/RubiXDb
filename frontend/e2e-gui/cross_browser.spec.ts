@@ -88,7 +88,7 @@ test.describe("Cross-browser GUI -- real rubixdb gui product path, every install
 
     const execStart = Date.now();
     await page.getByLabel("SQL").fill(`SELECT id, v, val FROM crossbrowser_t`);
-    await page.getByRole("button", { name: "Execute" }).click();
+    await page.getByRole("button", { name: "Run", exact: true }).click();
     await expect(page.getByText(new RegExp(`Result \\(${ROW_COUNT} rows\\)`))).toBeVisible({
       timeout: 30_000,
     });
@@ -99,13 +99,10 @@ test.describe("Cross-browser GUI -- real rubixdb gui product path, every install
     const renderedRows = await page.locator(".table-wrap tbody tr").count();
     expect(renderedRows).toBeLessThanOrEqual(200);
 
-    // Scroll behavior: this is a fixed `height: 100vh` app-shell grid
-    // layout (`global.css`) -- `.table-wrap` only scrolls horizontally
-    // and the page/window itself never scrolls at all; `.app-content`
-    // (the grid's own `overflow-y: auto` region) is the real vertical
-    // scroll container for a 200-row table, so that is the real,
-    // engine-observed element to exercise here.
-    const content = page.locator(".app-content");
+    // Scroll behavior: since the SQL Console redesign the page itself never scrolls (it fills the
+    // viewport); the results grid (`.grid-scroll`) is the real vertical scroll container for a
+    // 200-row table, so that is the real, engine-observed element to exercise here.
+    const content = page.locator(".grid-scroll");
     const beforeScrollTop = await content.evaluate((el) => el.scrollTop);
     await content.evaluate((el) => {
       el.scrollTop = el.scrollHeight;

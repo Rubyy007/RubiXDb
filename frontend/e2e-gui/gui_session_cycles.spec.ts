@@ -63,10 +63,10 @@ async function oneSession(browser: Browser, apiKey: string, i: number): Promise<
   // query
   await page.getByRole("link", { name: "SQL Console" }).click();
   await page.getByLabel("SQL").fill(`SELECT id, v FROM gui_cycle_t WHERE id < ${50 + (i % 50)} ORDER BY id`);
-  await page.getByRole("button", { name: /Execute/ }).click();
+  await page.getByRole("button", { name: "Run", exact: true }).click();
   await expect(page.getByRole("table").first()).toBeVisible({ timeout: 30_000 });
   // navigate every page
-  for (const name of ["Data Explorer", "Snapshots", "Compaction", "Health / Storage", "Operations", "Dashboard"]) {
+  for (const name of ["Catalog", "Snapshots", "Compute", "Monitoring", "Admin", "Home"]) {
     await page.getByRole("link", { name }).click();
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   }

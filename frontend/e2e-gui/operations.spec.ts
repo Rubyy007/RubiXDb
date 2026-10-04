@@ -34,7 +34,7 @@ async function execSql(request: APIRequestContext, apiKey: string, sql: string) 
 }
 
 async function openOperations(page: Page) {
-  await page.getByRole("link", { name: "Operations" }).click();
+  await page.getByRole("link", { name: "Admin" }).click();
   await expect(page.getByRole("heading", { name: "Operations", level: 1 })).toBeVisible();
 }
 

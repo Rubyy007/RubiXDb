@@ -11,7 +11,7 @@ function defaultBaseUrl(): string {
 }
 
 export function ConnectPage() {
-  const { session, setSession } = useSession();
+  const { session, setSession, bootstrapping } = useSession();
   const navigate = useNavigate();
   const [baseUrl, setBaseUrl] = useState(defaultBaseUrl());
   const [apiKey, setApiKey] = useState("");
@@ -21,6 +21,9 @@ export function ConnectPage() {
 
   if (session) {
     return <Navigate to="/" replace />;
+  }
+  if (bootstrapping) {
+    return <main aria-busy="true">Connecting…</main>;
   }
 
   async function handleSubmit(e: FormEvent) {
@@ -93,6 +96,15 @@ export function ConnectPage() {
           mono
           autoComplete="off"
         />
+        <p
+          role="note"
+          className="text-muted"
+          style={{ fontSize: "var(--font-size-sm)", margin: 0 }}
+        >
+          Warning: &ldquo;Remember&rdquo; saves this API key in this browser&rsquo;s localStorage, where
+          any script on this page&rsquo;s origin can read it and where it stays after the browser
+          closes. Leave it unticked to keep the key in this tab only.
+        </p>
         <label className="row" style={{ fontSize: "var(--font-size-sm)" }}>
           <input
             type="checkbox"

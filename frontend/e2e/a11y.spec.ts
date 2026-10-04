@@ -30,7 +30,7 @@ async function connect(page: Page) {
 // not a static/CSS-only check.
 const SCREENS: { path: string; label: string }[] = [
   { path: "/connect", label: "Connect" },
-  { path: "/", label: "Dashboard" },
+  { path: "/", label: "Home" },
   { path: "/explorer", label: "Data Explorer" },
   { path: "/snapshots", label: "Snapshots" },
   { path: "/compaction", label: "Compaction" },

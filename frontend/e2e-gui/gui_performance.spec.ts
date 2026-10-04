@@ -101,7 +101,7 @@ test.describe("GUI performance -- real rubixdb gui product path, real production
 
       const execStart = Date.now();
       await page.getByLabel("SQL").fill(`SELECT id, v, val FROM ${table}`);
-      await page.getByRole("button", { name: "Execute" }).click();
+      await page.getByRole("button", { name: "Run", exact: true }).click();
       await expect(page.getByText(new RegExp(`Result \\(${rowCount} rows\\)`))).toBeVisible({
         timeout: 60_000,
       });

@@ -4,6 +4,7 @@ import { Card, CardGrid, Stat } from "../components/Card";
 import { Badge, storageStateTone } from "../components/Badge";
 import { Spinner } from "../components/Spinner";
 import { ErrorState } from "../components/EmptyState";
+import { QuickActions, RecentItems, Templates } from "./HomeSections";
 import { formatBytes, formatDurationSecs, formatNumber } from "../utils/format";
 
 export function DashboardPage() {
@@ -13,7 +14,11 @@ export function DashboardPage() {
 
   return (
     <div className="stack">
-      <h1 style={{ fontSize: "var(--font-size-2xl)" }}>Dashboard</h1>
+      <h1 style={{ fontSize: "var(--font-size-2xl)" }}>Home</h1>
+
+      <QuickActions />
+      <RecentItems />
+      <Templates />
 
       {status.isLoading && <Spinner label="Loading status" />}
       {status.isError && <ErrorState message="Could not load engine status." />}

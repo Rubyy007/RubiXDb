@@ -13,7 +13,10 @@ import { SettingsPage } from "./pages/SettingsPage";
 import { SqlConsolePage } from "./pages/SqlConsolePage";
 
 function RequireSession({ children }: { children: ReactElement }) {
-  const { session } = useSession();
+  const { session, bootstrapping } = useSession();
+  // Hold the route while a `#token=` handoff is verified, so the redirect to
+  // /connect cannot race it.
+  if (!session && bootstrapping) return <main aria-busy="true">Connecting…</main>;
   if (!session) return <Navigate to="/connect" replace />;
   return children;
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SqlConsolePage } from "./SqlConsolePage";
@@ -9,6 +9,11 @@ const sqlMock = vi.fn<(req: unknown, signal?: AbortSignal) => Promise<SqlRespons
 vi.mock("../api/queries", () => ({
   useApiClient: () => ({ sql: sqlMock }),
   invalidateCatalogQueries: () => {},
+  useDatabasesQuery: () => ({ data: [{ database_id: 1, name: "default" }], isError: false }),
+  useSchemasQuery: () => ({ data: [{ schema_id: 1, database_id: 1, name: "public" }], isError: false }),
+}));
+vi.mock("../context/SessionContext", () => ({
+  useSession: () => ({ session: { role: "admin", principalName: "p" } }),
 }));
 
 function renderPage() {
@@ -25,14 +30,19 @@ function typeSql(text: string) {
 }
 
 function clickExecute() {
-  fireEvent.click(screen.getByRole("button", { name: "Execute" }));
+  fireEvent.click(screen.getByRole("button", { name: "Run" }));
 }
 
 describe("SqlConsolePage", () => {
+  beforeEach(() => {
+    // worksheet text is kept in sessionStorage; start every test from a fresh browser tab
+    window.sessionStorage.clear();
+  });
+
   it("renders the editor and a disabled Execute button with empty input", () => {
     renderPage();
     expect(screen.getByLabelText("SQL")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Execute" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
   });
 
   it("executes a query and renders typed rows including NULL", async () => {

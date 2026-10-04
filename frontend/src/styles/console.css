@@ -1,0 +1,719 @@
+/* SQL Console page. Uses only the shell tokens from tokens.css. Panels follow
+   the shell: 1px --border, --radius-card, 16px card padding, 32px grid rows. */
+
+.sqlc {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  /* fill the viewport under the top bar; the page itself never scrolls */
+  height: calc(100vh - 56px - 2 * var(--space-5));
+  min-height: 480px;
+}
+
+@media (max-width: 640px) {
+  .sqlc {
+    height: calc(100vh - 56px - 2 * var(--space-4));
+  }
+}
+
+/* --- worksheet tab strip --- */
+
+.ws-strip {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.ws-tabs {
+  display: flex;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.ws-tab-wrap {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+.ws-tab-wrap[data-active="true"] {
+  background: var(--bg-card);
+  border-color: var(--border);
+  box-shadow:
+    var(--shadow-card),
+    inset 0 -2px 0 var(--accent);
+  margin-bottom: -1px;
+}
+
+.ws-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 34px;
+  padding: 0 var(--space-2) 0 var(--space-3);
+  border: 0;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ws-tab[aria-selected="true"] {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.ws-tab-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-dirty {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.ws-close,
+.ws-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.ws-close {
+  opacity: 0;
+}
+
+.ws-tab-wrap:hover .ws-close,
+.ws-tab-wrap:focus-within .ws-close,
+.ws-tab-wrap[data-active="true"] .ws-close {
+  opacity: 1;
+}
+
+.ws-tab:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+.ws-close:hover,
+.ws-add:hover:not(:disabled) {
+  background: var(--bg-rail-hover);
+  color: var(--text-primary);
+}
+
+.ws-add {
+  flex: none;
+  margin-bottom: var(--space-1);
+}
+
+.ws-add:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* --- toolbar --- */
+
+.sqlc-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+
+.sqlc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  font-size: 12px;
+}
+
+.chip-k {
+  color: var(--text-secondary);
+}
+
+.chip-v {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.sqlc-actions {
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.sqlc-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.menu-wrap {
+  position: relative;
+}
+
+.menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + var(--space-1));
+  z-index: 30;
+  min-width: 210px;
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  box-shadow:
+    var(--shadow-card),
+    0 8px 24px rgba(0, 0, 0, 0.08);
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-primary);
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu-item:hover:not(:disabled) {
+  background: var(--bg-rail-hover);
+}
+
+.menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* --- editor --- */
+
+.sqlc-panel {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.sqled {
+  display: flex;
+  min-height: 0;
+}
+
+.sqled-gutter {
+  flex: none;
+  width: 48px;
+  overflow: hidden;
+  background: var(--bg-rail);
+  border-right: 1px solid var(--border);
+  color: var(--text-secondary);
+  text-align: right;
+  user-select: none;
+}
+
+.sqled-gutter pre {
+  margin: 0;
+  padding: 12px 8px;
+  font: 13px/20px var(--font-mono);
+}
+
+.sqled-body {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.sqled-hl,
+.sqled-input {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 12px 16px;
+  border: 0;
+  font: 13px/20px var(--font-mono);
+  letter-spacing: normal;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.sqled-hl {
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.sqled-hl code {
+  font: inherit;
+}
+
+.sqled-band {
+  position: absolute;
+  z-index: -1;
+  left: 0;
+  right: 0;
+  height: 20px;
+  background: var(--bg-rail);
+}
+
+.sqled-input {
+  width: 100%;
+  height: 100%;
+  resize: none;
+  overflow: auto;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  /* the text is painted by the highlight layer underneath; only the caret and
+     selection are drawn here */
+  -webkit-text-fill-color: transparent;
+  caret-color: var(--text-primary);
+}
+
+.sqled-input::placeholder {
+  -webkit-text-fill-color: var(--text-secondary);
+  color: var(--text-secondary);
+}
+
+.sqled-input::selection {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.sqled-input:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+  border-radius: 0;
+}
+
+.tok-kw {
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+
+.tok-str {
+  color: var(--success);
+}
+
+.tok-num {
+  color: var(--danger);
+}
+
+.tok-com {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.tok-id {
+  font-weight: 600;
+}
+
+.sqled-resize {
+  height: 8px;
+  border-top: 1px solid var(--border);
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.sqled-resize:hover {
+  background: var(--bg-rail-hover);
+}
+
+.sqled-resize:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+  border-radius: 0;
+}
+
+.sqled-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  height: 28px;
+  padding: 0 var(--space-3);
+  border-top: 1px solid var(--border);
+  background: var(--bg-rail);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.sqled-footer-right {
+  display: flex;
+  gap: var(--space-4);
+}
+
+/* --- results panel --- */
+
+.sqlc-results {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 120px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.sqlc-results .tabs {
+  flex: none;
+  margin-bottom: 0;
+  padding: 0 var(--space-3);
+  border-bottom-color: var(--border);
+  background: var(--bg-rail);
+}
+
+.sqlc-results .tab {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+/* accent on the rail grey is 4.36:1 (< AA), so the selected tab is dark text with the accent underline */
+.sqlc-results .tab[aria-selected="true"] {
+  color: var(--text-primary);
+}
+
+.sqlc-results-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+}
+
+.sqlc-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 34px;
+  height: 2px;
+  overflow: hidden;
+  background: var(--bg-rail-hover);
+}
+
+.sqlc-progress::after {
+  content: "";
+  display: block;
+  width: 30%;
+  height: 100%;
+  background: var(--accent);
+  animation: sqlc-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes sqlc-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sqlc-progress::after {
+    animation: none;
+    width: 100%;
+  }
+}
+
+.sqlc-message {
+  padding: var(--space-4);
+}
+
+.sqlc-plan {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+/* --- result grid --- */
+
+.grid-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.grid-toolbar {
+  flex: none;
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.grid-count {
+  font-weight: 600;
+}
+
+.grid-empty {
+  padding: var(--space-4);
+}
+
+.table-wrap.grid-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+}
+
+.grid {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}
+
+.grid th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 32px;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-rail);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.grid-type {
+  margin-left: var(--space-2);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.grid td {
+  height: 32px;
+  max-width: 480px;
+  padding: 0 var(--space-3);
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.grid tbody tr:hover td {
+  background: var(--bg-rail-hover);
+}
+
+.grid .grid-rownum {
+  position: sticky;
+  left: 0;
+  min-width: 56px;
+  background: var(--bg-rail);
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+.grid th.grid-rownum {
+  z-index: 2;
+}
+
+.grid-null {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.grid-footer {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--bg-rail);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.grid-pager {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.grid-pager .btn {
+  height: 28px;
+  padding: 0 var(--space-3);
+}
+
+.grid-pagesize {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.grid-pagesize select {
+  height: 28px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text-primary);
+}
+
+/* --- details + history --- */
+
+.details {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  padding: var(--space-4);
+  font-size: 14px;
+}
+
+.details dt {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.details dd {
+  margin: 0;
+}
+
+.details-sql {
+  max-height: 220px;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  overflow: auto;
+  border-radius: var(--radius);
+  background: var(--bg-rail);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.history {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.history-item {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) 88px;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  height: 32px;
+  padding: 0 var(--space-4);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-item:hover {
+  background: var(--bg-rail-hover);
+}
+
+.history-time {
+  color: var(--text-secondary);
+}
+
+.history-sql {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-ok {
+  color: var(--success);
+}
+
+.history-fail {
+  color: var(--danger);
+}
+
+/* --- status bar --- */
+
+.sqlc-status {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  height: 28px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-rail);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.sqlc-status-left,
+.sqlc-status-right {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  margin-right: calc(-1 * var(--space-1));
+  border-radius: 50%;
+}
+
+.dot-ready {
+  background: var(--success);
+}
+
+.dot-running {
+  background: var(--warning);
+}
+
+.dot-failed {
+  background: var(--danger);
+}

@@ -17,7 +17,7 @@ async function connect(page: Page) {
 
 async function runSql(page: Page, sql: string) {
   await page.getByLabel("SQL").fill(sql);
-  await page.getByRole("button", { name: "Execute" }).click();
+  await page.getByRole("button", { name: "Run", exact: true }).click();
 }
 
 const PAYLOADS = [
@@ -86,11 +86,11 @@ test.describe("frontend security -- untrusted database content, real browser", (
     await runSql(page, `SELECT id, v FROM ${table}`);
     await expect(page.getByText(/Result \(1 rows?\)/)).toBeVisible({ timeout: 30_000 });
     expect(await page.evaluate(() => document.querySelectorAll(".table-wrap b").length)).toBe(0);
-    await expect(page.getByRole("button", { name: "Execute" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "Run", exact: true })).toBeEnabled();
     // An over-limit statement (> 1 MiB) is refused by the backend; the UI shows an error and stays usable.
     await runSql(page, `INSERT INTO ${table} (id, v) VALUES (2, '${"<b>".repeat(400_000)}')`);
     await expect(page.getByText(/limit|too large|resource/i).first()).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByRole("button", { name: "Execute" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "Run", exact: true })).toBeEnabled();
     await runSql(page, `DROP TABLE ${table}`);
   });
 });

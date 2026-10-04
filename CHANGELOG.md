@@ -2471,3 +2471,67 @@ the original Phase 1 throughput targets.
 ### Known / open
 - M1.3 intermittently below 80 k on this SATA machine (FAIL), M1.2 OPEN; power loss and real disk-full not tested; PITR not implemented; downgrade unsupported;
   engine: corrupt WAL segments do not stop `LsmEngine::open` and the manifest is unversioned (ADR-ENG-OPS-001, guarded at the product layer).
+
+## 2026-10-04 -- WAL M1.2/M1.3 diagnosis and final certification status (documentation only)
+### Added
+- `PHASE_RUBIXDB_WAL_M12_M13_DIAGNOSIS.md`, `PHASE_RUBIXDB_WAL_M12_M13_CERTIFICATION_FINAL.md`, `scratch/wal_diag/` raw data.
+### Changed
+- Certification status only: M1.3 reclassified FAIL (intermittent) -> OPEN (aggregate acceptance policy undefined; historical slow mode preserved, not reproduced in 58 runs, trigger unidentified); M1.2 OPEN; full release regression FAIL; power loss NOT TESTED; NVMe HARDWARE UNAVAILABLE. No code, test or threshold changed.
+### Known / open
+- Slow-mode trigger unknown; acceptance policy for repeated runs undefined; workspace release run still fails m1_3 (cause not investigated).
+
+## 2026-10-04 -- WAL certification status under Rule A (documentation only)
+### Changed
+- Certification status: M1.2 FAIL, M1.3 FAIL (Rule A, set S: 2/57 and 8/95 included runs below threshold), full release regression FAIL, WAL certification FAIL, power loss NOT TESTED, NVMe HARDWARE UNAVAILABLE. Supersedes the earlier OPEN statements (additive section in `PHASE_RUBIXDB_WAL_M12_M13_CERTIFICATION_FINAL.md`). No code, test or threshold change.
+### Known / open
+- Workspace m1_3 failure root cause UNRESOLVED; slow-run trigger unknown (one slow run observed on C: with device write latency 10.4 ms); certification-set boundary undefined; non-WAL CLI test flake logged; docs/PROJECT_STATE.md and missions/ACTIVE.md absent.
+
+## 2026-10-04 -- Phase 7 Increment A: repository hygiene (under [Unreleased])
+### Security
+- Stopped tracking `frontend/.e2e-crossbrowser-data/` (it held a generated admin credential published in commit `2afa0e1`); directory is now git-ignored. The key is treated as compromised; history is not rewritten.
+- Added `tests/repo_hygiene.rs`: fails if any `credentials.json`, key/certificate file, or 64-hex `admin_key` literal is tracked.
+- Release script now runs `cargo audit`, `cargo deny` and `npm audit --package-lock-only --omit=dev` (new `scripts/dependency_gates.ps1`) and fails the release on any of them.
+### Changed
+- Release packages no longer include `rubixdb-api.exe`; the standalone API binary is unsupported and not certified in v1. The package is asserted to contain no `rubixdb-api*`.
+
+## 2026-10-04 -- Phase 7 Increment B: credential at rest and replacement (under [Unreleased])
+### Security
+- `credentials.json` on Windows is now written with an owner + SYSTEM only, non-inherited DACL, applied to the empty staging file before the key is written. If the ACL cannot be set, nothing is persisted and instance creation fails. The accepted-risk note in `PHASE_RUBIXDB_INSTANCE_SECURITY.md` §2 is superseded for files written by this version.
+- Credential persistence is now stage -> restrict -> write -> fsync -> read-back verify -> rename; a damaged or mismatched staged file is never committed.
+### Added
+- `rubixdb instance rotate-credential <NAME> --confirm <NAME>`: offline credential replacement; refuses a running or concurrently-rotating instance; prints no key.
+- `rubixdb-instance`: `rotate_credential`, `RotateError`, `RotateOutcome`; `windows-sys` 0.61 as a `cfg(windows)` dependency (already in Cargo.lock; one new dependency edge, no new crate).
+
+## 2026-10-04 -- Phase 7 Increment C: redaction, security events, response headers, GUI handoff (under [Unreleased])
+### Security
+- Security event log: bounded JSON-lines `security.log` per instance (and `instances-security.log` for `instance drop`) recording authentication failures (rate-bounded), `/v1/admin/*` actions, catalog DDL create/drop, instance start/stop/drop and credential replacement. Never records keys, tokens, SQL text, parameters, row data or request URIs. 1 MiB x (1 + 4 generations) per log.
+- `Debug` for `InstanceCredentials`, `ApiKeyConfig` and `Config` no longer prints keys; `RUBIXDB_API_KEYS` parse errors no longer echo the offending entry (which contained the key).
+- Response headers on every response: strict `Content-Security-Policy` (no `'unsafe-inline'`/`'unsafe-eval'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on `/v1/*`.
+- `rubixdb gui` hands the instance key to the browser in the URL fragment; the console stores it in sessionStorage only and removes the fragment from the URL. "Remember" now carries an explicit warning.
+### Changed
+- The console can only reach its own origin (CSP `connect-src` falls back to `'self'`).
+- Connect-screen visual baseline regenerated for the new warning text.
+### Added
+- Dependency edges (no new crates): `rubixdb-cli` -> `tracing`, `tracing-subscriber`; `rubixdb-api` -> `pin-project-lite`.
+
+## 2026-10-04 -- Frontend shell redesign, Increment 1 (under [Unreleased])
+### Changed
+- Console layout: left navigation rail (grouped, collapsible), top bar with breadcrumb and search box, content container. Pages and routes are unchanged; navigation labels are now Home, SQL Console, Monitoring, Catalog, Governance & security, Compute, Admin, Snapshots.
+- Log out moved to the profile chip at the bottom of the rail.
+### Added
+- Design tokens for the shell (additive), inline icon set, rubiXDb logo asset, GUI shell spec.
+
+## 2026-10-04 -- Frontend shell redesign, Increment 2 (under [Unreleased])
+### Added
+- Home page: Quick actions, Recent items (queries from this session, held snapshots, backups for admins), SQL templates, and a RAM usage card in the rail ("Not available" until the server reports memory).
+### Changed
+- The Home page heading is now "Home" (was "Dashboard"); the existing dashboard cards are unchanged below it.
+
+## 2026-10-04 -- SQL Console redesign (under [Unreleased])
+### Changed
+- SQL Console: worksheet tabs (kept in this browser tab's sessionStorage), toolbar with session chips and Run/Stop, syntax-highlighted editor with line numbers and resize, results panel with Results / Query details / History, paginated grid (100/200/500 rows), CSV download, status bar. Page no longer scrolls; the grid scrolls inside its panel.
+
+## 2026-10-04 -- Self-contained executable (under [Unreleased])
+### Changed
+- `rubixdb.exe` now carries the console inside the file; no `frontend-dist` folder is needed next to it, and a leftover one can no longer show an old UI.
+- The `default` instance goes back to port 302 whenever it is free (it no longer stays on a random port chosen during an earlier collision).

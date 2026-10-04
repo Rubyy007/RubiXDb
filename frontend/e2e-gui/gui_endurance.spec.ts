@@ -101,7 +101,7 @@ async function execute(page: Page, sql: string) {
   const responsePromise = page.waitForResponse(
     (r) => r.url().endsWith("/v1/sql") && r.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "Execute" }).click();
+  await page.getByRole("button", { name: "Run", exact: true }).click();
   await responsePromise;
 }
 
@@ -196,12 +196,14 @@ test.describe("GUI endurance + memory -- real rubixdb gui product path", () => {
     // No result retention after Clear: the Result card must be gone.
     await expect(page.getByText(/^Result \(/)).toHaveCount(0);
 
-    // No history leak: HISTORY_LIMIT=50 in SqlConsolePage.tsx -- after
+    // No history leak: the history store is capped at 50 (utils/sessionActivity.ts) -- after
     // 50 cycles x 9 real statements (450 executes), the rendered
     // history list must still be capped, never growing unbounded with
     // every additional statement.
-    const historyItems = page.locator("li").filter({ has: page.locator("button.btn-ghost") });
-    const historyCount = await historyItems.count();
+    // History is the third tab of the results panel since the SQL Console redesign.
+    await page.getByRole("tab", { name: "History" }).click();
+    const historyCount = await page.locator("button.history-item").count();
+    expect(historyCount).toBeGreaterThan(0);
     expect(historyCount).toBeLessThanOrEqual(50);
 
     // No monotonic browser memory/DOM growth: compare the back half of

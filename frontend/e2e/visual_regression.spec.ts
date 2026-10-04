@@ -34,7 +34,7 @@ test.describe("Productization — Production Validation Phase §12: visual regre
 
   test("Settings screen matches its baseline", async ({ page }) => {
     await connect(page, ADMIN_KEY);
-    await page.getByRole("link", { name: "Settings" }).click();
+    await page.getByRole("link", { name: "Governance & security" }).click();
     await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
     await expect(page).toHaveScreenshot("settings-screen.png", { maxDiffPixelRatio: 0.01 });
   });

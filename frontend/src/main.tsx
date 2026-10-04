@@ -7,6 +7,7 @@ import { SessionProvider } from "./context/SessionContext";
 import { ToastProvider } from "./components/Toast";
 import "./styles/global.css";
 import "./components/components.css";
+import { takeTokenFromLocation } from "./utils/tokenHandoff";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -20,10 +21,14 @@ const queryClient = new QueryClient({
 const rootEl = document.getElementById("root");
 if (!rootEl) throw new Error("#root element not found");
 
+// Read (and scrub from the URL) the `rubixdb gui` token handoff exactly once,
+// before anything renders or any route can redirect and drop the fragment.
+const handoffToken = takeTokenFromLocation();
+
 createRoot(rootEl).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <SessionProvider>
+      <SessionProvider handoffToken={handoffToken}>
         <ToastProvider>
           <BrowserRouter>
             <App />

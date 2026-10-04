@@ -96,7 +96,7 @@ test.describe("100,000-row GUI case -- real rubixdb gui product path", () => {
 
     const execStart = Date.now();
     await page.getByLabel("SQL").fill("SELECT id, v, val FROM hundred_k_t");
-    await page.getByRole("button", { name: "Execute" }).click();
+    await page.getByRole("button", { name: "Run", exact: true }).click();
     await expect(page.getByText(new RegExp(`Result \\(${ROW_COUNT} rows\\)`))).toBeVisible({
       timeout: 120_000,
     });
@@ -118,7 +118,7 @@ test.describe("100,000-row GUI case -- real rubixdb gui product path", () => {
     expect(renderedRows).toBeLessThanOrEqual(200);
 
     // Scrolling/pagination must remain responsive at this size.
-    const content = page.locator(".app-content");
+    const content = page.locator(".grid-scroll");
     const pageStart = Date.now();
     await content.evaluate((el) => {
       el.scrollTop = el.scrollHeight;

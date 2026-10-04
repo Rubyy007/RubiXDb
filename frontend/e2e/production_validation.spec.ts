@@ -24,7 +24,7 @@ async function navTo(page: Page, label: string) {
 test.describe("Productization — Production Validation Phase §8: functional states", () => {
   test("empty state renders for a range query that matches nothing", async ({ page }) => {
     await connect(page, ADMIN_KEY);
-    await navTo(page, "Data Explorer");
+    await navTo(page, "Catalog");
     await page.getByRole("tab", { name: "Range Query" }).click();
     // Lexicographically after every real key this test suite ever
     // writes (all real keys use lowercase prefixes) -- deterministic
@@ -40,14 +40,14 @@ test.describe("Productization — Production Validation Phase §8: functional st
     page,
   }) => {
     await connect(page, ADMIN_KEY);
-    await navTo(page, "Data Explorer");
+    await navTo(page, "Catalog");
     await page.getByLabel("Key", { exact: true }).first().fill("definitely-not-a-real-key-xyz");
     await page.getByRole("button", { name: "Look up" }).click();
     await expect(page.getByText(/does not exist/)).toBeVisible({ timeout: 10_000 });
     // The app is still usable afterward -- an error state is not a
     // dead end.
-    await navTo(page, "Dashboard");
-    await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+    await navTo(page, "Home");
+    await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
   });
 
   test("a 401 mid-session clears the session and redirects to /connect", async ({ page }) => {
@@ -103,7 +103,7 @@ test.describe("Productization — Production Validation Phase §9: repeated-work
     });
 
     await connect(page, ADMIN_KEY);
-    await navTo(page, "Data Explorer");
+    await navTo(page, "Catalog");
 
     const cdp = await context.newCDPSession(page);
     await cdp.send("Performance.enable");
@@ -170,7 +170,7 @@ test.describe("Productization — Production Validation Phase §13: frontend sec
 
   test("logout clears both storages; a fresh reload requires reconnecting", async ({ page }) => {
     await connect(page, ADMIN_KEY);
-    await navTo(page, "Settings");
+    await navTo(page, "Governance & security");
     // Scoped to the page body's own logout action -- the top bar
     // (`AppShell`) renders a second "Log out" button of its own.
     await page.locator("#main-content").getByRole("button", { name: "Log out" }).click();

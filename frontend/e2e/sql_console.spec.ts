@@ -14,7 +14,7 @@ async function connect(page: Page, apiKey: string) {
 
 async function runSql(page: Page, sql: string) {
   await page.getByLabel("SQL").fill(sql);
-  await page.getByRole("button", { name: "Execute" }).click();
+  await page.getByRole("button", { name: "Run", exact: true }).click();
 }
 
 test.describe("SQL console — real backend, real rubixdb-sql engine", () => {
@@ -103,6 +103,8 @@ test.describe("SQL console — real backend, real rubixdb-sql engine", () => {
     await page.getByRole("link", { name: "SQL Console" }).click();
     await runSql(page, "SELECT 1");
     await expect(page.getByText(/Result \(1 row\)/)).toBeVisible({ timeout: 10_000 });
+    // History is now the third tab of the results panel (was an always-visible card).
+    await page.getByRole("tab", { name: "History" }).click();
     await page.getByRole("button", { name: /SELECT 1/ }).click();
     await expect(page.getByLabel("SQL")).toHaveValue("SELECT 1");
   });
