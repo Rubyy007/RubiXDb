@@ -52,6 +52,30 @@ pub fn bind_loopback(preferred_port: u16) -> std::io::Result<TcpListener> {
     }
 }
 
+/// Binds exactly `port` on loopback, or returns `None` (no fallback).
+pub fn try_bind_exact(port: u16) -> Option<TcpListener> {
+    TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))).ok()
+}
+
+/// Port for an instance that already has a persisted manifest port. The
+/// `default` instance goes back to the canonical port whenever it is free: an
+/// earlier run that fell back to a random port (because something else held
+/// 302 at the time) must not pin the instance to that random port forever.
+/// Every other instance keeps its own persisted port, as before. `canonical`
+/// is a parameter only so tests need not touch the real port 302.
+pub fn bind_for_existing(
+    name: &str,
+    persisted: u16,
+    canonical: u16,
+) -> std::io::Result<TcpListener> {
+    if name == "default" && persisted != canonical {
+        if let Some(listener) = try_bind_exact(canonical) {
+            return Ok(listener);
+        }
+    }
+    bind_loopback(persisted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +146,34 @@ mod tests {
     fn only_ever_binds_loopback() {
         let listener = bind_loopback(0).unwrap();
         assert!(listener.local_addr().unwrap().ip().is_loopback());
+    }
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn default_instance_returns_to_the_canonical_port_when_it_is_free() {
+        let canonical = free_port();
+        let persisted = free_port();
+        let l = bind_for_existing("default", persisted, canonical).unwrap();
+        assert_eq!(l.local_addr().unwrap().port(), canonical);
+    }
+
+    #[test]
+    fn default_instance_keeps_its_persisted_port_when_the_canonical_one_is_busy() {
+        let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let canonical = busy.local_addr().unwrap().port();
+        let persisted = free_port();
+        let l = bind_for_existing("default", persisted, canonical).unwrap();
+        assert_eq!(l.local_addr().unwrap().port(), persisted);
+    }
+
+    #[test]
+    fn other_instances_always_keep_their_persisted_port() {
+        let canonical = free_port();
+        let persisted = free_port();
+        let l = bind_for_existing("reports", persisted, canonical).unwrap();
+        assert_eq!(l.local_addr().unwrap().port(), persisted);
     }
 }

@@ -24,3 +24,7 @@ dist-ssr
 .env
 .env.local
 .env.*.local
+
+# Cross-browser GUI spec instance (holds a generated admin credential) -- never commit.
+# Previously tracked by mistake in 2afa0e1; see OPEN_ITEMS.md.
+.e2e-crossbrowser-data

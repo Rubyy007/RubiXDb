@@ -5,9 +5,12 @@
 
 use std::path::PathBuf;
 
-/// Checked in order; the first candidate containing a real
-/// `index.html` wins. `RUBIXDB_FRONTEND_DIST` is an explicit override
-/// (checked first) for non-standard layouts / development.
+/// Order: `RUBIXDB_FRONTEND_DIST` (explicit override, for development), then
+/// the console compiled into this executable (`embedded_frontend`), then -- only
+/// for a binary built without a frontend -- folders next to / above the
+/// executable; the first containing a real `index.html` wins. The embedded copy
+/// comes before the on-disk ones on purpose: a leftover `frontend-dist` folder
+/// must never shadow the UI that ships inside the binary.
 pub fn resolve() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("RUBIXDB_FRONTEND_DIST") {
         if !raw.is_empty() {
@@ -15,6 +18,12 @@ pub fn resolve() -> Option<PathBuf> {
             if is_valid(&candidate) {
                 return Some(candidate);
             }
+        }
+    }
+
+    if let Ok(root) = rubixdb_instance::paths::instances_root() {
+        if let Some(dir) = crate::embedded_frontend::extract_under(&root) {
+            return Some(dir);
         }
     }
 

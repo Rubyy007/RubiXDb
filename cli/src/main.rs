@@ -17,6 +17,7 @@
 //! `PHASE_RUBIXDB_GUI_ARCHITECTURE.md` for the host role's.
 
 mod client;
+mod embedded_frontend;
 mod frontend_dist;
 mod gui;
 mod host;

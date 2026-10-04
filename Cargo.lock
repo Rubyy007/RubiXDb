@@ -1521,6 +1521,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "pin-project-lite",
  "reqwest",
  "rubixdb",
  "rubixdb-sql",
@@ -1548,6 +1549,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1560,6 +1563,7 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

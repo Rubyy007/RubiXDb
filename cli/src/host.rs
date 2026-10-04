@@ -68,6 +68,7 @@ fn recover_incomplete_index_operations(state: &AppState) {
 
 pub struct EmbeddedServer {
     pub base_url: String,
+    instance_name: Box<str>,
     // Held for process lifetime -- dropping releases the OS lock.
     _lock: InstanceLock,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -111,6 +112,8 @@ impl EmbeddedServer {
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("could not create {}: {e}", data_dir.display()))?;
 
+        let instance_name = owned.manifest.name.clone();
+        install_security_log(&owned.dir);
         let admin_key = owned.credentials.admin_key.clone();
         let config = Config {
             data_dir,
@@ -195,6 +198,7 @@ impl EmbeddedServer {
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let data_dir_for_thread = config.data_dir.clone();
+        let start_name = instance_name.clone();
         let shutdown_drain = Duration::from_secs(config.shutdown_drain_secs);
 
         let server_thread = {
@@ -272,6 +276,15 @@ impl EmbeddedServer {
                                 return;
                             }
                         };
+                        // Recorded before the first request can be handled, so the
+                        // log's order is start -> (requests) -> stop.
+                        rubixdb_api::security_log::emit(&rubixdb_api::security_log::SecurityEvent {
+                            code: rubixdb_api::security_log::code::INSTANCE_START,
+                            outcome: "ok",
+                            object_kind: Some("instance"),
+                            object: Some(&start_name),
+                            ..Default::default()
+                        });
                         let _ = ready_tx.send(Ok(()));
 
                         serve(
@@ -333,6 +346,7 @@ impl EmbeddedServer {
 
         Ok(EmbeddedServer {
             base_url,
+            instance_name: instance_name.into_boxed_str(),
             _lock: owned.lock,
             shutdown_tx: Some(shutdown_tx),
             runtime: Some(runtime),
@@ -354,5 +368,32 @@ impl EmbeddedServer {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(5));
         }
+        // A kill leaves a start with no matching stop -- that asymmetry is the
+        // record of an unclean exit.
+        rubixdb_api::security_log::emit(&rubixdb_api::security_log::SecurityEvent {
+            code: rubixdb_api::security_log::code::INSTANCE_STOP,
+            outcome: "ok",
+            object_kind: Some("instance"),
+            object: Some(&self.instance_name),
+            ..Default::default()
+        });
     }
+}
+
+/// Phase 7 SG-3b: embedded mode had no `tracing` subscriber at all, so no
+/// server-side event was recorded anywhere. Installs one whose only job is to
+/// persist `rubixdb_security` events to `<instance dir>/security.log`
+/// (bounded; see `rubixdb_api::security_log`). Every other `tracing` event
+/// stays unsunk on purpose: several carry engine error text or filesystem
+/// paths and would also interleave with the interactive REPL's output. A
+/// global default can be installed once per process; a second embedded server
+/// in the same process keeps the first one's sink.
+fn install_security_log(instance_dir: &std::path::Path) {
+    use tracing_subscriber::layer::SubscriberExt;
+    let log = Arc::new(rubixdb_api::security_log::SecurityLog::open_in(
+        instance_dir,
+    ));
+    let subscriber =
+        tracing_subscriber::registry().with(rubixdb_api::security_log::SecurityLogLayer::new(log));
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }

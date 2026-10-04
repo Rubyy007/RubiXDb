@@ -13,7 +13,7 @@ pub mod status;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
-use axum::http::{header, Method};
+use axum::http::{header, HeaderName, HeaderValue, Method};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
@@ -42,6 +42,178 @@ async fn metrics_middleware(
     let response = next.run(req).await;
     guard.finish(response.status().is_client_error() || response.status().is_server_error());
     response
+}
+
+/// Phase 7 SG-3b: records the D-4 events that are decided by route alone --
+/// `/v1/admin/*` actions (every non-`GET`/`HEAD` call: backup create/verify/
+/// delete, check, purge-orphans, shutdown; read-only inspection such as
+/// `GET /v1/admin/status`, which the console polls, is not an action) and the
+/// REST catalog drops. Runs *inside* `auth_middleware` (so the principal is
+/// known) and after the handler (so the real status is recorded). The
+/// record carries the route *pattern*, never the raw URI, so a backup name
+/// or other path parameter is not logged; a catalog drop additionally carries
+/// its numeric object id (digits only, bounded).
+async fn audit_middleware(req: Request, next: Next) -> Response {
+    let classified = {
+        let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
+        route.and_then(|r| classify_for_audit(req.method(), r))
+    };
+    let Some((code, kind)) = classified else {
+        return next.run(req).await;
+    };
+    let method = req.method().as_str().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    let principal = req
+        .extensions()
+        .get::<crate::auth::Principal>()
+        .map(|p| p.name.clone());
+    let object_id = kind.and_then(|_| {
+        req.uri()
+            .path()
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit()))
+            .map(str::to_string)
+    });
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    crate::security_log::emit(&crate::security_log::SecurityEvent {
+        code,
+        principal: principal.as_deref(),
+        method: Some(&method),
+        route: Some(&route),
+        status: Some(status),
+        outcome: crate::security_log::outcome_for_status(status),
+        object_kind: kind,
+        object: object_id.as_deref(),
+    });
+    response
+}
+
+/// `(event code, object kind)` for the routes D-4 names, else `None`.
+fn classify_for_audit(
+    method: &Method,
+    route: &str,
+) -> Option<(&'static str, Option<&'static str>)> {
+    use crate::security_log::code;
+    if route.starts_with("/v1/admin/") && method != Method::GET && method != Method::HEAD {
+        return Some((code::ADMIN_ACTION, None));
+    }
+    if method == Method::DELETE {
+        return match route {
+            "/v1/catalog/schemas/:schema_id" => Some((code::CATALOG_DROP, Some("schema"))),
+            "/v1/catalog/tables/by-id/:table_id" => Some((code::CATALOG_DROP, Some("table"))),
+            "/v1/catalog/indexes/:index_id" => Some((code::CATALOG_DROP, Some("index"))),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Phase 7 SG-5: defence-in-depth response headers on every response (SPA,
+/// static assets, API, errors), applied by `tower-http`'s allocation-free
+/// `SetResponseHeaderLayer` (an `axum::middleware::from_fn` layer was measured
+/// at about +1.5 us per request here -- see PROGRESS.md). Rationale for the CSP is in
+/// `PROGRESS.md` (2026-10-04, Increment C): the built console has no inline
+/// `<script>`/`<style>` and no `data:` URIs, and React applies its `style`
+/// props through the CSSOM (which CSP does not restrict), so neither
+/// `'unsafe-inline'` nor `'unsafe-eval'` is needed anywhere. `Cache-Control:
+/// no-store` is added to API responses (`/v1/*`) so credentials-bearing
+/// responses are not cached; static assets stay cacheable.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'";
+
+/// One layer, one wrapper: adds the SG-5 headers to every response. It is a
+/// hand-written `tower` layer with a non-boxing future on purpose -- stacking
+/// four `Router::layer`/`SetResponseHeaderLayer` wrappers measured about
+/// +3-4 us per request on the in-process router path (A/B in PROGRESS.md)
+/// because each wrapper boxes and clones the inner service per request.
+#[derive(Clone, Copy)]
+struct SecurityHeadersLayer;
+
+impl<S> tower::Layer<S> for SecurityHeadersLayer {
+    type Service = SecurityHeaders<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        SecurityHeaders { inner }
+    }
+}
+
+#[derive(Clone)]
+struct SecurityHeaders<S> {
+    inner: S,
+}
+
+impl<S> tower::Service<Request> for SecurityHeaders<S>
+where
+    S: tower::Service<Request, Response = Response>,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = SecurityHeadersFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        // `Cache-Control: no-store` for API responses only (static assets
+        // stay cacheable); decided from the request path before it is moved.
+        let is_api = req.uri().path().starts_with("/v1/");
+        SecurityHeadersFuture {
+            inner: self.inner.call(req),
+            is_api,
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    struct SecurityHeadersFuture<F> {
+        #[pin]
+        inner: F,
+        is_api: bool,
+    }
+}
+
+impl<F, E> std::future::Future for SecurityHeadersFuture<F>
+where
+    F: std::future::Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let mut response = match this.inner.poll(cx) {
+            std::task::Poll::Ready(Ok(r)) => r,
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+        let h = response.headers_mut();
+        h.insert(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(CSP),
+        );
+        h.insert(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        );
+        h.insert(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("no-referrer"),
+        );
+        if *this.is_api {
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+        std::task::Poll::Ready(Ok(response))
+    }
 }
 
 /// axum's `Json` extractor enforces its own independent default body-
@@ -86,6 +258,10 @@ fn cors_layer(config: &crate::config::Config) -> Option<CorsLayer> {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // The audit layer is attached only to the routes `classify_for_audit` can
+    // ever match (admin actions and REST catalog drops), so the SQL/KV/read
+    // hot paths pay nothing for it.
+    let audit = middleware::from_fn(audit_middleware);
     let protected = Router::new()
         .route("/readyz", get(health::readyz))
         .route("/v1/whoami", get(health::whoami))
@@ -111,36 +287,44 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/catalog/schemas", get(catalog::schemas))
         .route(
             "/v1/catalog/schemas/:schema_id",
-            axum::routing::delete(catalog::delete_schema),
+            axum::routing::delete(catalog::delete_schema).layer(audit.clone()),
         )
         .route("/v1/catalog/tables", get(catalog::tables))
         .route("/v1/catalog/tables/:name", get(catalog::describe_table))
         .route(
             "/v1/catalog/tables/by-id/:table_id",
-            axum::routing::delete(catalog::delete_table),
+            axum::routing::delete(catalog::delete_table).layer(audit.clone()),
         )
         .route("/v1/catalog/indexes", get(catalog::indexes))
         .route(
             "/v1/catalog/indexes/:index_id",
-            axum::routing::delete(catalog::delete_index),
+            axum::routing::delete(catalog::delete_index).layer(audit.clone()),
         )
         .route("/v1/catalog/authz", get(catalog::authz))
         .route("/v1/admin/status", get(admin::status))
         .route(
             "/v1/admin/backups",
-            get(admin::list_backups).post(admin::create_backup),
+            get(admin::list_backups)
+                .post(admin::create_backup)
+                .layer(audit.clone()),
         )
-        .route("/v1/admin/backups/:name/verify", post(admin::verify_backup))
+        .route(
+            "/v1/admin/backups/:name/verify",
+            post(admin::verify_backup).layer(audit.clone()),
+        )
         .route(
             "/v1/admin/backups/:name",
-            axum::routing::delete(admin::delete_backup),
+            axum::routing::delete(admin::delete_backup).layer(audit.clone()),
         )
-        .route("/v1/admin/check", post(admin::check))
-        .route("/v1/admin/shutdown", post(admin::shutdown))
+        .route("/v1/admin/check", post(admin::check).layer(audit.clone()))
+        .route(
+            "/v1/admin/shutdown",
+            post(admin::shutdown).layer(audit.clone()),
+        )
         .route("/v1/admin/storage", get(admin::storage))
         .route(
             "/v1/admin/maintenance/purge-orphans",
-            post(admin::purge_orphans),
+            post(admin::purge_orphans).layer(audit),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -187,5 +371,5 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         let serve_dir = ServeDir::new(dist).fallback(ServeFile::new(index_html));
         router = router.fallback_service(serve_dir);
     }
-    router.with_state(state)
+    router.layer(SecurityHeadersLayer).with_state(state)
 }

@@ -19,6 +19,8 @@ serde_json = "1"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
+# Already in Cargo.lock (tower-http, hyper-util, tokio); used by the response-header layer.
+pin-project-lite = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
@@ -34,3 +36,4 @@ http-body-util = "0.1"
 # `heap_ownership_profile` example below, never linked into any
 # production binary.
 dhat = "0.3"
+ 

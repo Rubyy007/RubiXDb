@@ -27,14 +27,25 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiKeyConfig {
     pub name: String,
     pub role: Role,
     pub key: String,
 }
 
-#[derive(Debug, Clone)]
+/// Phase 7 SG-3a: the key is never printed by `{:?}`.
+impl fmt::Debug for ApiKeyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiKeyConfig")
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
     pub listen_addr: SocketAddr,
@@ -98,6 +109,23 @@ pub struct Config {
     pub backup_dir: Option<PathBuf>,
 }
 
+/// Phase 7 SG-3a: prints a fixed, non-secret subset and `..`; `api_keys` is
+/// shown only as a redacted count, so a field added to `Config` later cannot
+/// leak by default.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("data_dir", &self.data_dir)
+            .field("listen_addr", &self.listen_addr)
+            .field(
+                "api_keys",
+                &format_args!("<redacted: {} key(s)>", self.api_keys.len()),
+            )
+            .field("instance_name", &self.instance_name)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub struct ConfigError(pub String);
 
@@ -126,15 +154,19 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> Result<T, ConfigError
 /// `admin` key is required (otherwise no client could ever write).
 fn parse_api_keys(raw: &str) -> Result<Vec<ApiKeyConfig>, ConfigError> {
     let mut keys = Vec::new();
-    for entry in raw.split(',') {
+    for (index, entry) in raw.split(',').enumerate() {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
+        // Phase 7 SG-3c: error messages identify an entry by position (and,
+        // once parsed, by name) -- never by echoing its text, which contains
+        // the key.
         let parts: Vec<&str> = entry.splitn(3, ':').collect();
         let [name, role_str, key] = parts.as_slice() else {
             return Err(ConfigError(format!(
-                "RUBIXDB_API_KEYS entry {entry:?} must be name:role:key"
+                "RUBIXDB_API_KEYS entry #{} must be name:role:key",
+                index + 1
             )));
         };
         let role = match role_str.to_ascii_lowercase().as_str() {
@@ -142,7 +174,7 @@ fn parse_api_keys(raw: &str) -> Result<Vec<ApiKeyConfig>, ConfigError> {
             "admin" => Role::Admin,
             other => {
                 return Err(ConfigError(format!(
-                    "RUBIXDB_API_KEYS entry {entry:?}: unknown role {other:?} (expected reader or admin)"
+                    "RUBIXDB_API_KEYS entry for {name:?}: unknown role {other:?} (expected reader or admin)"
                 )))
             }
         };
@@ -235,6 +267,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_of_config_and_api_keys_never_prints_a_key() {
+        let keys =
+            parse_api_keys("svc-a:admin:0123456789abcdef,svc-b:reader:fedcba9876543210").unwrap();
+        let cfg = Config {
+            data_dir: "d".into(),
+            listen_addr: "127.0.0.1:302".parse().unwrap(),
+            api_keys: keys.clone(),
+            max_value_bytes: 1,
+            max_key_bytes: 1,
+            default_range_limit: 1,
+            max_range_limit: 1,
+            shutdown_drain_secs: 1,
+            rate_limit_rps: 1.0,
+            rate_limit_burst: 1,
+            compaction_auto_trigger: false,
+            compaction_trigger_count: 1,
+            cors_allowed_origins: vec![],
+            sql_max_sessions_per_principal: 1,
+            sql_session_idle_timeout_secs: 1,
+            sql_session_max_lifetime_secs: 1,
+            sql_statement_deadline_secs: 1,
+            instance_id: None,
+            instance_name: None,
+            frontend_dist: None,
+            backup_dir: None,
+        };
+        for rendered in [
+            format!("{cfg:?}"),
+            format!("{cfg:#?}"),
+            format!("{keys:?}"),
+            format!("{:?}", keys[0]),
+        ] {
+            assert!(!rendered.contains("0123456789abcdef"), "{rendered}");
+            assert!(!rendered.contains("fedcba9876543210"), "{rendered}");
+            assert!(rendered.contains("redacted"));
+        }
+    }
+
+    #[test]
     fn parses_valid_api_keys() {
         let keys =
             parse_api_keys("svc-a:admin:0123456789abcdef,svc-b:reader:fedcba9876543210").unwrap();
@@ -242,6 +313,22 @@ mod tests {
         assert_eq!(keys[0].name, "svc-a");
         assert_eq!(keys[0].role, Role::Admin);
         assert_eq!(keys[1].role, Role::Reader);
+    }
+
+    /// Phase 7 SG-3c: malformed/unknown-role entries must not echo the key.
+    #[test]
+    fn parse_errors_never_echo_the_key() {
+        let secret = "SUPERSECRETKEY0123456789";
+        for raw in [
+            format!("no-role-here{secret}"),
+            format!("svc:root:{secret}"),
+            format!("svc:{secret}"),
+            format!("svc-a:admin:{secret},bad{secret}"),
+        ] {
+            let err = parse_api_keys(&raw).unwrap_err();
+            assert!(!err.0.contains(secret), "{}", err.0);
+            assert!(!format!("{err:?}").contains(secret));
+        }
     }
 
     #[test]

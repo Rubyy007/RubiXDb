@@ -16,13 +16,52 @@ USAGE:
     rubixdb instance drop <NAME> --confirm <NAME>  permanently delete an instance's on-disk
                                                     data (refused unless --confirm repeats NAME
                                                     exactly, and refused while NAME is running)
+    rubixdb instance rotate-credential <NAME> --confirm <NAME>
+                                                  replace the instance's admin API key with a freshly
+                                                    generated one (offline only: refused while NAME is
+                                                    running, or while another rotate-credential holds it).
+                                                    Prints no key -- only the credential file's path.
+                                                    The previous key is rejected from the instance's next
+                                                    start; clients still using it (open browser tabs,
+                                                    RUBIXDB_API_KEY in scripts) get 401 and must read the
+                                                    new key from the credential file. Instance id and
+                                                    data are unchanged.
 "#;
+
+/// Phase 7 SG-3b (D-4): lifecycle events for commands that run without a
+/// server. `instance.drop` goes to `<instances root>/instances-security.log`
+/// because the instance's own directory (and its `security.log`) is exactly
+/// what the command deletes; `credential.replace` goes to the instance's own
+/// `security.log`. Only the instance NAME and an outcome are recorded -- never
+/// the key. Not-found and usage errors affect no instance and are not logged.
+fn audit_instance_event(code: &str, name: &str, outcome: &str, per_instance: bool) {
+    use rubixdb_api::security_log::{SecurityEvent, SecurityLog};
+    let log = if per_instance {
+        match rubixdb_instance::paths::instance_dir(name) {
+            Ok(dir) => SecurityLog::open_in(&dir),
+            Err(_) => return,
+        }
+    } else {
+        match rubixdb_instance::paths::instances_root() {
+            Ok(root) => SecurityLog::open_root(&root),
+            Err(_) => return,
+        }
+    };
+    log.record(&SecurityEvent {
+        code,
+        outcome,
+        object_kind: Some("instance"),
+        object: Some(name),
+        ..Default::default()
+    });
+}
 
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(|s| s.as_str()) {
         Some("list") => list(),
         Some("status") => status(args.get(1).map(|s| s.as_str())),
         Some("drop") => drop_instance(&args[1..]),
+        Some("rotate-credential") => rotate_credential(&args[1..]),
         Some("stop") => stop_instance(args.get(1).map(|s| s.as_str())),
         Some("--help") | Some("-h") | None => {
             println!("{HELP_TEXT}");
@@ -75,7 +114,29 @@ fn drop_instance(args: &[String]) -> i32 {
         );
         return 2;
     }
-    match rubixdb_instance::remove_instance(name) {
+    let result = rubixdb_instance::remove_instance(name);
+    match &result {
+        Ok(()) => audit_instance_event(
+            rubixdb_api::security_log::code::INSTANCE_DROP,
+            name,
+            "ok",
+            false,
+        ),
+        Err(rubixdb_instance::RemoveError::StillRunning) => audit_instance_event(
+            rubixdb_api::security_log::code::INSTANCE_DROP,
+            name,
+            "refused",
+            false,
+        ),
+        Err(rubixdb_instance::RemoveError::Io(_)) => audit_instance_event(
+            rubixdb_api::security_log::code::INSTANCE_DROP,
+            name,
+            "failed",
+            false,
+        ),
+        Err(_) => {}
+    }
+    match result {
         Ok(()) => {
             println!("instance {name:?} permanently deleted");
             0
@@ -92,6 +153,79 @@ fn drop_instance(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("rubixdb instance drop: {e}");
+            1
+        }
+    }
+}
+
+/// Phase 7 SG-4: offline credential replacement. Same exact-name confirmation
+/// discipline as `drop` (invalidating the key is a destructive action); the
+/// library primitive is the authority on "not running" (OS lock). Never prints
+/// key material.
+fn rotate_credential(args: &[String]) -> i32 {
+    let name = match args.first() {
+        Some(n) if !n.is_empty() && !n.starts_with("--") => n,
+        _ => {
+            eprintln!("rubixdb instance rotate-credential: NAME is required");
+            println!("{HELP_TEXT}");
+            return 2;
+        }
+    };
+    let confirm = args
+        .iter()
+        .position(|a| a == "--confirm")
+        .and_then(|i| args.get(i + 1));
+    match confirm {
+        None => {
+            eprintln!(
+                "rubixdb instance rotate-credential: refused -- --confirm <NAME> is required and must repeat {name:?} exactly"
+            );
+            return 2;
+        }
+        Some(c) if c != name => {
+            eprintln!(
+                "rubixdb instance rotate-credential: refused -- confirmation {c:?} does not match instance name {name:?}"
+            );
+            return 2;
+        }
+        Some(_) => {}
+    }
+    let result = rubixdb_instance::rotate_credential(name);
+    let outcome = match &result {
+        Ok(_) => Some("ok"),
+        Err(rubixdb_instance::RotateError::InUse) => Some("refused"),
+        Err(rubixdb_instance::RotateError::Io(_)) => Some("failed"),
+        Err(_) => None,
+    };
+    if let Some(outcome) = outcome {
+        audit_instance_event(
+            rubixdb_api::security_log::code::CREDENTIAL_REPLACE,
+            name,
+            outcome,
+            true,
+        );
+    }
+    match result {
+        Ok(out) => {
+            println!("instance {name:?}: admin credential replaced");
+            println!("credential file: {}", out.credential_path.display());
+            println!(
+                "The previous key is rejected from this instance's next start; clients still                  using it will get 401 and must read the new key from the credential file."
+            );
+            0
+        }
+        Err(rubixdb_instance::RotateError::NotFound) => {
+            eprintln!("rubixdb instance rotate-credential: no such instance: {name:?}");
+            1
+        }
+        Err(rubixdb_instance::RotateError::InUse) => {
+            eprintln!(
+                "rubixdb instance rotate-credential: {name:?} is running or being rotated by another process; stop it first"
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("rubixdb instance rotate-credential: {e}");
             1
         }
     }

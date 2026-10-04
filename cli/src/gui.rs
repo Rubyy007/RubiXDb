@@ -54,9 +54,9 @@ fn run_for_name(name: &str, open_browser: bool) -> i32 {
         ),
         Ok(AcquireOutcome::AlreadyRunning {
             manifest,
-            credentials: _,
+            credentials,
             dir: _,
-        }) => handle_already_running(name, manifest, open_browser),
+        }) => handle_already_running(name, manifest, &credentials.admin_key, open_browser),
         Ok(AcquireOutcome::LockedButUnverifiable { dir }) => {
             eprintln!(
                 "rubixdb gui: instance {name:?} at {} is locked by another process that did not \
@@ -74,13 +74,37 @@ fn run_for_name(name: &str, open_browser: bool) -> i32 {
     }
 }
 
+/// Phase 7 D-3 / O-2: the URL handed to the OS browser launcher carries the
+/// instance key in the URL *fragment* (`/#token=<key>`). A fragment is never
+/// sent to any server, is not included in `Referer`, and the console removes
+/// it from the address bar (`history.replaceState`) on first load, keeping the
+/// key only in that tab's `sessionStorage`. The key is deliberately NOT part
+/// of anything this process prints. Residual exposure, accepted by the
+/// maintainer decision: while the launcher runs, the URL appears in that
+/// process's command line (visible to the same OS user, who can already read
+/// `credentials.json`), and a browser may briefly hold it in its session
+/// store. A value that is not a plain token is never put in a URL.
+pub(crate) fn handoff_url(base_url: &str, admin_key: &str) -> String {
+    let plain = !admin_key.is_empty()
+        && admin_key.len() <= 256
+        && admin_key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if plain {
+        format!("{base_url}/#token={admin_key}")
+    } else {
+        base_url.to_string()
+    }
+}
+
 fn start_owned(owned: OwnedInstance, open_browser: bool) -> i32 {
     let manifest = owned.manifest.clone();
+    let admin_key = owned.credentials.admin_key.clone();
     let frontend_dist = crate::frontend_dist::resolve();
     if frontend_dist.is_none() {
         eprintln!(
-            "rubixdb gui: warning: no built frontend found (checked RUBIXDB_FRONTEND_DIST and \
-             paths relative to the executable) -- serving the API only. Run `npm run build` in \
+            "rubixdb gui: warning: no built frontend found (none embedded in this executable, and \
+             RUBIXDB_FRONTEND_DIST / paths relative to the executable had none) -- serving the API only. Run `npm run build` in \
              frontend/ to enable the console."
         );
     }
@@ -98,7 +122,7 @@ fn start_owned(owned: OwnedInstance, open_browser: bool) -> i32 {
         manifest.name, server.base_url
     );
     if frontend_dist.is_some() && open_browser {
-        if !rubixdb_instance::browser::open(&server.base_url) {
+        if !rubixdb_instance::browser::open(&handoff_url(&server.base_url, &admin_key)) {
             eprintln!(
                 "rubixdb gui: could not launch a browser automatically -- open {} manually.",
                 server.base_url
@@ -114,8 +138,14 @@ fn start_owned(owned: OwnedInstance, open_browser: bool) -> i32 {
     0
 }
 
-fn handle_already_running(name: &str, manifest: InstanceManifest, open_browser: bool) -> i32 {
+fn handle_already_running(
+    name: &str,
+    manifest: InstanceManifest,
+    admin_key: &str,
+    open_browser: bool,
+) -> i32 {
     let base_url = format!("http://127.0.0.1:{}", manifest.api_port);
+    let launch_url = handoff_url(&base_url, admin_key);
     println!("An instance named {name:?} is already running at {base_url}.");
 
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -124,7 +154,7 @@ fn handle_already_running(name: &str, manifest: InstanceManifest, open_browser: 
         // silently spin up a second owner for the same name.
         println!("Non-interactive session -- continuing with the existing instance.");
         if open_browser {
-            let _ = rubixdb_instance::browser::open(&base_url);
+            let _ = rubixdb_instance::browser::open(&launch_url);
         }
         return 0;
     }
@@ -146,7 +176,7 @@ fn handle_already_running(name: &str, manifest: InstanceManifest, open_browser: 
         }
         _ => {
             if open_browser {
-                let _ = rubixdb_instance::browser::open(&base_url);
+                let _ = rubixdb_instance::browser::open(&launch_url);
             }
             0
         }
@@ -210,4 +240,31 @@ fn block_until_shutdown_signal() {
             _ = rubixdb_api::shutdown::wait_requested() => {},
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handoff_url;
+
+    #[test]
+    fn handoff_puts_a_plain_token_in_the_fragment_only() {
+        let key = "ab12".repeat(16);
+        let url = handoff_url("http://127.0.0.1:302", &key);
+        assert_eq!(url, format!("http://127.0.0.1:302/#token={key}"));
+        // Fragment, not query: nothing before `#` carries the key.
+        let (before, after) = url.split_once('#').unwrap();
+        assert!(!before.contains(&key));
+        assert!(after.starts_with("token="));
+    }
+
+    #[test]
+    fn handoff_refuses_to_embed_anything_that_is_not_a_plain_token() {
+        for bad in ["", "a b", "a#b", "a&b=c", "a/b", "\u{e9}", &"x".repeat(257)] {
+            assert_eq!(
+                handoff_url("http://127.0.0.1:302", bad),
+                "http://127.0.0.1:302",
+                "{bad:?}"
+            );
+        }
+    }
 }

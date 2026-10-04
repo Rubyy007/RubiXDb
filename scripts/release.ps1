@@ -3,7 +3,8 @@
 #
 #   scripts\release.ps1 [-OutDir dist-release] [-SkipTests]
 #
-# Steps: format/lint gates -> (optional) full regression -> frontend clean
+# Steps: format/lint gates -> dependency-policy gates (audit, deny, npm audit) ->
+# (optional) full regression -> frontend clean
 # production build -> `cargo build --release --locked` -> artifact layout ->
 # SHA256SUMS + VERSION + manifest -> smoke test of the PACKAGED copy (start a
 # fresh instance, DDL/DML/query, backup + verify, integrity check, graceful stop).
@@ -18,6 +19,8 @@ $dirty = if ((git status --porcelain | Where-Object { $_ -notmatch '^\?\? (scrat
 
 Run "cargo fmt --check" { cargo fmt --all -- --check }
 Run "cargo clippy" { cargo clippy --workspace --all-targets --all-features -- -D warnings }
+# SG-7: a release must pass the dependency policy (scripts\dependency_gates.ps1).
+Run "dependency gates" { & (Join-Path $PSScriptRoot "dependency_gates.ps1") }
 if (-not $SkipTests) {
     Run "workspace tests (release)" { cargo test --release --workspace --no-fail-fast }
 }
@@ -28,20 +31,26 @@ Pop-Location
 # Bit-for-bit reproducible build: deterministic PE timestamp (/Brepro) and no build-machine paths in the binary.
 # Verified: two clean builds from the same commit give identical SHA-256 (PHASE_RUBIXDB_FINAL_SINGLE_NODE_RELEASE.md).
 $env:RUSTFLAGS = "-C link-arg=/Brepro --remap-path-prefix=$((Get-Location).Path)=/src --remap-path-prefix=$env:USERPROFILE\.cargo=/cargo"
-Run "cargo build --release --locked" { cargo build --release --locked -p rubixdb-cli -p rubixdb-api }
+Run "cargo build --release --locked" { cargo build --release --locked -p rubixdb-cli }
 Remove-Item Env:RUSTFLAGS
 
 $pkg = Join-Path $OutDir "rubixdb-$version"
 if (Test-Path $pkg) { throw "$pkg already exists; refusing to overwrite a release directory" }
 New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 Copy-Item target\release\rubixdb.exe $pkg
-Copy-Item target\release\rubixdb-api.exe $pkg
 Copy-Item -Recurse frontend\dist (Join-Path $pkg "frontend-dist")
+# Phase 7 D-2: the standalone API binary is not part of v1 and must not ship.
+Write-Host "NOTE: Standalone rubixdb-api is not part of v1. Not certified. It is not packaged."
 "rubixdb $version ($commit$dirty)`nbuilt $(Get-Date -Format o)`nrustc $(rustc --version)`ncargo $(cargo --version)`ndata-format 1; wal-segment 1; sstable 1; catalog-row 1; backup 1" | Set-Content (Join-Path $pkg "VERSION") -Encoding utf8
 Get-ChildItem -Recurse -File $pkg | Where-Object { $_.Name -ne 'SHA256SUMS' } | ForEach-Object {
     $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
     "$h  $($_.FullName.Substring($pkg.Length + 1).Replace('\','/'))"
 } | Set-Content (Join-Path $pkg "SHA256SUMS") -Encoding ascii
+
+# Packaging assertion: no standalone API binary anywhere in the package or its checksum list.
+if (Get-ChildItem -Recurse -File $pkg -Filter "rubixdb-api*") { throw "package contains rubixdb-api (standalone binary is unsupported in v1)" }
+if (Select-String -Path (Join-Path $pkg "SHA256SUMS") -Pattern "rubixdb-api" -Quiet) { throw "SHA256SUMS lists rubixdb-api" }
+Write-Host "package check: no rubixdb-api binary (ok)"
 
 # ---- smoke test of the packaged copy (fresh instances root, never the user's) ----
 $root = Join-Path ([IO.Path]::GetTempPath()) ("rbx_release_smoke_" + [Guid]::NewGuid().ToString("N").Substring(0,8))

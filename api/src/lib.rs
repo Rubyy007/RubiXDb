@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod resources;
 pub mod routes;
+pub mod security_log;
 pub mod server;
 pub mod shutdown;
 pub mod sql_metrics;

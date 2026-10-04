@@ -28,6 +28,9 @@ rubixdb = { path = ".." }
 rubixdb-api = { path = "../api" }
 rubixdb-instance = { path = "../instance" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+# Phase 7 SG-3b: embedded-mode security event log (the layer lives in rubixdb-api).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 [dev-dependencies]
 axum = "0.7"

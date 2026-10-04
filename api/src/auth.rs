@@ -118,11 +118,27 @@ pub async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let token = extract_bearer(&req).ok_or(ApiError::Unauthorized)?;
-    let principal = state
-        .auth
-        .authenticate(token)
-        .ok_or(ApiError::Unauthorized)?;
+    let principal = match extract_bearer(&req).and_then(|t| state.auth.authenticate(t)) {
+        Some(p) => p,
+        None => {
+            // Phase 7 SG-3b: authentication failure (rate-bounded by the
+            // sink). Only the method and the matched route *pattern* are
+            // recorded -- never the presented credential or the raw URI.
+            let route = req
+                .extensions()
+                .get::<axum::extract::MatchedPath>()
+                .map(|m| m.as_str().to_string());
+            crate::security_log::emit(&crate::security_log::SecurityEvent {
+                code: crate::security_log::code::AUTH_FAILURE,
+                method: Some(req.method().as_str()),
+                route: route.as_deref(),
+                status: Some(401),
+                outcome: "denied",
+                ..Default::default()
+            });
+            return Err(ApiError::Unauthorized);
+        }
+    };
     let required = required_role(&req);
     if !principal.role.satisfies(required) {
         return Err(ApiError::Forbidden);

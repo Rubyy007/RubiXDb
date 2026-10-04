@@ -14,6 +14,7 @@ use rubixdb::relational::{RelationalType, RelationalValue};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use rubixdb_sql::ast::Statement;
 use rubixdb_sql::auth::AuthContext;
 use rubixdb_sql::bind::bind_statement;
 use rubixdb_sql::bound::BoundStatement;
@@ -239,7 +240,28 @@ pub async fn sql(
     Json(req): Json<SqlRequest>,
 ) -> Result<Json<SqlResponse>, ApiError> {
     state.sql.api_metrics.record_request();
-    let result = handle(&state, &principal, req).await;
+    let mut ddl: Option<DdlAudit> = None;
+    let result = handle(&state, &principal, req, &mut ddl).await;
+    if let Some(d) = ddl {
+        // Phase 7 SG-3b: catalog DDL create/drop. Statement kind and the
+        // target identifier come from the parsed AST -- the SQL text, the
+        // parameters and any row data are never passed here.
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(ApiError::Sql(SqlError::AuthorizationDenied { .. })) => "denied",
+            Err(_) => "failed",
+        };
+        crate::security_log::emit(&crate::security_log::SecurityEvent {
+            code: d.code,
+            principal: Some(&principal.name),
+            method: Some("POST"),
+            route: Some("/v1/sql"),
+            outcome,
+            object_kind: Some(d.kind),
+            object: Some(&d.object),
+            ..Default::default()
+        });
+    }
     match &result {
         Ok(_) => state.sql.api_metrics.record_success(),
         Err(ApiError::Sql(SqlError::Cancelled)) => state.sql.api_metrics.record_cancellation(),
@@ -249,13 +271,42 @@ pub async fn sql(
     result.map(Json)
 }
 
+/// What a DDL statement is, for the security event log.
+struct DdlAudit {
+    code: &'static str,
+    kind: &'static str,
+    object: String,
+}
+
+/// DDL create/drop statements only; everything else is `None`. The object is
+/// the statement's most specific identifier (bounded and escaped by the log).
+fn ddl_audit(stmt: &Statement) -> Option<DdlAudit> {
+    use crate::security_log::code::{CATALOG_CREATE, CATALOG_DROP};
+    let (code, kind, object) = match stmt {
+        Statement::CreateDatabase(s) => (CATALOG_CREATE, "database", s.name.value.clone()),
+        Statement::CreateSchema(s) => (CATALOG_CREATE, "schema", s.name.last().value.clone()),
+        Statement::CreateTable(s) => (CATALOG_CREATE, "table", s.name.last().value.clone()),
+        Statement::DropTable(s) => (CATALOG_DROP, "table", s.name.last().value.clone()),
+        Statement::CreateIndex(s) => (
+            CATALOG_CREATE,
+            "index",
+            s.name.as_ref().map(|n| n.value.clone()).unwrap_or_default(),
+        ),
+        Statement::DropIndex(s) => (CATALOG_DROP, "index", s.name.value.clone()),
+        _ => return None,
+    };
+    Some(DdlAudit { code, kind, object })
+}
+
 async fn handle(
     state: &Arc<AppState>,
     principal: &Principal,
     req: SqlRequest,
+    ddl: &mut Option<DdlAudit>,
 ) -> Result<SqlResponse, ApiError> {
     let sql_limits = SqlLimits::default();
     let stmt = parse_statement(&req.sql, &sql_limits)?;
+    *ddl = ddl_audit(&stmt);
 
     let bind_context = state.sql.bind_context()?;
     let auth_ctx: AuthContext = to_sql_auth_context(principal);
