@@ -21,8 +21,8 @@ pub fn resolve() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(root) = rubixdb_instance::paths::instances_root() {
-        if let Some(dir) = crate::embedded_frontend::extract_under(&root) {
+    if let Ok(app_data) = rubixdb_instance::paths::app_data_dir() {
+        if let Some(dir) = crate::embedded_frontend::extract_under(&app_data) {
             return Some(dir);
         }
     }

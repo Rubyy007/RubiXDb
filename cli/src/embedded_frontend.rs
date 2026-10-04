@@ -1,6 +1,7 @@
 //! The console build that was compiled into this executable (see `build.rs`).
 //! At startup it is unpacked once into a content-hashed folder under the
-//! instances root and served from there, so the UI always matches the binary
+//! per-user app data directory (`<app data>/frontend/<hash>`, deliberately NOT
+//! inside the instances root, which holds only instance folders) and served from there, so the UI always matches the binary
 //! it ships in -- never a stale `frontend-dist` copy lying next to it.
 
 use std::fs;
@@ -10,17 +11,17 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/embedded_frontend.rs"));
 }
 
-/// Unpacks the embedded console under `<root>/.frontend/<hash>/` and returns
+/// Unpacks the embedded console under `<app_data>/frontend/<hash>/` and returns
 /// that folder, or `None` when this binary was built without a frontend.
-pub fn extract_under(root: &Path) -> Option<PathBuf> {
-    extract_files(root, generated::HASH, generated::FILES)
+pub fn extract_under(app_data: &Path) -> Option<PathBuf> {
+    extract_files(app_data, generated::HASH, generated::FILES)
 }
 
 pub(crate) fn extract_files(root: &Path, hash: &str, files: &[(&str, &[u8])]) -> Option<PathBuf> {
     if !files.iter().any(|(p, _)| *p == "index.html") {
         return None;
     }
-    let parent = root.join(".frontend");
+    let parent = root.join("frontend");
     let target = parent.join(hash);
     if target.join("index.html").is_file() {
         return Some(target);
