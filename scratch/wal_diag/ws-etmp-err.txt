@@ -1,0 +1,36 @@
+    Finished `release` profile [optimized] target(s) in 0.44s
+     Running unittests src\lib.rs (target\release\deps\rubixdb-4a243b77659cbd74.exe)
+     Running tests\crash_consistency.rs (target\release\deps\crash_consistency-6de6c5c27489bc0f.exe)
+     Running tests\group_commit.rs (target\release\deps\group_commit-0d0a152efcc385c9.exe)
+     Running tests\ops_restore_crash.rs (target\release\deps\ops_restore_crash-5bd914878cd43135.exe)
+     Running tests\pathological_recovery_matrix.rs (target\release\deps\pathological_recovery_matrix-9c0cb380f88669c6.exe)
+     Running tests\wal_tests.rs (target\release\deps\wal_tests-cb613d85ec29b8f2.exe)
+     Running unittests src\lib.rs (target\release\deps\rubixdb_api-67a3d9873e21a626.exe)
+     Running unittests src\main.rs (target\release\deps\rubixdb_api-bec095b83f0a6def.exe)
+     Running tests\admin_ops.rs (target\release\deps\admin_ops-8d82e64d2ad650c5.exe)
+     Running tests\api_cancellation.rs (target\release\deps\api_cancellation-72ef81324d987af8.exe)
+     Running tests\api_commit_ack_loss.rs (target\release\deps\api_commit_ack_loss-8b09b64658c041d6.exe)
+     Running tests\api_delete_safety.rs (target\release\deps\api_delete_safety-4e653a1eda46f897.exe)
+     Running tests\api_http_fuzz.rs (target\release\deps\api_http_fuzz-97de21be948033ba.exe)
+     Running tests\api_instance_and_frontend.rs (target\release\deps\api_instance_and_frontend-595c30c1f0bc6e3b.exe)
+     Running tests\api_integration.rs (target\release\deps\api_integration-717848c04c43d710.exe)
+     Running tests\api_security_validation.rs (target\release\deps\api_security_validation-905cd3a366c2bc8d.exe)
+     Running tests\api_sql_integration.rs (target\release\deps\api_sql_integration-7969a9ad59269d85.exe)
+     Running unittests src\main.rs (target\release\deps\rubixdb-e0962b997e1fe8c9.exe)
+     Running tests\cli_endurance_integration.rs (target\release\deps\cli_endurance_integration-1bf12f9d6eff83bc.exe)
+     Running tests\cli_integration.rs (target\release\deps\cli_integration-8d5cf827e12c4c50.exe)
+     Running tests\crash_recovery_integration.rs (target\release\deps\crash_recovery_integration-ff789b7eeb5c3aab.exe)
+     Running tests\gui_instance_integration.rs (target\release\deps\gui_instance_integration-0e63ac5068405748.exe)
+error: test failed, to rerun pass `-p rubixdb-cli --test gui_instance_integration`
+     Running tests\index_backfill_crash_integration.rs (target\release\deps\index_backfill_crash_integration-5533fdac3f95cce4.exe)
+     Running tests\instance_drop_integration.rs (target\release\deps\instance_drop_integration-e60da15f63d8a118.exe)
+     Running tests\multi_instance_sustained_load.rs (target\release\deps\multi_instance_sustained_load-14ea0f65724d210a.exe)
+     Running unittests src\lib.rs (target\release\deps\rubixdb_instance-99b1571bd3c7badb.exe)
+     Running unittests src\lib.rs (target\release\deps\rubixdb_sql-03b8024b39a07f23.exe)
+     Running tests\write_crash_consistency.rs (target\release\deps\write_crash_consistency-22bc478038234a48.exe)
+   Doc-tests rubixdb
+   Doc-tests rubixdb_api
+   Doc-tests rubixdb_instance
+   Doc-tests rubixdb_sql
+error: 1 target failed:
+    `-p rubixdb-cli --test gui_instance_integration`

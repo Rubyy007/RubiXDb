@@ -1,0 +1,7 @@
+group,label,iter,pos,test,ops,elapsed_s,class,batches,rec_per_batch,window_us,snapshot_us,fsync_us,coord_us,closes,cpu_s,wall_s,rss_mb,threads,handles,prio,affinity,mpeng_cpu_delta_s,perfpct_pre,plan,start_time,result
+p1tmp,tmpC,1,1,M13,107899,9.268,FAST,1453,688.2,1925.0,191.1,4085.1,176.1,"0,0,131,1,1321",49.6,15.4,78,1005,1059,Normal,255,0,91.4,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:11:06,ok
+p1tmp,tmpC,1,1,M13,116216,8.605,FAST,1349,741.3,2037.1,199.0,4000.1,139.0,"0,0,152,0,1197",59.4,14.8,81,1005,1060,Normal,255,0,33.2,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:12:00,ok
+p1tmp,tmpC,1,1,M13,61195,16.341,SLOW,1299,769.8,2293.2,232.0,9858.6,194.7,"0,0,145,2,1152",71.4,23,88,1005,1060,Normal,255,0,26.4,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:12:51,FAILED
+p1tmp,tmpC,1,1,M13,114174,8.759,FAST,1340,746.3,2087.9,197.6,4080.5,166.4,"0,0,128,1,1211",60.3,14.8,79,1005,1060,Normal,255,0,27.3,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:13:52,ok
+p1tmp,tmpC,1,1,M13,113297,8.826,FAST,1349,741.3,2146.6,190.1,4038.8,165.4,"0,0,166,0,1183",60.7,15,81,1005,1060,Normal,255,0,86,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:14:43,ok
+p1tmp,tmpC,1,1,M13,112205,8.912,FAST,1382,723.6,2024.9,206.7,4070.1,145.7,"0,0,139,0,1243",57.4,15,78,1005,1060,Normal,255,0,47.2,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:15:36,ok

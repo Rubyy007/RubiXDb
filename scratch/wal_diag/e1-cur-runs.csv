@@ -1,0 +1,3 @@
+group,label,iter,pos,test,ops,elapsed_s,class,batches,rec_per_batch,window_us,snapshot_us,fsync_us,coord_us,closes,cpu_s,wall_s,rss_mb,threads,handles,prio,affinity,mpeng_cpu_delta_s,perfpct_pre,plan,start_time,result
+e1,cur,1,1,M13,101509,9.851,FAST,1388,720.5,2093.5,177.3,4688.2,137.2,"0,0,104,1,1283",57.6,15,77,1005,1059,Normal,255,0,51.2,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:45:24,ok
+e1,cur,1,2,M12,17460,5.727,FAST,1089,91.8,489.0,58.7,4596.5,113.5,"0,0,1,3,1085",6.6,7.2,9,105,160,Normal,255,0,54.4,"Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e (Balanced)",15:45:41,ok

@@ -1,0 +1,2 @@
+[RGC_TIMING_REPORT] batches=1089 mean_window_us=489.0 mean_snapshot_us=58.7 mean_fsync_us=4596.5 mean_coordination_us=113.5 coordination_samples=1088 closes[zero,bytes,deadline,probe,cohort]=[0, 0, 1, 3, 1085]
+M1.2 hundred_writers_throughput: 100 threads x 1000 records = 100000 total in 5.727s => 17460 ops/sec (target >= 15000) (reproduce with: cargo test --release --test group_commit hundred_writers_throughput -- --nocapture)
