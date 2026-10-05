@@ -2539,3 +2539,69 @@ the original Phase 1 throughput targets.
 ## 2026-10-04 -- CLI race fix (under [Unreleased])
 ### Fixed
 - Two `rubixdb -c` processes starting together on a fresh instance could fail: the one that attached to the other's server found it gone when the owner finished. A statement that cannot connect now re-resolves the instance (never mid-transaction, at most 3 times), so it runs exactly once.
+
+## 2026-10-05 -- Phase 2 Increment A: startup configuration and credential validation (under [Unreleased])
+
+### Fixed
+- **The local credential file is validated.** `credentials.json` with an empty, short (< 16), over-long (> 256) or non-token (`[A-Za-z0-9_-]` only) `admin_key` used to start an instance that reported ready while rejecting every request (empty key; not even the admin shutdown worked) or ran with a trivially guessable key (3 characters), because the embedded server bypassed the API's own 16-character rule. It is now refused at load time by every command (start, attach, `instance status/stop`) with `credentials.json: <reason>; replace it with rubixdb instance rotate-credential ...`. The message never contains the key or any file content. Generated keys (64 hex characters) are unaffected; `rotate-credential` repairs an unusable file.
+- **`RUBIXDB_LOCAL_RATE_LIMIT_BURST=0` (and `RPS` <= 0, NaN, infinite) can no longer lock the operator out.** These values made the limiter reject every authenticated request, including `POST /v1/admin/shutdown` and `rubixdb instance stop`. Rate-limit values are now validated: RPS finite and in (0, 1e9], burst >= 1. The standalone loader (`RUBIXDB_RATE_LIMIT_RPS/_BURST`, unsupported in v1) uses the same rule.
+
+### Changed
+- **No silent fallbacks.** Unparsable `RUBIXDB_LOCAL_RATE_LIMIT_RPS/_BURST`, `RUBIXDB_INSTANCE_RETRY_BUDGET_MS` (integer 0..=600000) and an invalid `RUBIXDB_FRONTEND_DIST` (must be a directory containing `index.html`) now fail startup with a message naming the variable; previously each silently used a default. Unset or empty still means the documented default.
+- **Validation happens before anything is created or locked.** `rubixdb gui` and the client role check these values before taking the instance lock, so a bad value creates no directory, manifest or credential and leaves no process, lock or socket behind.
+- `rubixdb gui --help` documents the environment variables and their ranges.
+
+### Not changed
+Port contract (127.0.0.1:302), bind address, identity handshake, engine (`src/`), `Cargo.toml`, `Cargo.lock`.
+
+## 2026-10-05 -- Phase 2 Increment B: argument, instance-name, manifest and path validation (under [Unreleased])
+
+### Fixed
+- **`rubixdb gui` honours `RUBIXDB_INSTANCE_NAME`** as its help text always said (precedence: `--instance`, then the variable, then `default`). It used to ignore it and open `default`.
+- **`rubixdb gui` arguments are strict.** A missing or flag-shaped `--instance` value, a repeated `--instance`, an unknown option or a stray word is now an error that creates nothing. Previously `--instance` with no value silently opened `default`, `--instance --no-browser` created an instance named `--no-browser`, and unknown options were ignored.
+- **An `instance.json` that does not belong to its directory is refused.** Its `name` must satisfy the instance-name rule and match the directory name; before, a mismatching name made `rubixdb instance stop` fail with HTTP 400 and a name with control characters was printed raw by `rubixdb instance list`. `instance drop` and `rotate-credential` still work on such an instance so it can be removed or repaired.
+
+### Changed
+- Error messages name what is wrong: unusable instances root / instance directory errors include the path and the `RUBIXDB_INSTANCES_ROOT` setting; manifest errors include the file path; `RUBIXDB_API_URL` is checked for syntax (absolute http/https URL with a host, no user info, query or fragment) before any prompt or network attempt, and the value is never echoed.
+
+### Not changed
+Which hosts `RUBIXDB_API_URL` may name (plaintext/non-loopback), port contract (127.0.0.1:302), bind address, identity handshake, engine (`src/`), `Cargo.toml`, `Cargo.lock`.
+
+## 2026-10-05 -- Phase 2 Increment C: observable index recovery (under [Unreleased])
+
+### Added
+- **`GET /readyz` reports `index_recovery`** (`running` | `complete` | `failed` | `not_started`): whether the post-start recovery of interrupted `CREATE INDEX` / `DROP INDEX` operations is still running. `ready` keeps its meaning (normal work is safe, which is true while recovery runs) and does not change; the new field is additive. The state is `running` before the server is reported ready, so a client never reads a stale value.
+- **`POST /v1/admin/shutdown` replies with `index_recovery` and `waiting_for_index_recovery`**, and `rubixdb instance stop` says so ("is finishing an interrupted index build before it stops; this can take minutes on a large table"). If its 120 s wait ends first it now says the instance is still shutting down and is not stuck, instead of "did not exit within 120 s".
+
+### Changed
+- The embedded host and the standalone `rubixdb-api` share one implementation of the startup index recovery thread (`rubixdb_api::recovery`); messages are unchanged.
+
+### Not changed / blocked
+Stop latency while an index recovery is running (11-17 s at 400,000 rows; unbounded in principle) is unchanged: bounding it needs cooperative cancellation inside the index builder, a change to certified relational code, so it is proposed in `PHASE_RUBIXDB_LIFECYCLE_ADR_INDEX_RECOVERY_CANCELLATION.md` (ADR-LIFECYCLE-001) and not implemented. Port contract, bind address, handshake, engine, `Cargo.toml`, `Cargo.lock` untouched.
+
+## 2026-10-05 -- Phase 2 Increment C2: graceful stop no longer waits for index recovery (under [Unreleased])
+
+### Fixed
+- **Stopping an instance while it is still recovering an interrupted `CREATE INDEX` / `DROP INDEX` is now immediate** (about 0.1 s at 400,000 rows; it used to take 11-19 s and grew with table size, with no upper bound). Shutdown asks the recovery to stop at its next chunk boundary (500 rows for a build, 1,000 entries for a drop sweep); the unfinished index stays `Building` / `Dropping` -- the same state a process kill leaves -- and the next start restarts it from scratch through the existing recovery. The engine still shuts down through its normal path; nothing is terminated abruptly and no timeout was added.
+
+### Added
+- `GET /readyz` `index_recovery` can now also be `cancelled` (recovery was interrupted by shutdown). The owner process prints `index recovery was interrupted by shutdown; unfinished indexes stay Building/Dropping and restart at the next start`; `rubixdb instance stop` says it is interrupting the recovery.
+- Engine API (additive, `rubixdb::relational::index`): `RecoverySummary`, `IndexBuilder::recover_incomplete_builds_cancellable` and `recover_incomplete_drops_cancellable`. The existing methods are unchanged and never cancel; client-driven `CREATE INDEX` / `DROP INDEX` are never cancelled.
+
+### Not changed
+WAL, manifest, SSTable, compaction, `src/error.rs`, `Cargo.toml`, `Cargo.lock`, port contract, bind address, handshake. The change is documented and authorized in `PHASE_RUBIXDB_LIFECYCLE_ADR_INDEX_RECOVERY_CANCELLATION.md` (ADR-LIFECYCLE-001, accepted).
+
+## 2026-10-05 -- Phase 2 Increment D: stop signals, status accuracy, cleanup, attach latency (under [Unreleased])
+
+### Fixed
+- **Ctrl+Break, console close, logoff and system shutdown now stop `rubixdb gui` gracefully** (Windows), like Ctrl+C: drain, engine shutdown, lock and port released, exit code 0. Ctrl+Break used to end the process abruptly (exit code 0xC000013A, no shutdown line). The process prints what triggered the stop, e.g. `rubixdb gui: shutting down (Ctrl+Break)...`. SIGTERM is handled on Unix. A launcher that disabled Ctrl+C for the process is respected; stop such a process with `rubixdb instance stop`.
+- **`rubixdb instance status` no longer says "not running" while a process owns the instance.** It reports `locked (...)` when the OS lock is held and nothing answers on the port.
+- **The lock message no longer tells the operator to delete the lock file** (which does not release the lock and could let a second process open the same data); it says to wait or run `rubixdb instance stop <name>`.
+- **Stale console staging folders are removed.** A `<hash>.tmp-<pid>` folder left by a process killed mid-unpack was never pruned; folders older than 24 hours other than the current build's are now removed, also when the console is already cached.
+- **`DEFAULT`/`Default` follow the same "return to port 302" rule as `default`** (they name the same instance directory on NTFS).
+
+### Changed
+- A failed attach probe (a held lock whose owner does not answer) now gives up on the TCP connect after 0.5 s instead of about 2.1 s on Windows (single probe 2.1 -> 0.55 s). The outcome (`Unreachable`) and the retry budget semantics are unchanged.
+
+### Not changed
+Port contract (127.0.0.1:302), bind address, identity handshake semantics, engine (`src/`), `Cargo.toml`, `Cargo.lock`.
