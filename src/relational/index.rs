@@ -12,7 +12,7 @@
 //! `TableStore`'s own write path already uses.
 
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::catalog::schema::{IndexKind, IndexRow, IndexState};
@@ -33,6 +33,23 @@ use crate::relational::value::{RelationalType, RelationalValue};
 /// 22/23 of the governing directive): backfill/sweep never materialize
 /// the whole table/index in memory — bounded, streaming chunks.
 pub const BACKFILL_CHUNK_ROWS: usize = 500;
+
+/// Outcome of a (cancellable) startup recovery pass -- ADR-LIFECYCLE-001.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoverySummary {
+    /// Indexes that reached their final state (`Ready` for builds, removed for
+    /// drops) during this pass.
+    pub recovered: Vec<u32>,
+    /// `true` when the pass stopped early because cancellation was requested:
+    /// the remaining indexes are untouched (still `Building` / `Dropping`) and
+    /// the next start restarts them from scratch.
+    pub cancelled: bool,
+}
+
+#[inline]
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::SeqCst))
+}
 pub const SWEEP_CHUNK_ROWS: usize = 1000;
 /// Item 22/36: bounds the number of `CREATE INDEX` builds this process
 /// runs at once (a genuinely expensive, potentially adversarial
@@ -138,6 +155,11 @@ pub struct IndexBuilder {
     table_store: Arc<TableStore>,
     stats: IndexStats,
     active_builds: AtomicUsize,
+    /// Test-only seam (compiled out of every non-test build): called after each
+    /// backfill / sweep chunk is written, so cancellation tests can flip the flag
+    /// at an exact chunk boundary instead of racing a sleep.
+    #[cfg(test)]
+    pub(crate) test_after_chunk: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl IndexBuilder {
@@ -152,8 +174,26 @@ impl IndexBuilder {
             table_store,
             stats: IndexStats::default(),
             active_builds: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_after_chunk: std::sync::Mutex::new(None),
         }
     }
+
+    #[cfg(test)]
+    fn after_chunk(&self) {
+        let hook = self
+            .test_after_chunk
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn after_chunk(&self) {}
 
     pub fn stats(&self) -> IndexStatsSnapshot {
         self.stats.snapshot()
@@ -196,8 +236,9 @@ impl IndexBuilder {
                 .create_index(table_id, name, kind, column_ordinals)?
         };
 
-        match self.backfill_and_activate(table_id, index_id) {
-            Ok(()) => {
+        // A client-driven `CREATE INDEX` is never cancelled (`None`).
+        match self.backfill_and_activate(table_id, index_id, None) {
+            Ok(_) => {
                 self.stats
                     .index_build_duration_ms_total
                     .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -225,7 +266,18 @@ impl IndexBuilder {
     /// online` and `recover_incomplete_builds` — restart-recovery re-runs
     /// exactly this same path against a fresh snapshot (the ADR's chosen
     /// "restart," not "resume," recovery policy — see §8).
-    fn backfill_and_activate(&self, table_id: u32, index_id: u32) -> Result<()> {
+    ///
+    /// `cancel` (recovery only): checked once per chunk by `backfill`. Returns
+    /// `Ok(true)` when the index was promoted to `Ready`, `Ok(false)` when the
+    /// pass was cancelled -- in that case NOTHING is changed in the catalog: the
+    /// index stays `Building`, exactly the state a process kill leaves, and the
+    /// next start restarts it from scratch.
+    fn backfill_and_activate(
+        &self,
+        table_id: u32,
+        index_id: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool> {
         let index_row =
             self.catalog
                 .get_index(index_id)?
@@ -240,9 +292,11 @@ impl IndexBuilder {
                 ),
             });
         }
-        self.backfill(table_id, &index_row)?;
+        if self.backfill(table_id, &index_row, cancel)?.is_none() {
+            return Ok(false);
+        }
         self.catalog.mark_index_ready(index_id)?;
-        Ok(())
+        Ok(true)
     }
 
     /// The backfill pass itself (T1–T4). Enumerates every primary key
@@ -269,7 +323,19 @@ impl IndexBuilder {
     /// based on that just-observed current truth, its own write can
     /// never be "stale" relative to what any writer could have already
     /// established.
-    fn backfill(&self, table_id: u32, index_row: &IndexRow) -> Result<u64> {
+    ///
+    /// Cancellation (`cancel`, recovery only): the flag is read once at the top
+    /// of every chunk, **outside** the epoch write lock and before any write of
+    /// that chunk, so a cancelled pass never stops in the middle of a chunk's
+    /// critical section. Returns `Ok(None)` when cancelled (entries already
+    /// written are harmless: a restarted backfill overwrites them with
+    /// identical values, and a `Building` index is invisible to the planner).
+    fn backfill(
+        &self,
+        table_id: u32,
+        index_row: &IndexRow,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<u64>> {
         let table = self
             .catalog
             .get_table(table_id)?
@@ -310,6 +376,9 @@ impl IndexBuilder {
             .engine
             .range_scan(as_bound_ref(&start), as_bound_ref(&end), snap_seq);
         loop {
+            if is_cancelled(cancel) {
+                return Ok(None);
+            }
             let mut candidates: Vec<(Vec<RelationalValue>, Vec<u8>)> =
                 Vec::with_capacity(BACKFILL_CHUNK_ROWS);
             for row in iter.by_ref().take(BACKFILL_CHUNK_ROWS) {
@@ -354,6 +423,7 @@ impl IndexBuilder {
             self.stats
                 .index_entries_written
                 .fetch_add(ops.len() as u64, Ordering::Relaxed);
+            self.after_chunk();
         }
         // Increment 17: the enumeration visited every row of the table at
         // the backfill snapshot -- a free, exact row count for the cost
@@ -361,7 +431,7 @@ impl IndexBuilder {
         self.table_store
             .runtime_stats()
             .observe_row_count(table_id, rows_enumerated);
-        Ok(total_written)
+        Ok(Some(total_written))
     }
 
     // -----------------------------------------------------------------
@@ -378,9 +448,30 @@ impl IndexBuilder {
     /// successfully recovered to `Ready`; an index that fails recovery
     /// is marked `Failed` (not retried again automatically) and omitted.
     pub fn recover_incomplete_builds(&self) -> Result<Vec<u32>> {
+        Ok(self
+            .recover_incomplete_builds_cancellable(&AtomicBool::new(false))?
+            .recovered)
+    }
+
+    /// Same as [`Self::recover_incomplete_builds`], but stops promptly when
+    /// `cancel` becomes true (ADR-LIFECYCLE-001): between indexes and once per
+    /// backfill chunk. A cancelled index is left `Building` -- not `Failed`, not
+    /// promoted -- so the next start restarts it from scratch, the state a kill
+    /// leaves. `RecoverySummary::cancelled` tells the caller recovery is
+    /// incomplete; `recovered` lists the indexes that did reach `Ready`.
+    pub fn recover_incomplete_builds_cancellable(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<RecoverySummary> {
         let building = self.catalog.list_indexes_in_state(IndexState::Building)?;
         let mut recovered = Vec::new();
         for index_row in building {
+            if is_cancelled(Some(cancel)) {
+                return Ok(RecoverySummary {
+                    recovered,
+                    cancelled: true,
+                });
+            }
             let _slot = match acquire_build_slot(&self.active_builds) {
                 Ok(slot) => slot,
                 Err(e) => {
@@ -388,8 +479,14 @@ impl IndexBuilder {
                     return Err(e);
                 }
             };
-            match self.backfill_and_activate(index_row.table_id, index_row.index_id) {
-                Ok(()) => recovered.push(index_row.index_id),
+            match self.backfill_and_activate(index_row.table_id, index_row.index_id, Some(cancel)) {
+                Ok(true) => recovered.push(index_row.index_id),
+                Ok(false) => {
+                    return Ok(RecoverySummary {
+                        recovered,
+                        cancelled: true,
+                    })
+                }
                 Err(e) => {
                     self.stats
                         .index_build_failures
@@ -404,7 +501,10 @@ impl IndexBuilder {
                 }
             }
         }
-        Ok(recovered)
+        Ok(RecoverySummary {
+            recovered,
+            cancelled: false,
+        })
     }
 
     /// Every index found `Dropping` at startup has its physical sweep
@@ -413,15 +513,42 @@ impl IndexBuilder {
     /// complete, its catalog row removed. Returns the `index_id`s fully
     /// removed.
     pub fn recover_incomplete_drops(&self) -> Result<Vec<u32>> {
+        Ok(self
+            .recover_incomplete_drops_cancellable(&AtomicBool::new(false))?
+            .recovered)
+    }
+
+    /// Same as [`Self::recover_incomplete_drops`], but stops promptly when
+    /// `cancel` becomes true (between indexes and once per sweep chunk). A
+    /// cancelled index stays `Dropping` (its catalog row is not removed) and the
+    /// next start restarts the sweep.
+    pub fn recover_incomplete_drops_cancellable(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<RecoverySummary> {
         let dropping = self.catalog.list_indexes_in_state(IndexState::Dropping)?;
         let mut recovered = Vec::new();
         for index_row in dropping {
-            self.sweep_index_entries(index_row.table_id, index_row.index_id)?;
+            if is_cancelled(Some(cancel))
+                || !self.sweep_index_entries(
+                    index_row.table_id,
+                    index_row.index_id,
+                    Some(cancel),
+                )?
+            {
+                return Ok(RecoverySummary {
+                    recovered,
+                    cancelled: true,
+                });
+            }
             self.catalog.remove_index_row(index_row.index_id)?;
             self.stats.index_drops.fetch_add(1, Ordering::Relaxed);
             recovered.push(index_row.index_id);
         }
-        Ok(recovered)
+        Ok(RecoverySummary {
+            recovered,
+            cancelled: false,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -451,7 +578,8 @@ impl IndexBuilder {
             let _write_guard = epoch.write().unwrap_or_else(|p| p.into_inner());
             self.catalog.mark_index_dropping(index_id)?;
         }
-        self.sweep_index_entries(table_id, index_id)?;
+        // A client-driven `DROP INDEX` is never cancelled (`None`).
+        self.sweep_index_entries(table_id, index_id, None)?;
         self.catalog.remove_index_row(index_id)?;
         self.stats.index_drops.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -465,10 +593,22 @@ impl IndexBuilder {
     /// `mark_index_dropping` has already committed (under the epoch write
     /// lock, by every caller of this method), so no writer will ever
     /// again add a new entry for this index.
-    fn sweep_index_entries(&self, table_id: u32, index_id: u32) -> Result<()> {
+    ///
+    /// `cancel` (recovery only) is read once per chunk. Returns `Ok(true)` when
+    /// the whole range was swept, `Ok(false)` when cancelled (nothing else is
+    /// changed; deleting is idempotent, so a restarted sweep is safe).
+    fn sweep_index_entries(
+        &self,
+        table_id: u32,
+        index_id: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool> {
         let (range_start, range_end) = index_entry_range(table_id, index_id);
         let mut cursor = range_start;
         loop {
+            if is_cancelled(cancel) {
+                return Ok(false);
+            }
             let mut batch = Vec::with_capacity(SWEEP_CHUNK_ROWS);
             let mut last_key: Option<Vec<u8>> = None;
             for row in self
@@ -487,9 +627,10 @@ impl IndexBuilder {
             self.stats
                 .index_entries_deleted
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            self.after_chunk();
             cursor = Bound::Excluded(last_key.expect("batch non-empty"));
         }
-        Ok(())
+        Ok(true)
     }
 
     // -----------------------------------------------------------------

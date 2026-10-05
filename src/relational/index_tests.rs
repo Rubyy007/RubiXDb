@@ -453,6 +453,180 @@ fn recover_incomplete_drops_completes_the_sweep() {
 }
 
 // -----------------------------------------------------------------
+// ADR-LIFECYCLE-001: cooperative cancellation of startup recovery. A
+// cancelled pass must leave exactly the state a process kill leaves (index
+// still Building / Dropping, never Failed, never promoted) so the next
+// start's certified "restart, not resume" recovery finishes the job.
+// -----------------------------------------------------------------
+
+use std::sync::atomic::AtomicBool;
+
+/// Calls `flip` after the `n`-th chunk the builder writes.
+fn cancel_after_chunks(builder: &IndexBuilder, n: usize, cancel: &Arc<AtomicBool>) {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancel = Arc::clone(cancel);
+    *builder.test_after_chunk.lock().unwrap() = Some(Arc::new(move || {
+        if seen.fetch_add(1, Ordering::SeqCst) + 1 == n {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }));
+}
+
+#[test]
+fn cancel_before_start_changes_nothing_and_a_later_run_completes() {
+    let f = Fixture::new("cancel_before_start");
+    let table_id = create_simple_table(&f.catalog, "t");
+    for i in 0..30 {
+        f.store.put_row(table_id, &row(i, "x", true)).unwrap();
+    }
+    let index_id = f
+        .catalog
+        .create_index(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+        .unwrap();
+
+    let summary = f
+        .builder
+        .recover_incomplete_builds_cancellable(&AtomicBool::new(true))
+        .unwrap();
+    assert!(summary.cancelled);
+    assert!(summary.recovered.is_empty());
+    assert_eq!(
+        f.catalog.get_index(index_id).unwrap().unwrap().state,
+        IndexState::Building,
+        "a cancelled recovery must not promote or fail the index"
+    );
+
+    let summary = f
+        .builder
+        .recover_incomplete_builds_cancellable(&AtomicBool::new(false))
+        .unwrap();
+    assert!(!summary.cancelled);
+    assert_eq!(summary.recovered, vec![index_id]);
+    assert_eq!(
+        f.catalog.get_index(index_id).unwrap().unwrap().state,
+        IndexState::Ready
+    );
+    f.cleanup();
+}
+
+#[test]
+fn cancel_mid_backfill_leaves_building_and_the_restart_is_correct_even_after_writes() {
+    let f = Fixture::new("cancel_mid_backfill");
+    let table_id = create_simple_table(&f.catalog, "t");
+    // 1,200 rows = three chunks of BACKFILL_CHUNK_ROWS (500, 500, 200).
+    for i in 0..1200 {
+        f.store.put_row(table_id, &row(i, "x", true)).unwrap();
+    }
+    let index_id = f
+        .catalog
+        .create_index(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+        .unwrap();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    cancel_after_chunks(&f.builder, 2, &cancel);
+    let summary = f
+        .builder
+        .recover_incomplete_builds_cancellable(&cancel)
+        .unwrap();
+    assert!(summary.cancelled, "cancelled at the chunk-2 boundary");
+    assert!(summary.recovered.is_empty());
+    assert_eq!(
+        f.catalog.get_index(index_id).unwrap().unwrap().state,
+        IndexState::Building,
+        "never Failed, never Ready"
+    );
+
+    // Writers keep working while the index is parked in Building (the online
+    // protocol maintains it), and the restarted pass re-derives from current truth.
+    *f.builder.test_after_chunk.lock().unwrap() = None;
+    for i in 5000..5100 {
+        f.store.put_row(table_id, &row(i, "x", true)).unwrap();
+    }
+    for i in 0..10 {
+        f.store
+            .delete_row(table_id, &[RelationalValue::Integer(i)])
+            .unwrap();
+    }
+    let summary = f
+        .builder
+        .recover_incomplete_builds_cancellable(&AtomicBool::new(false))
+        .unwrap();
+    assert!(!summary.cancelled);
+    assert_eq!(summary.recovered, vec![index_id]);
+    assert_eq!(
+        f.catalog.get_index(index_id).unwrap().unwrap().state,
+        IndexState::Ready
+    );
+    let hits = f
+        .builder
+        .index_lookup(index_id, &[Some(RelationalValue::Text("x".to_string()))])
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1200 + 100 - 10,
+        "index must match the table exactly"
+    );
+    f.cleanup();
+}
+
+#[test]
+fn cancel_mid_drop_sweep_leaves_dropping_and_the_restart_removes_it() {
+    let f = Fixture::new("cancel_mid_sweep");
+    let table_id = create_simple_table(&f.catalog, "t");
+    let index_id = f
+        .builder
+        .create_index_online(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+        .unwrap();
+    // 2,500 entries = three sweep chunks of SWEEP_CHUNK_ROWS (1,000).
+    for i in 0..2500 {
+        f.store.put_row(table_id, &row(i, "x", true)).unwrap();
+    }
+    f.catalog.mark_index_dropping(index_id).unwrap();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    cancel_after_chunks(&f.builder, 1, &cancel);
+    let summary = f
+        .builder
+        .recover_incomplete_drops_cancellable(&cancel)
+        .unwrap();
+    assert!(summary.cancelled);
+    assert!(summary.recovered.is_empty());
+    assert_eq!(
+        f.catalog.get_index(index_id).unwrap().unwrap().state,
+        IndexState::Dropping,
+        "catalog row must remain until the sweep completes"
+    );
+
+    *f.builder.test_after_chunk.lock().unwrap() = None;
+    let summary = f
+        .builder
+        .recover_incomplete_drops_cancellable(&AtomicBool::new(false))
+        .unwrap();
+    assert!(!summary.cancelled);
+    assert_eq!(summary.recovered, vec![index_id]);
+    assert!(f.catalog.get_index(index_id).unwrap().is_none());
+    f.cleanup();
+}
+
+#[test]
+fn the_original_recovery_methods_are_never_cancelled() {
+    let f = Fixture::new("uncancellable_originals");
+    let table_id = create_simple_table(&f.catalog, "t");
+    for i in 0..1200 {
+        f.store.put_row(table_id, &row(i, "x", true)).unwrap();
+    }
+    let index_id = f
+        .catalog
+        .create_index(table_id, "t_name_idx", IndexKind::NonUnique, &[1])
+        .unwrap();
+    assert_eq!(
+        f.builder.recover_incomplete_builds().unwrap(),
+        vec![index_id]
+    );
+    f.cleanup();
+}
+
+// -----------------------------------------------------------------
 // Online-build correctness under controlled concurrent interleavings —
 // item 40 of the governing directive: the dangerous cases, deterministic
 // (barrier-synchronized), never sleep-based.
