@@ -18,6 +18,42 @@ use uuid::Uuid;
 
 const FILE_NAME: &str = "credentials.json";
 
+/// The local credential path enforces the same minimum the API's own key parser
+/// (`rubixdb_api::config::parse_api_keys`) enforces -- the embedded server is
+/// configured directly from this file and never goes through that parser -- and
+/// additionally restricts the key to the plain-token alphabet that
+/// `rubixdb gui` can hand to a browser in a URL fragment and that is always a
+/// valid HTTP header value. Generated keys (64 hex characters) always satisfy it.
+pub const MIN_KEY_LEN: usize = 16;
+pub const MAX_KEY_LEN: usize = 256;
+
+/// Why `key` is unusable as an instance admin key, or `Ok`. The returned text
+/// never contains the key.
+pub fn validate_admin_key(key: &str) -> Result<(), String> {
+    if key.len() < MIN_KEY_LEN {
+        return Err(format!(
+            "admin_key is {} characters; at least {MIN_KEY_LEN} are required",
+            key.len()
+        ));
+    }
+    if key.len() > MAX_KEY_LEN {
+        return Err(format!(
+            "admin_key is {} characters; at most {MAX_KEY_LEN} are allowed",
+            key.len()
+        ));
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("admin_key may contain only ASCII letters, digits, '-' and '_'".to_string());
+    }
+    Ok(())
+}
+
+const ROTATE_HINT: &str =
+    "replace it with `rubixdb instance rotate-credential <NAME> --confirm <NAME>`";
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InstanceCredentials {
     pub admin_key: String,
@@ -46,12 +82,33 @@ impl InstanceCredentials {
         InstanceCredentials { admin_key: key }
     }
 
+    ///
+    /// Loads and **validates** the credential. A file that does not parse, or
+    /// whose key fails [`validate_admin_key`], is an error -- never a credential
+    /// the server would start with. Error text names the file and the problem,
+    /// never the key (a serde message can echo a malformed value, so only the
+    /// error class and position are reported).
     pub fn load(dir: &Path) -> std::io::Result<Option<Self>> {
         let path = dir.join(FILE_NAME);
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let c: Self = serde_json::from_slice(&bytes)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let c: Self = serde_json::from_slice(&bytes).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "{FILE_NAME} is not a valid credential file ({:?} error at line {} column {}); {ROTATE_HINT}",
+                            e.classify(),
+                            e.line(),
+                            e.column()
+                        ),
+                    )
+                })?;
+                validate_admin_key(&c.admin_key).map_err(|why| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{FILE_NAME}: {why}; {ROTATE_HINT}"),
+                    )
+                })?;
                 Ok(Some(c))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -165,6 +222,67 @@ mod tests {
             assert!(!rendered.contains(&c.admin_key), "{rendered}");
             assert!(rendered.contains("<redacted>"));
         }
+    }
+
+    #[test]
+    fn key_rules_accept_generated_keys_and_reject_everything_else() {
+        assert!(validate_admin_key(&InstanceCredentials::generate().admin_key).is_ok());
+        assert!(validate_admin_key(&"a".repeat(MIN_KEY_LEN)).is_ok());
+        assert!(validate_admin_key(&"a".repeat(MAX_KEY_LEN)).is_ok());
+        assert!(validate_admin_key("A-b_C-d_E-f_G-h_").is_ok());
+        for bad in [
+            String::new(),
+            "abc".to_string(),
+            "a".repeat(MIN_KEY_LEN - 1),
+            "a".repeat(MAX_KEY_LEN + 1),
+            "k \u{e9} k \u{e9} k \u{e9} k \u{e9} ".to_string(),
+            "a".repeat(15) + " ",
+            "a".repeat(15) + "#",
+            "a".repeat(15) + "\n",
+        ] {
+            let why = validate_admin_key(&bad).unwrap_err();
+            assert!(bad.is_empty() || !why.contains(&bad), "{why}");
+        }
+    }
+
+    fn write_raw(dir: &Path, text: &str) {
+        std::fs::write(dir.join(FILE_NAME), text).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_unusable_keys_without_echoing_them() {
+        let dir = tmp_dir();
+        for (text, secret) in [
+            (r#"{"admin_key":""}"#, ""),
+            (r#"{"admin_key":"abc"}"#, "abc"),
+            (
+                r#"{"admin_key":"has space has space has space"}"#,
+                "has space",
+            ),
+            (r#"{"admin_key":"kékékékékéké"}"#, "k\u{e9}"),
+        ] {
+            write_raw(&dir, text);
+            let err = InstanceCredentials::load(&dir).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            let msg = err.to_string();
+            assert!(msg.contains("credentials.json"), "{msg}");
+            assert!(msg.contains("rotate-credential"), "{msg}");
+            if !secret.is_empty() {
+                assert!(!msg.contains(secret), "{msg}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_parse_errors_never_echo_the_file_content() {
+        let dir = tmp_dir();
+        // A bare JSON string: serde's own message would quote it.
+        write_raw(&dir, r#""SUPERSECRETKEY0123456789""#);
+        let msg = InstanceCredentials::load(&dir).unwrap_err().to_string();
+        assert!(!msg.contains("SUPERSECRET"), "{msg}");
+        assert!(msg.contains("credentials.json"), "{msg}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

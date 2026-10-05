@@ -202,6 +202,27 @@ fn parse_api_keys(raw: &str) -> Result<Vec<ApiKeyConfig>, ConfigError> {
     Ok(keys)
 }
 
+/// Largest accepted sustained rate (requests per second). Far above any measured
+/// throughput of this service; exists so `inf`/absurd values are rejected.
+pub const MAX_RATE_LIMIT_RPS: f64 = 1_000_000_000.0;
+
+/// The per-principal token bucket must be able to admit at least one request and
+/// must refill: `burst == 0` or `rps <= 0` (or NaN/infinite) rejects every
+/// authenticated request -- including the admin shutdown -- so the operator could
+/// not stop the instance through the API. Rejected up front with a message that
+/// names the offending setting.
+pub fn validate_rate_limit(rps: f64, burst: u32) -> Result<(), String> {
+    if !rps.is_finite() || rps <= 0.0 || rps > MAX_RATE_LIMIT_RPS {
+        return Err(format!(
+            "rate limit RPS must be a finite number greater than 0 and at most {MAX_RATE_LIMIT_RPS}, got {rps}"
+        ));
+    }
+    if burst == 0 {
+        return Err("rate limit BURST must be an integer of at least 1, got 0".to_string());
+    }
+    Ok(())
+}
+
 impl Config {
     /// Deterministic, fail-fast load — `PHASE_API_ARCHITECTURE.md` §6:
     /// startup must fail loudly on any misconfiguration, never silently
@@ -215,6 +236,13 @@ impl Config {
         let api_keys_raw = env_var("RUBIXDB_API_KEYS")
             .ok_or_else(|| ConfigError("RUBIXDB_API_KEYS is required".to_string()))?;
         let api_keys = parse_api_keys(&api_keys_raw)?;
+        let rate_limit_rps: f64 = env_or("RUBIXDB_RATE_LIMIT_RPS", 50.0)?;
+        let rate_limit_burst: u32 = env_or("RUBIXDB_RATE_LIMIT_BURST", 100)?;
+        validate_rate_limit(rate_limit_rps, rate_limit_burst).map_err(|e| {
+            ConfigError(format!(
+                "{e} (RUBIXDB_RATE_LIMIT_RPS={rate_limit_rps}, RUBIXDB_RATE_LIMIT_BURST={rate_limit_burst})"
+            ))
+        })?;
 
         Ok(Config {
             data_dir: PathBuf::from(data_dir),
@@ -225,8 +253,8 @@ impl Config {
             default_range_limit: env_or("RUBIXDB_DEFAULT_RANGE_LIMIT", 100)?,
             max_range_limit: env_or("RUBIXDB_MAX_RANGE_LIMIT", 10_000)?,
             shutdown_drain_secs: env_or("RUBIXDB_SHUTDOWN_DRAIN_SECS", 30)?,
-            rate_limit_rps: env_or("RUBIXDB_RATE_LIMIT_RPS", 50.0)?,
-            rate_limit_burst: env_or("RUBIXDB_RATE_LIMIT_BURST", 100)?,
+            rate_limit_rps,
+            rate_limit_burst,
             // Deliberately different from the raw engine's own
             // conservative `LsmConfig::default()` (`compaction_auto_
             // trigger: false`, chosen to protect Increment 1-era test
@@ -335,6 +363,25 @@ mod tests {
     fn rejects_missing_admin_key() {
         let err = parse_api_keys("svc-b:reader:fedcba9876543210").unwrap_err();
         assert!(err.0.contains("admin"));
+    }
+
+    #[test]
+    fn rate_limit_validation_rejects_lockout_values() {
+        assert!(validate_rate_limit(50.0, 100).is_ok());
+        assert!(validate_rate_limit(0.001, 1).is_ok());
+        assert!(validate_rate_limit(MAX_RATE_LIMIT_RPS, u32::MAX).is_ok());
+        for rps in [
+            0.0,
+            -1.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2e9,
+        ] {
+            assert!(validate_rate_limit(rps, 10).is_err(), "rps {rps}");
+        }
+        assert!(validate_rate_limit(10.0, 0).is_err());
     }
 
     #[test]

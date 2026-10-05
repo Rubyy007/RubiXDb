@@ -68,7 +68,9 @@ pub fn bind_for_existing(
     persisted: u16,
     canonical: u16,
 ) -> std::io::Result<TcpListener> {
-    if name == "default" && persisted != canonical {
+    // ASCII case-insensitive: NTFS resolves `DEFAULT` and `default` to the same
+    // instance directory, so the rule must not depend on how the name was typed.
+    if name.eq_ignore_ascii_case(crate::paths::DEFAULT_INSTANCE_NAME) && persisted != canonical {
         if let Some(listener) = try_bind_exact(canonical) {
             return Ok(listener);
         }
@@ -167,6 +169,16 @@ mod tests {
         let persisted = free_port();
         let l = bind_for_existing("default", persisted, canonical).unwrap();
         assert_eq!(l.local_addr().unwrap().port(), persisted);
+    }
+
+    #[test]
+    fn the_default_rule_ignores_ascii_case() {
+        for name in ["default", "DEFAULT", "Default"] {
+            let canonical = free_port();
+            let persisted = free_port();
+            let l = bind_for_existing(name, persisted, canonical).unwrap();
+            assert_eq!(l.local_addr().unwrap().port(), canonical, "{name}");
+        }
     }
 
     #[test]

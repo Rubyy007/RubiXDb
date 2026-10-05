@@ -93,13 +93,7 @@ async fn main() {
     // See the identical block in `cli/src/host.rs`: index-build recovery runs
     // after the server is serving (measured 21-35 s on 600k rows), and
     // graceful shutdown joins it before the engine stops.
-    let recovery = {
-        let st = state.clone();
-        std::thread::Builder::new()
-            .name("rubixdb-index-recovery".to_string())
-            .spawn(move || recover_incomplete_index_operations(&st))
-            .ok()
-    };
+    let recovery = rubixdb_api::recovery::spawn_index_recovery(&state, log_recovery);
     let listen_addr = state.config.listen_addr;
     let router = build_router(state.clone());
 
@@ -115,7 +109,18 @@ async fn main() {
     // Bounded graceful shutdown -- `server::serve`'s own doc comment
     // has the full contract; `main.rs`'s only job here is to supply
     // the *real* OS-signal trigger (tests supply a programmatic one).
-    serve(listener, router, shutdown_signal(), shutdown_drain).await;
+    let trigger_state = state.clone();
+    serve(
+        listener,
+        router,
+        async move {
+            shutdown_signal().await;
+            // ADR-LIFECYCLE-001: stop a running index recovery at its next chunk.
+            trigger_state.index_recovery.request_cancel();
+        },
+        shutdown_drain,
+    )
+    .await;
 
     // The listener has stopped accepting new connections and in-flight
     // requests have drained (bounded by `with_graceful_shutdown`'s own
@@ -127,7 +132,7 @@ async fn main() {
     tracing::info!("draining complete, shutting down engine");
     if let Some(handle) = recovery {
         if !handle.is_finished() {
-            tracing::warn!("waiting for interrupted index recovery to finish before shutting down");
+            tracing::warn!("stopping the interrupted index recovery before shutting down");
         }
         let _ = handle.join();
     }
@@ -135,56 +140,33 @@ async fn main() {
     tracing::info!(?report.pool_state, fully_drained = report.fully_drained, "engine shutdown complete");
 }
 
-/// Increment 14, Blocker 4 — see the identical function's doc comment
-/// in `cli/src/host.rs` for the full "why": this standalone binary is
-/// a second, separately-real product entry point that opens its own
-/// `AppState`, so it needs the same startup call to the existing,
-/// already-certified `IndexBuilder` recovery primitives.
-fn recover_incomplete_index_operations(state: &rubixdb_api::AppState) {
-    match state.sql.index_builder.recover_incomplete_builds() {
-        Ok(recovered) if !recovered.is_empty() => {
-            tracing::warn!(
-                index_ids = ?recovered,
-                "recovered incomplete CREATE INDEX backfill(s) from a prior crash"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, "index build recovery failed at startup"),
-    }
-    match state.sql.index_builder.recover_incomplete_drops() {
-        Ok(recovered) if !recovered.is_empty() => {
-            tracing::warn!(
-                index_ids = ?recovered,
-                "recovered incomplete DROP INDEX sweep(s) from a prior crash"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, "index drop recovery failed at startup"),
-    }
+async fn shutdown_signal() {
+    let reason = rubixdb_api::shutdown::wait_for_stop().await;
+    tracing::info!(
+        reason,
+        "shutdown signal received, draining in-flight requests"
+    );
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        signal(SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-        _ = rubixdb_api::shutdown::wait_requested() => {},
+/// Logs what the startup index recovery did (`rubixdb_api::recovery`), through
+/// the same `tracing` events this binary always used.
+fn log_recovery(report: &rubixdb_api::recovery::RecoveryReport) {
+    if !report.recovered_builds.is_empty() {
+        tracing::warn!(
+            index_ids = ?report.recovered_builds,
+            "recovered incomplete CREATE INDEX backfill(s) from a prior crash"
+        );
     }
-    tracing::info!("shutdown signal received, draining in-flight requests");
+    if !report.recovered_drops.is_empty() {
+        tracing::warn!(
+            index_ids = ?report.recovered_drops,
+            "recovered incomplete DROP INDEX sweep(s) from a prior crash"
+        );
+    }
+    if report.cancelled {
+        tracing::warn!("index recovery interrupted by shutdown; it restarts at the next start");
+    }
+    for e in &report.errors {
+        tracing::error!(error = %e, "index recovery failed at startup");
+    }
 }

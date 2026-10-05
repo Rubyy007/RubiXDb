@@ -654,5 +654,17 @@ pub async fn shutdown(
         ));
     }
     crate::shutdown::request();
-    Ok((StatusCode::ACCEPTED, Json(json!({"shutting_down": true}))))
+    // The listener closes first. A still-running index recovery is cancelled at
+    // its next chunk boundary (ADR-LIFECYCLE-001) and the unfinished index
+    // restarts at the next start; the reply says whether that applies.
+    let recovery = state.index_recovery.state();
+    state.index_recovery.request_cancel();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "shutting_down": true,
+            "index_recovery": recovery.as_str(),
+            "waiting_for_index_recovery": recovery == crate::recovery::RecoveryState::Running,
+        })),
+    ))
 }

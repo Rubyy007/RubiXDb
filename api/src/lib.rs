@@ -16,6 +16,7 @@ pub mod encoding;
 pub mod error;
 pub mod metrics;
 pub mod rate_limit;
+pub mod recovery;
 pub mod resources;
 pub mod routes;
 pub mod security_log;

@@ -30,39 +30,32 @@ pub struct OwnedInstance {
     pub dir: std::path::PathBuf,
 }
 
-/// Increment 14, Blocker 4 — `CREATE INDEX` mid-backfill crash. A real
-/// gap found by inspection, not guessed: `IndexBuilder::recover_
-/// incomplete_builds`/`recover_incomplete_drops` (`PHASE_RELATIONAL_
-/// INDEX_BACKFILL_ADR.md` §8) already implement the certified
-/// "restart, not resume" crash-recovery protocol and are already
-/// unit-tested (`src/relational/index_tests.rs`) -- but before this
-/// increment, neither was ever called from any real product entry
-/// point (`grep -rn "recover_incomplete_builds\|recover_incomplete_
-/// drops"` outside that engine crate and its own tests had zero
-/// matches). A real process kill mid-`CREATE INDEX` backfill therefore
-/// left the index permanently stuck `Building` across restarts in the
-/// actual product, even though the engine-level primitive to fix it
-/// already existed. This wires that existing, already-certified
-/// primitive into the real startup path -- no engine change, no new
-/// recovery logic, just the missing call site.
-fn recover_incomplete_index_operations(state: &AppState) {
-    match state.sql.index_builder.recover_incomplete_builds() {
-        Ok(recovered) if !recovered.is_empty() => {
-            eprintln!(
-                "rubixdb: recovered incomplete CREATE INDEX backfill(s) from a prior crash: {recovered:?}"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("rubixdb: index build recovery failed at startup: {e}"),
+/// Increment 14, Blocker 4 -- `CREATE INDEX` mid-backfill crash: the certified
+/// "restart, not resume" recovery primitives (`PHASE_RELATIONAL_INDEX_BACKFILL_
+/// ADR.md` section 8) are run at startup by `rubixdb_api::recovery`; this only
+/// prints what they did, to stderr as before. Phase 2 Increment C moved the
+/// thread and its observable state (`GET /readyz` `index_recovery`) into the API
+/// crate so the embedded host and the standalone binary share one implementation.
+fn report_recovery(report: &rubixdb_api::recovery::RecoveryReport) {
+    if !report.recovered_builds.is_empty() {
+        eprintln!(
+            "rubixdb: recovered incomplete CREATE INDEX backfill(s) from a prior crash: {:?}",
+            report.recovered_builds
+        );
     }
-    match state.sql.index_builder.recover_incomplete_drops() {
-        Ok(recovered) if !recovered.is_empty() => {
-            eprintln!(
-                "rubixdb: recovered incomplete DROP INDEX sweep(s) from a prior crash: {recovered:?}"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("rubixdb: index drop recovery failed at startup: {e}"),
+    if !report.recovered_drops.is_empty() {
+        eprintln!(
+            "rubixdb: recovered incomplete DROP INDEX sweep(s) from a prior crash: {:?}",
+            report.recovered_drops
+        );
+    }
+    if report.cancelled {
+        eprintln!(
+            "rubixdb: index recovery was interrupted by shutdown; unfinished indexes stay Building/Dropping and restart at the next start"
+        );
+    }
+    for e in &report.errors {
+        eprintln!("rubixdb: {e}");
     }
 }
 
@@ -108,6 +101,13 @@ impl EmbeddedServer {
         owned: OwnedInstance,
         frontend_dist: Option<std::path::PathBuf>,
     ) -> Result<Self, String> {
+        // Strictly parsed, and checked before anything is created. Callers also
+        // run `startup_env::load` before taking the instance lock; this is the
+        // authority for the values actually used.
+        let local_env = crate::startup_env::load()?;
+        // Defense in depth: never serve with a credential the loader would refuse.
+        rubixdb_instance::credentials::validate_admin_key(&owned.credentials.admin_key)
+            .map_err(|why| format!("instance credential is unusable: {why}"))?;
         let data_dir = owned.dir.join("data");
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("could not create {}: {e}", data_dir.display()))?;
@@ -155,14 +155,8 @@ impl EmbeddedServer {
             // class) so it is raised again, not removed:
             // `RUBIXDB_LOCAL_RATE_LIMIT_RPS`/`_BURST` let an operator
             // size it further.
-            rate_limit_rps: std::env::var("RUBIXDB_LOCAL_RATE_LIMIT_RPS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000.0),
-            rate_limit_burst: std::env::var("RUBIXDB_LOCAL_RATE_LIMIT_BURST")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(200_000),
+            rate_limit_rps: local_env.rate_limit_rps,
+            rate_limit_burst: local_env.rate_limit_burst,
             compaction_auto_trigger: true,
             compaction_trigger_count: 4,
             cors_allowed_origins: vec![],
@@ -245,13 +239,10 @@ impl EmbeddedServer {
                         // the server is serving; graceful shutdown joins it
                         // before the engine stops (a kill simply retries at the
                         // next start, exactly as before).
-                        let recovery = {
-                            let st = state.clone();
-                            std::thread::Builder::new()
-                                .name("rubixdb-index-recovery".to_string())
-                                .spawn(move || recover_incomplete_index_operations(&st))
-                                .ok()
-                        };
+                        // The state is `Running` before this returns, so
+                        // `GET /readyz` never reports a stale `not_started`.
+                        let recovery =
+                            rubixdb_api::recovery::spawn_index_recovery(&state, report_recovery);
                         let router = build_router(state.clone());
                         // `tokio::net::TcpListener::from_std` requires
                         // the socket already be non-blocking -- a std
@@ -290,15 +281,23 @@ impl EmbeddedServer {
                         serve(
                             async_listener,
                             router,
-                            async move {
-                                let _ = shutdown_rx.await;
+                            {
+                                let st = state.clone();
+                                async move {
+                                    let _ = shutdown_rx.await;
+                                    // Shutdown began: ask a running index recovery
+                                    // to stop at its next chunk boundary right away
+                                    // (ADR-LIFECYCLE-001), in parallel with the
+                                    // request drain, instead of after it.
+                                    st.index_recovery.request_cancel();
+                                }
                             },
                             shutdown_drain,
                         )
                         .await;
                         if let Some(handle) = recovery {
                             if !handle.is_finished() {
-                                eprintln!("rubixdb: waiting for interrupted index recovery to finish before shutting down...");
+                                eprintln!("rubixdb: stopping the interrupted index recovery (it restarts at the next start)...");
                             }
                             let _ = handle.join();
                         }

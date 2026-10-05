@@ -15,6 +15,16 @@ USAGE:
     rubixdb gui                 use (or create) the "default" instance
     rubixdb gui --instance NAME use (or create) a named instance
     rubixdb gui --no-browser    start/attach but do not launch a browser tab
+
+Unknown options, a missing NAME, or a repeated --instance are errors.
+
+ENVIRONMENT (a bad value is an error, never ignored; unset or empty = default):
+    RUBIXDB_INSTANCE_NAME                 instance to use when --instance is not given (default "default")
+    RUBIXDB_INSTANCES_ROOT                where instances live
+    RUBIXDB_FRONTEND_DIST                 serve this directory (must hold index.html) instead of the embedded console
+    RUBIXDB_LOCAL_RATE_LIMIT_RPS          sustained requests/second per principal, > 0 (default 100000)
+    RUBIXDB_LOCAL_RATE_LIMIT_BURST        burst size, integer >= 1 (default 200000)
+    RUBIXDB_INSTANCE_RETRY_BUDGET_MS      how long to wait for a running instance to answer, 0-600000 (default 10000)
 "#;
 
 pub fn run(args: &[String]) -> i32 {
@@ -22,16 +32,80 @@ pub fn run(args: &[String]) -> i32 {
         println!("{HELP_TEXT}");
         return 0;
     }
-    let name = instance_name_arg(args)
-        .unwrap_or_else(|| rubixdb_instance::DEFAULT_INSTANCE_NAME.to_string());
-    let open_browser = !args.iter().any(|a| a == "--no-browser");
+    // Every externally supplied value (arguments and environment) is validated
+    // before the instance lock is taken or anything is created on disk: a bad
+    // value fails here, with nothing to clean up.
+    let parsed = parse_args(args).and_then(|a| {
+        let env_name = std::env::var("RUBIXDB_INSTANCE_NAME").ok();
+        let name = resolve_name(a.instance.as_deref(), env_name.as_deref())?;
+        validate_environment()?;
+        Ok((name, a.open_browser))
+    });
+    let (name, open_browser) = match parsed {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rubixdb gui: {e}");
+            return 1;
+        }
+    };
 
     run_for_name(&name, open_browser)
 }
 
-fn instance_name_arg(args: &[String]) -> Option<String> {
-    let idx = args.iter().position(|a| a == "--instance")?;
-    args.get(idx + 1).cloned()
+fn validate_environment() -> Result<(), String> {
+    crate::startup_env::load()?;
+    crate::frontend_dist::env_override()?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GuiArgs {
+    instance: Option<String>,
+    open_browser: bool,
+}
+
+/// Strict: every argument must be one of the documented options. A missing or
+/// flag-shaped `--instance` value, a repeated `--instance`, an unknown option or
+/// a stray word is an error -- it used to silently open `default`, or to swallow
+/// the next flag as the instance name.
+fn parse_args(args: &[String]) -> Result<GuiArgs, String> {
+    let mut instance: Option<String> = None;
+    let mut open_browser = true;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--no-browser" => open_browser = false,
+            "--instance" => {
+                if instance.is_some() {
+                    return Err("--instance was given more than once".to_string());
+                }
+                match it.next() {
+                    Some(v) if !v.starts_with("--") => instance = Some(v.clone()),
+                    _ => return Err("--instance requires an instance NAME".to_string()),
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument {other:?} (see `rubixdb gui --help`)"
+                ))
+            }
+        }
+    }
+    Ok(GuiArgs {
+        instance,
+        open_browser,
+    })
+}
+
+/// `--instance` > `RUBIXDB_INSTANCE_NAME` (non-empty) > `default`, as for every
+/// other command; the result must satisfy the instance name rule.
+fn resolve_name(flag: Option<&str>, env: Option<&str>) -> Result<String, String> {
+    let name = flag
+        .or(env.filter(|s| !s.is_empty()))
+        .unwrap_or(rubixdb_instance::DEFAULT_INSTANCE_NAME);
+    rubixdb_instance::paths::validate_instance_name(name)
+        .map_err(|why| format!("invalid instance name {name:?}: {why}"))?;
+    Ok(name.to_string())
 }
 
 fn run_for_name(name: &str, open_browser: bool) -> i32 {
@@ -61,8 +135,10 @@ fn run_for_name(name: &str, open_browser: bool) -> i32 {
             eprintln!(
                 "rubixdb gui: instance {name:?} at {} is locked by another process that did not \
                  answer a real health/identity check -- refusing to attach or override it.\n\
-                 If you are certain no rubiXDb process is actually running, remove the lock file \
-                 manually and try again.",
+                 It may still be starting or stopping: wait a moment and retry. To end it run \
+                 `rubixdb instance stop {name}` (or stop that process); the operating system \
+                 releases the lock when the owning process exits. Do not delete the lock file: \
+                 that does not release the lock and could let a second process open the same data.",
                 dir.display()
             );
             1
@@ -100,7 +176,16 @@ pub(crate) fn handoff_url(base_url: &str, admin_key: &str) -> String {
 fn start_owned(owned: OwnedInstance, open_browser: bool) -> i32 {
     let manifest = owned.manifest.clone();
     let admin_key = owned.credentials.admin_key.clone();
-    let frontend_dist = crate::frontend_dist::resolve();
+    let frontend_dist = match crate::frontend_dist::resolve() {
+        Ok(d) => d,
+        Err(e) => {
+            // Unreachable after `validate_environment`, kept so a failure can
+            // never be turned into a silent fallback; dropping `owned` releases
+            // the lock and the socket.
+            eprintln!("rubixdb gui: {e}");
+            return 1;
+        }
+    };
     if frontend_dist.is_none() {
         eprintln!(
             "rubixdb gui: warning: no built frontend found (none embedded in this executable, and \
@@ -132,8 +217,8 @@ fn start_owned(owned: OwnedInstance, open_browser: bool) -> i32 {
         println!("Open {} in a browser to use the console.", server.base_url);
     }
 
-    block_until_shutdown_signal();
-    println!("rubixdb gui: shutting down...");
+    let reason = block_until_shutdown_signal();
+    println!("rubixdb gui: shutting down ({reason})...");
     server.shutdown();
     0
 }
@@ -201,12 +286,11 @@ fn next_available_instance_name(base: &str) -> String {
     unreachable!()
 }
 
-fn block_until_shutdown_signal() {
-    // A tiny dedicated runtime just for signal waiting -- the actual
-    // server runs on `EmbeddedServer`'s own runtime/thread; this
-    // function's only job is to park the main thread until Ctrl+C/
-    // SIGTERM, the same trigger `rubixdb-api`'s own standalone binary
-    // uses (`api/src/main.rs::shutdown_signal`).
+/// Parks the main thread until a graceful stop is requested -- Ctrl+C,
+/// Ctrl+Break, console close, logoff, system shutdown (Windows), SIGTERM (Unix),
+/// or `POST /v1/admin/shutdown` -- and returns what triggered it. The server
+/// itself runs on `EmbeddedServer`'s own runtime/thread; this only waits.
+fn block_until_shutdown_signal() -> &'static str {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -220,31 +304,60 @@ fn block_until_shutdown_signal() {
             }
         }
     };
-    rt.block_on(async {
-        let ctrl_c = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
-        #[cfg(unix)]
-        let terminate = async {
-            use tokio::signal::unix::{signal, SignalKind};
-            if let Ok(mut sig) = signal(SignalKind::terminate()) {
-                sig.recv().await;
-            }
-        };
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {},
-            _ = terminate => {},
-            _ = rubixdb_api::shutdown::wait_requested() => {},
-        }
-    });
+    rt.block_on(rubixdb_api::shutdown::wait_for_stop())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::handoff_url;
+    use super::{handoff_url, parse_args, resolve_name, GuiArgs};
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_the_documented_options() {
+        assert_eq!(
+            parse_args(&v(&[])).unwrap(),
+            GuiArgs {
+                instance: None,
+                open_browser: true
+            }
+        );
+        assert_eq!(
+            parse_args(&v(&["--no-browser", "--instance", "x"])).unwrap(),
+            GuiArgs {
+                instance: Some("x".into()),
+                open_browser: false
+            }
+        );
+        // a single leading dash is a legal instance name
+        assert!(parse_args(&v(&["--instance", "-x"])).is_ok());
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for bad in [
+            v(&["--instance"]),
+            v(&["--instance", "--no-browser"]),
+            v(&["--instance", "a", "--instance", "b"]),
+            v(&["--bogus"]),
+            v(&["stray"]),
+            v(&["--no-browser", "extra"]),
+        ] {
+            assert!(parse_args(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn name_precedence_is_flag_then_env_then_default() {
+        assert_eq!(resolve_name(Some("a"), Some("b")).unwrap(), "a");
+        assert_eq!(resolve_name(None, Some("b")).unwrap(), "b");
+        assert_eq!(resolve_name(None, Some("")).unwrap(), "default");
+        assert_eq!(resolve_name(None, None).unwrap(), "default");
+        assert!(resolve_name(None, Some("../x")).is_err());
+        assert!(resolve_name(Some("a b"), None).is_err());
+    }
 
     #[test]
     fn handoff_puts_a_plain_token_in_the_fragment_only() {

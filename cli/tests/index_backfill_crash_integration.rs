@@ -347,3 +347,169 @@ fn create_index_killed_mid_backfill_recovers_correctly_on_restart() {
     let _ = restarted.child.wait();
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 Increment C: recovery is observable and a graceful stop during it is
+// reported honestly.
+// ---------------------------------------------------------------------------
+
+/// Seeds `bigidx`, starts `CREATE INDEX`, and kills the owner while the catalog
+/// reports the index `building` (the same proof the test above uses).
+fn seed_and_kill_mid_backfill(root: &Path) {
+    let owner = start_owner_and_wait_ready(root);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+    seed(&client, &owner.base_url, &owner.admin_key);
+    let (base_url, admin_key) = (owner.base_url.clone(), owner.admin_key.clone());
+    let create = std::thread::spawn(move || {
+        let short = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let _ = short
+            .post(format!("{base_url}/v1/sql"))
+            .bearer_auth(&admin_key)
+            .json(&json!({ "sql": "CREATE INDEX idx_val ON bigidx (val)", "params": [] }))
+            .send();
+    });
+    let poll = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_building = false;
+    while Instant::now() < deadline {
+        let idx = list_indexes(&poll, &owner.base_url, &owner.admin_key);
+        if let Some(i) = idx.iter().find(|i| i["name"] == "idx_val") {
+            assert_ne!(i["state"], "ready", "backfill finished before the kill");
+            if i["state"] == "building" {
+                saw_building = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(saw_building, "never observed the index building");
+    let mut child = owner.child;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let _ = create.join();
+}
+
+fn readyz(client: &reqwest::blocking::Client, owner: &RunningOwner) -> Value {
+    client
+        .get(format!("{}/readyz", owner.base_url))
+        .bearer_auth(&owner.admin_key)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap()
+}
+
+#[test]
+fn readyz_reports_index_recovery_running_then_complete_and_ready_stays_true() {
+    let root = fresh_root("readyz_recovery");
+    seed_and_kill_mid_backfill(&root);
+
+    let owner = start_owner_and_wait_ready(&root);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    // The very first answer after readiness: serving, recovery not finished.
+    let first = readyz(&client, &owner);
+    assert_eq!(first["ready"], true, "{first}");
+    assert_eq!(first["index_recovery"], "running", "{first}");
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let last = loop {
+        let body = readyz(&client, &owner);
+        assert_eq!(body["ready"], true, "ready must not flap: {body}");
+        if body["index_recovery"] != "running" {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recovery never completed: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(last["index_recovery"], "complete", "{last}");
+    let idx = list_indexes(&client, &owner.base_url, &owner.admin_key);
+    let idx_val = idx.iter().find(|i| i["name"] == "idx_val").unwrap();
+    assert_eq!(idx_val["state"], "ready", "{idx_val}");
+
+    let mut owner = owner;
+    let _ = owner.child.kill();
+    let _ = owner.child.wait();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_graceful_stop_during_recovery_cancels_it_quickly_and_the_next_start_finishes_it() {
+    let root = fresh_root("stop_recovery");
+    seed_and_kill_mid_backfill(&root);
+
+    let mut owner = start_owner_and_wait_ready(&root);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    assert_eq!(readyz(&client, &owner)["index_recovery"], "running");
+
+    let stop_started = Instant::now();
+    let out = rubixdb_cmd(&root)
+        .args(["instance", "stop", "default"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stop_took = stop_started.elapsed();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("interrupted index build"), "{text}");
+    assert!(text.contains("stopped cleanly"), "{text}");
+    // ADR-LIFECYCLE-001: the stop no longer waits for the whole backfill. The same
+    // stop took 11-17 s at 400,000 rows before cancellation existed (about 6 s for
+    // these 200,000 rows); a stop is idle-fast (~0.1 s) plus at most one chunk.
+    assert!(
+        stop_took < Duration::from_secs(4),
+        "stop during recovery took {stop_took:?}"
+    );
+    // The owner exited by itself (graceful), not through a kill, and said why the
+    // index is unfinished.
+    assert!(owner.child.wait().unwrap().success());
+    let mut owner_stderr = String::new();
+    std::io::Read::read_to_string(&mut owner.child.stderr.take().unwrap(), &mut owner_stderr)
+        .unwrap();
+    assert!(
+        owner_stderr.contains("interrupted by shutdown"),
+        "owner stderr: {owner_stderr}"
+    );
+
+    // The cancelled index stayed Building; the next start restarts it from scratch and finishes it.
+    let restarted = start_owner_and_wait_ready(&root);
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let body = readyz(&client, &restarted);
+        if body["index_recovery"] == "complete" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{body}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let idx = list_indexes(&client, &restarted.base_url, &restarted.admin_key);
+    assert_eq!(
+        idx.iter().find(|i| i["name"] == "idx_val").unwrap()["state"],
+        "ready"
+    );
+    let mut restarted = restarted;
+    let _ = restarted.child.kill();
+    let _ = restarted.child.wait();
+    std::fs::remove_dir_all(&root).ok();
+}

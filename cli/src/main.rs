@@ -30,6 +30,7 @@ mod repl;
 mod runner;
 mod script;
 mod sql_split;
+mod startup_env;
 
 use std::io::Read;
 use std::time::Duration;
@@ -111,6 +112,30 @@ fn resolve_api_key_for_explicit_url() -> Result<String, String> {
     rpassword::prompt_password("API key: ").map_err(|e| format!("could not read API key: {e}"))
 }
 
+/// `RUBIXDB_API_URL` must be an absolute `http`/`https` URL with a host, and must
+/// not carry credentials, a query or a fragment. (Which hosts are acceptable is a
+/// separate, still-open question; this only rejects values that cannot work, with
+/// a message that names the variable instead of a transport error.)
+fn validate_api_url(raw: &str) -> Result<(), String> {
+    // The value is never echoed: a malformed URL may still contain a password.
+    let url = reqwest::Url::parse(raw).map_err(|e| {
+        format!("RUBIXDB_API_URL is not a valid URL ({e}); expected e.g. http://127.0.0.1:302")
+    })?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("RUBIXDB_API_URL must start with http:// or https://".to_string());
+    }
+    if url.host_str().is_none_or(|h| h.is_empty()) {
+        return Err("RUBIXDB_API_URL has no host".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("RUBIXDB_API_URL must not contain a user name or password (the key is read from RUBIXDB_API_KEY)".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("RUBIXDB_API_URL must not contain a query or fragment".to_string());
+    }
+    Ok(())
+}
+
 /// Kept alive for the whole client-mode run only when this process
 /// itself became the instance owner (the "no instance exists yet"
 /// first-run path) -- `None` on the explicit-`RUBIXDB_API_URL` path
@@ -134,6 +159,8 @@ enum ConnectionSource {
 fn resolve_connection() -> Result<(Connection, ConnectionSource), String> {
     if let Ok(base_url) = std::env::var("RUBIXDB_API_URL") {
         if !base_url.is_empty() {
+            // Syntax is checked before any key prompt or network attempt.
+            validate_api_url(&base_url)?;
             let api_key = resolve_api_key_for_explicit_url()?;
             return Ok((
                 Connection::new(base_url, api_key, Duration::from_secs(120)),
@@ -141,6 +168,10 @@ fn resolve_connection() -> Result<(Connection, ConnectionSource), String> {
             ));
         }
     }
+
+    // Validated before the instance lock is taken or any file is created, so an
+    // invalid value never leaves a half-created instance behind.
+    startup_env::load()?;
 
     let name = std::env::var("RUBIXDB_INSTANCE_NAME")
         .ok()
@@ -266,4 +297,40 @@ fn run_client(args: &[String]) -> i32 {
     }
 
     exit_code
+}
+
+#[cfg(test)]
+mod api_url_tests {
+    use super::validate_api_url;
+
+    #[test]
+    fn accepts_plain_http_and_https_urls() {
+        for ok in [
+            "http://127.0.0.1:302",
+            "https://example.test",
+            "http://[::1]:8/",
+            "http://127.0.0.1:302/base",
+        ] {
+            assert!(validate_api_url(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn rejects_unusable_urls_without_echoing_secrets() {
+        for bad in [
+            "notaurl",
+            "http://",
+            "ftp://x",
+            "file:///c:/x",
+            "http://u:SECRETPW@h:1",
+            "http://h:1/?k=SECRETPW",
+            "http://h:1/#SECRETPW",
+            "",
+            "http://:1",
+        ] {
+            let e = validate_api_url(bad).unwrap_err();
+            assert!(e.contains("RUBIXDB_API_URL"), "{bad}: {e}");
+            assert!(!e.contains("SECRETPW"), "{bad}: {e}");
+        }
+    }
 }

@@ -43,6 +43,50 @@ impl InstanceManifest {
         }
     }
 
+    /// Loads the manifest of the instance living in `dir` and checks it against
+    /// that directory: the file must parse, its `name` must satisfy the instance
+    /// name rule and must be the directory's own name (ASCII case-insensitive:
+    /// NTFS resolves `DEFAULT` and `default` to one directory). A manifest that
+    /// names another instance would otherwise make the confirmation string of
+    /// `POST /v1/admin/shutdown` differ from the name an operator types, and its
+    /// name is printed by `rubixdb instance list`. Errors name the file.
+    pub fn load_for(dir: &Path) -> std::io::Result<Option<Self>> {
+        let path = dir.join(FILE_NAME);
+        let bad = |why: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {why}", path.display()),
+            )
+        };
+        let Some(m) = Self::load(dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                bad(format!("not a valid instance manifest ({e})"))
+            } else {
+                e
+            }
+        })?
+        else {
+            return Ok(None);
+        };
+        crate::paths::validate_instance_name(&m.name).map_err(|why| {
+            bad(format!(
+                "name {:?} is not a valid instance name ({why})",
+                m.name
+            ))
+        })?;
+        let dir_name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !dir_name.eq_ignore_ascii_case(&m.name) {
+            return Err(bad(format!(
+                "name {:?} does not match the instance directory name {:?}",
+                m.name, dir_name
+            )));
+        }
+        Ok(Some(m))
+    }
+
     /// Atomic write-then-rename so a reader never observes a
     /// partially-written manifest (write-tmp-then-rename is atomic on
     /// the same filesystem on both Windows -- `MoveFileEx` w/o
@@ -72,6 +116,59 @@ mod tests {
         let loaded = InstanceManifest::load(&dir).unwrap().unwrap();
         assert_eq!(m, loaded);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn instance_dir(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rubixdb_manifest_for_{}", Uuid::new_v4()));
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_for_accepts_a_manifest_that_matches_its_directory() {
+        let dir = instance_dir("alpha");
+        InstanceManifest::new("alpha".to_string(), 1234)
+            .save(&dir)
+            .unwrap();
+        assert!(InstanceManifest::load_for(&dir).unwrap().is_some());
+        // NTFS aliases `ALPHA` and `alpha`; the ASCII-case-insensitive match keeps that working.
+        let upper = dir.parent().unwrap().join("ALPHA");
+        assert!(InstanceManifest::load_for(&upper).unwrap().is_some() || !upper.exists());
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn load_for_rejects_a_foreign_invalid_or_unparsable_name_and_names_the_file() {
+        for (dir_name, manifest_name) in [
+            ("alpha", "beta"),
+            ("alpha", "../../x"),
+            ("alpha", "bad name"),
+            ("alpha", ""),
+            ("alpha", "a\u{1b}[31mred"),
+        ] {
+            let dir = instance_dir(dir_name);
+            let mut m = InstanceManifest::new("alpha".to_string(), 1234);
+            m.name = manifest_name.to_string();
+            m.save(&dir).unwrap();
+            let err = InstanceManifest::load_for(&dir).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            let msg = err.to_string();
+            assert!(msg.contains("instance.json"), "{msg}");
+            assert!(
+                !msg.contains('\u{1b}'),
+                "control characters must not reach the terminal: {msg:?}"
+            );
+            std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+        }
+        let dir = instance_dir("alpha");
+        std::fs::write(dir.join(FILE_NAME), b"not json").unwrap();
+        let msg = InstanceManifest::load_for(&dir).unwrap_err().to_string();
+        assert!(
+            msg.contains("instance.json") && msg.contains("not a valid"),
+            "{msg}"
+        );
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 
     #[test]

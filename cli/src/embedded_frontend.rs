@@ -24,6 +24,13 @@ pub(crate) fn extract_files(root: &Path, hash: &str, files: &[(&str, &[u8])]) ->
     let parent = root.join("frontend");
     let target = parent.join(hash);
     if target.join("index.html").is_file() {
+        // Also on the cached path: a staging folder left by a process that was killed
+        // mid-unpack is only ever visited here once the folder for this build exists.
+        prune_stale(
+            &parent,
+            hash,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60),
+        );
         return Some(target);
     }
     fs::create_dir_all(&parent).ok()?;
@@ -53,24 +60,35 @@ pub(crate) fn extract_files(root: &Path, hash: &str, files: &[(&str, &[u8])]) ->
             return None;
         }
     }
-    // Best effort: drop folders left by other builds -- only ones untouched for a day, so a
-    // still-running older binary never loses the folder it is serving from.
-    let day = std::time::Duration::from_secs(24 * 60 * 60);
-    if let Ok(rd) = fs::read_dir(&parent) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let stale = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > day);
-            if !name.starts_with(hash) && stale {
-                let _ = fs::remove_dir_all(e.path());
-            }
+    prune_stale(
+        &parent,
+        hash,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60),
+    );
+    Some(target)
+}
+
+/// Best effort: removes every entry of `parent` other than the folder named exactly
+/// `hash` that was last modified before `cutoff` -- folders of other builds AND
+/// `<hash>.tmp-<pid>` staging folders (of any build, including this one) that a killed
+/// process left behind. Entries newer than `cutoff` are kept, so a still-running older
+/// binary never loses the folder it is serving from and a process that is unpacking right
+/// now keeps its staging folder.
+pub(crate) fn prune_stale(parent: &Path, hash: &str, cutoff: std::time::SystemTime) {
+    let Ok(rd) = fs::read_dir(parent) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == hash {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < cutoff);
+        if stale {
+            let _ = fs::remove_dir_all(e.path());
         }
     }
-    Some(target)
 }
 
 #[cfg(test)]
@@ -117,6 +135,30 @@ mod tests {
             old.exists(),
             "an older build may still be running from its folder"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_removes_stale_staging_folders_of_any_build_but_never_the_current_folder() {
+        let root = tmp("prune");
+        let parent = root.join("frontend");
+        for d in ["cur", "cur.tmp-111", "old", "old.tmp-222"] {
+            fs::create_dir_all(parent.join(d)).unwrap();
+        }
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let now = std::time::SystemTime::now();
+        // Everything is brand new: a one-day cutoff in the past keeps every entry.
+        prune_stale(&parent, "cur", now - day);
+        assert!(parent.join("cur.tmp-111").is_dir() && parent.join("old").is_dir());
+        // A cutoff in the future makes everything stale: all but the current folder go.
+        prune_stale(&parent, "cur", now + day);
+        assert!(
+            parent.join("cur").is_dir(),
+            "the current build's folder is never pruned"
+        );
+        for d in ["cur.tmp-111", "old", "old.tmp-222"] {
+            assert!(!parent.join(d).exists(), "{d} should have been pruned");
+        }
         fs::remove_dir_all(&root).ok();
     }
 

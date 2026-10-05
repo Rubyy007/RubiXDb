@@ -64,6 +64,9 @@ pub enum AcquireOutcome {
 #[derive(Debug)]
 pub enum AcquireError {
     InvalidName(String),
+    /// An externally supplied configuration value (environment variable) is
+    /// invalid. Reported before anything on disk is touched.
+    InvalidConfig(String),
     Io(std::io::Error),
 }
 
@@ -71,6 +74,7 @@ impl std::fmt::Display for AcquireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AcquireError::InvalidName(e) => write!(f, "{e}"),
+            AcquireError::InvalidConfig(e) => write!(f, "{e}"),
             AcquireError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -89,10 +93,13 @@ impl From<std::io::Error> for AcquireError {
 /// wait.
 pub fn acquire(name: &str) -> Result<AcquireOutcome, AcquireError> {
     let dir = paths::instance_dir(name).map_err(AcquireError::InvalidName)?;
+    // Validated before the lock is attempted so a bad value never leaves a
+    // half-created instance directory behind.
+    let retry_budget = retry_budget_from_env().map_err(AcquireError::InvalidConfig)?;
 
     match InstanceLock::try_acquire(&dir) {
         Ok(lock) => {
-            let existing = InstanceManifest::load(&dir)?;
+            let existing = InstanceManifest::load_for(&dir)?;
             let (manifest, listener) = match existing {
                 Some(m) => {
                     let listener =
@@ -138,8 +145,48 @@ pub fn acquire(name: &str) -> Result<AcquireOutcome, AcquireError> {
                 dir,
             })
         }
-        Err(LockAcquireError::AlreadyLocked) => Ok(attach_with_retry(&dir)),
-        Err(LockAcquireError::Io(e)) => Err(AcquireError::Io(e)),
+        Err(LockAcquireError::AlreadyLocked) => Ok(attach_with_retry(&dir, retry_budget)),
+        Err(LockAcquireError::Io(e)) => Err(AcquireError::Io(with_path(
+            &dir,
+            "cannot use the instance directory",
+            e,
+        ))),
+    }
+}
+
+/// Adds the offending path and where the root comes from to an OS error, so the
+/// operator is told which setting to look at instead of only `os error 123`.
+fn with_path(path: &Path, what: &str, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        e.kind(),
+        format!(
+            "{what} {}: {e} (instances live under RUBIXDB_INSTANCES_ROOT if it is set, otherwise under the per-user application data folder)",
+            path.display()
+        ),
+    )
+}
+
+/// Environment override of the attach retry budget. Unset or empty = 10 s.
+/// Anything else must be an integer number of milliseconds in
+/// `0..=MAX_RETRY_BUDGET_MS`; a bad value is an error, never a silent default.
+pub const RETRY_BUDGET_ENV: &str = "RUBIXDB_INSTANCE_RETRY_BUDGET_MS";
+pub const DEFAULT_RETRY_BUDGET: Duration = Duration::from_secs(10);
+pub const MAX_RETRY_BUDGET_MS: u64 = 600_000;
+
+pub fn retry_budget_from_env() -> Result<Duration, String> {
+    match std::env::var(RETRY_BUDGET_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_RETRY_BUDGET),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{RETRY_BUDGET_ENV} is not valid Unicode"))
+        }
+        Ok(v) if v.is_empty() => Ok(DEFAULT_RETRY_BUDGET),
+        Ok(v) => match v.parse::<u64>() {
+            Ok(ms) if ms <= MAX_RETRY_BUDGET_MS => Ok(Duration::from_millis(ms)),
+            _ => Err(format!(
+                "{RETRY_BUDGET_ENV} must be an integer number of milliseconds between 0 and \
+                 {MAX_RETRY_BUDGET_MS}, got {v:?}"
+            )),
+        },
     }
 }
 
@@ -152,20 +199,14 @@ pub fn acquire(name: &str) -> Result<AcquireOutcome, AcquireError> {
 /// backoff for up to `RETRY_BUDGET` before finally reporting
 /// `LockedButUnverifiable` -- bounded, never an indefinite wait, and
 /// never a fixed sleep (each attempt is a real check, not a guess at
-/// how long startup takes).
-fn attach_with_retry(dir: &std::path::Path) -> AcquireOutcome {
-    // Test-only override so a deliberately-unverifiable-lock test case
-    // doesn't have to burn the full production budget for real.
-    let retry_budget = std::env::var("RUBIXDB_INSTANCE_RETRY_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(10));
+/// how long startup takes). `retry_budget` comes from
+/// [`retry_budget_from_env`], validated by `acquire` before the lock attempt.
+fn attach_with_retry(dir: &std::path::Path, retry_budget: Duration) -> AcquireOutcome {
     let deadline = std::time::Instant::now() + retry_budget;
     let mut backoff = Duration::from_millis(25);
 
     loop {
-        let manifest = InstanceManifest::load(dir).ok().flatten();
+        let manifest = InstanceManifest::load_for(dir).ok().flatten();
         let credentials = InstanceCredentials::load(dir).ok().flatten();
         if let (Some(manifest), Some(credentials)) = (manifest, credentials) {
             match handshake::verify_identity(
@@ -205,7 +246,7 @@ pub fn discover(
     name: &str,
 ) -> Result<Option<(InstanceManifest, InstanceCredentials, PathBuf)>, AcquireError> {
     let dir = paths::instance_dir(name).map_err(AcquireError::InvalidName)?;
-    let manifest = InstanceManifest::load(&dir)?;
+    let manifest = InstanceManifest::load_for(&dir)?;
     let credentials = InstanceCredentials::load(&dir)?;
     match (manifest, credentials) {
         (Some(m), Some(c)) => Ok(Some((m, c, dir))),
@@ -369,14 +410,20 @@ pub fn list_instances() -> Result<Vec<InstanceManifest>, AcquireError> {
     let entries = match std::fs::read_dir(&root) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(AcquireError::Io(e)),
+        Err(e) => {
+            return Err(AcquireError::Io(with_path(
+                &root,
+                "cannot read the instances root",
+                e,
+            )))
+        }
     };
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        if let Some(m) = InstanceManifest::load(&entry.path())? {
+        if let Some(m) = InstanceManifest::load_for(&entry.path())? {
             out.push(m);
         }
     }
@@ -409,6 +456,78 @@ mod tests {
         std::env::remove_var("RUBIXDB_INSTANCE_RETRY_BUDGET_MS");
         std::fs::remove_dir_all(&root).ok();
         result
+    }
+
+    #[test]
+    fn invalid_retry_budget_fails_before_touching_disk() {
+        with_isolated_root(|root| {
+            for bad in ["abc", "-5", "1.5", "600001", "99999999999999999999", " 5"] {
+                std::env::set_var(RETRY_BUDGET_ENV, bad);
+                let err = match acquire("default") {
+                    Err(AcquireError::InvalidConfig(m)) => m,
+                    other => panic!("{bad:?}: expected InvalidConfig, got ok={}", other.is_ok()),
+                };
+                assert!(err.contains(RETRY_BUDGET_ENV), "{err}");
+                assert!(!root.exists(), "{bad:?} must not create the instances root");
+            }
+            for ok in ["", "0", "200", "600000"] {
+                std::env::set_var(RETRY_BUDGET_ENV, ok);
+                assert!(retry_budget_from_env().is_ok(), "{ok:?}");
+            }
+            std::env::set_var(RETRY_BUDGET_ENV, "200");
+        });
+    }
+
+    #[test]
+    fn rotate_replaces_a_credential_the_loader_refuses() {
+        with_isolated_root(|_root| {
+            let (lock, dir) = held_instance("rot-weak");
+            drop(lock);
+            std::fs::write(dir.join("credentials.json"), br#"{"admin_key":"abc"}"#).unwrap();
+            assert!(InstanceCredentials::load(&dir).is_err());
+            assert!(matches!(acquire("rot-weak"), Err(AcquireError::Io(_))));
+            rotate_credential("rot-weak").unwrap();
+            assert!(InstanceCredentials::load(&dir).unwrap().is_some());
+            assert!(matches!(
+                acquire("rot-weak"),
+                Ok(AcquireOutcome::Owned { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn a_manifest_naming_another_instance_is_refused_but_the_instance_can_still_be_dropped() {
+        with_isolated_root(|_root| {
+            let (lock, dir) = held_instance("mism");
+            drop(lock);
+            let mut m = InstanceManifest::load(&dir).unwrap().unwrap();
+            m.name = "someone-else".to_string();
+            m.save(&dir).unwrap();
+            assert!(matches!(acquire("mism"), Err(AcquireError::Io(_))));
+            assert!(discover("mism").is_err());
+            assert!(list_instances().is_err());
+            remove_instance("mism").unwrap();
+            assert!(!dir.exists());
+        });
+    }
+
+    #[test]
+    fn an_unusable_root_error_names_the_path_and_the_setting() {
+        with_isolated_root(|root| {
+            std::fs::write(root, b"a file where the root directory should be").unwrap_or_else(
+                |_| {
+                    std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+                    std::fs::write(root, b"x").unwrap();
+                },
+            );
+            let msg = match acquire("default") {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("a file as the root must fail"),
+            };
+            assert!(msg.contains("RUBIXDB_INSTANCES_ROOT"), "{msg}");
+            assert!(msg.contains(&root.display().to_string()), "{msg}");
+            std::fs::remove_file(root).ok();
+        });
     }
 
     #[test]

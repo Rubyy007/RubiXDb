@@ -16,6 +16,9 @@ struct HealthBody {
     status: String,
 }
 
+/// Bound on establishing the TCP connection of one identity probe.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
 fn base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -76,6 +79,11 @@ pub enum HandshakeOutcome {
 pub fn verify_identity(port: u16, expected_id: Uuid, timeout: Duration) -> HandshakeOutcome {
     let client = match reqwest::blocking::Client::builder()
         .timeout(timeout)
+        // A loopback connect to a port nobody listens on is not reported as refused for
+        // about 2 s on Windows (measured). Give up on the CONNECT after a short bound
+        // instead: the answer is the same (`Unreachable`), the attach retry loop simply
+        // tries again, and a listener that is bound answers the connect immediately.
+        .connect_timeout(CONNECT_TIMEOUT.min(timeout))
         .build()
     {
         Ok(c) => c,

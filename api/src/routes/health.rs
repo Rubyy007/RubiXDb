@@ -26,6 +26,10 @@ pub async fn healthz() -> Json<HealthBody> {
 pub struct ReadyBody {
     ready: bool,
     storage_state: String,
+    /// `running` | `complete` | `failed` | `not_started`: the startup recovery
+    /// of interrupted `CREATE INDEX` / `DROP INDEX` operations. Additive field;
+    /// `ready` keeps its meaning (normal work is safe while this runs).
+    index_recovery: &'static str,
 }
 
 /// Requires auth (every route except `/healthz` does). Returns 200 as
@@ -33,10 +37,14 @@ pub struct ReadyBody {
 /// `storage_state` value -- `StorageFull` still means "ready to serve
 /// reads and rejects writes correctly," not "the service is down."
 /// `/v1/status` is where `storage_state` itself is inspected.
+/// `index_recovery` says whether the post-start recovery of interrupted index
+/// builds is still running, so "ready" is no longer the only thing a script can
+/// learn from this endpoint.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> Json<ReadyBody> {
     Json(ReadyBody {
         ready: true,
         storage_state: format!("{:?}", state.engine.storage_state()),
+        index_recovery: state.index_recovery.state().as_str(),
     })
 }
 

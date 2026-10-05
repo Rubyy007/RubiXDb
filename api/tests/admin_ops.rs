@@ -813,6 +813,9 @@ async fn shutdown_requires_the_exact_confirmation() {
     .await;
     assert_eq!(s, StatusCode::ACCEPTED);
     assert_eq!(v["shutting_down"], true);
+    // No recovery was started for this fixture: nothing for the stop to wait on.
+    assert_eq!(v["index_recovery"], "not_started");
+    assert_eq!(v["waiting_for_index_recovery"], false);
 }
 
 #[tokio::test]

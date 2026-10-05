@@ -134,6 +134,9 @@ pub struct AppState {
     pub sql: SqlContext,
     pub started_at: SystemTime,
     pub admin: AdminOps,
+    /// Progress of the startup recovery of interrupted index operations
+    /// (`crate::recovery`); reported by `GET /readyz`.
+    pub index_recovery: crate::recovery::IndexRecovery,
 }
 
 impl AppState {
@@ -191,6 +194,7 @@ impl AppState {
             sql,
             started_at: SystemTime::now(),
             admin: AdminOps::default(),
+            index_recovery: crate::recovery::IndexRecovery::default(),
         }
     }
 }

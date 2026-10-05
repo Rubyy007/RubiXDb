@@ -206,6 +206,40 @@ async fn readyz_requires_auth_and_reports_storage_state() {
     let body = json_body(ok).await;
     assert_eq!(body["ready"], true);
     assert_eq!(body["storage_state"], "Healthy");
+    assert_eq!(
+        body["index_recovery"], "not_started",
+        "no recovery was started for this fixture"
+    );
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Phase 2 Increment C: `/readyz` reports the startup index recovery. The state
+/// is `running` as soon as `spawn_index_recovery` returns (never a stale
+/// `not_started`), and `complete` once the thread has finished with nothing to
+/// do; `ready` stays true throughout.
+#[tokio::test]
+async fn readyz_reports_the_index_recovery_state() {
+    let dir = temp_dir("ready_recovery");
+    let (state, router) = build_app(&dir);
+
+    let handle = rubixdb_api::recovery::spawn_index_recovery(&state, |_| {})
+        .expect("recovery thread must start");
+    // Immediately after the spawn call the state is never `not_started`.
+    assert_ne!(
+        state.index_recovery.state(),
+        rubixdb_api::recovery::RecoveryState::NotStarted
+    );
+    handle.join().unwrap();
+
+    let ok = router
+        .oneshot(req("GET", "/readyz", Some(READER_KEY), None))
+        .await
+        .unwrap();
+    let body = json_body(ok).await;
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["index_recovery"], "complete");
 
     state.engine.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

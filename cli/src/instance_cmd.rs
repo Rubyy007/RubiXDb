@@ -251,6 +251,16 @@ fn list() -> i32 {
     }
 }
 
+/// `true` when some process holds the instance's OS lock right now. Takes and
+/// immediately releases the lock when it is free (the same probe `instance stop`
+/// uses); never breaks a held lock.
+fn instance_lock_is_held(dir: &std::path::Path) -> bool {
+    matches!(
+        rubixdb_instance::InstanceLock::try_acquire(dir),
+        Err(rubixdb_instance::LockAcquireError::AlreadyLocked)
+    )
+}
+
 fn status(name: Option<&str>) -> i32 {
     let name = name.unwrap_or(rubixdb_instance::DEFAULT_INSTANCE_NAME);
     match rubixdb_instance::discover(name) {
@@ -268,9 +278,23 @@ fn status(name: Option<&str>) -> i32 {
                 "status:      {}",
                 match live {
                     rubixdb_instance::HandshakeOutcome::Confirmed => "running",
-                    rubixdb_instance::HandshakeOutcome::Mismatch =>
-                        "port reassigned (stale manifest)",
-                    rubixdb_instance::HandshakeOutcome::Unreachable => "not running",
+                    rubixdb_instance::HandshakeOutcome::Mismatch => {
+                        if instance_lock_is_held(&dir) {
+                            "locked (another process owns this instance, but the process answering on its port is not it)"
+                        } else {
+                            "port reassigned (stale manifest)"
+                        }
+                    }
+                    rubixdb_instance::HandshakeOutcome::Unreachable => {
+                        // The OS lock, not the port, says whether an owner exists: a
+                        // process that is starting, stopping or unresponsive holds it
+                        // while nothing answers.
+                        if instance_lock_is_held(&dir) {
+                            "locked (a process owns this instance but is not answering: it may be starting, stopping or unresponsive)"
+                        } else {
+                            "not running"
+                        }
+                    }
                 }
             );
             0
@@ -313,9 +337,20 @@ fn stop_instance(name: Option<&str>) -> i32 {
         std::time::Duration::from_secs(30),
     );
     let body = serde_json::json!({"confirm": name});
-    if let Err(e) = conn.admin_request(reqwest::Method::POST, "/v1/admin/shutdown", Some(&body)) {
-        eprintln!("rubixdb instance stop: {e}");
-        return 1;
+    let reply = match conn.admin_request(reqwest::Method::POST, "/v1/admin/shutdown", Some(&body)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rubixdb instance stop: {e}");
+            return 1;
+        }
+    };
+    // The server closes its listener at once and cancels a still-running index
+    // recovery at its next chunk boundary (ADR-LIFECYCLE-001); say so.
+    let waiting_for_recovery = reply["waiting_for_index_recovery"].as_bool() == Some(true);
+    if waiting_for_recovery {
+        println!(
+            "instance {name:?} is interrupting its recovery of an interrupted index build before it stops; the index restarts at the next start"
+        );
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while std::time::Instant::now() < deadline {
@@ -325,6 +360,12 @@ fn stop_instance(name: Option<&str>) -> i32 {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    eprintln!("rubixdb instance stop: {name:?} did not exit within 120 s");
+    if waiting_for_recovery {
+        eprintln!(
+            "rubixdb instance stop: {name:?} is still shutting down after 120 s (it was interrupting an index recovery); it is not accepting requests; the instance lock is released when it has exited"
+        );
+    } else {
+        eprintln!("rubixdb instance stop: {name:?} did not exit within 120 s");
+    }
     1
 }
