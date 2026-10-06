@@ -118,6 +118,9 @@ pub async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    use crate::observability::events::{kind, severity, Event};
+    use std::sync::atomic::Ordering;
+    let request_id = state.obs.counters.next_request_id();
     let principal = match extract_bearer(&req).and_then(|t| state.auth.authenticate(t)) {
         Some(p) => p,
         None => {
@@ -136,17 +139,54 @@ pub async fn auth_middleware(
                 outcome: "denied",
                 ..Default::default()
             });
+            state
+                .obs
+                .counters
+                .auth_failures
+                .fetch_add(1, Ordering::Relaxed);
+            state.obs.events.push_security(
+                Event::new(kind::AUTH_FAILURE, severity::WARNING, "auth", "denied")
+                    .request(Some(request_id))
+                    .error_class("UNAUTHORIZED"),
+            );
             return Err(ApiError::Unauthorized);
         }
     };
     let required = required_role(&req);
     if !principal.role.satisfies(required) {
+        state
+            .obs
+            .counters
+            .auth_forbidden
+            .fetch_add(1, Ordering::Relaxed);
+        state.obs.events.push_security(
+            Event::new(kind::AUTH_FORBIDDEN, severity::WARNING, "auth", "denied")
+                .request(Some(request_id))
+                .error_class("FORBIDDEN"),
+        );
         return Err(ApiError::Forbidden);
     }
     if !state.rate_limiter.check(&principal.name) {
+        state
+            .obs
+            .counters
+            .rate_limited
+            .fetch_add(1, Ordering::Relaxed);
+        state.obs.events.push_security(
+            Event::new(
+                kind::AUTH_RATE_LIMITED,
+                severity::WARNING,
+                "auth",
+                "refused",
+            )
+            .request(Some(request_id))
+            .error_class("RATE_LIMITED"),
+        );
         return Err(ApiError::RateLimited);
     }
     req.extensions_mut().insert(principal);
+    req.extensions_mut()
+        .insert(crate::observability::RequestId(request_id));
     Ok(next.run(req).await)
 }
 

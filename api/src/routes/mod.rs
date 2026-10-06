@@ -5,6 +5,8 @@ pub mod health;
 pub mod instance;
 pub mod kv;
 pub mod metrics_route;
+pub mod metrics_system;
+pub mod observability;
 pub mod range;
 pub mod snapshots;
 pub mod sql;
@@ -24,23 +26,47 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::auth::auth_middleware;
 use crate::state::AppState;
 
-/// Records one `ServiceMetrics` sample per request -- route label from
-/// `MatchedPath` when available (the normal case for every route this
-/// service defines), falling back to the raw URI path only for a
-/// request that matched no route at all (a 404 from the router itself).
+/// The route label used as a metric key. **Closed set**: the route *template* from the router
+/// (`MatchedPath`, a member of the static route table) combined with the HTTP method only when
+/// the method is one of the standard ones; any other method token is folded into `OTHER`, and a
+/// request that matched no route gets the constant `UNMATCHED`. Request input (path parameters,
+/// query strings, arbitrary method tokens) therefore can never create a new key.
+pub fn route_label(method: &Method, matched: Option<&str>) -> String {
+    let m = match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::PATCH => "PATCH",
+        _ => "OTHER",
+    };
+    format!("{m} {}", matched.unwrap_or("UNMATCHED"))
+}
+
+/// Records one `ServiceMetrics` sample per request, labelled by [`route_label`], and counts
+/// 5xx responses.
 async fn metrics_middleware(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    let route = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|m| format!("{} {}", req.method(), m.as_str()))
-        .unwrap_or_else(|| format!("{} {}", req.method(), req.uri().path()));
+    let route = route_label(
+        req.method(),
+        req.extensions().get::<MatchedPath>().map(|m| m.as_str()),
+    );
     let guard = state.metrics.start_request(route);
     let response = next.run(req).await;
-    guard.finish(response.status().is_client_error() || response.status().is_server_error());
+    let status = response.status();
+    if status.is_server_error() {
+        state
+            .obs
+            .counters
+            .http_server_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    guard.finish(status.is_client_error() || status.is_server_error());
     response
 }
 
@@ -53,7 +79,11 @@ async fn metrics_middleware(
 /// record carries the route *pattern*, never the raw URI, so a backup name
 /// or other path parameter is not logged; a catalog drop additionally carries
 /// its numeric object id (digits only, bounded).
-async fn audit_middleware(req: Request, next: Next) -> Response {
+async fn audit_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
     let classified = {
         let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
         route.and_then(|r| classify_for_audit(req.method(), r))
@@ -79,8 +109,39 @@ async fn audit_middleware(req: Request, next: Next) -> Response {
             .filter(|s| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit()))
             .map(str::to_string)
     });
+    let request_id = req
+        .extensions()
+        .get::<crate::observability::RequestId>()
+        .map(|r| r.0);
+    let started = std::time::Instant::now();
     let response = next.run(req).await;
     let status = response.status().as_u16();
+    {
+        use crate::observability::events::{kind, severity, Event};
+        let outcome = crate::security_log::outcome_for_status(status);
+        let is_admin = code == crate::security_log::code::ADMIN_ACTION;
+        if is_admin {
+            state.obs.counters.record_admin_action(&route, outcome);
+        }
+        state.obs.events.push_security(
+            Event::new(
+                if is_admin {
+                    kind::ADMIN_ACTION
+                } else {
+                    kind::CATALOG_DDL
+                },
+                if outcome == "ok" {
+                    severity::INFO
+                } else {
+                    severity::WARNING
+                },
+                if is_admin { "admin" } else { "catalog" },
+                outcome,
+            )
+            .request(request_id)
+            .duration(started.elapsed().as_secs_f64() * 1000.0),
+        );
+    }
     crate::security_log::emit(&crate::security_log::SecurityEvent {
         code,
         principal: principal.as_deref(),
@@ -261,7 +322,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // The audit layer is attached only to the routes `classify_for_audit` can
     // ever match (admin actions and REST catalog drops), so the SQL/KV/read
     // hot paths pay nothing for it.
-    let audit = middleware::from_fn(audit_middleware);
+    let audit = middleware::from_fn_with_state(state.clone(), audit_middleware);
     let protected = Router::new()
         .route("/readyz", get(health::readyz))
         .route("/v1/whoami", get(health::whoami))
@@ -282,6 +343,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/compaction/status", get(compaction::status))
         .route("/v1/compaction/metrics", get(compaction::metrics))
         .route("/v1/metrics", get(metrics_route::metrics))
+        .route("/v1/metrics/system", get(metrics_system::system))
+        .route(
+            "/v1/metrics/system/timeseries",
+            get(metrics_system::timeseries),
+        )
+        .route("/v1/observability/sessions", get(observability::sessions))
+        .route("/v1/observability/queries", get(observability::queries))
+        .route("/v1/observability/events", get(observability::events))
+        .route("/v1/observability/version", get(observability::version))
         .route("/v1/sql", post(sql::sql))
         .route("/v1/catalog/databases", get(catalog::databases))
         .route("/v1/catalog/schemas", get(catalog::schemas))

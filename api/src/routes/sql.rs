@@ -234,14 +234,43 @@ fn exec_limits(state: &AppState) -> ExecLimits {
     }
 }
 
+/// Statement class label (closed set) for the query registry.
+fn statement_class(stmt: &Statement) -> &'static str {
+    use crate::observability::queries::class;
+    match stmt {
+        Statement::Select(_) => class::SELECT,
+        Statement::Insert(_) => class::INSERT,
+        Statement::Update(_) => class::UPDATE,
+        Statement::Delete(_) => class::DELETE,
+        Statement::CreateDatabase(_)
+        | Statement::CreateSchema(_)
+        | Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_) => class::DDL,
+        Statement::Begin | Statement::Commit | Statement::Rollback => class::TRANSACTION,
+        Statement::Explain(_) => class::EXPLAIN,
+    }
+}
+
 pub async fn sql(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
+    request_id: Option<Extension<crate::observability::RequestId>>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Json<SqlResponse>, ApiError> {
+    use crate::observability::events::{kind, severity, Event};
     state.sql.api_metrics.record_request();
+    let query = state
+        .obs
+        .queries
+        .start()
+        .log_disconnect_to(&state.obs.events);
+    let request_id = request_id.map(|Extension(r)| r.0);
+    let session_id = req.session_id;
+    let started = Instant::now();
     let mut ddl: Option<DdlAudit> = None;
-    let result = handle(&state, &principal, req, &mut ddl).await;
+    let result = handle(&state, &principal, req, &mut ddl, &query).await;
     if let Some(d) = ddl {
         // Phase 7 SG-3b: catalog DDL create/drop. Statement kind and the
         // target identifier come from the parsed AST -- the SQL text, the
@@ -262,11 +291,56 @@ pub async fn sql(
             ..Default::default()
         });
     }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     match &result {
-        Ok(_) => state.sql.api_metrics.record_success(),
-        Err(ApiError::Sql(SqlError::Cancelled)) => state.sql.api_metrics.record_cancellation(),
-        Err(ApiError::SqlDeadlineExceeded) => state.sql.api_metrics.record_deadline_exceeded(),
-        Err(_) => state.sql.api_metrics.record_error(),
+        Ok(resp) => {
+            state.sql.api_metrics.record_success();
+            let (returned, affected) = match &resp.result {
+                SqlResultBody::Rows { row_count, .. } => (Some(*row_count as u64), None),
+                SqlResultBody::Write { rows_affected, .. } => (None, Some(*rows_affected)),
+                _ => (None, None),
+            };
+            query.succeeded(returned, affected);
+        }
+        Err(ApiError::Sql(SqlError::Cancelled)) => {
+            state.sql.api_metrics.record_cancellation();
+            query.cancelled();
+            state.obs.events.push_operational(
+                Event::new(
+                    kind::QUERY_CANCELLED,
+                    severity::WARNING,
+                    "query",
+                    "cancelled",
+                )
+                .request(request_id)
+                .session(session_id)
+                .duration(elapsed_ms)
+                .error_class("CANCELLED"),
+            );
+        }
+        Err(ApiError::SqlDeadlineExceeded) => {
+            state.sql.api_metrics.record_deadline_exceeded();
+            query.timed_out();
+            state.obs.events.push_operational(
+                Event::new(kind::QUERY_TIMEOUT, severity::WARNING, "query", "timeout")
+                    .request(request_id)
+                    .session(session_id)
+                    .duration(elapsed_ms)
+                    .error_class("SQL_TIMEOUT"),
+            );
+        }
+        Err(e) => {
+            state.sql.api_metrics.record_error();
+            let code = e.code();
+            query.failed(code);
+            state.obs.events.push_operational(
+                Event::new(kind::QUERY_FAILED, severity::ERROR, "query", "failed")
+                    .request(request_id)
+                    .session(session_id)
+                    .duration(elapsed_ms)
+                    .error_class(code),
+            );
+        }
     }
     result.map(Json)
 }
@@ -303,9 +377,11 @@ async fn handle(
     principal: &Principal,
     req: SqlRequest,
     ddl: &mut Option<DdlAudit>,
+    query: &crate::observability::queries::QueryGuard<'_>,
 ) -> Result<SqlResponse, ApiError> {
     let sql_limits = SqlLimits::default();
     let stmt = parse_statement(&req.sql, &sql_limits)?;
+    query.set_class(statement_class(&stmt));
     *ddl = ddl_audit(&stmt);
 
     let bind_context = state.sql.bind_context()?;
@@ -408,7 +484,23 @@ async fn handle_begin(
         .sql
         .sessions
         .create(&principal.name, txn)
-        .map_err(|_| ApiError::SqlTooManySessions)?;
+        .map_err(|_| {
+            state
+                .obs
+                .counters
+                .sessions_rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.obs.events.push_operational(
+                crate::observability::events::Event::new(
+                    crate::observability::events::kind::SESSION_REJECTED,
+                    crate::observability::events::severity::WARNING,
+                    "session",
+                    "refused",
+                )
+                .error_class("TOO_MANY_SESSIONS"),
+            );
+            ApiError::SqlTooManySessions
+        })?;
     Ok(SqlResponse {
         session_id: Some(new_id),
         result: SqlResultBody::Begin,
@@ -430,6 +522,7 @@ async fn handle_commit(
         .sessions
         .take(id, &principal.name)
         .map_err(|_| ApiError::SqlSessionNotFound)?;
+    state.sql.sessions.finish(id);
     txn.commit().map_err(SqlError::from)?;
     Ok(SqlResponse {
         session_id: None,
@@ -452,6 +545,7 @@ async fn handle_rollback(
         .sessions
         .take(id, &principal.name)
         .map_err(|_| ApiError::SqlSessionNotFound)?;
+    state.sql.sessions.finish(id);
     txn.rollback().map_err(SqlError::from)?;
     Ok(SqlResponse {
         session_id: None,
@@ -540,7 +634,12 @@ async fn handle_read(
                         .put_back(id, principal.name.clone(), txn, created_at);
                     Err(e.into())
                 }
-                Err(api_err) => Err(api_err),
+                Err(api_err) => {
+                    // The transaction was dropped with the failed statement (deadline /
+                    // cancellation): the session is gone.
+                    state.sql.sessions.finish(id);
+                    Err(api_err)
+                }
             }
         }
     }
@@ -628,7 +727,12 @@ async fn handle_write(
                         .put_back(id, principal.name.clone(), txn, created_at);
                     Err(e.into())
                 }
-                Err(api_err) => Err(api_err),
+                Err(api_err) => {
+                    // The transaction was dropped with the failed statement (deadline /
+                    // cancellation): the session is gone.
+                    state.sql.sessions.finish(id);
+                    Err(api_err)
+                }
             }
         }
     }

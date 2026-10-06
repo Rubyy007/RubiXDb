@@ -75,6 +75,28 @@ pub async fn serve_with_limits(
     drain_bound: Duration,
     limits: ServerLimits,
 ) {
+    serve_observed(
+        listener,
+        router,
+        shutdown_trigger,
+        drain_bound,
+        limits,
+        None,
+    )
+    .await
+}
+
+/// Same as [`serve_with_limits`], and keeps `connections` equal to the number of open HTTP
+/// connections (incremented when one is accepted, decremented when it ends) so the sampler can
+/// report `active_connections`.
+pub async fn serve_observed(
+    listener: TcpListener,
+    router: Router,
+    shutdown_trigger: impl Future<Output = ()> + Send + 'static,
+    drain_bound: Duration,
+    limits: ServerLimits,
+    connections: Option<Arc<std::sync::atomic::AtomicI64>>,
+) {
     let svc = tower::ServiceBuilder::new()
         .layer(RequestBodyTimeoutLayer::new(limits.body_idle_timeout))
         .service(router);
@@ -117,8 +139,15 @@ pub async fn serve_with_limits(
             .serve_connection_with_upgrades(io, hyper_svc.clone())
             .into_owned();
         let conn = graceful.watch(conn);
+        let gauge = connections.clone();
+        if let Some(g) = &gauge {
+            g.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         tokio::spawn(async move {
             let _ = conn.await;
+            if let Some(g) = &gauge {
+                g.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             drop(permit);
         });
     }

@@ -15,7 +15,7 @@ use rubixdb::execution::batch_coordinator::BatchCoordinatorConfig;
 use rubixdb::lsm::{LsmConfig, LsmEngine};
 use rubixdb::wal::{SyncMode, WalConfig};
 use rubixdb_api::config::{ApiKeyConfig, Role};
-use rubixdb_api::{routes::build_router, server::serve, AppState, Config};
+use rubixdb_api::{routes::build_router, server::serve_observed, AppState, Config};
 use rubixdb_instance::{InstanceCredentials, InstanceLock, InstanceManifest};
 
 /// The pieces of `AcquireOutcome::Owned` this module needs -- kept
@@ -278,7 +278,24 @@ impl EmbeddedServer {
                         });
                         let _ = ready_tx.send(Ok(()));
 
-                        serve(
+                        // Start the observability sampler (1 Hz, one thread) and the SQL
+                        // session reaper before the server reports ready; both stop with it.
+                        let lock_dir = data_dir_for_thread
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_default();
+                        state.obs.set_lock_probe(Arc::new(move || {
+                            matches!(
+                                rubixdb_instance::InstanceLock::try_acquire(&lock_dir),
+                                Err(rubixdb_instance::LockAcquireError::AlreadyLocked)
+                            )
+                        }));
+                        let mut sampler = rubixdb_api::observability::sampler::start(&state).ok();
+                        let reaper = rubixdb_api::sql_session::spawn_reaper(
+                            state.sql.sessions.clone(),
+                            Duration::from_secs(30),
+                        );
+                        serve_observed(
                             async_listener,
                             router,
                             {
@@ -293,13 +310,20 @@ impl EmbeddedServer {
                                 }
                             },
                             shutdown_drain,
+                            rubixdb_api::server::ServerLimits::default(),
+                            Some(state.obs.connections.clone()),
                         )
                         .await;
+                        reaper.abort();
                         if let Some(handle) = recovery {
                             if !handle.is_finished() {
                                 eprintln!("rubixdb: stopping the interrupted index recovery (it restarts at the next start)...");
                             }
                             let _ = handle.join();
+                        }
+                        // The sampler reads the engine: stop and join it before the engine goes.
+                        if let Some(sm) = sampler.as_mut() {
+                            sm.stop();
                         }
                         engine.shutdown();
                     });

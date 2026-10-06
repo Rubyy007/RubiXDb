@@ -84,6 +84,13 @@ impl IndexRecovery {
         self.cancel.load(Ordering::SeqCst)
     }
 
+    /// Forces the state. **For tests only** (proves readiness does not depend on index
+    /// recovery without running a real backfill); production code uses `set`.
+    #[doc(hidden)]
+    pub fn set_for_test(&self, s: RecoveryState) {
+        self.set(s);
+    }
+
     fn set(&self, s: RecoveryState) {
         let v = match s {
             RecoveryState::NotStarted => 0,
@@ -169,6 +176,18 @@ pub fn spawn_index_recovery(
             };
             on_report(&report);
             st.index_recovery.set(outcome);
+            st.obs
+                .events
+                .push_operational(crate::observability::events::Event::new(
+                    crate::observability::events::kind::INDEX_RECOVERY,
+                    if outcome == RecoveryState::Failed {
+                        crate::observability::events::severity::ERROR
+                    } else {
+                        crate::observability::events::severity::INFO
+                    },
+                    "recovery",
+                    outcome.as_str(),
+                ));
         }) {
         Ok(h) => Some(h),
         Err(_) => {

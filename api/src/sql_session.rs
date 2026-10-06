@@ -85,8 +85,32 @@ pub struct SqlSessionMetricsSnapshot {
     pub active_sessions: u64,
 }
 
+/// What stays known about a session for its whole life, including while a statement is running
+/// (during which its `SqlSession` is checked out of `sessions`). Used only for observation and
+/// to keep the original creation time: it holds no transaction, no principal, no SQL.
+#[derive(Debug, Clone, Copy)]
+struct SessionMeta {
+    created_at: Instant,
+    last_active: Instant,
+    executing: bool,
+}
+
+/// One session as a client may see it. No principal, key, parameter or SQL text.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub id: Uuid,
+    pub executing: bool,
+    pub age_secs: f64,
+    pub idle_secs: f64,
+    pub idle_timeout_remaining_secs: Option<f64>,
+    pub lifetime_remaining_secs: f64,
+    /// `active` | `idle_expired_pending_reap` | `lifetime_expired_pending_reap`
+    pub timeout_state: &'static str,
+}
+
 pub struct SqlSessionRegistry {
     sessions: Mutex<HashMap<Uuid, SqlSession>>,
+    meta: Mutex<HashMap<Uuid, SessionMeta>>,
     limits: SqlSessionLimits,
 }
 
@@ -106,6 +130,7 @@ impl SqlSessionRegistry {
     pub fn new(limits: SqlSessionLimits) -> Self {
         SqlSessionRegistry {
             sessions: Mutex::new(HashMap::new()),
+            meta: Mutex::new(HashMap::new()),
             limits,
         }
     }
@@ -133,6 +158,14 @@ impl SqlSessionRegistry {
                 txn,
                 created_at: now,
                 last_active: now,
+            },
+        );
+        self.meta.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            id,
+            SessionMeta {
+                created_at: now,
+                last_active: now,
+                executing: false,
             },
         );
         Ok(id)
@@ -164,27 +197,118 @@ impl SqlSessionRegistry {
                 if let Some(s) = sessions.remove(&id) {
                     let _ = s.txn.rollback();
                 }
+                self.meta
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id);
             }
             return Err(SessionLookupError::NotFound);
         }
         let session = sessions.remove(&id).expect("checked present above");
+        if let Some(m) = self
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&id)
+        {
+            m.executing = true;
+        }
         Ok(session.txn)
     }
 
     /// Restores a still-active transaction after a statement that did
     /// not commit/rollback it, refreshing `last_active` (item 24's own
     /// idle-timeout clock).
+    ///
+    /// The session keeps the creation time of its `BEGIN`: the `created_at` argument is only a
+    /// fallback for a session this registry has no record of. (Callers used to pass a fresh
+    /// `Instant::now()` after every statement, which restarted the max-lifetime clock each time,
+    /// so the documented 30-minute lifetime bound never applied; keeping the original also makes
+    /// the reported session age true.)
     pub fn put_back(&self, id: Uuid, principal: String, txn: Transaction, created_at: Instant) {
+        let now = Instant::now();
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let created_at = {
+            let mut meta = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+            match meta.get_mut(&id) {
+                Some(m) => {
+                    m.executing = false;
+                    m.last_active = now;
+                    m.created_at
+                }
+                None => created_at,
+            }
+        };
         sessions.insert(
             id,
             SqlSession {
                 principal,
                 txn,
                 created_at,
-                last_active: Instant::now(),
+                last_active: now,
             },
         );
+    }
+
+    /// The session ended without being put back (COMMIT, ROLLBACK, or a failure that dropped its
+    /// transaction): forget its metadata so it no longer counts as open.
+    pub fn finish(&self, id: Uuid) {
+        self.meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+    }
+
+    /// Open sessions, including any whose statement is running right now (`active_count` counts
+    /// only the ones sitting in the registry between statements).
+    pub fn open_count(&self) -> usize {
+        self.meta.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// At most `limit` sessions ordered by id, plus the total number of open sessions.
+    pub fn list(&self, limit: usize) -> (Vec<SessionView>, usize) {
+        let now = Instant::now();
+        let meta = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let total = meta.len();
+        let mut ids: Vec<&Uuid> = meta.keys().collect();
+        ids.sort();
+        let views = ids
+            .into_iter()
+            .take(limit)
+            .map(|id| {
+                let m = meta[id];
+                let age = now.duration_since(m.created_at);
+                let idle = if m.executing {
+                    Duration::ZERO
+                } else {
+                    now.duration_since(m.last_active)
+                };
+                let timeout_state = if m.executing {
+                    "active"
+                } else if idle > self.limits.idle_timeout {
+                    "idle_expired_pending_reap"
+                } else if age > self.limits.max_lifetime {
+                    "lifetime_expired_pending_reap"
+                } else {
+                    "active"
+                };
+                SessionView {
+                    id: *id,
+                    executing: m.executing,
+                    age_secs: age.as_secs_f64(),
+                    idle_secs: idle.as_secs_f64(),
+                    idle_timeout_remaining_secs: (!m.executing)
+                        .then(|| self.limits.idle_timeout.saturating_sub(idle).as_secs_f64()),
+                    lifetime_remaining_secs: self
+                        .limits
+                        .max_lifetime
+                        .saturating_sub(age)
+                        .as_secs_f64(),
+                    timeout_state,
+                }
+            })
+            .collect();
+        (views, total)
     }
 
     pub fn active_count(&self) -> usize {
@@ -222,6 +346,10 @@ impl SqlSessionRegistry {
             if let Some(s) = sessions.remove(&id) {
                 let _ = s.txn.rollback();
             }
+            self.meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
         }
         count
     }
@@ -236,6 +364,7 @@ impl SqlSessionRegistry {
         for (_, session) in sessions.drain() {
             let _ = session.txn.rollback();
         }
+        self.meta.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 }
 
@@ -407,6 +536,53 @@ mod tests {
             0,
             "expired session must be cleaned up, not merely rejected"
         );
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_view_survives_a_statement_and_keeps_the_original_age() {
+        let (txm, engine, dir) = test_txm();
+        let registry = SqlSessionRegistry::new(SqlSessionLimits::default());
+        let id = registry.create("alice", dummy_txn(&txm)).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let txn = registry.take(id, "alice").unwrap();
+        // checked out: invisible to active_count, still open and executing
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.open_count(), 1);
+        let (v, total) = registry.list(10);
+        assert_eq!((v.len(), total, v[0].executing), (1, 1, true));
+        assert!(v[0].age_secs >= 0.03);
+        registry.put_back(id, "alice".to_string(), txn, Instant::now());
+        let (v, _) = registry.list(10);
+        assert!(!v[0].executing);
+        assert!(
+            v[0].age_secs >= 0.03,
+            "age must not restart on put_back: {}",
+            v[0].age_secs
+        );
+        assert_eq!(v[0].timeout_state, "active");
+        let txn = registry.take(id, "alice").unwrap();
+        txn.rollback().unwrap();
+        registry.finish(id);
+        assert_eq!(registry.open_count(), 0);
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_but_unreaped_session_is_reported_as_such() {
+        let (txm, engine, dir) = test_txm();
+        let registry = SqlSessionRegistry::new(SqlSessionLimits {
+            idle_timeout: Duration::from_millis(1),
+            ..SqlSessionLimits::default()
+        });
+        registry.create("alice", dummy_txn(&txm)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let (v, _) = registry.list(10);
+        assert_eq!(v[0].timeout_state, "idle_expired_pending_reap");
+        assert_eq!(registry.reap_expired(), 1);
+        assert_eq!(registry.open_count(), 0);
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

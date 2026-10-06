@@ -6,6 +6,28 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Product: Full observability -- sampler, system metrics, time series, diagnostics (2026-10-06)
+
+Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md`.
+
+#### Added
+
+- **Background sampler** (one thread, 1 Hz, immutable snapshots, panic-safe, stale/failed state derived from snapshot age) and **bounded time-series rings** (15 m / 1 h / 24 h / 7 d; 240,856 bytes measured, cap 1 MiB).
+- `GET /v1/metrics/system` (CPU, memory, disk capacity/free/sizes, process I/O, rates, gauges, latency, WAL, compaction, background, security and limit counters, health); a value that cannot be measured is `null`, never `0`.
+- `GET /v1/metrics/system/timeseries?window=15m|1h|24h|7d`; `GET /v1/observability/sessions|queries|events|version` (bounded, Reader, never SQL text, credentials or paths).
+- `rubixdb status --system [--json]`.
+- Counters: auth failures, forbidden, rate-limited, admin actions (+ last), refused sessions, 5xx, active connections, active queries. Health classification (decision requiring review).
+- `LsmEngine::compaction_running()` (read-only accessor).
+
+#### Fixed
+
+- **`/v1/metrics` route table was unbounded:** the HTTP method token was copied into the key (3,200 hostile requests grew it from 17 to 821 keys). Labels are now a closed method set plus the matched route pattern, capped at 128 keys with an overflow bucket (same probe: 23 keys).
+- SQL session age is the true age (creation time kept across statements).
+
+#### Unchanged
+
+`/healthz`, `/readyz`, `/v1/status`, `/v1/admin/status` and every other existing endpoint keep their field sets, status codes and headers (diffed on 18 endpoints); listener, port, CSP, nosniff, Referrer-Policy and Cache-Control unchanged; no new dependency.
+
 ### Product: Increment 18 -- unified access path, lazy index fetch, transaction scan semantics (2026-10-02)
 
 Full record: `PHASE_RUBIXDB_INCREMENT18_ACCESS_PATH_ARCHITECTURE.md`,

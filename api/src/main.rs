@@ -8,7 +8,7 @@ use std::time::Duration;
 use rubixdb::execution::batch_coordinator::BatchCoordinatorConfig;
 use rubixdb::lsm::{LsmConfig, LsmEngine};
 use rubixdb::wal::{SyncMode, WalConfig};
-use rubixdb_api::{routes::build_router, server::serve, AppState, Config};
+use rubixdb_api::{routes::build_router, server::serve_observed, AppState, Config};
 
 fn wal_config() -> WalConfig {
     WalConfig {
@@ -110,7 +110,10 @@ async fn main() {
     // has the full contract; `main.rs`'s only job here is to supply
     // the *real* OS-signal trigger (tests supply a programmatic one).
     let trigger_state = state.clone();
-    serve(
+    let mut sampler = rubixdb_api::observability::sampler::start(&state).ok();
+    let reaper =
+        rubixdb_api::sql_session::spawn_reaper(state.sql.sessions.clone(), Duration::from_secs(30));
+    serve_observed(
         listener,
         router,
         async move {
@@ -119,8 +122,14 @@ async fn main() {
             trigger_state.index_recovery.request_cancel();
         },
         shutdown_drain,
+        rubixdb_api::server::ServerLimits::default(),
+        Some(state.obs.connections.clone()),
     )
     .await;
+    reaper.abort();
+    if let Some(sm) = sampler.as_mut() {
+        sm.stop();
+    }
 
     // The listener has stopped accepting new connections and in-flight
     // requests have drained (bounded by `with_graceful_shutdown`'s own

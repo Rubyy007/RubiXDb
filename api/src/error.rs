@@ -84,6 +84,12 @@ struct ErrorDetail {
 }
 
 impl ApiError {
+    /// The stable error code of this error (a member of the closed set the response body also
+    /// uses). For observability labels: never the message, never request data.
+    pub fn code(&self) -> &'static str {
+        self.parts().1
+    }
+
     /// (status, code, message, detail). `detail` is `None` whenever the
     /// underlying value is server-side-only (a raw OS `io::Error`, a
     /// filesystem path) — logged by the caller, never returned in the

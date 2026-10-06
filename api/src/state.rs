@@ -137,6 +137,9 @@ pub struct AppState {
     /// Progress of the startup recovery of interrupted index operations
     /// (`crate::recovery`); reported by `GET /readyz`.
     pub index_recovery: crate::recovery::IndexRecovery,
+    /// Background sampler output, bounded time series, query / event registries and the
+    /// counters added by the observability layer.
+    pub obs: crate::observability::Observability,
 }
 
 impl AppState {
@@ -195,6 +198,7 @@ impl AppState {
             started_at: SystemTime::now(),
             admin: AdminOps::default(),
             index_recovery: crate::recovery::IndexRecovery::default(),
+            obs: crate::observability::Observability::default(),
         }
     }
 }

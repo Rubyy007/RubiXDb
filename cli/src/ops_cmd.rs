@@ -20,6 +20,8 @@ pub const HELP_TEXT: &str = r#"rubixdb -- operator commands
 
   INSPECTION (read only)
     rubixdb status [--json]                      instance, WAL, compaction, queries, resources, disk
+    rubixdb status --system [--json]             live system metrics: health, CPU, memory, disk I/O, rates
+                                                 (a value the platform cannot measure prints as -)
     rubixdb check [--instance NAME | --data-dir DIR] [--json]
                                                  integrity check; online through the running
                                                  instance, offline (physical + logical) when stopped
@@ -129,6 +131,9 @@ pub fn run(args: &[String]) -> i32 {
         Some("backup") => backup(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("check") => check(&args[1..]),
+        Some("status") if has_flag(args, "--system") => {
+            online(&args[1..], |c| status_system(c, has_flag(args, "--json")))
+        }
         Some("status") => online(&args[1..], |c| status(c, has_flag(args, "--json"))),
         Some("storage") => online(&args[1..], storage),
         Some("maintenance") => maintenance(&args[1..]),
@@ -261,6 +266,101 @@ fn status(conn: &Connection, json: bool) -> i32 {
         num(&v, &["backups", "ok_total"]),
         num(&v, &["backups", "failed_total"]),
         num(&v, &["backups", "running"])
+    );
+    0
+}
+
+/// `rubixdb status --system`: the sampler's latest snapshot (`GET /v1/metrics/system`). Every
+/// value is printed through `num`/`fmt1`, so JSON `null` shows as `-`, never as `0`.
+fn status_system(conn: &Connection, json: bool) -> i32 {
+    let v = match api(conn, reqwest::Method::GET, "/v1/metrics/system", None) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return 0;
+    }
+    let bytes = |path: &[&str]| {
+        g(&v, path)
+            .as_u64()
+            .map(human_bytes)
+            .unwrap_or_else(|| "-".into())
+    };
+    println!(
+        "SYSTEM      health={} readiness={} up {:.0}s  sampler={} age_ms={} generation={}",
+        san(g(&v, &["instance", "healthy"]).as_str().unwrap_or("-")),
+        san(g(&v, &["instance", "readiness"]).as_str().unwrap_or("-")),
+        g(&v, &["instance", "uptime_seconds"])
+            .as_f64()
+            .unwrap_or(0.0),
+        san(g(&v, &["sample_freshness", "state"])
+            .as_str()
+            .unwrap_or("?")),
+        num(&v, &["sample_freshness", "age_ms"]),
+        num(&v, &["sample_generation"])
+    );
+    println!(
+        "cpu         process={}% peak={}% vcpus={}",
+        fmt1(g(&v, &["cpu", "process_percent"])),
+        fmt1(g(&v, &["cpu", "peak_percent"])),
+        num(&v, &["cpu", "vcpu_count"])
+    );
+    println!(
+        "memory      rss={} peak_rss={} system_used={}% of {}",
+        bytes(&["memory", "rss_bytes"]),
+        bytes(&["memory", "peak_rss_bytes"]),
+        fmt1(g(&v, &["memory", "system_used_percent"])),
+        bytes(&["memory", "system_total_bytes"])
+    );
+    println!(
+        "disk        volume_free={} of {} ({}% used)  db={} wal={} sstables={}",
+        bytes(&["disk", "volume_free_bytes"]),
+        bytes(&["disk", "volume_total_bytes"]),
+        fmt1(g(&v, &["disk", "volume_used_percent"])),
+        bytes(&["disk", "db_bytes"]),
+        bytes(&["disk", "wal_bytes"]),
+        bytes(&["disk", "sstable_bytes"])
+    );
+    println!(
+        "process io  read_iops={} write_iops={} read={} MB/s write={} MB/s  (this process, not the device)",
+        fmt1(g(&v, &["disk", "read_iops"])),
+        fmt1(g(&v, &["disk", "write_iops"])),
+        fmt1(g(&v, &["disk", "read_mb_per_sec"])),
+        fmt1(g(&v, &["disk", "write_mb_per_sec"]))
+    );
+    println!(
+        "rates       http={}/s sql={}/s commits={}/s  connections={} sessions={} txns={} active_queries={}",
+        fmt1(g(&v, &["throughput", "http_requests_per_sec"])),
+        fmt1(g(&v, &["throughput", "sql_queries_per_sec"])),
+        fmt1(g(&v, &["throughput", "write_commits_per_sec"])),
+        num(&v, &["throughput", "active_connections"]),
+        num(&v, &["throughput", "active_sessions"]),
+        num(&v, &["throughput", "active_transactions"]),
+        num(&v, &["throughput", "active_queries"])
+    );
+    println!(
+        "latency     query p50/p95/p99 ms = {}/{}/{}",
+        fmt1(g(&v, &["latency", "query_p50_ms"])),
+        fmt1(g(&v, &["latency", "query_p95_ms"])),
+        fmt1(g(&v, &["latency", "query_p99_ms"]))
+    );
+    println!(
+        "storage     state={} wal_state={} wal_segments={} compaction_running={} live_sstables={} index_build={}",
+        san(g(&v, &["storage_state"]).as_str().unwrap_or("-")),
+        san(g(&v, &["wal", "state"]).as_str().unwrap_or("-")),
+        num(&v, &["wal", "segment_count"]),
+        num(&v, &["compaction", "running"]),
+        num(&v, &["compaction", "live_sstable_count"]),
+        san(g(&v, &["background", "index_build_state"]).as_str().unwrap_or("-"))
+    );
+    println!(
+        "security    auth_failures={} forbidden={} admin_actions={} rate_limited={} sessions_rejected={}",
+        num(&v, &["security", "auth_failures_since_start"]),
+        num(&v, &["security", "forbidden_since_start"]),
+        num(&v, &["security", "admin_actions_since_start"]),
+        num(&v, &["limits", "rate_limited_since_start"]),
+        num(&v, &["limits", "sessions_rejected_since_start"])
     );
     0
 }

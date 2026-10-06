@@ -2260,6 +2260,14 @@ impl LsmEngine {
         )
     }
 
+    /// `true` while a compaction cycle is executing right now. A single
+    /// relaxed atomic load of the flag the engine already maintains for its own
+    /// one-cycle-at-a-time guard; purely observational (read by the API's
+    /// background sampler), never consulted by any engine decision.
+    pub fn compaction_running(&self) -> bool {
+        self.compaction_running.load(Ordering::Relaxed)
+    }
+
     /// Increment 3: a point-in-time snapshot of cumulative Compaction
     /// health metrics — see `CompactionMetrics`'s own doc comment.
     /// Cheap (atomic loads plus one small `Mutex` lock for `last_

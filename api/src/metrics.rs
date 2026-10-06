@@ -14,6 +14,12 @@ use std::time::Instant;
 /// process lifetime.
 const RESERVOIR_CAP: usize = 1000;
 
+/// Hard cap on the number of distinct route keys. The keys already come from a closed set
+/// (route templates x a fixed method list, see `routes::route_label`); this is defence in
+/// depth: anything past the cap is folded into [`OVERFLOW_ROUTE`], so no input can grow the map.
+pub const MAX_ROUTE_KEYS: usize = 128;
+pub const OVERFLOW_ROUTE: &str = "OVERFLOW";
+
 #[derive(Default)]
 struct RouteStats {
     count: u64,
@@ -50,7 +56,12 @@ impl<'a> RequestGuard<'a> {
             .routes
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let stats = routes.entry(self.route.clone()).or_default();
+        let key = if routes.contains_key(&self.route) || routes.len() < MAX_ROUTE_KEYS {
+            self.route.clone()
+        } else {
+            OVERFLOW_ROUTE.to_string()
+        };
+        let stats = routes.entry(key).or_default();
         stats.count += 1;
         if elapsed_ms > stats.max_ms {
             stats.max_ms = elapsed_ms;
@@ -103,6 +114,36 @@ impl ServiceMetrics {
         self.active_requests.load(Ordering::Relaxed)
     }
 
+    /// Requests completed on every route since start (sum of the per-route counts).
+    pub fn total_requests(&self) -> u64 {
+        self.routes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|s| s.count)
+            .sum()
+    }
+
+    /// Number of distinct route keys currently held.
+    pub fn route_key_count(&self) -> usize {
+        self.routes.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// `(p50, p95, p99)` in ms of the newest samples of one route, or `None` when the route has
+    /// no samples (never 0). The reservoir is copied under the lock and sorted outside it.
+    pub fn route_percentiles(&self, route: &str) -> Option<(f64, f64, f64)> {
+        let mut v = {
+            let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            routes.get(route)?.latencies_ms.clone()
+        };
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pct = |p: f64| v[(((v.len() as f64) * p) as usize).min(v.len() - 1)];
+        Some((pct(0.50), pct(0.95), pct(0.99)))
+    }
+
     pub fn snapshot(&self) -> Vec<RouteMetricsSnapshot> {
         let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
         routes
@@ -144,6 +185,30 @@ mod tests {
         let route = snap.iter().find(|r| r.route == "GET /v1/kv/:key").unwrap();
         assert_eq!(route.count, 2);
         assert_eq!(route.error_count, 1);
+    }
+
+    #[test]
+    fn the_route_key_set_can_never_grow_past_its_cap() {
+        let m = ServiceMetrics::default();
+        for i in 0..(MAX_ROUTE_KEYS * 5) {
+            m.start_request(format!("GET /distinct/{i}")).finish(false);
+        }
+        assert_eq!(
+            m.route_key_count(),
+            MAX_ROUTE_KEYS + 1,
+            "cap plus the overflow bucket"
+        );
+        assert!(m.snapshot().iter().any(|r| r.route == OVERFLOW_ROUTE));
+        assert_eq!(m.total_requests(), (MAX_ROUTE_KEYS * 5) as u64);
+    }
+
+    #[test]
+    fn percentiles_are_none_without_samples_never_zero() {
+        let m = ServiceMetrics::default();
+        assert!(m.route_percentiles("POST /v1/sql").is_none());
+        m.start_request("POST /v1/sql").finish(false);
+        let (a, b, c) = m.route_percentiles("POST /v1/sql").unwrap();
+        assert!(a >= 0.0 && b >= a && c >= b);
     }
 
     #[test]
