@@ -6,6 +6,24 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Observability follow-up (2026-10-07)
+
+Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 25, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_02.md`, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_03.md`. Observability-scoped; nothing under `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/` or `src/error.rs` changed.
+
+#### Fixed
+
+- `GET /v1/admin/status` `wal.poisoned` no longer reads `true` while an fsync is merely in flight: it is `GroupCommitter::is_poisoned()` (read-only pass-through added to `BatchCoordinatorPool` and `LsmEngine`) or a failed coordinator. Real-process polls under 4 writers: 124 of 147 `true` before, 0 of 142 after. Field name, type and meaning unchanged.
+- `GET /v1/observability/queries` `untracked_active` is a gauge of statements running now that the in-flight table could not track, not a lifetime total.
+- `git_revision` of a binary built from a modified tree now ends in `-dirty` reliably: `api/build.rs` re-runs when HEAD, the ref, the index or any tracked file changes.
+
+#### Changed
+
+- `GET /v1/metrics/system` `errors.wal_sync_failures` is always `null` (key kept): the engine's only counter for it is racy (ADR-OBS-03).
+
+#### Documentation
+
+- Section 25 of the observability certification: binary identity statement (which binary produced which evidence, with hashes), clean-rebuild overhead re-measurement, amended D8 handle criterion, 30-minute RSS classification (engine, not observability), per-row classification of the section B failures, updated matrices.
+
 ### Observability closure (2026-10-07)
 
 Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 24, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` sections 16-17, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md`.

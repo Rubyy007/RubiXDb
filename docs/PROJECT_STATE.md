@@ -16,7 +16,7 @@ The standalone `rubixdb-api` binary is unsupported and not certified for v1 (`OP
 `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`, `src/error.rs` — as in `CLAUDE.md`.
 A change to any of them needs an ADR first and an explicit mission authorisation.
 No other path is declared certified by this file; `CLAUDE.md` allows this file to list more, and none is listed.
-The observability layer added one read-only accessor to `src/lsm/mod.rs` (`LsmEngine::compaction_running()`).
+The observability layer added read-only accessors to `src/lsm/mod.rs` (`LsmEngine::compaction_running()`, and in the follow-up `committer_poisoned()` with a `test-util`-gated fsync-hook pass-through) and to `src/execution/batch_coordinator.rs` (`committer_poisoned()`); nothing under the protected paths.
 
 ## Certifications on record (verdicts as stated by the documents themselves)
 
@@ -28,7 +28,7 @@ The observability layer added one read-only accessor to `src/lsm/mod.rs` (`LsmEn
 | WAL | NOT PRODUCTION READY (throughput gates met in isolation; full regression FAIL; power loss untested) | `PHASE_RUBIXDB_WAL_CERTIFICATION.md`, `PHASE_RUBIXDB_WAL_M12_M13_CERTIFICATION_FINAL.md` |
 | Single-node product | NOT PRODUCTION READY | `PHASE_RUBIXDB_FINAL_SINGLE_NODE_PRODUCTION_CERTIFICATION.md` |
 | Configuration / startup / shutdown | NOT declared production ready; lifecycle matrix with FAIL / OPEN / NOT TESTED rows | `PHASE_RUBIXDB_CONFIGURATION_STARTUP_SHUTDOWN_CERTIFICATION.md` |
-| Full observability | NOT PASS: implementation mixed (see section 24.12 A, closure dated 2026-10-07: FAIL, OPEN, NOT TESTED rows remain); workspace regression FAIL (pre-existing failures only) | `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 24 |
+| Full observability | NOT PASS: implementation mixed (section 25.11 A, follow-up dated 2026-10-07: no FAIL row, OPEN and NOT TESTED rows remain); workspace regression FAIL (pre-existing failures only; not re-run after the follow-up) | `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` sections 24 and 25 |
 
 ## Whole-product status
 

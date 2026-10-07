@@ -26,3 +26,7 @@
 ## Not part of this ADR
 
 `errors.wal_sync_failures` and `/v1/admin/status` `sync_failures` / `poisoned` still read the racy counter; they are recorded in `OPEN_ITEMS.md`.
+
+## Update 2026-10-07 (follow-up mission; the sections above are unchanged)
+
+Step 2 of the proposal (the read-only accessor) now exists: `LsmEngine::committer_poisoned()` -> `BatchCoordinatorPool::committer_poisoned()` -> `GroupCommitter::is_poisoned()` (`PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_02.md`; nothing under `src/wal/`). It is used for `/v1/admin/status` `wal.poisoned` only. Steps 1, 3 and 4 are **not** applied and this ADR stays **PROPOSED / OPEN**: `/readyz` is unchanged, and `instance.healthy` / `instance.coordinator_state` do not reflect a poisoned committer (observed: `ready: true`, `healthy`, `alive` with a really poisoned committer). The statement above that the layer "cannot see a committer poisoned by an fsync error, because `LsmEngine` has no accessor" is therefore out of date; the policy question is what remains.
