@@ -28,7 +28,7 @@ The observability layer added read-only accessors to `src/lsm/mod.rs` (`LsmEngin
 | WAL | NOT PRODUCTION READY (throughput gates met in isolation; full regression FAIL; power loss untested) | `PHASE_RUBIXDB_WAL_CERTIFICATION.md`, `PHASE_RUBIXDB_WAL_M12_M13_CERTIFICATION_FINAL.md` |
 | Single-node product | NOT PRODUCTION READY | `PHASE_RUBIXDB_FINAL_SINGLE_NODE_PRODUCTION_CERTIFICATION.md` |
 | Configuration / startup / shutdown | NOT declared production ready; lifecycle matrix with FAIL / OPEN / NOT TESTED rows | `PHASE_RUBIXDB_CONFIGURATION_STARTUP_SHUTDOWN_CERTIFICATION.md` |
-| Full observability | NOT PASS: implementation mixed (section 25.11 A, follow-up dated 2026-10-07: no FAIL row, OPEN and NOT TESTED rows remain); workspace regression FAIL (pre-existing failures only; not re-run after the follow-up) | `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` sections 24 and 25 |
+| Full observability | NOT PASS: implementation mixed (section 26.7, second follow-up dated 2026-10-07: no FAIL row, one OPEN row (A66) and NOT TESTED rows remain); workspace regression FAIL (pre-existing failures only; not re-run after the follow-up) | `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` sections 24, 25 and 26 |
 
 ## Whole-product status
 

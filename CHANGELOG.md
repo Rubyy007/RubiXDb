@@ -6,6 +6,19 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Observability follow-up 2 (2026-10-07)
+
+Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 26, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md` (now ACCEPTED), `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_03.md` (scope extended). Observability-scoped; protected engine paths unchanged.
+
+#### Changed
+
+- `GET /v1/metrics/system` `instance.coordinator_state` is `poisoned`, and `instance.healthy` is `failed`, when the WAL group committer is poisoned by a failed fsync or a leader panic (or the coordinator thread is dead). `GET /readyz` and `instance.readiness` are unchanged (constant `ready: true`).
+- `GET /v1/admin/status` `wal.sync_failures` is `null` (key kept): the engine's only counter is racy (ADR-OBS-03). The CLI inspection text prints `sync_failures=-`; the GUI Operations page shows `-`.
+
+#### Documentation
+
+- Section 26 of the observability certification: classification of the non-reproducible build hashes, the final wording of the D8 handle criterion, the read-p95 and idle-CPU outliers with their interpretation, the OPEN rows of section A by name.
+
 ### Observability follow-up (2026-10-07)
 
 Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 25, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_02.md`, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_03.md`. Observability-scoped; nothing under `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/` or `src/error.rs` changed.
