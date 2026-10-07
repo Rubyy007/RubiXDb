@@ -2305,6 +2305,25 @@ impl LsmEngine {
         self.pool.stats()
     }
 
+    /// `true` once the WAL group committer is poisoned (`GroupCommitter::is_poisoned`): the terminal
+    /// state in which no further write is accepted. A read-only pass-through of one bit, added for
+    /// the API's observability surface; never consulted by any engine decision. See
+    /// `BatchCoordinatorPool::committer_poisoned`.
+    pub fn committer_poisoned(&self) -> bool {
+        self.pool.committer_poisoned()
+    }
+
+    /// Test seam (compiled only with `test-util`): replaces the WAL group committer's `fsync` with
+    /// `hook`, so a test can poison the committer through the engine and observe
+    /// `committer_poisoned()` change.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn install_wal_fsync_fault_hook(
+        &self,
+        hook: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+    ) {
+        self.pool.install_fsync_fault_hook(hook);
+    }
+
     /// Delegates to the unmodified `BatchCoordinatorPool::shutdown` for
     /// the write path, then stops the background flush thread cleanly:
     /// sets `flush_stop` (so a persistently-failing flush's retry loop

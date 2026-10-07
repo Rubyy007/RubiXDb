@@ -120,7 +120,10 @@ pub struct QueryRegistry {
     next_id: AtomicU64,
     /// Running statements, readable without the lock (the sampler's `active_queries`).
     active: AtomicUsize,
-    untracked: AtomicU64,
+    /// Running statements that could not be tracked individually because `IN_FLIGHT_CAP` was
+    /// reached: a gauge (incremented when such a statement starts, decremented when it ends),
+    /// so it returns to zero when the load does.
+    untracked: AtomicUsize,
 }
 
 pub struct QueryGuard<'a> {
@@ -171,7 +174,9 @@ impl QueryRegistry {
         self.active.load(Ordering::Relaxed)
     }
 
-    pub fn untracked(&self) -> u64 {
+    /// Statements running right now that are counted in `active` but have no entry in the
+    /// in-flight table (the table was full when they started). Never more than `active`.
+    pub fn untracked(&self) -> usize {
         self.untracked.load(Ordering::Relaxed)
     }
 
@@ -237,6 +242,7 @@ impl<'a> QueryGuard<'a> {
         self.finished = true;
         self.reg.active.fetch_sub(1, Ordering::Relaxed);
         if !self.tracked {
+            self.reg.untracked.fetch_sub(1, Ordering::Relaxed);
             return;
         }
         let mut inner = self.reg.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -348,5 +354,44 @@ mod tests {
         assert_eq!(r.inner.lock().unwrap().in_flight.len(), IN_FLIGHT_CAP);
         drop(held);
         assert_eq!(r.active(), 0);
+        assert_eq!(
+            r.untracked(),
+            0,
+            "a gauge: it returns to zero when the statements end"
+        );
+    }
+
+    /// `untracked` is a gauge of statements running right now that could not be tracked
+    /// individually. A workload that starts and ends at zero in-flight, repeated, must leave it at
+    /// zero after every round; a cumulative counter (the earlier behaviour) would read 10, 20, 30...
+    #[test]
+    fn untracked_is_a_gauge_that_returns_to_zero_and_never_only_grows() {
+        let r = QueryRegistry::default();
+        let mut after_round = Vec::new();
+        for round in 0..20 {
+            let held: Vec<_> = (0..IN_FLIGHT_CAP + 10).map(|_| r.start()).collect();
+            assert_eq!(
+                r.untracked(),
+                10,
+                "round {round}: exactly the overflow is untracked"
+            );
+            assert!(r.untracked() <= r.active());
+            // Finish them in all three ways, so every exit path of a guard decrements.
+            for (i, g) in held.into_iter().enumerate() {
+                match i % 3 {
+                    0 => g.succeeded(None, None),
+                    1 => g.failed("X"),
+                    _ => drop(g), // client disconnect path (Drop)
+                }
+            }
+            assert_eq!(r.active(), 0);
+            after_round.push(r.untracked());
+        }
+        assert!(
+            after_round.iter().all(|&v| v == 0),
+            "at zero in-flight the gauge must read zero every time, got {after_round:?}"
+        );
+        let monotonic_growth = after_round.windows(2).all(|w| w[1] > w[0]);
+        assert!(!monotonic_growth, "the value must not only increase");
     }
 }

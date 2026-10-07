@@ -380,6 +380,17 @@ impl BatchCoordinatorPool {
         *slot = Some(Box::new(hook));
     }
 
+    /// Test seam: installs `hook` in place of the real `fsync` of the underlying `GroupCommitter`
+    /// (`GroupCommitter::install_fsync_fault_hook`), so an end-to-end test can drive the committer
+    /// into its terminal poisoned state through the engine. Only compiled with `test-util`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn install_fsync_fault_hook(
+        &self,
+        hook: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+    ) {
+        self.committer.install_fsync_fault_hook(hook);
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn clear_coordinator_fault_hook(&self) {
         let mut slot = self
@@ -561,6 +572,17 @@ impl BatchCoordinatorPool {
             bytes_total: self.shared.bytes_total.load(Ordering::Relaxed),
             committer_stats: self.committer.stats(),
         }
+    }
+
+    /// `true` once the underlying `GroupCommitter` is poisoned (a failed `fsync` or a leader panic;
+    /// `GroupCommitter::is_poisoned`): the terminal state in which the committer accepts no further
+    /// write. A single bit read under the committer's short `batch` mutex (never held across an
+    /// `fsync`); purely observational, never consulted by any engine decision. Unlike
+    /// `BatchCoordinatorStats::committer_stats.sync_failures()` (`sync_attempts - sync_successes`
+    /// from two independent atomics, transiently 1 while an `fsync` is in flight) it cannot read
+    /// true unless the committer really is poisoned.
+    pub fn committer_poisoned(&self) -> bool {
+        self.committer.is_poisoned()
     }
 
     pub fn state(&self) -> PoolState {

@@ -2568,3 +2568,161 @@ async fn two_concurrent_instances_share_nothing_and_a_restart_in_one_process_sta
     b2.stop().await;
     a.stop().await;
 }
+
+// ------------------------------------------------------------------------------------------
+// Follow-up (ADR-OBS-02, ADR-OBS-03): the two poison signals that used to read a phantom value.
+// ------------------------------------------------------------------------------------------
+// `/v1/admin/status` `wal.poisoned` now comes from `GroupCommitter::is_poisoned()` (one bit), not from
+// `sync_attempts - sync_successes`, which reads 1 while an fsync is merely in flight. Over at least 100
+// polls under concurrent write load it must stay false; it becomes true only once the committer really
+// is poisoned. `/v1/metrics/system` `errors.wal_sync_failures` is always null (ADR-OBS-03).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wal_poisoned_stays_false_under_write_load_and_turns_true_only_when_the_committer_is_poisoned(
+) {
+    let s = Arc::new(Server::real("poison").await);
+    s.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut load = Vec::new();
+    for k in 0..4u64 {
+        let s = s.clone();
+        let stop = stop.clone();
+        load.push(tokio::spawn(async move {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                s.sql(&format!(
+                    "INSERT INTO t (id, v) VALUES ({}, 'x')",
+                    k * 1_000_000 + n
+                ))
+                .await;
+            }
+        }));
+    }
+    let (_, a0) = s.get_with(ADMIN_KEY, "/v1/admin/status").await;
+    let attempts_first = a0["wal"]["sync_attempts"].as_u64().unwrap();
+    let (mut polls, mut poisoned_true, mut sync_failures_not_null, mut key_missing) =
+        (0u32, 0u32, 0u32, 0u32);
+    let mut attempts_last = attempts_first;
+    let until = Instant::now() + Duration::from_secs(3);
+    while polls < 120 || Instant::now() < until {
+        let (st, a) = s.get_with(ADMIN_KEY, "/v1/admin/status").await;
+        assert_eq!(st, 200);
+        if a["wal"]["poisoned"] != json!(false) {
+            poisoned_true += 1;
+        }
+        attempts_last = a["wal"]["sync_attempts"].as_u64().unwrap();
+        let (_, m) = s.get("/v1/metrics/system").await;
+        match m["errors"].get("wal_sync_failures") {
+            None => key_missing += 1,
+            Some(v) if !v.is_null() => sync_failures_not_null += 1,
+            Some(_) => {}
+        }
+        polls += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in load {
+        t.await.unwrap();
+    }
+    eprintln!(
+        "polls={polls} wal.poisoned!=false: {poisoned_true}; errors.wal_sync_failures not null: \
+         {sync_failures_not_null}; fsyncs during the polls: {}",
+        attempts_last - attempts_first
+    );
+    assert!(polls >= 100);
+    assert!(
+        attempts_last > attempts_first,
+        "the load must really have fsynced, or the polls prove nothing"
+    );
+    assert_eq!(
+        poisoned_true, 0,
+        "wal.poisoned read true without a poisoned committer"
+    );
+    assert_eq!(
+        key_missing, 0,
+        "the key stays present (schema unchanged), value null"
+    );
+    assert_eq!(sync_failures_not_null, 0);
+    assert!(!s.state.engine.committer_poisoned());
+
+    // Now poison the committer for real: the next fsync fails.
+    s.state
+        .engine
+        .install_wal_fsync_fault_hook(|| Err(std::io::Error::other("injected fsync failure")));
+    let (st, _) = s.sql("INSERT INTO t (id, v) VALUES (999999999, 'x')").await;
+    assert_ne!(
+        st, 200,
+        "a write whose fsync failed must not be acknowledged"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, a) = s.get_with(ADMIN_KEY, "/v1/admin/status").await;
+        if a["wal"]["poisoned"] == json!(true) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wal.poisoned never turned true: {a}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(s.state.engine.committer_poisoned());
+    // Terminal: it stays true, and readiness keeps its certified meaning (ADR-OBS-01 is the place
+    // to change that), and the always-null counter stays null.
+    for _ in 0..10 {
+        let (_, a) = s.get_with(ADMIN_KEY, "/v1/admin/status").await;
+        assert_eq!(a["wal"]["poisoned"], json!(true));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, r) = s.get("/readyz").await;
+    assert_eq!(r["ready"], true);
+    let (_, m) = s.get("/v1/metrics/system").await;
+    assert!(m["errors"]["wal_sync_failures"].is_null());
+    // Recorded, not asserted: what the other surfaces say about a poisoned committer today (ADR-OBS-01).
+    eprintln!(
+        "with a poisoned committer: readyz.ready={} instance.healthy={} coordinator_state={}",
+        r["ready"], m["instance"]["healthy"], m["instance"]["coordinator_state"]
+    );
+    let s = Arc::try_unwrap(s).ok().expect("load tasks have ended");
+    s.stop().await;
+}
+
+// The revision a binary reports must agree with the working tree it was built from (ADR: binary
+// identity). `build.rs` re-runs when HEAD, the index or any tracked file changes, so after the build
+// that precedes this test the embedded value ends in `-dirty` exactly when a tracked file differs from
+// HEAD, and its hash is HEAD's. If cargo ever served a stale build-script result this fails.
+#[test]
+fn the_embedded_revision_agrees_with_the_working_tree_it_was_built_from() {
+    use std::process::Command;
+    if option_env!("RUBIXDB_GIT_REVISION_OVERRIDE").is_some() {
+        return; // an explicit override is a statement by the builder, not a measurement
+    }
+    let Some(rev) = rubixdb_api::observability::version::git_revision() else {
+        return; // built without git: reported as null, never invented
+    };
+    let git = |args: &[&str]| -> Option<String> {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let (Some(head), Some(status)) = (
+        git(&["rev-parse", "--short=12", "HEAD"]),
+        git(&["status", "--porcelain", "--untracked-files=no"]),
+    ) else {
+        return; // git not available where the test runs
+    };
+    let dirty_now = !status.is_empty();
+    assert_eq!(
+        rev.ends_with("-dirty"),
+        dirty_now,
+        "embedded revision {rev:?}, but the tracked tree is {} now",
+        if dirty_now { "modified" } else { "clean" }
+    );
+    assert_eq!(rev.strip_suffix("-dirty").unwrap_or(rev), head);
+}

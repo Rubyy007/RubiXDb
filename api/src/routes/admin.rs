@@ -246,11 +246,14 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
             // Per drained batch: append + durable wait, i.e. includes the fsync.
             "avg_batch_processing_ms": avg_batch_processing_ms,
             "segment_rotations": g.segment_rotations,
-            // Derived: the certified committer is poisoned permanently by any
-            // failed fsync (`a_failed_leader_fsync_poisons_the_committer_
-            // permanently`), so `sync_failures > 0` <=> poisoned; a dead
-            // coordinator (`PoolState::Failed`) also stops all writes.
-            "poisoned": g.sync_failures() > 0
+            // Terminal state: the committer is poisoned (a failed fsync or a leader
+            // panic poisons it permanently, `a_failed_leader_fsync_poisons_the_
+            // committer_permanently`; `GroupCommitter::is_poisoned()`, one bit), or
+            // the coordinator thread is dead (`PoolState::Failed`), which also stops
+            // all writes. It was derived from `sync_failures() > 0` until
+            // ADR-OBS-02: that value is `sync_attempts - sync_successes` from two
+            // independent atomics and reads 1 while an fsync is merely in flight.
+            "poisoned": engine.committer_poisoned()
                 || matches!(ps.state, rubixdb::execution::batch_coordinator::PoolState::Failed),
         },
         "compaction": {

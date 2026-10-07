@@ -173,7 +173,11 @@ pub async fn system(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "http_server_errors_since_start": s.http_server_errors,
                     "sql_errors_since_start": s.sql_errors,
                     "wal_write_errors": s.wal_write_errors,
-                    "wal_sync_failures": s.wal_sync_failures,
+                    // Always null in v1 (ADR-OBS-03, NOT REQUIRED FOR V1): the only counter the engine
+                    // exposes is `sync_attempts - sync_successes`, two independent atomics, which reads a
+                    // phantom 1 while an fsync is in flight and no write has failed. A correct value needs
+                    // an engine change. The terminal state is `/v1/admin/status` `wal.poisoned`.
+                    "wal_sync_failures": Value::Null,
                 },
                 "storage_state": s.storage_state,
             })

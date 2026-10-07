@@ -138,7 +138,6 @@ pub struct Snapshot {
     pub http_server_errors: u64,
     pub wal_backpressure_rejections: u64,
     pub wal_write_errors: u64,
-    pub wal_sync_failures: u64,
     pub sql_resource_limit_hits: u64,
     pub sql_errors: u64,
 }
@@ -539,7 +538,6 @@ fn collect(
         http_server_errors: c.http_server_errors.load(Ordering::Relaxed),
         wal_backpressure_rejections: ps.rejected_backpressure,
         wal_write_errors: ps.completed_err,
-        wal_sync_failures: g.sync_failures(),
         sql_resource_limit_hits: exec.aggregate_resource_limit_hits + plan.plan_resource_limit_hits,
         sql_errors: sql_api.errors,
     };
