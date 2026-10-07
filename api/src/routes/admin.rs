@@ -239,7 +239,11 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
             "writes_timed_out": ps.writes_timed_out,
             "rejected_backpressure": ps.rejected_backpressure,
             "sync_attempts": g.sync_attempts,
-            "sync_failures": g.sync_failures(),
+            // Always null (ADR-OBS-03, scope extended to this sibling): the engine's only counter is
+            // `sync_attempts - sync_successes`, two independent atomics, which reads a phantom 1 while an
+            // fsync is in flight and no write has failed. The key stays present; the terminal state is
+            // `poisoned` below.
+            "sync_failures": Value::Null,
             "avg_batch_records": g.avg_batch_records(),
             "max_batch_records": g.max_batch_records,
             "avg_batch_bytes": ps.avg_bytes_per_batch(),

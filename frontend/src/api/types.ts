@@ -314,7 +314,8 @@ export interface AdminStatusBody {
     writes_timed_out: number;
     rejected_backpressure: number;
     sync_attempts: number;
-    sync_failures: number;
+    /** Always null (ADR-OBS-03): the engine has no non-racy failure counter. */
+    sync_failures: number | null;
     avg_batch_records: number;
     max_batch_records: number;
     avg_batch_bytes: number;

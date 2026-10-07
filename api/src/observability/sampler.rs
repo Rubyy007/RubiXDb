@@ -280,11 +280,13 @@ pub const fn ready() -> bool {
     true
 }
 
-/// What the WAL batch coordinator is doing, from public engine state only (the additive
-/// `instance.coordinator_state`). `Poisoned` is the terminal state: the coordinator thread died
-/// (`PoolState::Failed`, `batch_coordinator.rs` `CoordinatorAliveGuard`), no write can complete and
-/// nothing in-process repairs it. A committer poisoned by an fsync error is **not** visible here:
-/// the engine exposes no accessor for it through `LsmEngine` (an engine change, not made).
+/// What the WAL write path is doing (the additive `instance.coordinator_state`). `Poisoned` is the
+/// terminal state, in which no write can complete and nothing in-process repairs it: the coordinator
+/// thread died (`PoolState::Failed`, `batch_coordinator.rs` `CoordinatorAliveGuard`) **or** the group
+/// committer is poisoned by a failed fsync or a leader panic (`GroupCommitter::is_poisoned()`, the
+/// single authoritative bit, read through `LsmEngine::committer_poisoned()`; ADR-OBS-01, accepted).
+/// It is deliberately **not** derived from `sync_attempts - sync_successes`, which reads 1 while an
+/// fsync is merely in flight (ADR-OBS-02). `/readyz` is exempt: it stays constant `true`.
 /// `NotStarted` means "not alive and not failed": before the coordinator thread is up, or after an
 /// orderly stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,13 +306,16 @@ impl CoordinatorState {
     }
 }
 
-/// Pure mapping from the public pool stats; reads no racy counter.
+/// Pure mapping from the public pool stats and the committer's poison bit; reads no racy counter.
+/// `Poisoned` when the committer is poisoned **or** the pool is `Failed`; otherwise `Alive` while the
+/// coordinator thread is up, `NotStarted` when it is not.
 pub fn coordinator_state_from(
     coordinator_alive: bool,
     pool: rubixdb::execution::batch_coordinator::PoolState,
+    committer_poisoned: bool,
 ) -> CoordinatorState {
     use rubixdb::execution::batch_coordinator::PoolState;
-    if pool == PoolState::Failed {
+    if committer_poisoned || pool == PoolState::Failed {
         CoordinatorState::Poisoned
     } else if coordinator_alive {
         CoordinatorState::Alive
@@ -462,7 +467,11 @@ fn collect(
     // Health policy v1 (Decision D1, Option 3): see `classify_health`. An unavailable lock probe
     // is reported, never read as "not held"; the free-space figure is an advisory field only.
     let ready = ready();
-    let coordinator = coordinator_state_from(ps.coordinator_alive, ps.state);
+    let coordinator = coordinator_state_from(
+        ps.coordinator_alive,
+        ps.state,
+        state.engine.committer_poisoned(),
+    );
     let lock_state = state
         .obs
         .lock_probe()
@@ -797,33 +806,44 @@ mod policy_tests {
     }
 
     #[test]
-    fn coordinator_state_comes_from_public_pool_state_only() {
-        // alive while running or draining; poisoned only in the terminal Failed state (whatever
-        // `coordinator_alive` says: the guard clears it as it fails the pool); not_started otherwise
-        assert_eq!(
-            coordinator_state_from(true, PoolState::Running),
-            CoordinatorState::Alive
-        );
-        assert_eq!(
-            coordinator_state_from(true, PoolState::Draining),
-            CoordinatorState::Alive
-        );
-        assert_eq!(
-            coordinator_state_from(false, PoolState::Failed),
-            CoordinatorState::Poisoned
-        );
-        assert_eq!(
-            coordinator_state_from(true, PoolState::Failed),
-            CoordinatorState::Poisoned
-        );
-        assert_eq!(
-            coordinator_state_from(false, PoolState::Running),
-            CoordinatorState::NotStarted
-        );
-        assert_eq!(
-            coordinator_state_from(false, PoolState::Stopped),
-            CoordinatorState::NotStarted
-        );
+    fn coordinator_state_comes_from_pool_state_and_the_committer_poison_bit() {
+        // alive while running or draining; poisoned in the terminal Failed state (whatever
+        // `coordinator_alive` says: the guard clears it as it fails the pool) or when the committer
+        // is poisoned; not_started otherwise
+        for poisoned in [false, true] {
+            let want = |s| {
+                if poisoned {
+                    CoordinatorState::Poisoned
+                } else {
+                    s
+                }
+            };
+            assert_eq!(
+                coordinator_state_from(true, PoolState::Running, poisoned),
+                want(CoordinatorState::Alive)
+            );
+            assert_eq!(
+                coordinator_state_from(true, PoolState::Draining, poisoned),
+                want(CoordinatorState::Alive)
+            );
+            assert_eq!(
+                coordinator_state_from(false, PoolState::Running, poisoned),
+                want(CoordinatorState::NotStarted)
+            );
+            assert_eq!(
+                coordinator_state_from(false, PoolState::Stopped, poisoned),
+                want(CoordinatorState::NotStarted)
+            );
+            // Failed is poisoned regardless of the bit
+            assert_eq!(
+                coordinator_state_from(false, PoolState::Failed, poisoned),
+                CoordinatorState::Poisoned
+            );
+            assert_eq!(
+                coordinator_state_from(true, PoolState::Failed, poisoned),
+                CoordinatorState::Poisoned
+            );
+        }
         assert_eq!(CoordinatorState::Alive.as_str(), "alive");
         assert_eq!(CoordinatorState::Poisoned.as_str(), "poisoned");
         assert_eq!(CoordinatorState::NotStarted.as_str(), "not_started");

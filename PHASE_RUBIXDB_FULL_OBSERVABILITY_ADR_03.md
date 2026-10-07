@@ -1,7 +1,7 @@
-# ADR-OBS-03 — `errors.wal_sync_failures` is reported as `null` in v1; a correct value needs an engine change
+# ADR-OBS-03 — `errors.wal_sync_failures` and `wal.sync_failures` are reported as `null` in v1; a correct value needs an engine change
 
-**Status:** ACCEPTED for v1 as a documented limitation (maintainer instruction, follow-up mission 2026-10-07). The engine change below is **NOT REQUIRED FOR V1** and is **not applied**.
-**Date:** 2026-10-07. **Decided by:** maintainer. **Related:** `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_02.md` (the poison bit), `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md` (readiness, PROPOSED / OPEN).
+**Status:** ACCEPTED for v1 as a documented limitation (maintainer instruction, follow-up mission 2026-10-07); scope extended the same day to the sibling field `GET /v1/admin/status` `wal.sync_failures` (see "Scope"). The engine change below is **NOT REQUIRED FOR V1** and is **not applied**.
+**Date:** 2026-10-07. **Decided by:** maintainer. **Related:** `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_02.md` (the poison bit), `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md` (coordinator state and health, ACCEPTED; `/readyz` exempt).
 
 ## Context
 
@@ -21,7 +21,9 @@
 
 A non-racy count of failed `fsync` calls means counting **failures**, not `attempts - successes`: a `stat_sync_failures` atomic incremented at the one place the leader sees `fsync_result` is `Err` (`run_as_leader`, `src/wal/group_commit.rs`), exposed through `GroupCommitStats`. That is a change inside `src/wal/`, a protected path (`CLAUDE.md`): it needs an ADR and an explicit mission authorization, neither of which exists, and it is not needed for v1 because the poison bit already reports the only outcome that follows from a failed `fsync` (the committer is poisoned permanently, so there is at most one failure to count).
 
-The certified `GET /v1/admin/status` fields `wal.sync_failures` and the CLI inspection output that prints it (the `sync_failures=` text on the second `wal` line, `cli/src/ops_cmd.rs`) still read the same racy difference. They were **not** in this mission's scope, are unchanged and still show the phantom value under write load; they are recorded in `OPEN_ITEMS.md` and should be dealt with together with this ADR if it is ever taken up.
+## Scope (extended 2026-10-07, same decision, no new ADR)
+
+The same justification covers the sibling the certified `GET /v1/admin/status` carries: **`wal.sync_failures` is also `null`** (key present), exactly like `errors.wal_sync_failures`. It was the same racy `sync_attempts - sync_successes` (non-zero in 129 of 142 real-process polls under 4 writers, values `{0, 1}`, no write failing). This is a bug fix to the value of a certified endpoint's field, the same class as ADR-OBS-02, not a semantic change: the field's name, position and type-or-null are unchanged. The field's comment in `api/src/routes/admin.rs` points here. Consumers: the CLI inspection output (`rubixdb` `cli/src/ops_cmd.rs`) keeps its `sync_failures=` text and now prints **`-`** (its helper already renders JSON `null` as `-`, so no code was needed beyond a comment; the number is not removed from the line, it just never shows the racy value); the GUI Operations page (`frontend/src/pages/OperationsPage.tsx`, type `number | null`) shows `-`. `sync_attempts` is unchanged and is a true count. The terminal state is `wal.poisoned` (ADR-OBS-02).
 
 ## Consequences
 

@@ -36,3 +36,7 @@ See `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 25.5 for the rea
 * `wal.poisoned` can no longer be `true` unless the committer really is poisoned (or the coordinator is dead). It is a certified endpoint's field whose *value* was wrong; its name, type and meaning are unchanged.
 * The sibling field `wal.sync_failures` on the same endpoint (and the CLI text that prints it) still shows the racy difference; see ADR-OBS-03 and `OPEN_ITEMS.md`.
 * `instance.healthy` and `instance.coordinator_state` do **not** reflect a poisoned committer. With the accessor available that is now a policy choice rather than a technical limit; it belongs to ADR-OBS-01 and is recorded in `OPEN_ITEMS.md`.
+
+## Update 2026-10-07 (mission 3; the text above is unchanged)
+
+The last Consequences bullet is superseded: ADR-OBS-01 is ACCEPTED (step 3 applied to `instance.coordinator_state` and `instance.healthy`, `/readyz` exempt), so `coordinator_state` and `healthy` now do reflect a poisoned committer, using the accessor this ADR added. The sibling `wal.sync_failures` mentioned in the second bullet is now `null` (ADR-OBS-03, scope extended).

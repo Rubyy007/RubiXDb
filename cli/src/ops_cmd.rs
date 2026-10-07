@@ -221,6 +221,8 @@ fn status(conn: &Connection, json: bool) -> i32 {
         num(&v, &["wal", "queue_depth"]),
         num(&v, &["wal", "queue_capacity"])
     );
+    // `wal.sync_failures` is always null (ADR-OBS-03): `num` prints it as `-`, never the racy
+    // `sync_attempts - sync_successes` difference. The terminal state is `poisoned=` on the line above.
     println!("            syncs={} sync_failures={} avg_batch={:.1} rec avg_flush={:.2} ms completed_ok={} err={} timed_out={} rejected={}",
         num(&v, &["wal", "sync_attempts"]), num(&v, &["wal", "sync_failures"]),
         g(&v, &["wal", "avg_batch_records"]).as_f64().unwrap_or(0.0),

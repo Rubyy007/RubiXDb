@@ -1,6 +1,6 @@
 # ADR-OBS-01 — Should `/readyz` include committer-poisoned / coordinator-failed?
 
-**Status:** PROPOSED (OPEN policy; not applied). **Date:** 2026-10-06. **Decided by:** maintainer, in a later lifecycle phase.
+**Status:** ACCEPTED 2026-10-07, applied in part: step 3 is applied to `instance.coordinator_state` and `instance.healthy` only; **`/readyz` is explicitly exempt and stays frozen at `ready: true`** (it was PROPOSED / OPEN until then; the Proposal section below is the original text and is kept as history). **Date:** 2026-10-06 (proposed), 2026-10-07 (accepted). **Decided by:** maintainer.
 **Context mission:** Full Observability closure, Decision D5 (option R2).
 
 ## Context
@@ -30,3 +30,11 @@
 ## Update 2026-10-07 (follow-up mission; the sections above are unchanged)
 
 Step 2 of the proposal (the read-only accessor) now exists: `LsmEngine::committer_poisoned()` -> `BatchCoordinatorPool::committer_poisoned()` -> `GroupCommitter::is_poisoned()` (`PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_02.md`; nothing under `src/wal/`). It is used for `/v1/admin/status` `wal.poisoned` only. Steps 1, 3 and 4 are **not** applied and this ADR stays **PROPOSED / OPEN**: `/readyz` is unchanged, and `instance.healthy` / `instance.coordinator_state` do not reflect a poisoned committer (observed: `ready: true`, `healthy`, `alive` with a really poisoned committer). The statement above that the layer "cannot see a committer poisoned by an fsync error, because `LsmEngine` has no accessor" is therefore out of date; the policy question is what remains.
+
+## Decision (2026-10-07, maintainer; follow-up mission 3) - applied
+
+* `instance.coordinator_state` is `poisoned` when `LsmEngine::committer_poisoned()` (that is `GroupCommitter::is_poisoned()`, the single authoritative bit; ADR-OBS-02) is true **or** the pool state is `Failed`; `alive` while the coordinator thread is up; `not_started` otherwise (`sampler::coordinator_state_from(coordinator_alive, pool_state, committer_poisoned)`, evaluated once per sampler tick).
+* `instance.healthy` is `failed` when `coordinator_state == poisoned` (Decision D1; `classify_health` already said so, but the rule could never fire while the coordinator state could never be `poisoned` from a poisoned committer).
+* **`/readyz` exemption, stated explicitly:** `GET /readyz` keeps returning `ready: true` constant, as certified; `instance.readiness` stays the same value (both call `sampler::ready()`, unchanged). A poisoned committer therefore makes `wal.poisoned`, `coordinator_state` and `healthy` flip together while `/readyz` and `instance.readiness` do not. Steps 1 and 4 of the Proposal (a readiness definition that includes the coordinator and the committer; re-running lifecycle certification) are **not** applied and are not planned by this decision.
+* Test: `wal_poisoned_stays_false_under_write_load_and_turns_true_only_when_the_committer_is_poisoned` (`api/tests/observability.rs`) installs the fsync-fault hook and requires the three signals to agree (`wal.poisoned` true, `coordinator_state` `poisoned`, `healthy` `failed`) and to stay so, with `/readyz` `ready: true` and `instance.readiness` `ready`; with the poison bit hidden from the sampler (mutation) the same test fails (`coordinator_state` stays `alive`). Unit: `policy_tests::coordinator_state_comes_from_pool_state_and_the_committer_poison_bit`.
+* The earlier "Consequences / Until decided" bullet (`a committer poisoned by an fsync error is visible only as failed writes`) is superseded by this decision.

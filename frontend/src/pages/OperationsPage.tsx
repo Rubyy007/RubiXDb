@@ -155,7 +155,7 @@ function OperationsAdmin() {
               <Stat label="Pending waiters" value={s.wal.pending_waiters} />
               <Stat label="Avg batch (records)" value={s.wal.avg_batch_records.toFixed(1)} />
               <Stat label="Avg flush" value={formatMs(s.wal.avg_batch_processing_ms)} />
-              <Stat label="Sync failures" value={s.wal.sync_failures} />
+              <Stat label="Sync failures" value={s.wal.sync_failures ?? "-"} />
             </Card>
             <Card title="Compaction">
               <Badge tone={s.compaction.auto_trigger_enabled ? "healthy" : "neutral"}>

@@ -2570,12 +2570,15 @@ async fn two_concurrent_instances_share_nothing_and_a_restart_in_one_process_sta
 }
 
 // ------------------------------------------------------------------------------------------
-// Follow-up (ADR-OBS-02, ADR-OBS-03): the two poison signals that used to read a phantom value.
+// Follow-up (ADR-OBS-01 accepted, ADR-OBS-02, ADR-OBS-03): the poison signals.
 // ------------------------------------------------------------------------------------------
-// `/v1/admin/status` `wal.poisoned` now comes from `GroupCommitter::is_poisoned()` (one bit), not from
+// `/v1/admin/status` `wal.poisoned` comes from `GroupCommitter::is_poisoned()` (one bit), not from
 // `sync_attempts - sync_successes`, which reads 1 while an fsync is merely in flight. Over at least 100
-// polls under concurrent write load it must stay false; it becomes true only once the committer really
-// is poisoned. `/v1/metrics/system` `errors.wal_sync_failures` is always null (ADR-OBS-03).
+// polls under concurrent write load it must stay false, `instance.coordinator_state` must stay `alive`
+// and `instance.healthy` `healthy`. When the committer really is poisoned all three flip together
+// (`wal.poisoned` true, `coordinator_state` `poisoned`, `healthy` `failed`) while `/readyz` stays
+// `ready: true` (frozen by decision). `errors.wal_sync_failures` and `wal.sync_failures` are always null
+// (ADR-OBS-03, key present).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wal_poisoned_stays_false_under_write_load_and_turns_true_only_when_the_committer_is_poisoned(
 ) {
@@ -2603,6 +2606,7 @@ async fn wal_poisoned_stays_false_under_write_load_and_turns_true_only_when_the_
     let attempts_first = a0["wal"]["sync_attempts"].as_u64().unwrap();
     let (mut polls, mut poisoned_true, mut sync_failures_not_null, mut key_missing) =
         (0u32, 0u32, 0u32, 0u32);
+    let (mut sibling_not_null, mut not_alive_or_not_healthy) = (0u32, 0u32);
     let mut attempts_last = attempts_first;
     let until = Instant::now() + Duration::from_secs(3);
     while polls < 120 || Instant::now() < until {
@@ -2612,7 +2616,14 @@ async fn wal_poisoned_stays_false_under_write_load_and_turns_true_only_when_the_
             poisoned_true += 1;
         }
         attempts_last = a["wal"]["sync_attempts"].as_u64().unwrap();
+        match a["wal"].get("sync_failures") {
+            Some(v) if v.is_null() => {}
+            _ => sibling_not_null += 1,
+        }
         let (_, m) = s.get("/v1/metrics/system").await;
+        if m["instance"]["coordinator_state"] != "alive" || m["instance"]["healthy"] != "healthy" {
+            not_alive_or_not_healthy += 1;
+        }
         match m["errors"].get("wal_sync_failures") {
             None => key_missing += 1,
             Some(v) if !v.is_null() => sync_failures_not_null += 1,
@@ -2644,6 +2655,14 @@ async fn wal_poisoned_stays_false_under_write_load_and_turns_true_only_when_the_
         "the key stays present (schema unchanged), value null"
     );
     assert_eq!(sync_failures_not_null, 0);
+    assert_eq!(
+        sibling_not_null, 0,
+        "/v1/admin/status wal.sync_failures is null, key present (ADR-OBS-03)"
+    );
+    assert_eq!(
+        not_alive_or_not_healthy, 0,
+        "coordinator_state alive and healthy while writes fsync normally"
+    );
     assert!(!s.state.engine.committer_poisoned());
 
     // Now poison the committer for real: the next fsync fails.
@@ -2655,35 +2674,43 @@ async fn wal_poisoned_stays_false_under_write_load_and_turns_true_only_when_the_
         st, 200,
         "a write whose fsync failed must not be acknowledged"
     );
+    // All three signals flip together (the sampler publishes at its next tick, 50 ms here).
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let (_, a) = s.get_with(ADMIN_KEY, "/v1/admin/status").await;
-        if a["wal"]["poisoned"] == json!(true) {
+        let (_, m) = s.get("/v1/metrics/system").await;
+        if a["wal"]["poisoned"] == json!(true)
+            && m["instance"]["coordinator_state"] == "poisoned"
+            && m["instance"]["healthy"] == "failed"
+        {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "wal.poisoned never turned true: {a}"
+            "the three signals never agreed: wal.poisoned={} coordinator_state={} healthy={}",
+            a["wal"]["poisoned"],
+            m["instance"]["coordinator_state"],
+            m["instance"]["healthy"]
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(s.state.engine.committer_poisoned());
-    // Terminal: it stays true, and readiness keeps its certified meaning (ADR-OBS-01 is the place
-    // to change that), and the always-null counter stays null.
+    // Terminal: they stay that way; `/readyz` is frozen at `ready: true` by decision (ADR-OBS-01
+    // accepted with `/readyz` exempt); and `instance.readiness` stays equal to it; the always-null
+    // counters stay null.
     for _ in 0..10 {
         let (_, a) = s.get_with(ADMIN_KEY, "/v1/admin/status").await;
+        let (_, m) = s.get("/v1/metrics/system").await;
+        let (_, r) = s.get("/readyz").await;
         assert_eq!(a["wal"]["poisoned"], json!(true));
+        assert_eq!(m["instance"]["coordinator_state"], "poisoned");
+        assert_eq!(m["instance"]["healthy"], "failed");
+        assert_eq!(r["ready"], true, "/readyz must stay constant true");
+        assert_eq!(m["instance"]["readiness"], "ready");
+        assert!(m["errors"]["wal_sync_failures"].is_null());
+        assert!(a["wal"]["sync_failures"].is_null());
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let (_, r) = s.get("/readyz").await;
-    assert_eq!(r["ready"], true);
-    let (_, m) = s.get("/v1/metrics/system").await;
-    assert!(m["errors"]["wal_sync_failures"].is_null());
-    // Recorded, not asserted: what the other surfaces say about a poisoned committer today (ADR-OBS-01).
-    eprintln!(
-        "with a poisoned committer: readyz.ready={} instance.healthy={} coordinator_state={}",
-        r["ready"], m["instance"]["healthy"], m["instance"]["coordinator_state"]
-    );
     let s = Arc::try_unwrap(s).ok().expect("load tasks have ended");
     s.stop().await;
 }
