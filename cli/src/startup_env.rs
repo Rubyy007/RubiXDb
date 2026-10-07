@@ -27,9 +27,51 @@ fn read(name: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Reads and validates the environment.
+/// Reads and validates the environment (every variable of this module, so a bad value stops startup at
+/// the same early point whichever variable it is).
 pub fn load() -> Result<LocalServerEnv, String> {
-    parse(read(RPS_ENV)?.as_deref(), read(BURST_ENV)?.as_deref())
+    let env = parse(read(RPS_ENV)?.as_deref(), read(BURST_ENV)?.as_deref())?;
+    load_max_blocking_threads()?;
+    Ok(env)
+}
+
+/// Cap on the embedded server's tokio **blocking thread pool** (`ADR-ITEM-C-01`, `PHASE_ITEM_C_ADR.md`).
+/// Every SQL statement runs on that pool (`api/src/routes/sql.rs`); tokio starts a new thread whenever it
+/// counts no idle one, and from a cold start under load that created 300-512 threads in 0.1 s and cost
+/// throughput (`PHASE_ITEM_C_DISCOVERY.md`). Unset or empty means [`DEFAULT_MAX_BLOCKING_THREADS`], tokio's own
+/// default and the behaviour before this setting existed.
+///
+/// A cap lower than the number of statements running at once makes the excess statements wait for a free
+/// thread, and that wait counts toward the statement deadline (`sql_statement_deadline_secs`): choose a cap at
+/// or above the expected concurrent statements. The six admin routes share this pool.
+pub const BLOCKING_ENV: &str = "RUBIXDB_LOCAL_MAX_BLOCKING_THREADS";
+pub const DEFAULT_MAX_BLOCKING_THREADS: usize = 512;
+/// Smallest value measured with the real mechanism (`PHASE_ITEM_C_DISCOVERY.md` section 5).
+pub const MIN_MAX_BLOCKING_THREADS: usize = 16;
+pub const MAX_MAX_BLOCKING_THREADS: usize = 512;
+
+pub fn load_max_blocking_threads() -> Result<usize, String> {
+    parse_max_blocking_threads(read(BLOCKING_ENV)?.as_deref())
+}
+
+/// Digits only (no sign, no space, no exponent, no radix prefix), within the documented bounds.
+pub fn parse_max_blocking_threads(v: Option<&str>) -> Result<usize, String> {
+    let Some(v) = v else {
+        return Ok(DEFAULT_MAX_BLOCKING_THREADS);
+    };
+    let bad = || {
+        format!(
+            "{BLOCKING_ENV} must be an integer between {MIN_MAX_BLOCKING_THREADS} and {MAX_MAX_BLOCKING_THREADS}, got {v:?}"
+        )
+    };
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n = v.parse::<usize>().map_err(|_| bad())?;
+    if !(MIN_MAX_BLOCKING_THREADS..=MAX_MAX_BLOCKING_THREADS).contains(&n) {
+        return Err(bad());
+    }
+    Ok(n)
 }
 
 pub fn parse(rps: Option<&str>, burst: Option<&str>) -> Result<LocalServerEnv, String> {
@@ -109,6 +151,48 @@ mod tests {
         ] {
             let err = parse(None, Some(burst)).unwrap_err();
             assert!(err.contains(BURST_ENV), "{burst:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_blocking_pool_cap_defaults_to_the_value_in_force_before_it_existed() {
+        // tokio's default `max_blocking_threads` is 512: unset must change nothing.
+        assert_eq!(DEFAULT_MAX_BLOCKING_THREADS, 512);
+        assert_eq!(parse_max_blocking_threads(None), Ok(512));
+    }
+
+    #[test]
+    fn the_blocking_pool_cap_accepts_exactly_its_documented_range() {
+        for n in [16usize, 17, 32, 64, 256, 511, 512] {
+            assert_eq!(parse_max_blocking_threads(Some(&n.to_string())), Ok(n));
+        }
+        // leading zeros are digits: accepted as the number they spell
+        assert_eq!(parse_max_blocking_threads(Some("016")), Ok(16));
+    }
+
+    #[test]
+    fn every_bad_blocking_pool_cap_is_an_error_naming_the_variable() {
+        for v in [
+            "",
+            "0",
+            "1",
+            "15",
+            "513",
+            "1024",
+            "abc",
+            "-16",
+            "+16",
+            " 16",
+            "16 ",
+            "1.5",
+            "1e2",
+            "0x20",
+            "16,32",
+            "99999999999999999999",
+        ] {
+            let err = parse_max_blocking_threads(Some(v)).unwrap_err();
+            assert!(err.contains(BLOCKING_ENV), "{v:?}: {err}");
+            assert!(err.contains("16") && err.contains("512"), "{v:?}: {err}");
         }
     }
 }

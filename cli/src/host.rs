@@ -177,8 +177,12 @@ impl EmbeddedServer {
             .port();
         let base_url = format!("http://127.0.0.1:{port}");
 
+        // ADR-ITEM-C-01: the cap of the blocking pool every SQL statement runs on. Unset means 512,
+        // tokio's own default, i.e. exactly what this builder did before the setting existed.
+        let max_blocking_threads = crate::startup_env::load_max_blocking_threads()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .max_blocking_threads(max_blocking_threads)
             .build()
             .map_err(|e| format!("could not start Tokio runtime: {e}"))?;
 
