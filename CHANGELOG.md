@@ -6,6 +6,10 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Observability final closure (2026-10-07)
+
+Observability closure completed: section A of the certification is 69 PASS, 0 FAIL, 0 OPEN, 6 NOT REQUIRED, 10 NOT TESTED (85 rows; A66 reclassified to NOT TESTED - ENVIRONMENT LIMITATION by the maintainer), so the observability implementation status is PASS with every NOT REQUIRED and NOT TESTED row enumerated (section 27). The workspace regression status is FAIL with pre-existing failures only, and whole-product readiness is not declared. No code changed in this step.
+
 ### Observability follow-up 2 (2026-10-07)
 
 Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 26, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md` (now ACCEPTED), `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_03.md` (scope extended). Observability-scoped; protected engine paths unchanged.
