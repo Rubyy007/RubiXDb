@@ -553,6 +553,53 @@ async fn handle_rollback(
     })
 }
 
+/// Owns the "executing" state of a session whose transaction was taken out of the registry for the
+/// duration of one statement. The statement future can be dropped at any `.await` (the client
+/// disconnected): the transaction then goes with the blocking task (an implicit rollback, the
+/// existing `Transaction` drop path) and nothing would call `put_back` or `finish`, leaving a
+/// stale entry that the reaper never sees. Dropping an unresolved lease closes the session's
+/// observation entry and leaves a `session.closed` event (the existing event shape).
+struct SessionLease {
+    state: Arc<AppState>,
+    id: Uuid,
+    resolved: bool,
+}
+
+impl SessionLease {
+    fn new(state: &Arc<AppState>, id: Uuid) -> Self {
+        SessionLease {
+            state: Arc::clone(state),
+            id,
+            resolved: false,
+        }
+    }
+
+    /// The statement finished and the session was put back or ended through the normal path.
+    fn resolve(&mut self) {
+        self.resolved = true;
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        use crate::observability::events::{kind, severity, Event};
+        self.state.sql.sessions.finish(self.id);
+        self.state.obs.events.push_operational(
+            Event::new(
+                kind::SESSION_CLOSED,
+                severity::WARNING,
+                "session",
+                "cancelled",
+            )
+            .error_class("CLIENT_DISCONNECTED")
+            .session(Some(self.id)),
+        );
+    }
+}
+
 // =======================================================================
 // Reads / writes — session path (statement runs inside an existing
 // caller-held transaction) vs. autocommit path (no session touched at
@@ -597,6 +644,7 @@ async fn handle_read(
                 .take(id, &principal.name)
                 .map_err(|_| ApiError::SqlSessionNotFound)?;
             let created_at = Instant::now();
+            let mut lease = SessionLease::new(state, id);
             let outcome =
                 run_with_cancellation_and_deadline(state, deadline, move |state, cancellation| {
                     let out = execute(
@@ -618,6 +666,7 @@ async fn handle_read(
                         .sql
                         .sessions
                         .put_back(id, principal.name.clone(), txn, created_at);
+                    lease.resolve();
                     Ok(SqlResponse {
                         session_id: Some(id),
                         result: query_result_to_json(result, &state.sql.api_metrics),
@@ -632,12 +681,14 @@ async fn handle_read(
                         .sql
                         .sessions
                         .put_back(id, principal.name.clone(), txn, created_at);
+                    lease.resolve();
                     Err(e.into())
                 }
                 Err(api_err) => {
                     // The transaction was dropped with the failed statement (deadline /
                     // cancellation): the session is gone.
                     state.sql.sessions.finish(id);
+                    lease.resolve();
                     Err(api_err)
                 }
             }
@@ -689,6 +740,7 @@ async fn handle_write(
                 .take(id, &principal.name)
                 .map_err(|_| ApiError::SqlSessionNotFound)?;
             let created_at = Instant::now();
+            let mut lease = SessionLease::new(state, id);
             let outcome =
                 run_with_cancellation_and_deadline(state, deadline, move |state, cancellation| {
                     let out = execute_write(
@@ -711,6 +763,7 @@ async fn handle_write(
                         .sql
                         .sessions
                         .put_back(id, principal.name.clone(), txn, created_at);
+                    lease.resolve();
                     state
                         .sql
                         .api_metrics
@@ -725,12 +778,14 @@ async fn handle_write(
                         .sql
                         .sessions
                         .put_back(id, principal.name.clone(), txn, created_at);
+                    lease.resolve();
                     Err(e.into())
                 }
                 Err(api_err) => {
                     // The transaction was dropped with the failed statement (deadline /
                     // cancellation): the session is gone.
                     state.sql.sessions.finish(id);
+                    lease.resolve();
                     Err(api_err)
                 }
             }

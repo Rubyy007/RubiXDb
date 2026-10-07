@@ -272,3 +272,285 @@ fn two_real_instances_report_only_their_own_identity_and_a_stopped_one_leaves_th
     let _ = b.wait();
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ------------------------------------------------------------------------------------------
+// Closure: raw-HTTP helpers (std only) so a test can read every observability surface of a real
+// owner process, and the one real-process check of the lock probe and readiness unification.
+// ------------------------------------------------------------------------------------------
+fn instance_endpoint(root: &Path, instance: &str) -> (u16, String) {
+    let dir = root.join(instance);
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("instance.json")).unwrap()).unwrap();
+    let creds: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("credentials.json")).unwrap())
+            .unwrap();
+    (
+        manifest["api_port"].as_u64().unwrap() as u16,
+        creds["admin_key"].as_str().unwrap().to_string(),
+    )
+}
+
+/// One GET over a fresh connection; `key = None` sends no credential. Returns (status, JSON body).
+fn http_get(port: u16, key: Option<&str>, path: &str) -> (u16, Value) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let auth = key
+        .map(|k| format!("Authorization: Bearer {k}\r\n"))
+        .unwrap_or_default();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n").as_bytes(),
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status: u16 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    (status, serde_json::from_str(body).unwrap_or(Value::Null))
+}
+
+#[test]
+fn a_real_owner_reports_the_lock_as_held_and_one_readiness_on_both_endpoints() {
+    let root = fresh_root("lock_ready");
+    let mut owner = spawn_owner(&root, None);
+    wait_running(&root, "default");
+    let (port, key) = instance_endpoint(&root, "default");
+    let sys = system_json(&root, None);
+    // the real probe (`InstanceLock::try_acquire` against the real instance directory)
+    assert_eq!(sys["instance"]["lock_state"], "held", "{sys}");
+    assert_eq!(sys["instance"]["readiness"], "ready");
+    assert_eq!(sys["instance"]["coordinator_state"], "alive");
+    assert_eq!(sys["instance"]["healthy"], "healthy");
+    let (st, ready) = http_get(port, Some(&key), "/readyz");
+    assert_eq!(st, 200);
+    assert_eq!(ready["ready"], true, "/readyz and instance.readiness agree");
+    // the renamed process I/O group and the advisory are present, the old names are not
+    assert!(
+        sys["process"]["write_ops_per_sec"].is_number()
+            || sys["process"]["write_ops_per_sec"].is_null()
+    );
+    assert!(sys["disk"].get("write_iops").is_none() && sys["disk"].get("read_iops").is_none());
+    assert!(["ok", "low", "unknown"].contains(&sys["disk"]["free_advisory"].as_str().unwrap()));
+    let text = out(cmd(&root, None).args(["status", "--system"]));
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text.contains("lock=held"), "{text}");
+    assert!(text.contains("coordinator=alive"), "{text}");
+    let _ = owner.kill();
+    let _ = owner.wait();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn two_real_instances_keep_every_surface_apart_and_a_restarted_one_starts_fresh() {
+    let root = fresh_root("iso");
+    let mut a = spawn_owner(&root, Some("alpha"));
+    let mut b = spawn_owner(&root, Some("beta"));
+    wait_running(&root, "alpha");
+    wait_running(&root, "beta");
+    let (pa, ka) = instance_endpoint(&root, "alpha");
+    let (pb, kb) = instance_endpoint(&root, "beta");
+    assert_ne!(pa, pb);
+
+    // activity on alpha only: statements, bad credentials (security events), a rejected route
+    for _ in 0..4 {
+        assert!(out(cmd(&root, Some("alpha")).args(["-c", "SELECT 1"]))
+            .status
+            .success());
+    }
+    for k in 0..3 {
+        let (st, _) = http_get(pa, Some(&format!("bad-key-{k}-0123456789")), "/v1/status");
+        assert_eq!(st, 401);
+    }
+    // beta: one statement of its own
+    assert!(out(cmd(&root, Some("beta")).args(["-c", "SELECT 1"]))
+        .status
+        .success());
+    std::thread::sleep(Duration::from_millis(1500)); // let both samplers publish
+
+    let surface = |port: u16, key: &str| -> Value {
+        let (_, sys) = http_get(port, Some(key), "/v1/metrics/system");
+        let (_, sessions) = http_get(port, Some(key), "/v1/observability/sessions");
+        let (_, queries) = http_get(port, Some(key), "/v1/observability/queries");
+        let (_, events) = http_get(port, Some(key), "/v1/observability/events?limit=200");
+        let (_, version) = http_get(port, Some(key), "/v1/observability/version");
+        serde_json::json!({
+            "name": sys["instance"]["name"], "id": sys["instance"]["id"],
+            "auth_failures": sys["security"]["auth_failures_since_start"],
+            "sessions": sessions["total"],
+            "queries": queries["queries"].as_array().map(|q| q.len()).unwrap_or(0),
+            "security_events": events["security"].as_array().map(|q| q.len()).unwrap_or(0),
+            "startup": version["startup_timestamp_unix_ms"],
+            "rss": sys["memory"]["rss_bytes"], "generation": sys["sample_generation"],
+            "background_state": sys["background"]["index_build_state"],
+            "uptime": sys["instance"]["uptime_seconds"],
+        })
+    };
+    let sa = surface(pa, &ka);
+    let sb = surface(pb, &kb);
+    assert_eq!(sa["name"], "alpha");
+    assert_eq!(sb["name"], "beta");
+    assert_ne!(sa["id"], sb["id"]);
+    assert_eq!(
+        sa["auth_failures"], 3,
+        "alpha's failed logins are alpha's: {sa}"
+    );
+    assert_eq!(sb["auth_failures"], 0, "beta never saw them: {sb}");
+    assert_eq!(sa["security_events"], 3);
+    assert_eq!(sb["security_events"], 0);
+    assert!(sa["queries"].as_u64().unwrap() >= 4);
+    assert!(sb["queries"].as_u64().unwrap() < sa["queries"].as_u64().unwrap());
+    assert_ne!(
+        sa["startup"], sb["startup"],
+        "each instance reports its own start time"
+    );
+    assert_ne!(
+        sa["rss"], sb["rss"],
+        "each process reports its own resources"
+    );
+
+    // stop beta (process kill), restart it: fresh observability state; alpha is untouched
+    let _ = b.kill();
+    let _ = b.wait();
+    let alpha_before = surface(pa, &ka);
+    let mut b2 = spawn_owner(&root, Some("beta"));
+    wait_running(&root, "beta");
+    let (pb2, kb2) = instance_endpoint(&root, "beta");
+    std::thread::sleep(Duration::from_millis(1500));
+    let sb2 = surface(pb2, &kb2);
+    assert_eq!(sb2["name"], "beta");
+    assert_eq!(
+        sb2["id"], sb["id"],
+        "same instance identity after a restart"
+    );
+    assert_ne!(sb2["startup"], sb["startup"], "a new process start time");
+    assert_eq!(sb2["auth_failures"], 0);
+    assert_eq!(sb2["security_events"], 0);
+    assert_eq!(sb2["sessions"], 0);
+    assert!(
+        sb2["queries"].as_u64().unwrap() <= 1,
+        "no query history survives the restart: {sb2}"
+    );
+    let alpha_after = surface(pa, &ka);
+    assert_eq!(alpha_after["auth_failures"], alpha_before["auth_failures"]);
+    assert_eq!(alpha_after["security_events"], 3);
+    assert_eq!(
+        alpha_after["startup"], sa["startup"],
+        "alpha was not restarted"
+    );
+    assert!(
+        alpha_after["generation"].as_u64() >= alpha_before["generation"].as_u64(),
+        "alpha keeps sampling"
+    );
+    let _ = a.kill();
+    let _ = a.wait();
+    let _ = b2.kill();
+    let _ = b2.wait();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// One POST over a fresh connection; returns the HTTP status.
+fn http_post(port: u16, key: &str, path: &str, body: &str) -> u16 {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    s.write_all(
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    String::from_utf8_lossy(&buf)
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+// Decision D5 (option R2): `/readyz.ready` keeps its certified meaning and `instance.readiness` is the same
+// value (one function, `sampler::ready`). An earlier derivation from `GroupCommitStats::sync_failures()` (which
+// is transiently 1 whenever an fsync is in flight) made both flap under write load: measured on the real
+// binary with 4 writers, `/readyz.ready` was false in 286 of 426 polls. This test drives that load against the
+// real binary, in its own process, and fails if anything like it returns. (It lives here, not in the in-process
+// suite, because its writers grow the tokio blocking pool and disturbed `sampler_start_stop_100_times_...`,
+// which counts the whole process's threads.)
+#[test]
+fn readyz_and_instance_readiness_stay_true_and_equal_under_real_write_load() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let root = fresh_root("ready_load");
+    let mut owner = spawn_owner(&root, None);
+    wait_running(&root, "default");
+    let (port, key) = instance_endpoint(&root, "default");
+    assert_eq!(
+        http_post(
+            port,
+            &key,
+            "/v1/sql",
+            r#"{"sql":"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"}"#
+        ),
+        200
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let written = Arc::new(AtomicU64::new(0));
+    let mut writers = Vec::new();
+    for k in 0..4u64 {
+        let (stop, written, key) = (stop.clone(), written.clone(), key.clone());
+        writers.push(std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                let body = format!(
+                    r#"{{"sql":"INSERT INTO t (id, v) VALUES ({}, 'x')"}}"#,
+                    k * 1_000_000 + n
+                );
+                if http_post(port, &key, "/v1/sql", &body) == 200 {
+                    written.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    let (mut polls, mut generations) = (0u32, std::collections::BTreeSet::new());
+    let until = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < until {
+        let (st, m) = http_get(port, Some(&key), "/v1/metrics/system");
+        let (st2, r) = http_get(port, Some(&key), "/readyz");
+        assert_eq!((st, st2), (200, 200));
+        polls += 1;
+        generations.insert(m["sample_generation"].as_u64().unwrap());
+        assert_eq!(r["ready"], true, "/readyz flapped under write load: {r}");
+        assert_eq!(
+            m["instance"]["readiness"], "ready",
+            "readiness flapped: {m}"
+        );
+        assert_eq!(
+            r["ready"].as_bool().unwrap(),
+            m["instance"]["readiness"] == "ready"
+        );
+        assert_eq!(m["instance"]["coordinator_state"], "alive", "{m}");
+        assert_eq!(m["instance"]["healthy"], "healthy", "health flapped: {m}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+    let written = written.load(Ordering::Relaxed);
+    eprintln!(
+        "readyz under real write load: {polls} polls, {} generations, {written} committed writes",
+        generations.len()
+    );
+    assert!(
+        polls >= 50 && generations.len() >= 4 && written >= 100,
+        "too little load to mean anything: {polls} polls, {} generations, {written} writes",
+        generations.len()
+    );
+    let _ = owner.kill();
+    let _ = owner.wait();
+    std::fs::remove_dir_all(&root).ok();
+}

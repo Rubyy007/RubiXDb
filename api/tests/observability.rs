@@ -302,6 +302,7 @@ async fn metrics_system_has_every_required_field_with_the_right_types() {
     assert!(is_num(&i["uptime_seconds"]));
     assert!(["healthy", "degraded", "failed"].contains(&i["healthy"].as_str().unwrap()));
     assert_eq!(i["readiness"], "ready");
+    assert_eq!(i["coordinator_state"], "alive");
 
     let c = &v["cpu"];
     assert!(num_or_null(&c["process_percent"]) && num_or_null(&c["peak_percent"]));
@@ -322,12 +323,20 @@ async fn metrics_system_has_every_required_field_with_the_right_types() {
         "db_bytes",
         "wal_bytes",
         "sstable_bytes",
-        "read_iops",
-        "write_iops",
+    ] {
+        assert!(num_or_null(&d[k]), "disk.{k} = {}", d[k]);
+    }
+    for k in [
+        "read_ops_per_sec",
+        "write_ops_per_sec",
         "read_mb_per_sec",
         "write_mb_per_sec",
     ] {
-        assert!(num_or_null(&d[k]), "disk.{k} = {}", d[k]);
+        assert!(
+            num_or_null(&v["process"][k]),
+            "process.{k} = {}",
+            v["process"][k]
+        );
     }
     assert!(d["volume_total_bytes"].as_u64().unwrap() >= d["volume_free_bytes"].as_u64().unwrap());
 
@@ -403,10 +412,10 @@ async fn a_platform_that_measures_nothing_yields_nulls_never_zeros() {
         &v["disk"]["volume_total_bytes"],
         &v["disk"]["volume_free_bytes"],
         &v["disk"]["volume_used_percent"],
-        &v["disk"]["read_iops"],
-        &v["disk"]["write_iops"],
-        &v["disk"]["read_mb_per_sec"],
-        &v["disk"]["write_mb_per_sec"],
+        &v["process"]["read_ops_per_sec"],
+        &v["process"]["write_ops_per_sec"],
+        &v["process"]["read_mb_per_sec"],
+        &v["process"]["write_mb_per_sec"],
     ] {
         assert!(p.is_null(), "an unmeasurable field must be null, got {p}");
     }
@@ -563,10 +572,10 @@ async fn timeseries_windows_resolution_empty_history_and_invalid_window() {
         for name in [
             "cpu_process_percent",
             "memory_rss_bytes",
-            "disk_read_iops",
-            "disk_write_iops",
-            "disk_read_mb_per_sec",
-            "disk_write_mb_per_sec",
+            "process_read_ops_per_sec",
+            "process_write_ops_per_sec",
+            "process_read_mb_per_sec",
+            "process_write_mb_per_sec",
             "sql_queries_per_sec",
             "active_queries",
         ] {
@@ -637,7 +646,7 @@ async fn timeseries_returns_injected_history_oldest_first_with_exact_resolution_
         );
         assert!(pts.iter().all(|p| p["v"].is_number()));
         // never-measured series (disk I/O in this injection) are null, not empty
-        assert!(v["series"]["disk_read_iops"].is_null());
+        assert!(v["series"]["process_read_ops_per_sec"].is_null());
     }
     let r = s
         .http
@@ -1250,7 +1259,7 @@ async fn back_to_back_reads_while_the_sampler_ticks_never_see_a_torn_snapshot() 
             "disk belongs to generation {g}"
         );
         assert!(
-            v["disk"]["read_iops"].is_null(),
+            v["process"]["read_ops_per_sec"].is_null(),
             "io probe unavailable: null"
         );
     }
@@ -1434,6 +1443,11 @@ impl OsProbe for DiskProbe {
     }
 }
 
+async fn advisory(s: &Server) -> String {
+    let (_, v) = s.get("/v1/metrics/system").await;
+    v["disk"]["free_advisory"].as_str().unwrap().to_string()
+}
+
 async fn health_after_tick(s: &Server) -> (String, String) {
     let (_, v) = s.get("/v1/metrics/system").await;
     wait_for_generation(s, v["sample_generation"].as_u64().unwrap() + 2).await;
@@ -1511,13 +1525,17 @@ async fn health_follows_storage_state_and_disk_free_and_leaves_readiness_alone()
         .set_storage_state_for_test(StorageState::Healthy);
     assert_eq!(health_after_tick(&s).await.0, "healthy");
 
-    // disk free: < 10 % of total is degraded, exactly 10 % is not, > 10 % is not.
+    // disk free (policy of 2026-10-06, Decision D1 Option 3): free space is an ADVISORY field and
+    // never decides `healthy`. 9.9 % free -> healthy, advisory `low`; exactly 10 % -> healthy, `ok`.
     free.0.store(total / 10 - 1, Ordering::SeqCst);
-    assert_eq!(health_after_tick(&s).await.0, "degraded");
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+    assert_eq!(advisory(&s).await, "low");
     free.0.store(total / 10, Ordering::SeqCst);
     assert_eq!(health_after_tick(&s).await.0, "healthy");
+    assert_eq!(advisory(&s).await, "ok");
     free.0.store(total / 2, Ordering::SeqCst);
     assert_eq!(health_after_tick(&s).await.0, "healthy");
+    assert_eq!(advisory(&s).await, "ok");
 
     // instance lock lost => failed (the probe is the same one the embedded host installs)
     let held = Arc::new(AtomicBool::new(true));
@@ -2031,4 +2049,522 @@ async fn a_panic_in_a_tick_is_contained_and_the_sampler_recovers() {
     let (_, v) = s.get("/v1/metrics/system").await;
     assert_eq!(v["sample_freshness"]["state"], "running", "recovered");
     s.stop().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Closure P0: a client that disconnects while a statement runs INSIDE an explicit transaction must
+// not leave a session behind (reproduced in the Prompt 1 reconciliation: 60 of 60 stayed forever).
+// ------------------------------------------------------------------------------------------
+
+/// Starts `BEGIN`, sends `sql` carrying the session id over a raw socket, waits until the server
+/// reports that session as `executing`, then aborts the connection (RST) mid-statement.
+async fn begin_then_abort_mid_statement(s: &Server, sql: &str) -> String {
+    use tokio::io::AsyncWriteExt;
+    let (st, b) = s.sql("BEGIN").await;
+    assert_eq!(st, 200, "{b}");
+    let sid = b["session_id"].as_str().unwrap().to_string();
+    let body = json!({"sql": sql, "session_id": sid}).to_string();
+    let mut sock = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    sock.write_all(
+        format!(
+            "POST /v1/sql HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, v) = s.get("/v1/observability/sessions").await;
+        let running = v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["session_id"] == sid.as_str() && r["state"] == "executing");
+        if running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the statement never showed as executing (it finished before the disconnect): use a heavier statement"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    #[allow(deprecated)]
+    sock.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(sock); // RST: the client is gone while the statement is still running
+    sid
+}
+
+async fn session_counts(s: &Server) -> (u64, u64, u64) {
+    let (_, v) = s.get("/v1/observability/sessions").await;
+    let (_, m) = s.get("/v1/metrics/system").await;
+    (
+        v["total"].as_u64().unwrap(),
+        m["throughput"]["active_sessions"].as_u64().unwrap(),
+        m["throughput"]["active_transactions"].as_u64().unwrap(),
+    )
+}
+
+/// Polls (up to 10 s) until the counts equal `want`; returns the last counts seen.
+async fn settled_counts(s: &Server, want: (u64, u64, u64)) -> (u64, u64, u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut now = session_counts(s).await;
+    while now != want && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        now = session_counts(s).await;
+    }
+    now
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disconnect_mid_statement_inside_a_transaction_leaves_no_session_behind() {
+    const CAP: usize = 5;
+    let s = Server::start_cfg(
+        "session_leak",
+        Arc::new(RealProbe),
+        Duration::from_millis(50),
+        |c| c.sql_max_sessions_per_principal = CAP,
+    )
+    .await;
+    s.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .await;
+    for lo in (1..=8000).step_by(500) {
+        let vals: Vec<String> = (lo..lo + 500).map(|i| format!("({i},'row{i}')")).collect();
+        let (st, b) = s
+            .sql(&format!("INSERT INTO t (id, v) VALUES {}", vals.join(",")))
+            .await;
+        assert_eq!(st, 200, "{b}");
+    }
+    let heavy = "SELECT COUNT(*) FROM t WHERE v LIKE '%9%9%'";
+    // (the gauges come from the last sampler tick, so wait for it to catch up with the inserts)
+    let before = settled_counts(&s, (0, 0, 0)).await;
+    assert_eq!(before, (0, 0, 0), "baseline: no sessions, no transactions");
+
+    let mut aborted = Vec::new();
+    for _ in 0..CAP {
+        aborted.push(begin_then_abort_mid_statement(&s, heavy).await);
+    }
+
+    // Bounded time: every aborted session must disappear and its transaction be rolled back.
+    let now = settled_counts(&s, (0, 0, 0)).await;
+    assert_eq!(
+        now,
+        (0, 0, 0),
+        "after {CAP} aborted in-transaction statements: (sessions listed, active_sessions gauge, active_transactions) must return to the baseline (0,0,0)"
+    );
+
+    // The aborted sessions are gone for good.
+    for sid in &aborted {
+        let r = s
+            .http
+            .post(s.url("/v1/sql"))
+            .bearer_auth(ADMIN_KEY)
+            .json(&json!({"sql": "COMMIT", "session_id": sid}))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r.status(),
+            200,
+            "an aborted session must not be committable"
+        );
+    }
+
+    // A second client can open a session immediately, up to exactly the per-principal cap.
+    for _ in 0..CAP {
+        assert_eq!(
+            s.sql("BEGIN").await.0,
+            200,
+            "slots freed by the aborted sessions"
+        );
+    }
+    let (st, b) = s.sql("BEGIN").await;
+    assert_ne!(st, 200, "the cap applies: {b}");
+    assert_eq!(session_counts(&s).await.0, CAP as u64);
+
+    // The disconnect left a session-close record in the operational ring (existing event shape).
+    let (_, ev) = s.get("/v1/observability/events?limit=200").await;
+    let closed = ev["operational"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["event_type"] == "session.closed" && e["error_class"] == "CLIENT_DISCONNECTED"
+        })
+        .count();
+    assert_eq!(
+        closed, CAP,
+        "one session.closed event per aborted session: {ev}"
+    );
+    s.stop().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Closure D1: health policy v1 (Option 3). Only repository-defined states decide `healthy`.
+// ------------------------------------------------------------------------------------------
+// After an orderly engine stop the coordinator is no longer alive: `coordinator_state` says
+// `not_started` (not alive, not failed), `/readyz` and `instance.readiness` are unchanged (R2),
+// and health stays `healthy` (`not_started` is not one of the repository-defined failing states).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orderly_engine_stop_changes_coordinator_state_only_never_readiness() {
+    let probe = Arc::new(DiskProbe(AtomicU64::new(500_000_000), 1_000_000_000));
+    let s = Server::start("ready_stop", probe, Duration::from_millis(30)).await;
+    wait_for_generation(&s, 3).await;
+    let (_, m) = s.get("/v1/metrics/system").await;
+    assert_eq!(m["instance"]["coordinator_state"], "alive");
+    s.state.engine.shutdown();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, m) = s.get("/v1/metrics/system").await;
+        if m["instance"]["coordinator_state"] == "not_started" {
+            let (_, r) = s.get("/readyz").await;
+            assert_eq!(r["ready"], true);
+            assert_eq!(m["instance"]["readiness"], "ready");
+            assert_eq!(m["instance"]["healthy"], "healthy");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "coordinator_state never changed: {m}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_three_valued_lock_probe_never_reads_unavailable_as_lost() {
+    use rubixdb_api::observability::LockState;
+    let probe = Arc::new(DiskProbe(AtomicU64::new(500_000_000), 1_000_000_000));
+    let s = Server::start("lock3", probe, Duration::from_millis(30)).await;
+    // No probe installed (the standalone shape): unavailable, healthy, never failed.
+    wait_for_generation(&s, 3).await;
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["instance"]["lock_state"], "unavailable");
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+
+    let state = Arc::new(std::sync::atomic::AtomicU8::new(2));
+    let st2 = state.clone();
+    s.state
+        .obs
+        .set_lock_state_probe(Arc::new(move || match st2.load(Ordering::SeqCst) {
+            0 => LockState::Held,
+            1 => LockState::NotHeld,
+            _ => LockState::Unavailable,
+        }));
+    // unavailable (the probe could not find out): neither failed nor any other change
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["instance"]["lock_state"], "unavailable");
+    // held
+    state.store(0, Ordering::SeqCst);
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["instance"]["lock_state"], "held");
+    // confirmed not held -> failed
+    state.store(1, Ordering::SeqCst);
+    assert_eq!(health_after_tick(&s).await.0, "failed");
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["instance"]["lock_state"], "not_held");
+    // back to unavailable: the failed verdict clears, it was never about "unavailable"
+    state.store(2, Ordering::SeqCst);
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_pressure_degrades_and_the_advisory_echoes_its_threshold() {
+    use rubixdb::lsm::StorageState;
+    let probe = Arc::new(DiskProbe(AtomicU64::new(99_000_000), 1_000_000_000)); // 9.9 % free
+    let s = Server::start("policy_pressure", probe, Duration::from_millis(30)).await;
+    // 9.9 % free with everything else healthy: healthy, advisory low
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["disk"]["free_advisory"], "low");
+    assert_eq!(v["disk"]["free_advisory_threshold_percent"], 10.0);
+    // StoragePressure -> degraded; StorageFull -> failed
+    s.state
+        .engine
+        .set_storage_state_for_test(StorageState::StoragePressure);
+    assert_eq!(health_after_tick(&s).await.0, "degraded");
+    s.state
+        .engine
+        .set_storage_state_for_test(StorageState::StorageFull);
+    assert_eq!(health_after_tick(&s).await.0, "failed");
+    s.state
+        .engine
+        .set_storage_state_for_test(StorageState::Healthy);
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+    s.stop().await;
+    // A volume whose capacity cannot be read: advisory unknown, health unaffected.
+    let s = Server::start_cfg(
+        "policy_unknown",
+        Arc::new(CtlProbe(Arc::new(Ctl {
+            fail_disk: AtomicBool::new(true),
+            ..Ctl::default()
+        }))),
+        Duration::from_millis(30),
+        |_| {},
+    )
+    .await;
+    assert_eq!(health_after_tick(&s).await.0, "healthy");
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["disk"]["free_advisory"], "unknown");
+    s.stop().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Closure D3: process I/O naming; the old names must not come back, `device_*` stays empty.
+// ------------------------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_io_is_named_as_process_level_and_the_old_disk_names_are_absent() {
+    let s = Server::real("process_names").await;
+    wait_for_generation(&s, 3).await;
+    let (_, v) = s.get("/v1/metrics/system").await;
+    let process = v["process"].as_object().expect("process group");
+    let keys: BTreeSet<&str> = process.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "read_ops_per_sec",
+            "write_ops_per_sec",
+            "read_mb_per_sec",
+            "write_mb_per_sec"
+        ])
+    );
+    let disk = v["disk"].as_object().unwrap();
+    for old in [
+        "read_iops",
+        "write_iops",
+        "read_mb_per_sec",
+        "write_mb_per_sec",
+    ] {
+        assert!(
+            !disk.contains_key(old),
+            "old name disk.{old} must not reappear"
+        );
+    }
+    assert!(
+        v.as_object()
+            .unwrap()
+            .keys()
+            .all(|k| !k.starts_with("device")),
+        "the device_* namespace is reserved and empty in v1"
+    );
+    assert!(disk.keys().all(|k| !k.starts_with("device")));
+    let (_, t) = s.get("/v1/metrics/system/timeseries?window=15m").await;
+    let series = t["series"].as_object().unwrap();
+    assert!(
+        series
+            .keys()
+            .all(|k| !k.starts_with("disk_") && !k.starts_with("device")),
+        "{series:?}"
+    );
+    for k in [
+        "process_read_ops_per_sec",
+        "process_write_ops_per_sec",
+        "process_read_mb_per_sec",
+        "process_write_mb_per_sec",
+    ] {
+        assert!(series.contains_key(k), "{k}");
+    }
+    s.stop().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Closure sampler start failure: a sampler that cannot run is logged once at WARN and reads `failed`.
+// ------------------------------------------------------------------------------------------
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_logs() -> Arc<std::sync::Mutex<Vec<u8>>> {
+    static BUF: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    BUF.get_or_init(|| {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b2 = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || LogCapture(b2.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(sub);
+        buf
+    })
+    .clone()
+}
+
+fn log_lines_containing(needle: &str) -> usize {
+    String::from_utf8_lossy(&captured_logs().lock().unwrap())
+        .lines()
+        .filter(|l| l.contains(needle))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sampler_that_keeps_failing_is_logged_once_and_reads_failed() {
+    let _ = captured_logs();
+    let panic_now = Arc::new(AtomicBool::new(true));
+    // every tick (including the first, synchronous one) panics inside the probe
+    let s = Server::start(
+        "sampler_failing",
+        Arc::new(PanicProbe(panic_now.clone())),
+        Duration::from_millis(30),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (st, v) = s.get("/v1/metrics/system").await;
+        assert_eq!(st, 200);
+        if v["sample_freshness"]["state"] == "failed" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never reported failed: {v}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await; // many more failing ticks
+    assert_eq!(
+        log_lines_containing("observability sampler failed"),
+        1,
+        "the failure is logged once, not once per tick"
+    );
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["sample_freshness"]["state"], "failed");
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sampler_that_could_not_start_logs_the_reason_and_reads_failed_not_not_started() {
+    let _ = captured_logs();
+    let mut s = Server::real("sampler_nostart").await;
+    wait_for_generation(&s, 2).await;
+    s.sampler.take().unwrap().stop(); // the thread is gone; state is not_started
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(v["sample_freshness"]["state"], "not_started");
+    let before = log_lines_containing("observability sampler could not start");
+    rubixdb_api::observability::sampler::report_start_failure_for_test(
+        &s.state,
+        &std::io::Error::other("injected: thread limit reached"),
+    );
+    let (_, v) = s.get("/v1/metrics/system").await;
+    assert_eq!(
+        v["sample_freshness"]["state"], "failed",
+        "not running, not not_started"
+    );
+    assert_eq!(
+        log_lines_containing("observability sampler could not start") - before,
+        1
+    );
+    assert!(
+        log_lines_containing("injected: thread limit reached") >= 1,
+        "the reason is in the log line"
+    );
+    s.stop().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Closure section 12: no mutable observability state is global. A second instance created in the
+// SAME process after the first one has been stopped starts from empty everywhere, and two
+// instances running at once never see each other's sessions, queries, events or counters.
+// ------------------------------------------------------------------------------------------
+async fn observability_fingerprint(s: &Server) -> Value {
+    let (_, sessions) = s.get("/v1/observability/sessions").await;
+    let (_, queries) = s.get("/v1/observability/queries").await;
+    let (_, events) = s.get("/v1/observability/events?limit=200").await;
+    let (_, m) = s.get("/v1/metrics/system").await;
+    json!({
+        "sessions_total": sessions["total"],
+        "queries_listed": queries["queries"].as_array().unwrap().len(),
+        "security_events": events["security"].as_array().unwrap().len(),
+        "operational_events": events["operational"].as_array().unwrap().len(),
+        "auth_failures": m["security"]["auth_failures_since_start"],
+        "sql_errors": m["errors"]["sql_errors_since_start"],
+        "forbidden": m["security"]["forbidden_since_start"],
+        "instance": m["instance"]["name"],
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_instances_share_nothing_and_a_restart_in_one_process_starts_empty() {
+    let a = Server::real("iso_a").await;
+    let b = Server::real("iso_b").await;
+    // activity on A only: a transaction, a failing statement, bad credentials
+    a.sql("CREATE TABLE t (id INTEGER PRIMARY KEY)").await;
+    let (st, begin) = a.sql("BEGIN").await;
+    assert_eq!(st, 200);
+    assert_ne!(a.sql("SELEKT broken").await.0, 200);
+    for k in 0..3 {
+        let r = a
+            .http
+            .get(a.url("/v1/status"))
+            .bearer_auth(format!("bad-{k}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+    // activity on B only, concurrently: different shape
+    b.sql("CREATE TABLE u (id INTEGER PRIMARY KEY)").await;
+    wait_for_generation(&a, 3).await;
+    wait_for_generation(&b, 3).await;
+    let fa = observability_fingerprint(&a).await;
+    let fb = observability_fingerprint(&b).await;
+    assert_eq!(fa["sessions_total"], 1);
+    assert_eq!(fa["auth_failures"], 3);
+    assert_eq!(fa["sql_errors"], 1);
+    assert_eq!(
+        fb["sessions_total"], 0,
+        "A's session is invisible to B: {fb}"
+    );
+    assert_eq!(
+        fb["auth_failures"], 0,
+        "A's failed logins are invisible to B: {fb}"
+    );
+    assert_eq!(
+        fb["sql_errors"], 0,
+        "A's failing statement is invisible to B: {fb}"
+    );
+    assert_eq!(fb["security_events"], 0);
+    assert_ne!(fa["instance"], fb["instance"]);
+    // A's session id means nothing to B
+    let r = b
+        .http
+        .post(b.url("/v1/sql"))
+        .bearer_auth(ADMIN_KEY)
+        .json(&json!({"sql": "COMMIT", "session_id": begin["session_id"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(r.status(), 200);
+
+    // Stop B, start a fresh B2 in this same process: nothing of B (or A) may survive.
+    b.stop().await;
+    let b2 = Server::real("iso_b2").await;
+    wait_for_generation(&b2, 2).await;
+    let f2 = observability_fingerprint(&b2).await;
+    assert_eq!(f2["sessions_total"], 0);
+    assert_eq!(f2["queries_listed"], 0, "{f2}");
+    assert_eq!(f2["security_events"], 0, "{f2}");
+    assert_eq!(f2["auth_failures"], 0);
+    assert_eq!(f2["sql_errors"], 0);
+    // ... and A, which kept running throughout, is unaffected and still sampling.
+    let fa2 = observability_fingerprint(&a).await;
+    assert_eq!(fa2["sessions_total"], 1);
+    assert_eq!(fa2["auth_failures"], 3);
+    let (_, m1) = a.get("/v1/metrics/system").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_, m2) = a.get("/v1/metrics/system").await;
+    assert!(m2["sample_generation"].as_u64() > m1["sample_generation"].as_u64());
+    b2.stop().await;
+    a.stop().await;
 }

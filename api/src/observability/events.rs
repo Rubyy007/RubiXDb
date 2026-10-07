@@ -32,6 +32,7 @@ pub mod kind {
     pub const QUERY_TIMEOUT: &str = "query.timeout";
     pub const QUERY_CANCELLED: &str = "query.cancelled";
     pub const SESSION_REJECTED: &str = "session.rejected";
+    pub const SESSION_CLOSED: &str = "session.closed";
     pub const INDEX_RECOVERY: &str = "index_recovery";
     pub const SAMPLER_STATE: &str = "sampler.state";
     pub const HTTP_SERVER_ERROR: &str = "http.server_error";

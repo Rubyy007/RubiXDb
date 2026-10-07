@@ -329,3 +329,277 @@ Rows: 53 — PASS 52, FAIL 1, OPEN 0, NOT REQUIRED 0, NOT TESTED 0, NOT IMPLEMEN
 ## 23. Overall verdict
 
 **OBSERVABILITY: IMPLEMENTED AND VERIFIED — OVERALL PASS NOT DECLARED**, because the mandatory REGRESSION row is FAIL (3 pre-existing failures, verified at clean HEAD and not introduced here); 52 of 53 rows PASS, 1 FAIL, 0 OPEN, 0 NOT TESTED rows (untested areas are listed in section 19); this certifies observability only, not WAL performance, product readiness or production readiness.
+
+
+## 24. CLOSURE - 2026-10-07 (dated addendum; sections 1-23 above are unchanged)
+
+This section is appended; nothing above was rewritten. Where it conflicts with sections 1-23 (for example "OPEN 0 / NOT TESTED 0" in section 22, the "uncommitted working tree" identity in section 0, the health thresholds of section 8, the `disk.*` I/O names, row 49 PASS without a threshold), **this section governs**; the earlier text remains as the historical record. Companion documents: `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` (reconciliation, sections 16-17 closure evidence), `PHASE_RUBIXDB_FULL_OBSERVABILITY_ARCHITECTURE.md` (sections 12.1-12.7), `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md`.
+
+### 24.1 Identity of what was closed
+
+* Repository: branch `master`, HEAD `2cbd5a7e2b1891898c34c58e2adb8df57a9c3acb` (`observability: sampler, system metrics, time series, diagnostics, status --system`) plus the uncommitted closure changes committed together with this section (the closure commit hash is reported in the final report and in `git log`; it cannot be written into a file inside that same commit).
+* Start state: the working tree already held the Prompt 1 documents and the **uncommitted edits of an earlier, stopped closure attempt** (it had stopped at a second P0 defect, section 24.5). That work was resumed, not discarded; every claim below was re-measured with the final build.
+* **Final build used for every measurement:** `E:\rubixdb_closure\rubixdb_final2.exe`, SHA-256 `044c45eaecd30fa07f38c7528f15a6a90867962f587a9c7d5fd517363280373e`, built 2026-10-06 23:58 from the working tree. No file under `src/`, `api/src/`, `cli/src/`, `instance/src/` is newer than it; only tests and documents changed afterwards. It reports `git_revision 2cbd5a7e2b18` **without** `-dirty` although the tree was modified (row A10, FAIL). Reference binaries: prior certified `E:\rubixdb_recon\rubixdb_certified_fe511ff.exe`; Prompt 1 HEAD build `rubixdb_head_5c01ef.exe`; pre-observability baseline `rubixdb_base_8e4737.exe` (`8e47379`).
+* Protected paths: zero diff (row B14).
+
+### 24.2 Maintainer decisions applied (value actually used)
+
+| ID | Decision | Applied as |
+|---|---|---|
+| D1 | Health policy | Option 3: `failed` = not ready, or coordinator `poisoned`, or `StorageFull`, or lock `not_held`; `degraded` = `StoragePressure`; otherwise `healthy`. 10 % free-space rule is the advisory `disk.free_advisory` (`low`/`ok`/`unknown`) with `disk.free_advisory_threshold_percent` echoed; 30 s grace removed; lock probe three-valued (`instance.lock_state`). The `coordinator poisoned` term is the closure's own reading of "repository-defined terminal state" after D5 left readiness constant (maintainer to confirm). |
+| D2 | Session leak (P0) | Fixed (24.4). |
+| D3 | Disk I/O naming | `process.{read,write}_ops_per_sec`, `process.{read,write}_mb_per_sec` (series `process_*`); `disk.*` is volume capacity / free / sizes / advisory only; `device_*` reserved and empty (no such key exists). |
+| D4 | Device-level I/O | NOT REQUIRED FOR V1; feasibility evidence recorded (unelevated `IOCTL_DISK_PERFORMANCE`, 4-27 us, no new crate). |
+| D5 | Readiness | Maintainer's later instruction, option **R2 + additive extension**: `/readyz.ready` keeps its certified meaning (constant `true`); `instance.readiness` and `/readyz.ready` both call `sampler::ready()`; nothing reads `sync_failures()` for readiness; new additive `instance.coordinator_state`; ADR-OBS-01 proposes extending `/readyz` later (OPEN policy, not applied). |
+| D6 | `last_flush_ms` | Kept `null`; contract documented (doc comment, architecture 12.4, OPEN_ITEMS). No engine change. |
+| D7 | Overhead threshold | Left blank, so the defaults apply: idle RSS delta <= +2.0 MB, idle CPU <= 0.1 % of one core, thread delta <= +2, load p95 within the baseline run-to-run range. |
+| D8 | Soak | 2 h wall-clock minimum: achieved 127.5 min (24.7). |
+| D9 | Item B | Closed as NOT REPRODUCED, status OPEN with cause NOT TESTED (environment limitation); Prompt 1's volume reused; not re-investigated. |
+| D10 | Item C | Deferred to a SQL/runtime phase; recorded in `OPEN_ITEMS.md` with Prompt 1's measurement (~489-530 tokio blocking threads under 16-client SQL load). Runtime untouched. |
+| D11 | State documents | `docs/PROJECT_STATE.md` and `missions/ACTIVE.md` created, minimal; `CLAUDE.md` not amended. |
+
+### 24.3 Code and test changes
+
+`api/src/sql_session.rs`, `api/src/routes/sql.rs` (session lease and cap, D2); `api/src/observability/{sampler,mod,ring,events}.rs`, `api/src/routes/{metrics_system,health}.rs` (D1, D3, D5, D6, D9); `cli/src/host.rs` (three-valued lock probe), `cli/src/ops_cmd.rs` (`status --system` prints `coordinator=`, `lock=`, advisory, `process io`); tests `api/tests/observability.rs` (34 tests), `cli/tests/observability_integration.rs` (6 tests), unit tests in `sql_session.rs` and `sampler.rs`. No file in `src/` (engine), no dependency, no `Cargo.toml` / `Cargo.lock` changed.
+
+### 24.4 P0: session registry leak (D2)
+
+* **Reproduced first** on the Prompt 1 HEAD build with a real server and real sockets (`ghost_repro.py`, 60 sessions each `BEGIN` then a heavy `SELECT` carrying the session id, socket reset mid-statement): 3 s and 23 s after the last abort `sessions_total` 60 (all `executing`, ages 7.7 s -> 27.8 s), `active_sessions` 60, `active_transactions` 0, `COMMIT` on the first 10 non-200 (`final/ghost_before_head.txt`).
+* **Fix:** `SessionLease` (`routes/sql.rs`) closes the observation entry and emits a `session.closed` event (existing event shape, `CLIENT_DISCONNECTED`) when the statement future is dropped; the transaction is rolled back by the existing `Transaction` drop path (no second rollback path); the per-principal cap counts `SessionMeta.principal`, so an executing session counts.
+* **After, same script, final build:** `sessions_total` 0, `active_sessions` 0, `active_transactions` 0 at both 3 s and 23 s (`final/ghost_after_final.txt`). A second client can open a session at once, and the cap rejects at the cap (`a_disconnect_mid_statement_inside_a_transaction_leaves_no_session_behind`, `per_principal_cap_counts_a_session_whose_statement_is_running`). Soak: 716 mid-statement aborts, `sessions_total` never above 2.
+
+### 24.5 Second P0 found during closure: readiness flapped under write load (D5)
+
+The earlier closure attempt derived readiness from `GroupCommitStats::sync_failures()` (`sync_attempts - sync_successes`, two independent atomics): it is transiently 1 while an fsync is in flight (`PHASE_WRITE_ENGINE_MEMORY_INVESTIGATION.md` section 7), so `/readyz` and `instance.readiness` flapped. Measured with 4 writers on real binaries (`final/readyz_flap_before_after.txt`):
+
+| Binary | `/readyz.ready` false | `instance.readiness` not_ready | `instance.healthy` failed |
+|---|---|---|---|
+| earlier closure attempt (readiness from `sync_failures()`) | 374 of 426 | 76 of 85 | 76 of 85 |
+| Prompt 1 HEAD build | 0 of 424 | 46 of 84 | 0 of 84 |
+| **final (R2)** | **0 of 424** | **0 of 84** | **0 of 84** |
+
+The work stopped there and the maintainer chose R2 (24.2). The same counter still feeds `errors.wal_sync_failures` (row A81) and the certified `/v1/admin/status` `wal.poisoned` (row C09): both measured wrong under load; neither was changed.
+
+### 24.6 Overhead methodology (D7) and measurements
+
+Methodology: fresh process per run on a copy of the same 20,000-row data, 16 closed-loop clients, no observer poller, 5 runs per workload per binary interleaved (BASELINE, PROMPT 1, FINAL per workload per run; `overhead_final.py`). The FINAL column passes iff idle RSS delta <= +2.0 MB, idle CPU <= 0.1 % of one core, thread delta <= +2 and the load p95 median lies within the BASELINE run-to-run range (reported). Raw runs: `E:\rubixdb_closure\overhead_final\` (45 JSON files, `analysis.txt`).
+
+| Workload / metric | BASELINE `8e47379` (pre-observability) | PROMPT 1 `2cbd5a7` build | FINAL (this mission) |
+|---|---|---|---|
+| idle RSS MB, median of 5 runs (min-max) | 12.58 (12.53-12.59) | 13.06 (13.05-13.17) | 13.06 (13-13.29) |
+| idle threads (median per run; min-max) | 14 (14-14) | 15 (15-15) | 15 (15-15) |
+| idle handles | 104 (104-104) | 105 (105-105) | 105 (105-107) |
+| idle CPU, harness field (cores, resolution 0.001), 5 runs | 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0 | 0, 0, 0.001, 0, 0 |
+| read (16 clients, 15 s): p50 ms, median (min-max) of 5 | 0.562 (0.503-0.719) | 0.546 (0.523-0.567) | 0.558 (0.525-0.581) |
+| read (16 clients, 15 s): p95 ms, median (min-max) of 5 | 1.547 (0.926-2.112) | 1.397 (1.1-1.515) | 1.471 (1.082-1.769) |
+| read (16 clients, 15 s): p99 ms, median (min-max) of 5 | 2.91 (1.525-4.434) | 2.627 (1.978-2.919) | 2.825 (1.92-3.534) |
+| read (16 clients, 15 s): req/s, median (min-max) of 5 | 21820.3 (16363.9-27760.7) | 23057.9 (21731.1-25648.6) | 22255.3 (20133.3-25748.6) |
+| read: server CPU cores | 5.586 (5.397-5.795) | 5.546 (5.476-5.682) | 5.752 (5.239-5.874) |
+| read: RSS max MB | 30.67 (23.86-33.03) | 29.27 (26.44-30.43) | 30.49 (25.53-33.28) |
+| read: threads max | 449 (216-529) | 403 (296-433) | 435 (278-530) |
+| read: handles max | 566 (333-646) | 520 (413-550) | 552 (395-647) |
+| write (16 clients, 15 s): p50 ms, median (min-max) of 5 | 63.188 (60.294-68.565) | 64.743 (58.539-68.353) | 61.971 (59.968-66.3) |
+| write (16 clients, 15 s): p95 ms, median (min-max) of 5 | 74.77 (72.085-76.402) | 74.482 (68.504-75.386) | 73.182 (68.072-73.637) |
+| write (16 clients, 15 s): p99 ms, median (min-max) of 5 | 87.795 (76.731-90.925) | 87.075 (83.125-92.947) | 84.91 (81.23-88.309) |
+| write (16 clients, 15 s): req/s, median (min-max) of 5 | 247.5 (235.3-259.7) | 244.2 (234.5-268.4) | 251.6 (239.4-262.4) |
+| write: server CPU cores | 0.251 (0.187-0.312) | 0.253 (0.231-0.297) | 0.241 (0.198-0.337) |
+| write: RSS max MB | 15.94 (15.86-16.02) | 16.65 (16.52-17.08) | 16.53 (16.35-16.58) |
+| write: threads max | 33 (33-33) | 34 (34-34) | 34 (34-34) |
+| write: handles max | 143 (143-147) | 144 (144-148) | 144 (142-148) |
+
+D7 applied to the FINAL column: idle RSS delta **+0.48 MB** (limit 2.0); idle thread delta **+1** (limit 2); **read p95 median 1.471 ms** inside the baseline range 0.926-2.112; **write p95 median 73.18 ms** inside the baseline range 72.09-76.40; idle CPU: the harness field has 0.001-core resolution (FINAL run 3 read 0.001), so a precise measurement was made from cumulative process CPU time over 3 x 120 s per binary (`precise_idle_cpu.py`): BASELINE 0.0 / 0.0 / 0.0 %, FINAL 0.026 / 0.0 / 0.026 % of one core (limit 0.1 %; Windows CPU time resolves in 15.6 ms ticks, i.e. 0.013 % over 120 s). All five thresholds met; row A67 PASS. (The read-load thread and handle counts vary widely between runs in every column, 216-530 threads: the tokio blocking pool, item C / D10.)
+
+### 24.7 Soak (D8) and retention attribution
+
+* **Run:** real release process `rubixdb_final2.exe` launched as a real process, data directory `D:\rubixdb_soak\root` (D: had 33.4 GB free), log **outside the repository: `D:\rubixdb_soak\soak_log.jsonl`** (126 per-minute records), `soak_summary.json`, `soak_restart_reference.json`, analysis `D:\rubixdb_soak\soak_analysis.json` (copy `E:\rubixdb_closure\final\soak_analysis.txt`). Wall clock **7,652.3 s = 127.5 min** (no simulated clock). Profile: 15 min idle, 45 min read (8 readers at 200 req/s), 45 min write (4 writers), 15 min read + write + 4 metrics-endpoint clients, 5 min cool-down; session churn (7,162 cycles, 716 aborted mid-statement), queries / events / time-series pollers and a 10 Hz `/v1/metrics/system` observer throughout; compactions (4 cycles) and flushes ran.
+* **A first soak attempt (2 h 7 min) was INVALID and discarded** (`D:\rubixdb_soak_attempt2_INVALID_port_collision`): the control instance was started first and took port 302, so the soak server fell back to a random port and every soak client hit the wrong instance (all 401s). This was a launch-order mistake in the harness, not a product result. The valid run above started the soak first (it owns port 302) and the control instance second (own port), and was verified from its first record before being left running.
+* **Results:** sampler `running` in every record; generations 1 -> 7,561, **0 gaps, 0 regressions**; maximum snapshot age 1,015 ms; health `healthy` throughout; observer / diagnostic / client errors 0, non-200 responses 0 on every workload. Client latency medians: read p50 0.398 ms / p95 0.834 ms / p99 0.99 ms at 1,600 req/s; write p50 13.9 ms / p95 16.6 ms at ~282 req/s; metrics endpoint under the mixed load p50 0.149 ms / p95 0.221 ms / p99 0.263 ms at ~24.9 k req/s. Observer maxima per phase 8.05 / 18.5 / 459 / 895 / 444 ms (idle / read / write / mixed / first cool-down minute; host saturated, row A66). Occupancy inside documented bounds (sessions <= 2, queries <= 200, events <= 200 per ring, series 15 / 240 / 125 points for 15 m / 1 h / 24 h).
+* **Observability memory:** the observability-only control instance (same pollers, no SQL) held RSS 12.08 -> 13.41 MB over 130 min, min 12.08, max 14.44; non-decreasing steps 56.6 % (a monotonic-growth rule of >= 90 % is not met); slope 0.65 MB/h overall, 0.46 MB/h in the second half; threads 14-17, handles 131-134, sockets 2, constant. No monotonic RSS growth from observability.
+* **Return to baseline (traffic-free tail):** 90 s with no poller, no worker and no request in flight: threads **14 vs baseline 15 (-1, within +/-1)**, sockets 1 vs 2, **handles 121 vs 112 (+9; restart reference on the same data 109): NOT within +/-2 (row A83, FAIL)**. During the 5-minute cool-down (pollers still issuing ~3 statements/s) threads stayed at 31 and handles at 138 (blocking-pool threads are kept alive by that trickle; they decay only once traffic stops).
+* **Attribution of the retention (not observability):** the same 3-minute read + write load with no pollers (`attribution.py`, `final/attribution.json`) on the pre-observability baseline `8e47379` and on the final build:
+
+| | idle before | end of load | +60 s | +420 s |
+|---|---|---|---|---|
+| baseline `8e47379`: threads / handles / RSS MB | 17 / 104 / 12.57 | 90 / 206 / 28.44 | 14 / 119 / 25.28 | 14 / 118 / 25.29 |
+| final: threads / handles / RSS MB | 18 / 107 / 13.11 | 104 / 220 / 30.03 | 15 / 120 / 27.83 | 15 / 119 / 27.78 |
+
+  The engine retains about +14 handles and +12.7 MB after this load with no observability code at all; the final build retains +12 handles and +14.7 MB. The main soak instance therefore ended at RSS 57.9 MB (idle start 17.2 MB; 17.6 MB after a restart on the same data): that growth is the write path, not observability, and is recorded in `OPEN_ITEMS.md`; it was not investigated.
+
+### 24.8 API compatibility diff (black box)
+
+Method: `compat.py` starts the certified binary and the final binary on copies of the same data and compares, for `/healthz`, `/readyz`, `/v1/status`, `/v1/metrics`, `/v1/admin/status` (and the unmatched route): status, headers (content-type, cache-control, CSP, nosniff, referrer-policy), no-key / bad-key / POST behaviour, error shape, every JSON path and type, and latency over 200 sequential requests. **Result: 0 differences for all five endpoints and the unmatched route.** `/v1/metrics/system` (added in `2cbd5a7`, so it is also in the certified binary) differs in exactly 12 schema paths, every one justified by a decision:
+
+| Change | Decision |
+|---|---|
+| ADDED `instance.lock_state` (str) | D1 |
+| ADDED `instance.coordinator_state` (str) | D5 (additive extension) |
+| ADDED `disk.free_advisory` (str), `disk.free_advisory_threshold_percent` (float) | D1 |
+| REMOVED `disk.read_iops`, `disk.write_iops`, `disk.read_mb_per_sec`, `disk.write_mb_per_sec` | D3 (rename) |
+| ADDED `process.read_ops_per_sec`, `process.write_ops_per_sec`, `process.read_mb_per_sec`, `process.write_mb_per_sec` | D3 (rename) |
+
+Not purely additive, as the maintainer was told: four existing field names moved by D3. No field was retyped. `instance.readiness` keeps its type (string). Security headers (CSP, nosniff, referrer-policy, cache-control) unchanged on every endpoint; loopback only; no secret in any observability response (`no_api_key_appears_in_any_observability_response`).
+
+### 24.9 Full regression and classification
+
+Commands (logs `E:\rubixdb_closure\final\reg_*.log`, per-suite table `suite_tables.txt`): `cargo fmt --all -- --check` (exit 0), `cargo clippy --workspace --all-targets --all-features -- -D warnings` (exit 0), `cargo check --workspace --all-targets --all-features` (exit 0), `cargo test --workspace --no-fail-fast` (1,346 passed, 2 failed, 28 ignored), `cargo test --release --workspace --no-fail-fast` (1,347 passed, 3 failed, 26 ignored). The observability suites by name: `api/tests/observability.rs` 34/34, `security_events_and_headers` 10/10, `api_integration` 16/16, `admin_ops` 12/12, `api_security_validation` 11/11, `api_http_fuzz` 4/4, `api_cancellation` 1/1, CLI `observability_integration` 6/6, `rubixdb-api --lib` 77 passed 1 ignored (debug and release).
+
+| Failing test | Where | Class | Evidence |
+|---|---|---|---|
+| `repo_hygiene::no_tracked_credentials_json` | debug, release | PRE-EXISTING | the file is tracked at `8e47379` and HEAD (`git ls-tree`) |
+| `repo_hygiene::no_tracked_file_contains_a_64_hex_admin_key_literal` | debug, release | PRE-EXISTING | same file |
+| `m1_3_thousand_writers_throughput` | release | PRE-EXISTING, INTERMITTENT | workspace 43,228 ops/s; isolated 111,824 / 60,610 / 92,078 on this tree; clean `8e47379` worktree 55,256 / 80,562 / 110,880; `src/` has zero diff vs HEAD |
+| `sampler_start_stop_100_times_leaves_no_thread_behind` (first release run only) | release | INTRODUCED BY THIS MISSION'S TEST, FIXED | see B13: 11 of 12 repeated runs failed while 10 of 10 isolated runs passed; skipping this mission's in-process write-load test: 6 of 6 pass; fixed by moving that check into the real-process CLI suite (no existing test edited); then 10 of 10 pass |
+
+### 24.10 Changed test assertion (Decision D1) - stated explicitly
+
+* **File and test:** `api/tests/observability.rs`, `health_follows_storage_state_and_disk_free_and_leaves_readiness_alone`.
+* **Old expectation (at `2cbd5a7`):** with free space at `total / 10 - 1` (just under 10 %), `instance.healthy` is `degraded`; at exactly `total / 10` and above it is `healthy`.
+* **New expectation:** at `total / 10 - 1`, `instance.healthy` is `healthy` and `disk.free_advisory` is `low`; at exactly `total / 10`, `healthy` and `ok`; the `healthy` expectations at 10 % and above are unchanged.
+* **Reason:** **Decision D1 explicitly reverses the policy: the 10 % rule is now advisory and no longer an input of `instance.healthy`. The assertion changed because the policy changed, not because the test was flaky, intermittent or inconvenient.** No other health assertion in that test was weakened (StoragePressure -> degraded, StorageFull -> failed, lock lost -> failed all stay asserted). The other edits to existing tests are the mechanical D3 renames (`disk_*` -> `process_*`) with an added test that the old names are absent.
+
+### 24.11 Findings recorded, not fixed (outside the approved items)
+
+* A10 (FAIL): `-dirty` suffix not applied to a binary built from a modified tree.
+* A32 (FAIL): `untracked_active` is cumulative (Prompt 1 P2).
+* A81 (FAIL): `errors.wal_sync_failures` shows a phantom 1 under write load; C09 (FAIL): the certified `/v1/admin/status` `wal.poisoned` is true under write load with no failure.
+* A83 (FAIL): handle count after the soak, attributed to the engine (24.7).
+* A80 (NOT IMPLEMENTED): an fsync-poisoned committer is not visible without an engine accessor (ADR-OBS-01).
+* Not tested: A09, A12, A14, A16, A19, A64, A70, A71, A82.
+
+### 24.12 Final certification matrix
+
+Statuses are exactly PASS / FAIL / OPEN / NOT REQUIRED / NOT TESTED / NOT IMPLEMENTED. The three sections are independent: no status transfers between them and each has its own arithmetic.
+
+#### A. OBSERVABILITY IMPLEMENTATION STATUS
+
+| # | Row | Status | Evidence |
+|---|---|---|---|
+| A01 | HEALTH classification (`instance.healthy`) | **PASS** | `sampler::classify_health` (pure) + `collect`; unit `policy_tests::health_rules_one_by_one`; integration `health_follows_storage_state_and_disk_free_and_leaves_readiness_alone` (StoragePressure -> degraded, StorageFull -> failed, lock lost -> failed, each back to healthy), `a_three_valued_lock_probe_never_reads_unavailable_as_lost`, `storage_pressure_degrades_and_the_advisory_echoes_its_threshold`. Soak: `healthy` in every one of 7,561 generations. Decision D1. |
+| A02 | HEALTH rule: readiness false -> `failed` at once (30 s grace removed) | **PASS** | Classifier level: `policy_tests::health_rules_one_by_one` (`classify_health(false, ..) == failed`, no timer). End to end the rule cannot fire today because readiness is constant `true` (D5/R2); it stays in the classifier so ADR-OBS-01 would flow through it. Decision D1. |
+| A03 | HEALTH rule: lock probe, real instance lock, `held` path | **PASS** | Real process: `cli/tests/observability_integration.rs::a_real_owner_reports_the_lock_as_held_and_one_readiness_on_both_endpoints` (`lock_state == held`, `status --system` prints `lock=held`); soak: `lock_state` `held` throughout. Three-valued probe: `a_three_valued_lock_probe_never_reads_unavailable_as_lost` (closure probe: unavailable -> healthy, not_held -> failed). Decision D1. |
+| A04 | READINESS endpoint (`/readyz` meaning unchanged; index recovery reported beside it) | **PASS** | Black-box inventory against the certified binary: `/readyz` 0 differences in status / headers / auth / error shape / schema (`E:\rubixdb_closure\compat\diff.txt`); `readiness_stays_true_while_safe_index_recovery_runs`; soak: `/readyz` `{ready:true, storage_state:Healthy, index_recovery:complete}` at the end. |
+| A05 | READINESS UNIFICATION (`instance.readiness` and `/readyz.ready`: one definition) | **PASS** | Both call `sampler::ready()` (`sampler.rs:280`, `const fn` returning `true`): `sampler.rs:465` (per tick, stored as `instance.readiness`) and `routes/health.rs:47` (per request). Two call sites of one constant function, not one call; they cannot disagree. Tests: `policy_tests::readiness_is_one_constant_definition`; real binary under 4-writer load `readyz_and_instance_readiness_stay_true_and_equal_under_real_write_load` (> 50 polls, > 4 generations, > 100 writes, 0 deviations); `readyz_under_write2.py`: 0 of 424 `/readyz` false, 0 of 84 `readiness` not_ready (the earlier derivation from `sync_failures()`: 374 of 426 and 76 of 85). Decision D5 (option R2). Type note: `/readyz.ready` is bool, `instance.readiness` is the string `ready`/`not_ready` (both pre-existing types kept). |
+| A06 | STATUS and other pre-existing endpoints unchanged (`/healthz`, `/readyz`, `/v1/status`, `/v1/metrics`, `/v1/admin/status`) | **PASS** | Black-box inventory, certified binary `rubixdb_certified_fe511ff.exe` vs final build, same data: 0 differences in status, headers (content-type, cache-control, CSP, nosniff, referrer), auth (no key / bad key / POST), error shape and JSON schema for all five plus the unmatched route; latency over 200 sequential requests equal within noise (`compat.py`, `diff.txt`). |
+| A07 | PRODUCT VERSION / BUILD IDENTITY | **PASS** | Final build `/v1/observability/version`: `product_version 0.1.0`, `build_identifier 0.1.0-release-x86_64-windows`, `git_revision`, `startup_timestamp_unix_ms`; no path, host, user or credential. Tests `version_reports_product_version_build_identity_and_startup_time`, unit `identity_has_no_paths_and_a_null_revision_is_allowed`. Revision truthfulness is A10. |
+| A08 | GIT REVISION UNKNOWN -> `null` (no-git release build) | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch (`version_nogit.py`: `git_revision: null`); `api/build.rs` and `observability/version.rs` unmodified. |
+| A09 | DEV-PROFILE (debug) BUILD IDENTITY, revision unknown | **NOT TESTED** | No debug no-git binary was built (`api/build.rs` `emit_profile`). |
+| A10 | GIT REVISION `-dirty` SUFFIX FRESHNESS | **FAIL** | Observed this mission: the binary soaked and measured here was built from a modified working tree (14 modified files) and reports `git_revision 2cbd5a7e2b18` with no `-dirty` (`E:\rubixdb_closure\final\wsf_version.txt`). `api/build.rs` re-evaluates only when `.git/HEAD`, `.git/index` or the override change. Not fixed (not an approved item); the build recorded at commit time is rebuilt from the committed tree so its revision is the new commit's. |
+| A11 | METRICS SNAPSHOT shape (groups, types, nulls) | **PASS** | `metrics_system_has_every_required_field_with_the_right_types` (now also `instance.coordinator_state`), `a_platform_that_measures_nothing_yields_nulls_never_zeros`; 34/34 debug and release. |
+| A12 | `errors.*` (4), `limits.wal_backpressure_rejections`, `limits.sql_resource_limit_hits`, `storage_state`: presence / type / value | **NOT TESTED** | No test asserts them (unchanged since Prompt 1 A12). `errors.wal_sync_failures` is A82. |
+| A13 | METRIC FRESHNESS (timestamp, generation, age, state, stale) | **PASS** | `a_wedged_sampler_goes_stale_then_failed_and_recovers_when_unblocked`, `a_dead_sampler_is_visible_as_stale_and_failed_never_as_current_data`. Soak: snapshot age <= 1,015 ms over 7,561 generations. |
+| A14 | FRESHNESS when no snapshot exists yet (`stale:false` with `age_ms:null`) | **NOT TESTED** | `routes/metrics_system.rs` no-snapshot branch; not exercised (Prompt 1 A14). |
+| A15 | SAMPLER HEALTH (running / degraded / failed / not_started) | **PASS** | `cpu_rss_and_disk_read_failures_null_the_field_degrade_the_sampler_and_never_stop_it`, `a_panic_in_a_tick_is_contained_and_the_sampler_recovers`, `a_wedged_sampler_...`, `a_dead_sampler_...`. |
+| A16 | SAMPLER: 5 consecutive panicking ticks -> `failed` | **NOT TESTED** | `a_sampler_that_keeps_failing_is_logged_once_and_reads_failed` asserts `failed` and exactly one WARN line, but the 5-panic transition through a real panicking probe is not exercised end to end (Prompt 1 A16 unchanged). |
+| A17 | SAMPLER START LOGGING (start failure logged once at WARN; state `failed`) | **PASS** | `sampler::report_start_failure` (log + `failed`); tests `a_sampler_that_could_not_start_logs_the_reason_and_reads_failed_not_not_started`, `a_sampler_that_keeps_failing_is_logged_once_and_reads_failed`. Caveat: the start-failure test drives the handler through a `#[doc(hidden)]` test hook, because a thread-spawn failure cannot be forced from outside; `cli/src/host.rs` still ends in `.ok()`, after the log. Reuses the existing `tracing` path. Decision D9. |
+| A18 | TIME-SERIES (windows, resolution, bounds, 400 on bad window, null for never measured, <= 2 MiB) | **PASS** | `timeseries_windows_resolution_empty_history_and_invalid_window`, `timeseries_returns_injected_history_oldest_first_with_exact_resolution_and_a_size_cap`; series renamed (A78). |
+| A19 | TIME-SERIES over real 24 h / 7 d wall-clock | **NOT TESTED** | The 127.5-min soak filled the real 15 m (15 points) and 1 h (240 points) windows and 125 of 1,440 points of the 24 h window; a real 24 h / 7 d run was not performed (environment: no such run available in this session). |
+| A20 | REQUEST THROUGHPUT | **PASS** | `rates_and_gauges_follow_real_load_and_fall_back_when_it_stops`. |
+| A21 | SQL THROUGHPUT | **PASS** | Same test. |
+| A22 | WRITE THROUGHPUT | **PASS** | Same test. |
+| A23 | LATENCY DISTRIBUTION (`latency.query_p50/p95/p99_ms`) | **PASS** | `latency_percentiles_are_consistent_with_client_measured_times`. Definition caveat unchanged (handler time of the newest 1,000 SQL requests). |
+| A24 | ACTIVE CONNECTIONS | **PASS** | `rates_and_gauges_...`; soak: sockets 2-18 under load, back to 1 in the traffic-free tail. |
+| A25 | ACTIVE SESSIONS gauge and `/v1/observability/sessions` truthfulness | **PASS** | Was FAIL in Prompt 1. After the fix: `a_disconnect_mid_statement_inside_a_transaction_leaves_no_session_behind`; real binary `ghost_repro.py`: 60 aborted sessions -> `sessions_total` 0 / `active_sessions` 0 (before: 60 / 60). Soak: 716 aborted mid-statement sessions, `sessions_total` never above 2, final 1 (the one held session). |
+| A26 | ACTIVE TRANSACTIONS | **PASS** | Reuses `TxnMetrics`; soak final `active_transactions` 1 = the one held session's transaction. |
+| A27 | ACTIVE QUERIES | **PASS** | `running_and_cancelled_queries_are_visible_while_real_expensive_queries_run`. |
+| A28 | QUERY STATES | **PASS** | Same + `queries_endpoint_lists_bounded_records_never_sql_text`. |
+| A29 | QUERY TIMEOUTS | **PASS** | `a_statement_past_its_deadline_is_recorded_as_timed_out_with_an_event`. |
+| A30 | QUERY CANCELLATIONS | **PASS** | `running_and_cancelled_...`; in-transaction case: `a_disconnect_mid_statement_...` (A77). |
+| A31 | QUERY FAILURES | **PASS** | `queries_endpoint_...never_sql_text`, `events_endpoint_...`. |
+| A32 | TRACKED / UNTRACKED QUERY COUNTER CONSISTENCY (`untracked_active`) | **FAIL** | Unchanged from Prompt 1: `queries.rs:123,156,174`, `routes/observability.rs:93`: `untracked_active` is a cumulative counter, not a gauge. Not an approved item of this mission (Prompt 1 proposal P2); not fixed. |
+| A33 | PROCESS CPU | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch (`cpu_xval.py`: 71.14 / 72.60 / 72.26 % vs psutil 70.93 / 72.45 / 72.41 %); `probe.rs` unmodified. |
+| A34 | PROCESS RSS | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch (15,900,672 vs 15,908,864 B). |
+| A35 | SYSTEM MEMORY | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch (equal to psutil to the byte). |
+| A36 | DISK CAPACITY | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch (equal to psutil to the byte). |
+| A37 | DISK FREE | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch (equal to psutil to the byte). |
+| A38 | DATABASE SIZE (`disk.db_bytes`) and its age (`sizes_age_ms`) | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch; soak `sizes_age_ms` never above the 10 s refresh period. |
+| A39 | WAL SIZE / segment count | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch; soak: `wal.segment_count` 1 -> 2 as writes ran. |
+| A40 | SSTABLE SIZE | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch; soak: live SSTables 0 -> 3 -> 2 across 4 compaction cycles. |
+| A41 | PROCESS I/O measurement | **PASS** | Prompt 1 measurement (2026-10-06, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` section 3.A) on code this mission did not touch (process write ops = commits 1:1). |
+| A42 | DISK I/O LABELLING (process-level unmistakable) | **PASS** | Was FAIL. Fields are now `process.{read,write}_ops_per_sec`, `process.{read,write}_mb_per_sec`, documented in code and `ARCHITECTURE` 12.2 as the process's own I/O, not device activity (device saw 2.0x ops and ~177x bytes in Prompt 1 section 10). See A78. Decision D3. |
+| A43 | DEVICE-LEVEL DISK I/O | **NOT REQUIRED** | Decision D4. Feasibility evidence (`ioctl_probe.py`, Prompt 1): `IOCTL_DISK_PERFORMANCE` reads unelevated in 4-27 us with no new crate; exposing it is a v2 policy decision. The `device_*` namespace is reserved and empty (test asserts none). |
+| A44 | WAL STATE | **PASS** | `metrics_system_has_every_required_field_with_the_right_types`. |
+| A45 | COMPACTION STATE | **PASS** | Same test; soak: `compactions` 4 cycles reported, `compaction_running()` unchanged accessor. |
+| A46 | INDEX RECOVERY STATE | **PASS** | `readiness_stays_true_while_safe_index_recovery_runs`. |
+| A47 | BACKGROUND OPERATIONS (`flush_queue_depth`, `pending_groups`, `index_build_state`) | **PASS** | Shape test; soak `flush_queue` series. |
+| A48 | FLUSH TIMESTAMP `background.last_flush_ms` | **NOT REQUIRED** | Decision D6: always `null` in v1; the engine exposes no flush-completion timestamp; no engine change, no sampler-observed substitute. Contract in the field's doc comment (`routes/metrics_system.rs`), `ARCHITECTURE` 12.4 and `OPEN_ITEMS.md` 2026-10-07; asserted null by the shape test. |
+| A49 | RESOURCE-LIMIT COUNTERS `rate_limited`, `sessions_rejected` | **PASS** | `rate_limit_rejections_are_counted_with_events`, `session_cap_refusals_and_admin_actions_are_counted_and_visible`. |
+| A50 | SECURITY EVENT COUNTERS | **PASS** | Same suites + CLI `two_real_instances_keep_every_surface_apart_...` (alpha 3 auth failures, beta 0). |
+| A51 | OPERATIONAL EVENT RETRIEVAL | **PASS** | `events_endpoint_is_bounded_clamped_and_keeps_security_and_operational_apart`. |
+| A52 | STRUCTURED LOGGING (existing `security.log`) | **PASS** | `security_events_and_headers` 10/10 (debug and release), lib unit tests. |
+| A53 | LOG BOUNDS (`security.log`) | **PASS** | `security_log.rs` unit tests (in the 77 lib tests); module unmodified. |
+| A54 | EVENT BOUNDS (rings 256 + 256, <= 200 returned) | **PASS** | `events_endpoint_...` flood test; soak: operational events returned never above 200. |
+| A55 | OPERATIONAL EVENT PERSISTENCE | **NOT REQUIRED** | v1 contract: bounded in-memory history (`events.rs:6-8`); durable security events go to the bounded `security.log`. CLI `killing_the_owner_and_restarting_it_starts_observability_state_from_empty`. |
+| A56 | METRIC CARDINALITY (closed key set) | **PASS** | `adversarial_inputs_never_grow_the_metric_key_set`. |
+| A57 | METRIC / RING MEMORY BOUNDS | **PASS** | Ring unit tests + compile-time assertion `ring.rs`; soak occupancy within documented bounds (A72). |
+| A58 | NO UNBOUNDED GROWTH FROM ANY REQUEST (all registries) | **PASS** | Was FAIL (session-observation map). After the fix the map is cleaned on every exit path and counts against the per-principal cap: `per_principal_cap_counts_a_session_whose_statement_is_running` (unit), `a_disconnect_mid_statement_inside_a_transaction_leaves_no_session_behind`; soak: 716 aborts, `sessions_total` <= 2. |
+| A59 | SAMPLER FAILURE HANDLING (probe failure, panic, wedge) | **PASS** | Tests in A15. |
+| A60 | SNAPSHOT CONSISTENCY (no torn reads) | **PASS** | `back_to_back_reads_while_the_sampler_ticks_never_see_a_torn_snapshot`. |
+| A61 | MULTI-INSTANCE ISOLATION (re-verified, two real instances running together) | **PASS** | Real processes: CLI `two_real_instances_keep_every_surface_apart_and_a_restarted_one_starts_fresh` (metrics, sessions, queries, events, version, resources, background state of alpha vs beta: no cross-contamination under concurrent activity) and `two_real_instances_report_only_their_own_identity_and_a_stopped_one_leaves_the_other`; in-process `two_instances_report_only_their_own_data_...`. The soak ran a second real instance (control) beside the main one on a different port: no interference. |
+| A62 | RESTART BEHAVIOR (state fresh; no global registry survives) | **PASS** | CLI `killing_the_owner_and_restarting_it_starts_observability_state_from_empty`; CLI two-instance test restarts beta (same id, new start time, 0 auth failures, 0 events, 0 sessions, alpha unchanged); in-process `two_concurrent_instances_share_nothing_and_a_restart_in_one_process_starts_empty` (fails if a global mutable registry survived). |
+| A63 | CRASH BEHAVIOR (process kill) | **PASS** | Same CLI tests (process kill; not graceful stop, not power loss). |
+| A64 | POWER LOSS | **NOT TESTED** | Belongs to durability certification; observability state is memory-only. Not tested. |
+| A65 | API PERFORMANCE gate: `/v1/metrics/system` p95 < 50 ms with 16 readers | **PASS** | `metrics_system_p95_is_below_50ms_with_16_concurrent_readers` (debug and release); soak mixed phase: 4 metrics clients at ~24.9 k req/s alongside 8 readers and 4 writers: p50 0.149 ms, p95 0.221 ms, p99 0.263 ms. |
+| A66 | API TAIL LATENCY (reported 387 ms - 1.35 s maxima) | **OPEN** | Decision D9: closed as NOT REPRODUCED, cause NOT TESTED (environment limitation); not re-investigated. Prompt 1 volume: 12,107,104 requests in 27 runs, slowest 214.0 ms; 1,852,006 requests in the original harness shape, slowest 65.7 ms; every request > 50 ms fell in the first 100 ms of a synchronized client start. Closes when the original host conditions can be reproduced. In this soak the 10 Hz observer's per-phase maxima were 8.05 ms (idle), 18.5 ms (read), 459 ms (write), 895 ms (mixed, 16 client processes saturating the host) and 444 ms (the first cool-down minute, when the load stopped); medians stayed 0.15-0.85 ms. Not attributed. |
+| A67 | OBSERVABILITY OVERHEAD vs baseline (threshold D7) | **PASS** | D7 defaults applied to the FINAL column (5 runs per workload, interleaved, `overhead_final/analysis.txt`): idle RSS delta +0.48 MB (<= 2.0), idle CPU 0.026 % of one core at most over 3 x 120 s (<= 0.1; baseline 0.0 %), thread delta +1 (<= 2), read p95 median 1.471 ms inside the baseline range 0.926-2.112, write p95 median 73.18 ms inside the baseline range 72.09-76.40. See the overhead table in this section. |
+| A68 | CLI OBSERVABILITY (`rubixdb status --system`) | **PASS** | `status_system_prints_the_live_snapshot_and_never_a_credential`; prints `coordinator=` and `lock=`. |
+| A69 | GUI API COMPATIBILITY (existing endpoints untouched) | **PASS** | A06. |
+| A70 | GUI / BROWSER CONSUMPTION of the new endpoints | **NOT TESTED** | No frontend code references them (no screen exists). |
+| A71 | NON-WINDOWS RUNTIME | **NOT TESTED** | Environment limitation: Windows only; WSL2 has no Rust toolchain. Linux branches compile only; `disk_total_free` returns `None` off Windows. |
+| A72 | REAL WALL-CLOCK SAMPLER SOAK (2 h, real process, real clients) | **PASS** | 127.5 min (7,652.3 s), 126 per-minute records, `D:\rubixdb_soak\soak_log.jsonl`. Profile 15 min idle / 45 read / 45 write / 15 mixed with a 4-client metrics load / 5 cool-down; sessions, queries, events pollers and mid-statement aborts throughout. Sampler `running` in every record; generations 1 -> 7,561 with 0 gaps and 0 regressions; max snapshot age 1,015 ms; 0 observer errors, 0 diagnostic errors, 0 client errors, 0 non-200 on any workload; observability-only control instance RSS 12.08 -> 13.41 MB (non-decreasing steps 56.6 %, not monotonic; 0.65 MB/h, second half 0.46 MB/h), threads 14-17, handles 131-134, sockets 2 throughout; threads in the 90 s traffic-free tail 14 vs baseline 15 (-1); sockets 1 vs 2; ring/series/event occupancy within bounds (sessions <= 2, queries <= 200, events <= 200, series 15/240/125 points). Decision D8. |
+| A73 | STANDALONE `rubixdb-api` BINARY | **NOT REQUIRED** | `OPEN_ITEMS.md` 2026-10-04 SG-6 / D-2; unchanged. |
+| A74 | READER PRIVILEGE POLICY for the observability endpoints | **NOT REQUIRED** | The v1 host provisions one principal, `local`, Admin (`cli/src/host.rs`). |
+| A75 | DOCUMENTATION | **PASS** | Architecture sections 12.1-12.7, this closure section, RESULTS sections 16-17, PROGRESS / CHANGELOG / OPEN_ITEMS appended, ADR-OBS-01, `docs/PROJECT_STATE.md`, `missions/ACTIVE.md`. The Prompt 1 inconsistencies listed in RESULTS A75 are corrected by this dated section (the earlier text is kept above, unmodified). |
+| A76 | HEALTH POLICY (Option 3: repository-defined states only; 10 % rule advisory; 30 s grace dropped; three-valued lock) | **PASS** | All of: `failed` = not ready / coordinator poisoned / StorageFull / lock not_held; `degraded` = StoragePressure; 9.9 % free -> healthy + advisory `low`, 10.0 % -> healthy + `ok` (`health_follows_storage_state_and_disk_free_and_leaves_readiness_alone`); lock `unavailable` neither failed nor any other change (`a_three_valued_lock_probe_never_reads_unavailable_as_lost`); documented in `ARCHITECTURE` 12.1 / 12.7 with the threshold labelled provisional, not a guarantee. One existing assertion changed because the policy changed (see "Changed test assertion"). Decision D1. |
+| A77 | SESSION REGISTRY LEAK (disconnect mid-statement inside a transaction) | **PASS** | Reproduced on the Prompt 1 HEAD build (`ghost_before_head.txt`): 60 of 60 aborted sessions stay `executing`, `active_sessions` 60 vs `active_transactions` 0, `COMMIT` on them non-200. Fixed (`SessionLease`, `routes/sql.rs`; cap counts `meta`, `sql_session.rs`): same script on the final build: 0 / 0 / 0 and COMMIT non-200 (`ghost_after_final.txt`). Regression tests: `a_disconnect_mid_statement_inside_a_transaction_leaves_no_session_behind` (counts back to baseline, cap rejects at the cap, a new session opens at once, one `session.closed` event per abort), `per_principal_cap_counts_a_session_whose_statement_is_running`. The transaction is rolled back by the existing `Transaction` drop path; the event reuses the existing shape. Decision D2. |
+| A78 | DISK I/O NAMING (`process.*`; `disk.*` = volume only; `device_*` reserved and empty) | **PASS** | `process_io_is_named_as_process_level_and_the_old_disk_names_are_absent` (old names absent, no `device*` key); black-box diff: the four `disk.*` I/O fields removed and `process.*` added, nothing else changed (approved rename, see API compatibility). Decision D3. |
+| A79 | COORDINATOR STATE (additive `instance.coordinator_state`: alive / poisoned / not_started) | **PASS** | `policy_tests::coordinator_state_comes_from_public_pool_state_only`; `an_orderly_engine_stop_changes_coordinator_state_only_never_readiness`; real binary: `alive` under 4-writer load and in the soak's final state. Limit: A80. |
+| A80 | COMMITTER-POISON VISIBILITY (fsync-poisoned committer) | **NOT IMPLEMENTED** | `LsmEngine` exposes no accessor for `GroupCommitter::is_poisoned()`; adding one is an engine change not authorised here. `coordinator_state == poisoned` covers only a dead coordinator thread (`PoolState::Failed`). Proposed in `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md` (OPEN policy). |
+| A81 | `errors.wal_sync_failures` truthfulness | **FAIL** | Reads `GroupCommitStats::sync_failures()` = `sync_attempts - sync_successes`, transiently 1 while an fsync is in flight (`PHASE_WRITE_ENGINE_MEMORY_INVESTIGATION.md` section 7). Measured on the final binary under 4 writers: non-zero in 97 of 108 polls, values {0, 1}, no write failed (`wsf_version.txt`). Not an approved item; not changed. |
+| A82 | REAL lock probe: `not_held` and `unavailable` paths on a real instance | **NOT TESTED** | Only the `held` path of `InstanceLock::try_acquire` is exercised on a real instance; lost-lock and I/O-error outcomes were exercised with closure probes only (A03). |
+| A83 | SOAK: handle count returns to baseline +/- 2 (D8 literal criterion) | **FAIL** | Traffic-free tail (90 s, no request in flight): 121 handles vs idle baseline 112 (+9; restart reference on the same data 109). Attribution (`attribution.py`, same read+write load, no pollers): the pre-observability baseline binary `8e47379` retains +14 handles (104 -> 118) and +12.7 MB RSS, the final binary +12 (107 -> 119) and +14.7 MB; the observability-only control instance stayed at 131-134 handles. So the retention is the engine/runtime, not observability, but the criterion as written is not met. Recorded in `OPEN_ITEMS.md`; the maintainer may redefine it. |
+
+Rows: **83** - PASS 63, FAIL 4, OPEN 1, NOT REQUIRED 5, NOT TESTED 9, NOT IMPLEMENTED 1  (check: 63 + 4 + 1 + 5 + 9 + 1 = 83)
+
+#### B. WORKSPACE REGRESSION STATUS
+
+| # | Row | Status | Evidence |
+|---|---|---|---|
+| B01 | `cargo fmt --all -- --check` | **PASS** | exit 0 (`reg_fmt.log`). |
+| B02 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **PASS** | exit 0 (`reg_clippy.log`); NOT TESTED in Prompt 1. |
+| B03 | `cargo check --workspace --all-targets --all-features` | **PASS** | exit 0 (`reg_check.log`). |
+| B04 | `api/tests/observability.rs`, debug and release | **PASS** | 34 passed in each; release 10 of 10 consecutive full-suite runs after the fix (see B13). |
+| B05 | `api/tests/security_events_and_headers.rs` | **PASS** | 10/10 debug and release. |
+| B06 | `api_integration` (16), `admin_ops` (12), `api_security_validation` (11), `api_http_fuzz` (4), `api_cancellation` (1) | **PASS** | All pass in debug and release (`suite_tables.txt`). |
+| B07 | `rubixdb-api --lib` | **PASS** | 77 passed, 1 ignored, debug and release. |
+| B08 | CLI `observability_integration` | **PASS** | 6/6 debug and release (adds the real-process lock/readiness test, the two-instance restart test and the 4-writer readiness test). |
+| B09 | `tests/repo_hygiene.rs` (2 of 4 tests) | **FAIL** | `no_tracked_credentials_json`, `no_tracked_file_contains_a_64_hex_admin_key_literal`: `frontend/.e2e-crossbrowser-data/default/credentials.json` is tracked at `8e47379` and at HEAD (`git ls-tree`). Class: PRE-EXISTING (`OPEN_ITEMS.md` 2026-10-04); not caused by observability. |
+| B10 | `m1_3_thousand_writers_throughput` (release, >= 80,000 ops/s) | **FAIL** | Workspace run: 43,228 ops/s (first run 43,557). Isolated on this tree: 111,824 / 60,610 / 92,078. Clean `8e47379` (separate worktree, same test): 55,256 / 80,562 / 110,880. `git diff HEAD -- src/` is empty. Class: PRE-EXISTING, INTERMITTENT (engine WAL throughput; unrelated to observability). |
+| B11 | `cargo test --workspace --no-fail-fast` (debug) | **FAIL** | 1,346 passed, 2 failed, 28 ignored: exactly the two B09 tests. Both PRE-EXISTING. |
+| B12 | `cargo test --release --workspace --no-fail-fast` | **FAIL** | 1,347 passed, 3 failed, 26 ignored: the two B09 tests and B10. All three PRE-EXISTING. |
+| B13 | Failures introduced by this mission | **PASS** | One occurred and is fixed: `sampler_start_stop_100_times_leaves_no_thread_behind` failed in the first release workspace run and in 11 of 12 repeated full-suite runs of the release observability binary (threads 86-87 -> 88-95) while passing 10 of 10 alone; cause (proven by skipping): this mission's new in-process write-load test grew the tokio blocking pool in the same process (skipping it: 6 of 6 pass; `--test-threads=1`: 2 of 2). Class: INTRODUCED BY THIS MISSION'S TEST (test interference, not a sampler leak). Fix: the write-load check moved to the real-process CLI suite; no existing test was edited for it. After: 10 of 10 consecutive passes, and the final workspace runs above. |
+| B14 | Protected paths: zero diff (`src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`, `src/error.rs`) | **PASS** | `git diff --stat HEAD -- src/wal/ src/manifest/ src/sstable/ src/compaction/ src/error.rs` (working tree) and `git diff --cached --stat` on the same paths: both empty. `git diff --stat HEAD -- src/ Cargo.toml Cargo.lock`: empty (the observability commit's `LsmEngine::compaction_running()` accessor is already in HEAD `2cbd5a7`; nothing added since). |
+
+Rows: **14** - PASS 10, FAIL 4, OPEN 0, NOT REQUIRED 0, NOT TESTED 0, NOT IMPLEMENTED 0  (check: 10 + 4 + 0 + 0 + 0 + 0 = 14)
+
+#### C. WHOLE-PRODUCT PRODUCTION READINESS
+
+| # | Row | Status | Evidence |
+|---|---|---|---|
+| C01 | WAL throughput gate M1.3 (>= 80,000 ops/s) | **FAIL** | B10; `OPEN_ITEMS.md`. |
+| C02 | No tracked credential material in the repository | **FAIL** | B09. |
+| C03 | Power-loss durability | **NOT TESTED** | A64; `PHASE_RUBIXDB_FINAL_SINGLE_NODE_PRODUCTION_CERTIFICATION.md`. |
+| C04 | Real disk-full (ENOSPC) | **NOT TESTED** | `PHASE_RUBIXDB_PRODUCTION_OPERATIONS_RESULTS.md` F14: injected `StorageFull` only. |
+| C05 | Lifecycle baseline findings F-07, F-08, F-11, F-18 | **OPEN** | `OPEN_ITEMS.md` 2026-10-05. |
+| C06 | `docs/PROJECT_STATE.md` and `missions/ACTIVE.md` exist (required reading per `CLAUDE.md`) | **PASS** | Created by this mission (D11); minimal. |
+| C07 | Standalone `rubixdb-api` (unsupported for v1) | **NOT REQUIRED** | D-2. |
+| C08 | Observability layer meets its own matrix (section A) | **OPEN** | Section A contains FAIL, OPEN, NOT TESTED and NOT IMPLEMENTED rows (totals in section A). |
+| C09 | Certified `GET /v1/admin/status` field `wal.poisoned` is truthful under write load | **FAIL** | `api/src/routes/admin.rs:253` (`g.sync_failures() > 0`, unchanged since the certified build): true in 100 of 108 polls under 4 writers on the final binary with no write failing (`wsf_version.txt`). Pre-existing in a certified endpoint; not changed (out of scope). |
+
+Rows: **9** - PASS 1, FAIL 3, OPEN 2, NOT REQUIRED 1, NOT TESTED 2, NOT IMPLEMENTED 0  (check: 1 + 3 + 2 + 1 + 2 + 0 = 9)
+
+### 24.13 Verdict (2026-10-07)
+
+* **OBSERVABILITY IMPLEMENTATION: mixed.** 63 of 83 rows PASS; 4 FAIL (A10, A32, A81, A83), 1 OPEN (A66), 9 NOT TESTED, 5 NOT REQUIRED, 1 NOT IMPLEMENTED. Every defect the maintainer approved for this mission is fixed and verified (P0 session leak, health policy, disk I/O naming, readiness unification, flush-timestamp contract, sampler start logging, state documents). The remaining FAIL rows are findings outside the approved items; they are listed, not hidden.
+* **OBSERVABILITY CERTIFICATION: not PASS.** The rule "PASS for the observability scope only if every row in section A is PASS or NOT REQUIRED" is not met (4 FAIL, 1 OPEN, 9 NOT TESTED, 1 NOT IMPLEMENTED).
+* **WORKSPACE REGRESSION: FAIL**, entirely PRE-EXISTING (`repo_hygiene` x2 and the intermittent `m1_3`); nothing introduced by this mission remains (B13).
+* **WHOLE-PRODUCT PRODUCTION READY: NOT DECLARED** (`CLAUDE.md`: the mandatory matrix must be entirely PASS first).

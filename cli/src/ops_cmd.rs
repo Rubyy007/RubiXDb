@@ -288,9 +288,13 @@ fn status_system(conn: &Connection, json: bool) -> i32 {
             .unwrap_or_else(|| "-".into())
     };
     println!(
-        "SYSTEM      health={} readiness={} up {:.0}s  sampler={} age_ms={} generation={}",
+        "SYSTEM      health={} readiness={} coordinator={} lock={} up {:.0}s  sampler={} age_ms={} generation={}",
         san(g(&v, &["instance", "healthy"]).as_str().unwrap_or("-")),
         san(g(&v, &["instance", "readiness"]).as_str().unwrap_or("-")),
+        san(g(&v, &["instance", "coordinator_state"])
+            .as_str()
+            .unwrap_or("-")),
+        san(g(&v, &["instance", "lock_state"]).as_str().unwrap_or("-")),
         g(&v, &["instance", "uptime_seconds"])
             .as_f64()
             .unwrap_or(0.0),
@@ -314,20 +318,21 @@ fn status_system(conn: &Connection, json: bool) -> i32 {
         bytes(&["memory", "system_total_bytes"])
     );
     println!(
-        "disk        volume_free={} of {} ({}% used)  db={} wal={} sstables={}",
+        "disk        volume_free={} of {} ({}% used, advisory={})  db={} wal={} sstables={}",
         bytes(&["disk", "volume_free_bytes"]),
         bytes(&["disk", "volume_total_bytes"]),
         fmt1(g(&v, &["disk", "volume_used_percent"])),
+        san(g(&v, &["disk", "free_advisory"]).as_str().unwrap_or("-")),
         bytes(&["disk", "db_bytes"]),
         bytes(&["disk", "wal_bytes"]),
         bytes(&["disk", "sstable_bytes"])
     );
     println!(
-        "process io  read_iops={} write_iops={} read={} MB/s write={} MB/s  (this process, not the device)",
-        fmt1(g(&v, &["disk", "read_iops"])),
-        fmt1(g(&v, &["disk", "write_iops"])),
-        fmt1(g(&v, &["disk", "read_mb_per_sec"])),
-        fmt1(g(&v, &["disk", "write_mb_per_sec"]))
+        "process io  read_ops={}/s write_ops={}/s read={} MB/s write={} MB/s  (this process, not the device)",
+        fmt1(g(&v, &["process", "read_ops_per_sec"])),
+        fmt1(g(&v, &["process", "write_ops_per_sec"])),
+        fmt1(g(&v, &["process", "read_mb_per_sec"])),
+        fmt1(g(&v, &["process", "write_mb_per_sec"]))
     );
     println!(
         "rates       http={}/s sql={}/s commits={}/s  connections={} sessions={} txns={} active_queries={}",

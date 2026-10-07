@@ -87,9 +87,11 @@ pub struct SqlSessionMetricsSnapshot {
 
 /// What stays known about a session for its whole life, including while a statement is running
 /// (during which its `SqlSession` is checked out of `sessions`). Used only for observation and
-/// to keep the original creation time: it holds no transaction, no principal, no SQL.
-#[derive(Debug, Clone, Copy)]
+/// to keep the original creation time and to count the session against its principal's cap
+/// while a statement is running: it holds no transaction and no SQL.
+#[derive(Debug, Clone)]
 struct SessionMeta {
+    principal: String,
     created_at: Instant,
     last_active: Instant,
     executing: bool,
@@ -142,9 +144,14 @@ impl SqlSessionRegistry {
     /// principal's fair share of it).
     pub fn create(&self, principal: &str, txn: Transaction) -> Result<Uuid, SqlSessionLimitError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let owned_by_principal = sessions
+        // The cap counts every open session of the principal, including one whose statement is
+        // running right now (checked out of `sessions`): `meta` holds all of them.
+        let owned_by_principal = self
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .values()
-            .filter(|s| s.principal == principal)
+            .filter(|m| m.principal == principal)
             .count();
         if owned_by_principal >= self.limits.max_sessions_per_principal {
             return Err(SqlSessionLimitError::TooManySessionsForPrincipal);
@@ -163,6 +170,7 @@ impl SqlSessionRegistry {
         self.meta.lock().unwrap_or_else(|p| p.into_inner()).insert(
             id,
             SessionMeta {
+                principal: principal.to_string(),
                 created_at: now,
                 last_active: now,
                 executing: false,
@@ -276,7 +284,7 @@ impl SqlSessionRegistry {
             .into_iter()
             .take(limit)
             .map(|id| {
-                let m = meta[id];
+                let m = &meta[id];
                 let age = now.duration_since(m.created_at);
                 let idle = if m.executing {
                     Duration::ZERO
@@ -498,6 +506,35 @@ mod tests {
         );
         // A different principal is unaffected -- independent budgets.
         assert!(registry.create("bob", dummy_txn(&txm)).is_ok());
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_principal_cap_counts_a_session_whose_statement_is_running() {
+        let (txm, engine, dir) = test_txm();
+        let registry = SqlSessionRegistry::new(SqlSessionLimits {
+            max_sessions_per_principal: 2,
+            ..SqlSessionLimits::default()
+        });
+        let a = registry.create("alice", dummy_txn(&txm)).unwrap();
+        let b = registry.create("alice", dummy_txn(&txm)).unwrap();
+        // Both statements are running: both transactions are checked out of `sessions`.
+        let ta = registry.take(a, "alice").unwrap();
+        let tb = registry.take(b, "alice").unwrap();
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(
+            registry.create("alice", dummy_txn(&txm)),
+            Err(SqlSessionLimitError::TooManySessionsForPrincipal),
+            "executing sessions still count against the principal's cap"
+        );
+        registry.finish(a);
+        drop(ta);
+        assert!(
+            registry.create("alice", dummy_txn(&txm)).is_ok(),
+            "a freed slot is usable at once"
+        );
+        drop(tb);
         engine.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

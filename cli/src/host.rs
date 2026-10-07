@@ -284,11 +284,20 @@ impl EmbeddedServer {
                             .parent()
                             .map(|p| p.to_path_buf())
                             .unwrap_or_default();
-                        state.obs.set_lock_probe(Arc::new(move || {
-                            matches!(
-                                rubixdb_instance::InstanceLock::try_acquire(&lock_dir),
-                                Err(rubixdb_instance::LockAcquireError::AlreadyLocked)
-                            )
+                        // Three-valued (Decision D1): `AlreadyLocked` = held (this process owns it);
+                        // acquiring it = nobody holds it (not held; the guard drops at once); an
+                        // I/O error = the probe could not find out (unavailable, never "not held").
+                        state.obs.set_lock_state_probe(Arc::new(move || {
+                            use rubixdb_api::observability::LockState;
+                            match rubixdb_instance::InstanceLock::try_acquire(&lock_dir) {
+                                Err(rubixdb_instance::LockAcquireError::AlreadyLocked) => {
+                                    LockState::Held
+                                }
+                                Ok(_released_at_once) => LockState::NotHeld,
+                                Err(rubixdb_instance::LockAcquireError::Io(_)) => {
+                                    LockState::Unavailable
+                                }
+                            }
                         }));
                         let mut sampler = rubixdb_api::observability::sampler::start(&state).ok();
                         let reaper = rubixdb_api::sql_session::spawn_reaper(

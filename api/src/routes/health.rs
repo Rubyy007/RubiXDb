@@ -42,7 +42,9 @@ pub struct ReadyBody {
 /// learn from this endpoint.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> Json<ReadyBody> {
     Json(ReadyBody {
-        ready: true,
+        // The one readiness definition (`observability::sampler::ready`), unchanged in meaning: the
+        // same value `GET /v1/metrics/system` reports as `instance.readiness` (`true` <=> `"ready"`).
+        ready: crate::observability::sampler::ready(),
         storage_state: format!("{:?}", state.engine.storage_state()),
         index_recovery: state.index_recovery.state().as_str(),
     })

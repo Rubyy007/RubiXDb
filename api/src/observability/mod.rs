@@ -75,9 +75,29 @@ impl ObsCounters {
 #[derive(Debug, Clone, Copy)]
 pub struct RequestId(pub u64);
 
-/// A probe that answers "does this process still hold the instance lock?" (`true` = held).
-/// Installed by the embedded host, which owns the lock; absent for the standalone binary.
-pub type LockProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+/// What the instance-lock probe could establish. `Unavailable` means the probe could not find
+/// out (an I/O error, or no probe is installed): it is reported as such and is **never** treated
+/// as "not held".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockState {
+    Held,
+    NotHeld,
+    Unavailable,
+}
+
+impl LockState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockState::Held => "held",
+            LockState::NotHeld => "not_held",
+            LockState::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// A probe that answers "does this process still hold the instance lock?". Installed by the
+/// embedded host, which owns the lock; absent for the standalone binary (reads `unavailable`).
+pub type LockProbe = Arc<dyn Fn() -> LockState + Send + Sync>;
 
 #[derive(Default)]
 pub struct Observability {
@@ -91,7 +111,18 @@ pub struct Observability {
 }
 
 impl Observability {
-    pub fn set_lock_probe(&self, p: LockProbe) {
+    /// Installs a two-valued probe (`true` = held). Convenience over [`Self::set_lock_state_probe`].
+    pub fn set_lock_probe(&self, p: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.set_lock_state_probe(Arc::new(move || {
+            if p() {
+                LockState::Held
+            } else {
+                LockState::NotHeld
+            }
+        }));
+    }
+
+    pub fn set_lock_state_probe(&self, p: LockProbe) {
         *self.lock_probe.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
     }
 
@@ -102,9 +133,10 @@ impl Observability {
             .clone()
     }
 
-    /// Health policy: `degraded` when free space on the data volume is below this percent of
-    /// the volume's total. **A choice made in this implementation, not a repository policy**;
-    /// documented in the certification document as requiring review.
+    /// Threshold of the **advisory** `disk.free_advisory` field: `low` when free space on the data
+    /// volume is below this percent of the volume's total. A provisional value, **not a policy and
+    /// not an input of `instance.healthy`** (Decision D1, Option 3): it is echoed in the response
+    /// as `disk.free_advisory_threshold_percent` so nobody mistakes it for a guarantee.
     pub fn disk_low_percent(&self) -> f64 {
         10.0
     }

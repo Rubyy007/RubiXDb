@@ -6,6 +6,44 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Observability closure (2026-10-07)
+
+Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` section 24, `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` sections 16-17, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ADR_01.md`.
+
+#### Fixed
+
+- A client disconnect while a statement runs inside an explicit transaction no longer leaves a permanent session entry (`active_sessions` is truthful, the per-principal cap counts executing sessions, a `session.closed` event is recorded).
+
+#### Changed (`GET /v1/metrics/system`; the five older endpoints are byte-for-byte compatible in the black-box inventory)
+
+- Renamed: `disk.read_iops`, `disk.write_iops`, `disk.read_mb_per_sec`, `disk.write_mb_per_sec` -> `process.read_ops_per_sec`, `process.write_ops_per_sec`, `process.read_mb_per_sec`, `process.write_mb_per_sec` (the process's own I/O, not device activity); time-series names likewise (`process_*`).
+- `instance.healthy` follows repository-defined states only (`failed`: coordinator poisoned / `StorageFull` / lock not held; `degraded`: `StoragePressure`); the 10 % free-space rule is now the advisory `disk.free_advisory`; the 30 s grace is gone.
+
+#### Added
+
+- `instance.lock_state` (`held` | `not_held` | `unavailable`), `instance.coordinator_state` (`alive` | `poisoned` | `not_started`), `disk.free_advisory`, `disk.free_advisory_threshold_percent`; `rubixdb status --system` prints them.
+- A WARN log line when the sampler cannot start or keeps failing; `docs/PROJECT_STATE.md`, `missions/ACTIVE.md`.
+
+#### Unchanged
+
+- `/readyz.ready` keeps its certified meaning (constant `true`); `instance.readiness` reports the same value from the same function. `background.last_flush_ms` stays `null`. No engine, dependency or protected-path change. ADR-OBS-01 (extending `/readyz`) is PROPOSED, not applied.
+
+### Docs: Full observability reconciliation (2026-10-06, read-only; no code change)
+
+Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md`, `PHASE_RUBIXDB_FULL_OBSERVABILITY_ARCHITECTURE.md`.
+
+#### Added
+
+- `PHASE_RUBIXDB_FULL_OBSERVABILITY_ARCHITECTURE.md` (the layer as built at `2cbd5a7`) and `PHASE_RUBIXDB_FULL_OBSERVABILITY_RESULTS.md` (fresh three-part matrix, classification of the twelve open items, health-policy decision packet, latency investigation, verifications, proposed fixes P1-P14, maintainer decisions).
+
+#### Found (documented, not fixed)
+
+- Session-observation entries leak after a client disconnect mid-statement inside a transaction (`active_sessions` inflated, unbounded); `untracked_active` is cumulative; `disk.*_iops` / `*_mb_per_sec` are process-level but unlabelled; health thresholds have no approved policy; `/readyz.ready` and `instance.readiness` are two different definitions; several fields and rules are untested.
+
+#### Unchanged
+
+No production source, test, dependency or protected path was modified; `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md` is unchanged (closure addendum belongs to the next prompt).
+
 ### Product: Full observability -- sampler, system metrics, time series, diagnostics (2026-10-06)
 
 Full record: `PHASE_RUBIXDB_FULL_OBSERVABILITY_CERTIFICATION.md`.

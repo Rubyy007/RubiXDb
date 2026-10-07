@@ -23,10 +23,10 @@ pub const SAMPLE_BYTES: usize = 16;
 pub const SERIES_NAMES: [&str; 8] = [
     "cpu_process_percent",
     "memory_rss_bytes",
-    "disk_read_iops",
-    "disk_write_iops",
-    "disk_read_mb_per_sec",
-    "disk_write_mb_per_sec",
+    "process_read_ops_per_sec",
+    "process_write_ops_per_sec",
+    "process_read_mb_per_sec",
+    "process_write_mb_per_sec",
     "sql_queries_per_sec",
     "active_queries",
 ];

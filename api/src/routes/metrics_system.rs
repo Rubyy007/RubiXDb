@@ -54,6 +54,8 @@ pub async fn system(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "uptime_seconds": uptime,
                 "healthy": Value::Null,
                 "readiness": Value::Null,
+                "lock_state": Value::Null,
+                "coordinator_state": Value::Null,
             },
         }),
         Some(s) => {
@@ -76,7 +78,13 @@ pub async fn system(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "name": state.config.instance_name,
                     "uptime_seconds": uptime,
                     "healthy": s.health,
+                    // The same value `GET /readyz` reports as `ready` (`ready` <=> true).
                     "readiness": s.readiness,
+                    // held | not_held | unavailable (a probe that could not find out says so).
+                    "lock_state": s.lock_state,
+                    // alive | poisoned | not_started: the WAL coordinator's terminal state, from
+                    // public engine state. Additive; it does not change `readiness`.
+                    "coordinator_state": s.coordinator_state,
                 },
                 "cpu": {
                     "process_percent": s.cpu_percent,
@@ -94,16 +102,24 @@ pub async fn system(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "volume_total_bytes": s.disk_total_bytes,
                     "volume_free_bytes": s.disk_free_bytes,
                     "volume_used_percent": disk_used_pct,
+                    // Advisory only (never an input of `instance.healthy`): `low` when free space
+                    // is below the provisional threshold below, `ok`, or `unknown`.
+                    "free_advisory": s.disk_free_advisory,
+                    "free_advisory_threshold_percent": state.obs.disk_low_percent(),
                     "db_bytes": s.db_bytes,
                     "wal_bytes": s.wal_bytes,
                     "sstable_bytes": s.sstable_bytes,
                     "sizes_age_ms": s.sizes_taken_unix_ms.map(|t| s.taken_unix_ms.saturating_sub(t)),
-                    // Process-level I/O as reported by the OS (this process's reads and writes),
-                    // not device-level disk activity.
-                    "read_iops": s.read_iops,
-                    "write_iops": s.write_iops,
-                    "read_mb_per_sec": s.read_mb_per_sec,
-                    "write_mb_per_sec": s.write_mb_per_sec,
+                },
+                // This process's own I/O as the OS reports it (`GetProcessIoCounters`): the
+                // operations and bytes the process requested, NOT device activity (a device does
+                // more: sectors, file-system metadata, flushes). The `device_*` namespace is
+                // reserved and intentionally empty in v1 (Decision D4).
+                "process": {
+                    "read_ops_per_sec": s.process_read_ops_per_sec,
+                    "write_ops_per_sec": s.process_write_ops_per_sec,
+                    "read_mb_per_sec": s.process_read_mb_per_sec,
+                    "write_mb_per_sec": s.process_write_mb_per_sec,
                 },
                 "throughput": {
                     "http_requests_per_sec": s.http_requests_per_sec,
@@ -134,8 +150,9 @@ pub async fn system(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "flush_queue_depth": s.flush_queue_depth,
                     "pending_groups": s.wal_pending_waiters,
                     "index_build_state": s.index_build_state,
-                    // The engine keeps no flush-completion timestamp, so this is not measurable
-                    // here (reported as null rather than invented).
+                    // The engine does not currently expose a flush-completion timestamp; this
+                    // field is always null in v1 (Decision D6: no engine change, no
+                    // sampler-observed substitute, which would be a different field).
                     "last_flush_ms": Value::Null,
                 },
                 "security": {
