@@ -6,6 +6,10 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Observability coverage-gap closure (2026-10-07)
+
+Tests only: three observability rows that were NOT TESTED for want of a test are now covered (`errors.*`, `limits.*` and `storage_state` of `/v1/metrics/system`; the freshness response before any snapshot exists; five consecutive sampler panics driving the state to `failed` and back to `running`, in the new test file `api/tests/observability_sampler_failure.rs`). No production code changed. Section A of the certification is 72 PASS, 0 FAIL, 0 OPEN, 6 NOT REQUIRED, 7 NOT TESTED (85 rows); two value-trigger cases stay NOT TESTED inside row A12. See certification section 28.
+
 ### Observability final closure (2026-10-07)
 
 Observability closure completed: section A of the certification is 69 PASS, 0 FAIL, 0 OPEN, 6 NOT REQUIRED, 10 NOT TESTED (85 rows; A66 reclassified to NOT TESTED - ENVIRONMENT LIMITATION by the maintainer), so the observability implementation status is PASS with every NOT REQUIRED and NOT TESTED row enumerated (section 27). The workspace regression status is FAIL with pre-existing failures only, and whole-product readiness is not declared. No code changed in this step.

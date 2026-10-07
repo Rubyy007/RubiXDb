@@ -2753,3 +2753,207 @@ fn the_embedded_revision_agrees_with_the_working_tree_it_was_built_from() {
     );
     assert_eq!(rev.strip_suffix("-dirty").unwrap_or(rev), head);
 }
+
+// ------------------------------------------------------------------------------------------
+// Coverage-gap closure (rows A12 and A14): the `errors.*` and `limits.*` fields of
+// `/v1/metrics/system`, `storage_state`, and the response while no snapshot exists yet.
+// ------------------------------------------------------------------------------------------
+
+/// The next metrics body whose snapshot was certainly taken after everything the caller did so far
+/// (generation + 2: a tick that was already running when the caller looked may have read its
+/// counters before the caller's trigger finished).
+async fn system_after_a_fresh_sample(s: &Server) -> Value {
+    let (_, v) = s.get("/v1/metrics/system").await;
+    let g = v["sample_generation"].as_u64().unwrap();
+    wait_for_generation(s, g + 2).await;
+    s.get("/v1/metrics/system").await.1
+}
+
+// errors.* : presence and type; `wal_sync_failures` is always null (ADR-OBS-03) and is asserted as
+// the value null, not merely as a key that exists; `sql_errors_since_start` rises by at least one for a
+// statement that does not parse; `http_server_errors_since_start` never decreases and ends at or above
+// the number of 5xx responses the client saw (a write whose fsync fails answers with a 5xx);
+// `wal_write_errors` is an integer (it is an engine counter, measurable on every platform).
+// limits.* : `wal_backpressure_rejections` and `sql_resource_limit_hits` are present, integers and 0
+// at idle. NOT TESTED, by decision (row A12): the value-trigger case of `wal_backpressure_rejections`
+// (no API-level test exercises the pre-existing backpressure path; constructing one is outside this
+// coverage-gap closure) and of `sql_resource_limit_hits` (a statement of 1,024 balanced conjuncts is
+// refused earlier, by the front-end limit on chained operators, and never reaches the planner counter;
+// no special SQL path was built to make it fire).
+// storage_state : a string from the closed set, and `Healthy` here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn errors_and_limits_fields_have_their_documented_type_and_move_with_real_triggers() {
+    let s = Server::real("errors_limits").await;
+    wait_for_generation(&s, 2).await;
+    let m0 = system_after_a_fresh_sample(&s).await;
+
+    // ---- presence, type, idle values
+    let errors = m0["errors"].as_object().expect("errors group present");
+    assert!(errors["http_server_errors_since_start"].is_u64());
+    assert!(errors["sql_errors_since_start"].is_u64());
+    assert!(
+        errors["wal_write_errors"].is_u64(),
+        "an engine counter, measurable on every platform: an integer, never a fabricated 0 for 'unknown'"
+    );
+    assert_eq!(
+        errors.get("wal_sync_failures"),
+        Some(&Value::Null),
+        "errors.wal_sync_failures is present and the value null (ADR-OBS-03)"
+    );
+    let limits = m0["limits"].as_object().expect("limits group present");
+    assert_eq!(limits["wal_backpressure_rejections"].as_u64(), Some(0));
+    assert_eq!(limits["sql_resource_limit_hits"].as_u64(), Some(0));
+    let storage = m0["storage_state"]
+        .as_str()
+        .expect("storage_state is a string");
+    assert!(["Healthy", "StoragePressure", "StorageFull"].contains(&storage));
+    assert_eq!(storage, "Healthy", "normal test conditions");
+
+    let mut http5xx_seen: Vec<u64> =
+        vec![errors["http_server_errors_since_start"].as_u64().unwrap()];
+
+    // ---- a statement that does not parse: sql_errors_since_start rises by at least 1
+    assert_eq!(
+        s.sql("CREATE TABLE t (id INTEGER PRIMARY KEY)").await.0,
+        200
+    );
+    let before = system_after_a_fresh_sample(&s).await["errors"]["sql_errors_since_start"]
+        .as_u64()
+        .unwrap();
+    let (st, _) = s.sql("SELEC nonsense FROM").await;
+    assert!(
+        (400..500).contains(&st),
+        "a parse error is a client error, got {st}"
+    );
+    let m1 = system_after_a_fresh_sample(&s).await;
+    let after = m1["errors"]["sql_errors_since_start"].as_u64().unwrap();
+    assert!(after > before, "sql_errors_since_start {before} -> {after}");
+    http5xx_seen.push(
+        m1["errors"]["http_server_errors_since_start"]
+            .as_u64()
+            .unwrap(),
+    );
+
+    // ---- 5xx: poison the committer through the test seam; the next writes cannot be acknowledged
+    s.state
+        .engine
+        .install_wal_fsync_fault_hook(|| Err(std::io::Error::other("injected fsync failure")));
+    let werr_before = m1["errors"]["wal_write_errors"].as_u64().unwrap();
+    let mut observed_5xx = 0u64;
+    for i in 0..3 {
+        let (st, _) = s
+            .sql(&format!("INSERT INTO t (id) VALUES ({})", 100 + i))
+            .await;
+        assert_ne!(st, 200, "a write whose fsync failed is never acknowledged");
+        if st >= 500 {
+            observed_5xx += 1;
+        }
+    }
+    let m3 = system_after_a_fresh_sample(&s).await;
+    let http5xx_final = m3["errors"]["http_server_errors_since_start"]
+        .as_u64()
+        .unwrap();
+    http5xx_seen.push(http5xx_final);
+    assert!(
+        observed_5xx >= 1,
+        "the failed writes must surface as at least one 5xx"
+    );
+    assert!(
+        http5xx_final >= observed_5xx,
+        "counter {http5xx_final} < observed 5xx {observed_5xx}"
+    );
+    assert!(
+        http5xx_seen.windows(2).all(|w| w[0] <= w[1]),
+        "http_server_errors_since_start must never decrease: {http5xx_seen:?}"
+    );
+    let werr_after = m3["errors"]["wal_write_errors"].as_u64().unwrap();
+    assert!(
+        werr_after > werr_before,
+        "wal_write_errors {werr_before} -> {werr_after} after failed writes"
+    );
+    assert!(m3["errors"].get("wal_sync_failures") == Some(&Value::Null));
+    s.stop().await;
+}
+
+// Row A14: while no snapshot exists yet, the response says `stale: false` and `age_ms: null`; it does
+// not invent an age (not 0) and does not omit the key. The server here is the real router and engine
+// with the sampler never started, so no snapshot is ever published; no hook is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn before_any_snapshot_exists_freshness_is_not_stale_and_age_is_null() {
+    let dir = temp_dir("no_snapshot");
+    let lsm_config = LsmConfig::default();
+    let engine = Arc::new(
+        LsmEngine::open(
+            &dir,
+            WalConfig {
+                sync_mode: SyncMode::GroupCommit {
+                    max_wait: Duration::from_millis(5),
+                    max_batch_bytes: 256 * 1024,
+                },
+                ..WalConfig::default()
+            },
+            BatchCoordinatorConfig {
+                queue_capacity: 256,
+                max_queued_bytes: 16 * 1024 * 1024,
+                submission_timeout: Duration::from_secs(5),
+                shutdown_drain_bound: Duration::from_secs(10),
+                await_retry_budget: Duration::from_secs(5),
+                max_drain_per_batch: 4096,
+            },
+            lsm_config.clone(),
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(AppState::new(
+        engine,
+        lsm_config,
+        test_config(dir.clone(), "no_snapshot"),
+    ));
+    let router = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let conns = state.obs.connections.clone();
+    let join = tokio::spawn(serve_observed(
+        listener,
+        router,
+        async move {
+            let _ = rx.await;
+        },
+        Duration::from_secs(5),
+        ServerLimits::default(),
+        Some(conns),
+    ));
+    let s = Server {
+        state,
+        addr,
+        dir,
+        stop_tx: Some(tx),
+        join: Some(join),
+        sampler: None, // never started
+        http: reqwest::Client::builder().build().unwrap(),
+    };
+    for round in 0..2 {
+        let (st, v) = s.get("/v1/metrics/system").await;
+        assert_eq!(st, 200, "round {round}");
+        let f = v["sample_freshness"].as_object().expect("freshness object");
+        assert_eq!(
+            f.get("stale"),
+            Some(&Value::Bool(false)),
+            "round {round}: {v}"
+        );
+        assert_eq!(f.get("age_ms"), Some(&Value::Null), "round {round}: {v}");
+        assert_eq!(f.get("last_sample_ms"), Some(&Value::Null));
+        assert_eq!(f["state"], "not_started");
+        assert!(v["sample_generation"].is_null());
+        assert!(v["instance"]["healthy"].is_null());
+        // it stays that way: nothing is sampling
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // the rest of the server is unaffected
+    assert_eq!(
+        s.http.get(s.url("/healthz")).send().await.unwrap().status(),
+        200
+    );
+    s.stop().await;
+}
