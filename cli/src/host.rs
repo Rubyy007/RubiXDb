@@ -59,14 +59,39 @@ fn report_recovery(report: &rubixdb_api::recovery::RecoveryReport) {
     }
 }
 
+/// The small, rarely used identity of a running embedded server, boxed so `EmbeddedServer` (carried by value in a
+/// `main.rs` enum) does not grow: `instance_name` for the stop event and, for ADR-WAL-01, the data directory where
+/// the clean-stop attestation is written after the engine has fully stopped.
+struct ServerMeta {
+    instance_name: String,
+    data_dir: std::path::PathBuf,
+}
+
 pub struct EmbeddedServer {
     pub base_url: String,
-    instance_name: Box<str>,
+    meta: Box<ServerMeta>,
     // Held for process lifetime -- dropping releases the OS lock.
     _lock: InstanceLock,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     runtime: Option<tokio::runtime::Runtime>,
     server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// ADR-WAL-01 (F-07): reports what the startup tail policy did on its channels - stderr and the security log. Only
+/// segment / offset / byte count / sequence numbers are ever reported, never the preserved bytes.
+fn report_tail_guard(g: &rubixdb::ops::format::StartupGuard) {
+    for line in g.tail.stderr_lines() {
+        eprintln!("{line}");
+    }
+    for note in g.tail.security_notes() {
+        rubixdb_api::security_log::emit(&rubixdb_api::security_log::SecurityEvent {
+            code: note.code,
+            outcome: "ok",
+            object_kind: Some("wal"),
+            object: Some(&note.object),
+            ..Default::default()
+        });
+    }
 }
 
 fn wal_config() -> WalConfig {
@@ -105,6 +130,8 @@ impl EmbeddedServer {
         // run `startup_env::load` before taking the instance lock; this is the
         // authority for the values actually used.
         let local_env = crate::startup_env::load()?;
+        // ADR-WAL-01: validated here too (it is part of `load`), so a bad value never reaches the guard.
+        let allow_truncate_corrupt_wal = crate::startup_env::load_allow_truncate_corrupt_wal()?;
         // Defense in depth: never serve with a credential the loader would refuse.
         rubixdb_instance::credentials::validate_admin_key(&owned.credentials.admin_key)
             .map_err(|why| format!("instance credential is unusable: {why}"))?;
@@ -196,6 +223,7 @@ impl EmbeddedServer {
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let data_dir_for_thread = config.data_dir.clone();
+        let data_dir_for_attestation = config.data_dir.clone();
         let start_name = instance_name.clone();
         let shutdown_drain = Duration::from_secs(config.shutdown_drain_secs);
 
@@ -205,14 +233,22 @@ impl EmbeddedServer {
                 .name("rubixdb-embedded-server".to_string())
                 .spawn(move || {
                     rt_handle.block_on(async move {
-                        let format_state =
-                            match rubixdb::ops::format::startup_guard(&data_dir_for_thread) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    let _ = ready_tx.send(Err(format!("engine open refused: {e}")));
-                                    return;
-                                }
-                            };
+                        // ADR-WAL-01: the startup-only guard (the format decision and the unchanged `WAL_CORRUPT`
+                        // preflight, then the clean-stop attestation / tail quarantine policy). It only reads until
+                        // every refusal is decided; a refused start leaves the directory untouched.
+                        let format_state = match rubixdb::ops::format::startup_guard_with_tail_policy(
+                            &data_dir_for_thread,
+                            allow_truncate_corrupt_wal,
+                        ) {
+                            Ok(g) => {
+                                report_tail_guard(&g);
+                                g.format_state
+                            }
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(format!("engine open refused: {e}")));
+                                return;
+                            }
+                        };
                         let engine = match LsmEngine::open(
                             &data_dir_for_thread,
                             wal_config(),
@@ -382,7 +418,10 @@ impl EmbeddedServer {
 
         Ok(EmbeddedServer {
             base_url,
-            instance_name: instance_name.into_boxed_str(),
+            meta: Box::new(ServerMeta {
+                instance_name,
+                data_dir: data_dir_for_attestation,
+            }),
             _lock: owned.lock,
             shutdown_tx: Some(shutdown_tx),
             runtime: Some(runtime),
@@ -404,13 +443,25 @@ impl EmbeddedServer {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(5));
         }
+        // ADR-WAL-01 (F-07): the engine has fully stopped (the server thread is joined and the runtime, with every
+        // task that could hold the engine, is dropped), so its WAL lock is released and the directory can be read
+        // back. Attest where the log ends; a failure is reported on stderr and never fails the shutdown.
+        match rubixdb::ops::wal_tail::write_attestation(&self.meta.data_dir) {
+            rubixdb::ops::wal_tail::AttestWrite::Written(_) => {}
+            rubixdb::ops::wal_tail::AttestWrite::NotEligible(why) => {
+                eprintln!("rubixdb: the clean-stop attestation was not written ({why})");
+            }
+            rubixdb::ops::wal_tail::AttestWrite::Failed(why) => {
+                eprintln!("rubixdb: the clean-stop attestation could not be written ({why})");
+            }
+        }
         // A kill leaves a start with no matching stop -- that asymmetry is the
         // record of an unclean exit.
         rubixdb_api::security_log::emit(&rubixdb_api::security_log::SecurityEvent {
             code: rubixdb_api::security_log::code::INSTANCE_STOP,
             outcome: "ok",
             object_kind: Some("instance"),
-            object: Some(&self.instance_name),
+            object: Some(&self.meta.instance_name),
             ..Default::default()
         });
     }

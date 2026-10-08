@@ -6,6 +6,23 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### F-07: a damaged WAL tail after a clean stop is no longer opened silently (ADR-WAL-01, 2026-10-08)
+
+**Added**
+- **`WAL_CLEAN_STOP` attestation.** A graceful `rubixdb gui` shutdown records where the WAL ended (segment, length, last sequence, CRC32C) after the engine has fully stopped. At the next start, if the WAL (or the manifest checkpoint) no longer reaches that sequence, the start is refused with `WAL_TAIL_DAMAGED` (exit 1; names the segment, both sequence numbers and the exact number of missing acknowledged records; the directory is not modified).
+- **Tail quarantine.** Whenever recovery will truncate a torn tail, the exact removed bytes are first preserved in `<data_dir>/wal-quarantine/wal-<segment>.<offset>.<unix_ms>.tail` (header + bytes, CRC32C, temp file + fsync + atomic rename) and reported on stderr, in the security log (`wal.tail_quarantined`) and by the stopped `rubixdb check` (informational `WAL_TAIL_QUARANTINED`). If the bytes cannot be preserved the start is refused (`WAL_TAIL_QUARANTINE_FAILED`).
+- **`RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL=1`** (unset or empty = off; any other value stops startup naming the variable): accepts the loss named by `WAL_TAIL_DAMAGED` (or an unwritable quarantine). It never bypasses `WAL_CORRUPT`. `wal.tail_override` is logged only when it changes an outcome.
+
+**Changed**
+- `rubixdb check` knows `WAL_CLEAN_STOP` and `wal-quarantine/` (no longer `UNEXPECTED_FILE`). `WAL_TORN_TAIL` is still a warning; no exit code changes.
+- Graceful shutdown now performs one extra read-only replay of the stopped WAL and a small fsynced file write (about +70 ms for a 20,000-row WAL; proportional to the number of records retained in the WAL). Start-up time is unchanged.
+
+**Not changed**
+- Anything under `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`, `src/error.rs`; the WAL format and the engine's recovery classification and truncation; `ops::open` (so `rubixdb check` and `restore` behave as before); every existing `WAL_CORRUPT` refusal; `Cargo.toml`, `Cargo.lock`.
+
+**Limits**
+- After a kill or power loss there is no attestation: a damaged acknowledged tail is still truncated (now quarantined and reported). Power loss is NOT TESTED. The standalone `rubixdb-api` binary writes no attestation.
+
 ### Item C: operator-settable cap on the blocking thread pool (2026-10-07)
 
 Added `RUBIXDB_LOCAL_MAX_BLOCKING_THREADS` (integer 16..=512; unset or empty = 512, tokio's default, i.e. the behaviour before this change). It bounds the thread pool every SQL statement runs on (`spawn_blocking`) in the embedded host (`rubixdb gui`); a bad value stops startup and names the variable. Measured (`PHASE_ITEM_C_DISCOVERY.md`, `PHASE_ITEM_C_CERTIFICATION.md`): with 16 clients connecting inside the timed window the server created 165-530 threads in the first fraction of a second and ran at 24.0-29.2k req/s; capped at 16 or 64 the thread count is exactly 18 + cap, throughput 29.5-30.6k req/s and p99 1.14-1.24 ms; warm reads and writes are unchanged. **The default is not changed**, so an operator who sets nothing sees the previous behaviour. ADR-ITEM-C-01. Not changed: `api/`, timeouts, cancellation, sessions, snapshot semantics, error shapes, response schemas, engine (`src/`), `Cargo.toml`, `Cargo.lock`.

@@ -70,6 +70,8 @@ pub mod finding_codes {
     pub const SSTABLE_ORPHAN: &str = "SSTABLE_ORPHAN";
     pub const WAL_CORRUPT: &str = "WAL_CORRUPT";
     pub const WAL_TORN_TAIL: &str = "WAL_TORN_TAIL";
+    /// ADR-WAL-01: a damaged WAL tail that recovery removed was preserved in `wal-quarantine/` (informational).
+    pub const WAL_TAIL_QUARANTINED: &str = "WAL_TAIL_QUARANTINED";
     pub const WAL_UNREADABLE: &str = "WAL_UNREADABLE";
     pub const CHECK_INCOMPLETE: &str = "CHECK_INCOMPLETE";
 }
@@ -816,7 +818,9 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
                 || name == crate::wal::LOCK_FILE_NAME
                 || name == "MANIFEST.tmp"
                 || name == crate::ops::format::DATA_FORMAT_FILE
-                || name == crate::ops::restore::MARKER_FILE;
+                || name == crate::ops::restore::MARKER_FILE
+                || name == crate::ops::wal_tail::ATTESTATION_FILE
+                || name == crate::ops::wal_tail::QUARANTINE_DIR;
             if !known {
                 sink.add(
                     Severity::Info,
@@ -825,6 +829,31 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
                     format!("unrecognised entry {name:?}"),
                 );
             }
+        }
+    }
+    // ---- preserved WAL tails (ADR-WAL-01); read only, Info so no exit code changes ----
+    for (name, parsed, path) in crate::ops::wal_tail::list_quarantine(data_dir) {
+        let object = format!("{}/{name}", crate::ops::wal_tail::QUARANTINE_DIR);
+        match parsed {
+            Ok(h) => sink.add(
+                Severity::Info,
+                fc::WAL_TAIL_QUARANTINED,
+                object,
+                format!(
+                    "{} byte(s) that recovery removed from WAL segment {} at offset {} were preserved in {} (crc32c {:08x}); kept for review, never replayed",
+                    h.length,
+                    h.segment,
+                    h.offset,
+                    path.display(),
+                    h.tail_crc32c
+                ),
+            ),
+            Err(why) => sink.add(
+                Severity::Info,
+                fc::WAL_TAIL_QUARANTINED,
+                object,
+                format!("unrecognised or incomplete quarantine entry at {} ({why}); not a valid preserved tail", path.display()),
+            ),
         }
     }
 

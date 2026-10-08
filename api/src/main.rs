@@ -61,8 +61,35 @@ async fn main() {
     );
     // Refuse a data directory written by an incompatible build BEFORE the
     // engine (and therefore recovery) touches it.
-    let format_state = match rubixdb::ops::format::startup_guard(&config.data_dir) {
-        Ok(s) => s,
+    // ADR-WAL-01 (F-07): the startup-only guard with the WAL tail policy. This unsupported standalone binary writes
+    // no clean-stop attestation, so it reaches the quarantine / reporting half (and honours an attestation left by
+    // the embedded host); the override variable is validated before anything is read or written.
+    let allow_truncate_corrupt_wal = match rubixdb::ops::wal_tail::override_from_env() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rubixdb-api: startup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let format_state = match rubixdb::ops::format::startup_guard_with_tail_policy(
+        &config.data_dir,
+        allow_truncate_corrupt_wal,
+    ) {
+        Ok(g) => {
+            for line in g.tail.stderr_lines() {
+                eprintln!("{line}");
+            }
+            for note in g.tail.security_notes() {
+                rubixdb_api::security_log::emit(&rubixdb_api::security_log::SecurityEvent {
+                    code: note.code,
+                    outcome: "ok",
+                    object_kind: Some("wal"),
+                    object: Some(&note.object),
+                    ..Default::default()
+                });
+            }
+            g.format_state
+        }
         Err(e) => {
             eprintln!("rubixdb-api: startup failed: {e}");
             std::process::exit(1);

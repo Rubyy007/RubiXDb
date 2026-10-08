@@ -110,10 +110,17 @@ pub fn ensure_compatible(dir: &Path) -> Result<FormatState, OpsError> {
 /// without touching the engine.
 pub fn startup_guard(dir: &Path) -> Result<FormatState, OpsError> {
     let state = ensure_compatible(dir)?;
+    wal_preflight(dir)?;
+    Ok(state)
+}
+
+/// The read-only WAL replay preflight shared by both guards. Its refusals (`WAL_CORRUPT`) and their messages are
+/// exactly those `startup_guard` always had; the summary is returned so the tail policy can use it.
+fn wal_preflight(dir: &Path) -> Result<Option<crate::wal::WalReplaySummary>, OpsError> {
     if dir.join("wal").is_dir() {
         let cfg = crate::wal::WalConfig::default();
         match crate::wal::replay_streaming(dir, &cfg, |_, _| Ok(())) {
-            Ok(s) if s.corrupted_segments_count == 0 => {}
+            Ok(s) if s.corrupted_segments_count == 0 => return Ok(Some(s)),
             Ok(s) => {
                 return Err(OpsError::new(
                     codes::WAL_CORRUPT,
@@ -131,7 +138,56 @@ pub fn startup_guard(dir: &Path) -> Result<FormatState, OpsError> {
             }
         }
     }
-    Ok(state)
+    Ok(None)
+}
+
+/// What the startup-only guard decided (ADR-WAL-01).
+#[derive(Debug, Clone)]
+pub struct StartupGuard {
+    pub format_state: FormatState,
+    pub tail: crate::ops::wal_tail::TailReport,
+    /// Wall time of the whole guard (format decision, WAL replay, tail policy, attestation removal).
+    pub guard_micros: u128,
+}
+
+/// **Startup-only successor of [`startup_guard`]** (ADR-WAL-01, F-07), used by `rubixdb gui` (`cli/src/host.rs`) and
+/// the standalone `rubixdb-api`. Order: the format decision and the unchanged `WAL_CORRUPT` preflight first (their
+/// refusals take precedence), then the attestation / quarantine tail policy (`ops::wal_tail`).
+///
+/// **Deliberately not shared with `ops::open::open_engine_for_ops`**, which `rubixdb check` (its logical pass) and
+/// `restore` use: the tail policy writes (quarantine files) and deletes (the attestation), and `check` is documented
+/// read-only; giving it those side effects, or a new refusal, would change its behaviour. `startup_guard` is
+/// unchanged for those callers.
+pub fn startup_guard_with_tail_policy(
+    dir: &Path,
+    allow_truncate_corrupt_wal: bool,
+) -> Result<StartupGuard, OpsError> {
+    startup_guard_with_tail_policy_inner(
+        dir,
+        allow_truncate_corrupt_wal,
+        crate::ops::wal_tail::QuarantineFault::default(),
+    )
+}
+
+pub(crate) fn startup_guard_with_tail_policy_inner(
+    dir: &Path,
+    allow_truncate_corrupt_wal: bool,
+    fault: crate::ops::wal_tail::QuarantineFault,
+) -> Result<StartupGuard, OpsError> {
+    let started = std::time::Instant::now();
+    let format_state = ensure_compatible(dir)?;
+    let summary = wal_preflight(dir)?;
+    let tail = match summary {
+        Some(s) => {
+            crate::ops::wal_tail::apply_tail_policy(dir, &s, allow_truncate_corrupt_wal, fault)?
+        }
+        None => crate::ops::wal_tail::TailReport::default(),
+    };
+    Ok(StartupGuard {
+        format_state,
+        tail,
+        guard_micros: started.elapsed().as_micros(),
+    })
 }
 
 /// Writes the marker (atomically) iff the directory is `Fresh`/empty or

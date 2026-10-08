@@ -32,7 +32,18 @@ fn read(name: &str) -> Result<Option<String>, String> {
 pub fn load() -> Result<LocalServerEnv, String> {
     let env = parse(read(RPS_ENV)?.as_deref(), read(BURST_ENV)?.as_deref())?;
     load_max_blocking_threads()?;
+    load_allow_truncate_corrupt_wal()?;
     Ok(env)
+}
+
+/// `RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL` (ADR-WAL-01, F-07): the operator's explicit acceptance of losing the
+/// acknowledged WAL records that a clean shutdown recorded but the log no longer holds. Unset or empty = off;
+/// exactly `1` = on; anything else stops startup naming the variable (no `true`/`yes`/`01`/padding forms).
+/// It bypasses only the `WAL_TAIL_DAMAGED` refusal (and an unwritable quarantine) - never `WAL_CORRUPT`.
+pub const ALLOW_TRUNCATE_ENV: &str = rubixdb::ops::wal_tail::OVERRIDE_ENV;
+
+pub fn load_allow_truncate_corrupt_wal() -> Result<bool, String> {
+    rubixdb::ops::wal_tail::parse_override(read(ALLOW_TRUNCATE_ENV)?.as_deref())
 }
 
 /// Cap on the embedded server's tokio **blocking thread pool** (`ADR-ITEM-C-01`, `PHASE_ITEM_C_ADR.md`).
@@ -151,6 +162,22 @@ mod tests {
         ] {
             let err = parse(None, Some(burst)).unwrap_err();
             assert!(err.contains(BURST_ENV), "{burst:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_wal_tail_override_is_off_by_default_and_on_only_for_exactly_one() {
+        assert_eq!(ALLOW_TRUNCATE_ENV, "RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL");
+        assert_eq!(rubixdb::ops::wal_tail::parse_override(None), Ok(false));
+        assert_eq!(rubixdb::ops::wal_tail::parse_override(Some("")), Ok(false));
+        assert_eq!(rubixdb::ops::wal_tail::parse_override(Some("1")), Ok(true));
+        for v in [
+            "0", "true", "TRUE", "True", "yes", "on", "01", "1.0", " 1", "1 ", "1
+", "bogus", "2",
+            "-1", "+1", "١",
+        ] {
+            let err = rubixdb::ops::wal_tail::parse_override(Some(v)).unwrap_err();
+            assert!(err.contains(ALLOW_TRUNCATE_ENV), "{v:?}: {err}");
         }
     }
 

@@ -1,6 +1,6 @@
 # ADR-WAL-01 — A damaged WAL tail must not open silently: attested clean stop, loud and non-destructive truncation
 
-**Status: PROPOSED — awaiting maintainer approval. Do not apply.** Nothing in this ADR has been implemented; no engine, protected-path, test, `Cargo.toml` or `Cargo.lock` change was made in the mission that wrote it. Evidence: `PHASE_ITEM_F07_DISCOVERY.md` (2026-10-08, tree `caf12be`). Related and unchanged: ADR-ENG-OPS-001 Finding A (`PHASE_RUBIXDB_ENGINE_PERFORMANCE_ADR.md:107-115`, the engine ignores `corrupted_segments`), which this ADR does not decide.
+**Status: ACCEPTED (2026-10-08).** Approved by the maintainer and implemented by the F-07 implementation mission as written (`PHASE_ITEM_F07_IMPLEMENTATION.md`; deviations and clarifications are listed in the *Implementation notes* section at the end). History: written PROPOSED — awaiting maintainer approval, with no engine, protected-path, test, `Cargo.toml` or `Cargo.lock` change in the mission that wrote it. Evidence: `PHASE_ITEM_F07_DISCOVERY.md` (2026-10-08, tree `caf12be`). Related and unchanged: ADR-ENG-OPS-001 Finding A (`PHASE_RUBIXDB_ENGINE_PERFORMANCE_ADR.md:107-115`, the engine ignores `corrupted_segments`), which this ADR does not decide.
 
 ## Decision
 
@@ -80,3 +80,14 @@ P1's attribution to external systems in the mission text was not verified (Disco
 ## Out of scope
 
 Any change under `src/wal/` (including P1's classification); the engine-level refusal of ADR-ENG-OPS-001 Finding A; making the engine write a seal frame at shutdown (would make the attestation unnecessary but needs an authorised engine change); a durable acknowledged-watermark; power-loss testing; automatic repair of a quarantined tail; exposing quarantine state through `/readyz` or the observability schema; the two separate findings recorded in `OPEN_ITEMS.md` (`rubixdb check` modifies the directory; zero-filled tail refused); F-08, F-11, F-18 and everything else.
+
+## Implementation notes (2026-10-08, appended; the sections above are unchanged)
+
+The approved design was implemented without reinterpretation; see `PHASE_ITEM_F07_IMPLEMENTATION.md` for the evidence. Clarifications made while implementing, none of which changes a decision above:
+
+1. **Override and an unwritable quarantine.** The Design section says the override lets a start proceed past the attestation refusal, and also that an unwritable quarantine refuses the start "unless the override is set". Both are implemented as written: with the override on, a quarantine that cannot be written no longer blocks the start, which then proceeds loudly (stderr: the bytes "could NOT be preserved"; `wal.tail_override` logged because the override changed the outcome). The override still bypasses nothing else.
+2. **Where the guard lives.** The startup-only successor is `ops::format::startup_guard_with_tail_policy` (host and standalone binary). `startup_guard` and `ops::open::open_engine_for_ops` are unchanged, so `rubixdb check` and `restore` keep their behaviour; the tail policy is deliberately not shared with them because it writes and deletes files.
+3. **`check` finding.** The quarantine listing (`WAL_TAIL_QUARANTINED`) is informational, so exit codes and `WAL_TORN_TAIL` (a warning) are unchanged. It appears in the offline/stopped `rubixdb check`; the online check of a running instance runs only the logical pass and does not list it.
+4. **Security log.** Events use the existing fixed record: code `wal.tail_quarantined` / `wal.tail_override`, `object_kind` `wal`, and `object` carrying only segment / offset / byte count / sequence numbers. No change was made in `api/src/security_log.rs`.
+5. **Manifest read.** The checkpoint is read lazily, only when an attestation exists and the log is behind it; an unreadable manifest then refuses the start with its own message (the engine would fail on it anyway).
+6. **Unattested note.** The stderr note is printed when a file exists but is unusable, or when the file is absent and the WAL holds records (a kill, power loss or a directory from before this change); not for a brand-new empty directory.

@@ -15,6 +15,7 @@ pub mod maintenance;
 pub mod open;
 pub mod restore;
 pub mod storage;
+pub mod wal_tail;
 
 #[cfg(test)]
 mod fuzz_tests;
@@ -22,6 +23,8 @@ mod fuzz_tests;
 mod integration_tests;
 #[cfg(test)]
 mod physical_tests;
+#[cfg(test)]
+mod wal_tail_tests;
 
 use std::fmt;
 
@@ -67,6 +70,10 @@ impl From<crate::EngineError> for OpsError {
 pub mod codes {
     pub const IO: &str = "IO";
     pub const WAL_CORRUPT: &str = "WAL_CORRUPT";
+    /// ADR-WAL-01: acknowledged records recorded by the last graceful shutdown are missing from the WAL.
+    pub const WAL_TAIL_DAMAGED: &str = "WAL_TAIL_DAMAGED";
+    /// ADR-WAL-01: a damaged WAL tail that recovery would remove could not be preserved first.
+    pub const WAL_TAIL_QUARANTINE_FAILED: &str = "WAL_TAIL_QUARANTINE_FAILED";
     pub const ENGINE: &str = "ENGINE";
     pub const BAD_MAGIC: &str = "BACKUP_BAD_MAGIC";
     pub const UNSUPPORTED_VERSION: &str = "BACKUP_UNSUPPORTED_VERSION";
