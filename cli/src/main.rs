@@ -157,6 +157,18 @@ enum ConnectionSource {
 /// unchanged from Increment 12, including its own interactive-prompt
 /// credential path.
 fn resolve_connection() -> Result<(Connection, ConnectionSource), String> {
+    resolve_connection_for(None, true)
+}
+
+/// The one connection-resolution path. `instance` is the instance the caller already resolved (`--instance` >
+/// `RUBIXDB_INSTANCE_NAME` > `default`, `ops_cmd::resolve_instance_name`); `None` keeps the historical behaviour
+/// (`RUBIXDB_INSTANCE_NAME`, else `default`). `may_start == false` is attach-only: if the instance turns out not to
+/// be running the call fails and nothing is started or created (`rubixdb check` on a running instance uses this - it
+/// must never become the owner of any instance, least of all a different one).
+fn resolve_connection_for(
+    instance: Option<&str>,
+    may_start: bool,
+) -> Result<(Connection, ConnectionSource), String> {
     if let Ok(base_url) = std::env::var("RUBIXDB_API_URL") {
         if !base_url.is_empty() {
             // Syntax is checked before any key prompt or network attempt.
@@ -173,10 +185,13 @@ fn resolve_connection() -> Result<(Connection, ConnectionSource), String> {
     // invalid value never leaves a half-created instance behind.
     startup_env::load()?;
 
-    let name = std::env::var("RUBIXDB_INSTANCE_NAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| rubixdb_instance::DEFAULT_INSTANCE_NAME.to_string());
+    let name = match instance {
+        Some(n) => n.to_string(),
+        None => std::env::var("RUBIXDB_INSTANCE_NAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| rubixdb_instance::DEFAULT_INSTANCE_NAME.to_string()),
+    };
 
     // Always goes through `acquire()`, never `discover()`, for the
     // connection this process will actually use: `discover()` is a
@@ -191,6 +206,10 @@ fn resolve_connection() -> Result<(Connection, ConnectionSource), String> {
     // (through a fresh, live bind) or attaches only after a real
     // handshake confirms someone else is actually listening.
     match rubixdb_instance::acquire(&name).map_err(|e| e.to_string())? {
+        // Attach-only and nobody answered: release the lock and the port again, start nothing.
+        rubixdb_instance::AcquireOutcome::Owned { .. } if !may_start => Err(format!(
+            "instance {name:?} is not running; nothing was started"
+        )),
         rubixdb_instance::AcquireOutcome::Owned {
             lock,
             listener,

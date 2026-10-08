@@ -6,6 +6,11 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### `rubixdb check --instance NAME` checks the instance it names (2026-10-08)
+
+**Fixed**
+- **`rubixdb check --instance NAME` on a running instance no longer checks (and creates) the `default` instance.** The flag was used only to detect that NAME is running; the check then connected through the environment-only resolution and reported `0 error(s)`, exit 0, for an empty `default` database - a false "clean" from the integrity detector. It now connects to NAME, with the precedence `--instance` > `RUBIXDB_INSTANCE_NAME` (non-empty) > `default` (the rule of `rubixdb gui`), and only attaches: if the instance is not running by then it fails with "not running; nothing was started" and never becomes the owner of any instance. `rubixdb check` without the flag or the variable behaves as before; the offline check of a stopped instance is unchanged. CLI only: no engine, API, port or handshake change.
+
 ### F-08: a damaged SSTable is found before any file is changed, and reported while it is serving (ADR-SST-01, 2026-10-08)
 
 **Added**

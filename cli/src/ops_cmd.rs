@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::client::Connection;
 use crate::render::sanitize_for_terminal as san;
-use crate::{resolve_connection, ConnectionSource};
+use crate::{resolve_connection_for, ConnectionSource};
 
 pub const HELP_TEXT: &str = r#"rubixdb -- operator commands
 
@@ -68,17 +68,21 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+/// `--instance` > `RUBIXDB_INSTANCE_NAME` (non-empty) > `default`: the rule `rubixdb gui` uses
+/// (`gui::resolve_name`), as a pure function so the two can be compared in a test.
+fn resolve_instance_name(flag: Option<&str>, env: Option<&str>) -> String {
+    flag.or(env.filter(|s| !s.is_empty()))
+        .unwrap_or(rubixdb_instance::DEFAULT_INSTANCE_NAME)
+        .to_string()
+}
+
 /// `--instance NAME`, else `RUBIXDB_INSTANCE_NAME`, else `default` — the same
 /// resolution every other command uses.
 fn default_instance_name(args: &[String]) -> String {
-    flag_value(args, "--instance")
-        .map(|s| s.to_string())
-        .or_else(|| {
-            std::env::var("RUBIXDB_INSTANCE_NAME")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| rubixdb_instance::DEFAULT_INSTANCE_NAME.to_string())
+    resolve_instance_name(
+        flag_value(args, "--instance"),
+        std::env::var("RUBIXDB_INSTANCE_NAME").ok().as_deref(),
+    )
 }
 
 fn utc_stamp() -> String {
@@ -147,7 +151,14 @@ pub fn run(args: &[String]) -> i32 {
 /// Connects to (or becomes) the local instance, runs `f`, then shuts down an
 /// instance this process had to start.
 fn online(_args: &[String], f: impl FnOnce(&Connection) -> i32) -> i32 {
-    let (conn, source) = match resolve_connection() {
+    online_for(None, true, f)
+}
+
+/// [`online`] for a caller that has already resolved the instance (`Some(name)`) and, with `may_start == false`, must
+/// only attach to it: `rubixdb check --instance NAME` (the F-08 finding: `online` used to ignore `--instance`, connect
+/// to `default` - creating it if it was not running - and report a false clean for a different, empty database).
+fn online_for(instance: Option<&str>, may_start: bool, f: impl FnOnce(&Connection) -> i32) -> i32 {
+    let (conn, source) = match resolve_connection_for(instance, may_start) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("rubixdb: {e}");
@@ -692,7 +703,7 @@ fn check(args: &[String]) -> i32 {
                 if let Err(rubixdb_instance::LockAcquireError::AlreadyLocked) =
                     rubixdb_instance::InstanceLock::try_acquire(&dir)
                 {
-                    return online(args, |c| {
+                    return online_for(Some(&name), false, |c| {
                         println!("INSPECTION  online logical check at one snapshot (instance {} is running)", san(&name));
                         let v = match api(c, reqwest::Method::POST, "/v1/admin/check", None) {
                             Ok(v) => v,
@@ -820,3 +831,60 @@ fn maintenance(args: &[String]) -> i32 {
 
 #[allow(dead_code)]
 const _TIMEOUT: Duration = Duration::from_secs(3600);
+
+#[cfg(test)]
+mod instance_name_tests {
+    use super::{default_instance_name, flag_value, resolve_instance_name};
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--instance` > `RUBIXDB_INSTANCE_NAME` (non-empty) > `default`, and exactly what `rubixdb gui` resolves for the
+    /// same inputs (`gui::resolve_name`): the two commands must not have two different rules.
+    #[test]
+    fn the_flag_beats_the_environment_beats_the_default_exactly_as_gui_resolves_it() {
+        let cases: [(Option<&str>, Option<&str>, &str); 7] = [
+            (Some("recon"), None, "recon"),
+            (Some("recon"), Some("other"), "recon"),
+            (Some("recon"), Some(""), "recon"),
+            (None, Some("other"), "other"),
+            (None, Some(""), "default"),
+            (None, None, "default"),
+            (Some("default"), Some("other"), "default"),
+        ];
+        for (flag, env, want) in cases {
+            assert_eq!(resolve_instance_name(flag, env), want, "{flag:?} {env:?}");
+            assert_eq!(
+                crate::gui::resolve_name(flag, env).unwrap(),
+                want,
+                "gui disagrees for {flag:?} {env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flag_is_read_from_the_arguments_and_a_missing_value_falls_back() {
+        assert_eq!(
+            flag_value(&args(&["check", "--instance", "recon"]), "--instance"),
+            Some("recon")
+        );
+        assert_eq!(flag_value(&args(&["check", "--json"]), "--instance"), None);
+        assert_eq!(
+            flag_value(&args(&["check", "--instance"]), "--instance"),
+            None
+        );
+        // with no environment variable set the flag still wins and its absence gives the default; the environment
+        // path of `default_instance_name` itself is exercised by the real-binary tests
+        if std::env::var("RUBIXDB_INSTANCE_NAME").map_or(true, |v| v.is_empty()) {
+            assert_eq!(
+                default_instance_name(&args(&["check", "--instance", "recon"])),
+                "recon"
+            );
+            assert_eq!(
+                default_instance_name(&args(&["check", "--json"])),
+                "default"
+            );
+        }
+    }
+}

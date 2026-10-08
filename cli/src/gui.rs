@@ -99,7 +99,7 @@ fn parse_args(args: &[String]) -> Result<GuiArgs, String> {
 
 /// `--instance` > `RUBIXDB_INSTANCE_NAME` (non-empty) > `default`, as for every
 /// other command; the result must satisfy the instance name rule.
-fn resolve_name(flag: Option<&str>, env: Option<&str>) -> Result<String, String> {
+pub(crate) fn resolve_name(flag: Option<&str>, env: Option<&str>) -> Result<String, String> {
     let name = flag
         .or(env.filter(|s| !s.is_empty()))
         .unwrap_or(rubixdb_instance::DEFAULT_INSTANCE_NAME);
