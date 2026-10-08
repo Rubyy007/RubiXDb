@@ -285,3 +285,7 @@ The full workspace regression was not re-run (mission instruction).
 ## 9. Conclusion
 
 ITEM C = CLOSED on this basis: the mechanism is established by intervention (Phase A), a bounded, additive, strictly parsed setting exists with the default unchanged (Phase B), the bound is exact and the cold-start gain and neutrality elsewhere are measured with multiple interleaved runs (3.3-3.4, section 5), no regression is demonstrated with the setting unset (section 4, including the re-check), and tests and lint pass (section 6). What this does **not** claim: that the default is optimal, that the shipped server no longer creates a thread burst (it does, by default), or anything about whole-product readiness, which is not declared.
+
+**Residual, stated plainly:** 2 of 9 fixed-binary runs at 64 read clients (26.1k and 24.6k req/s) fell below the current binary's 9-run minimum (26.8k req/s); cause not established; treated as noise at the measurement's resolution. Both were among the last two of the six re-check runs, and the current binary's runs in the same rounds were normal (28.2k, 28.2k req/s).
+
+**Correction 2026-10-07 to section 3.5:** the sentence "Late in the session both binaries ran lower (the host drifts)" is not supported by the last two re-check rounds, in which the current binary was not lower (28.2k and 28.2k req/s). Session drift is therefore not an established explanation for the two low fixed runs.

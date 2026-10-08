@@ -246,6 +246,7 @@ Experimental binary `rubixdb_exp_2.5.exe` (a throw-away build of `36db7b3` plus 
 * The write workload was tested to 64 writers only with caps 16-64 and the default; caps below 16 were not tested on writes, which is why the proposed lower bound in the ADR is 8, not 1 (the single-worker read result is not a basis for allowing 1).
 * Windows only (the project's platform). Item C was not examined on another OS.
 * The Spearman values are descriptive (section 6).
+* **Correction 2026-10-07:** the ADR's lower bound is **16** (`PHASE_ITEM_C_ADR.md`, Configuration surface; implemented as `MIN_MAX_BLOCKING_THREADS = 16` in `cli/src/startup_env.rs`). The "8" in the write-workload bullet above was stale; the original sentence is left unchanged and this note supersedes it.
 
 ## 11. Evidence index
 
