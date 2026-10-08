@@ -34,7 +34,7 @@ The observability layer added read-only accessors to `src/lsm/mod.rs` (`LsmEngin
 
 **Not declared production ready.** `CLAUDE.md`: the current mandatory certification matrix must be entirely PASS
 first. Known blockers are recorded in `OPEN_ITEMS.md` (tracked burnt credential file, WAL throughput gate M1.3,
-power-loss and real disk-full not tested, lifecycle findings F-08 / F-11 / F-18, and others).
+power-loss and real disk-full not tested, lifecycle findings F-11 / F-18, and others).
 
 ## Where to look
 
