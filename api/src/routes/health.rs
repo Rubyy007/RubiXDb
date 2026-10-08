@@ -30,6 +30,10 @@ pub struct ReadyBody {
     /// of interrupted `CREATE INDEX` / `DROP INDEX` operations. Additive field;
     /// `ready` keeps its meaning (normal work is safe while this runs).
     index_recovery: &'static str,
+    /// `disabled` | `running` | `complete` | `damaged`: the background verification of every data block of the tables
+    /// that were live at start (ADR-SST-01). Additive; `ready` is unchanged and never depends on it. `damaged` means
+    /// at least one table has a data block that failed its checksum: see `GET /v1/status` `sstable_integrity`.
+    sstable_verification: &'static str,
 }
 
 /// Requires auth (every route except `/healthz` does). Returns 200 as
@@ -47,6 +51,7 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Json<ReadyBody> {
         ready: crate::observability::sampler::ready(),
         storage_state: format!("{:?}", state.engine.storage_state()),
         index_recovery: state.index_recovery.state().as_str(),
+        sstable_verification: state.sstable_integrity.state().as_str(),
     })
 }
 

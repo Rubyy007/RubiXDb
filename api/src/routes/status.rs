@@ -20,6 +20,27 @@ pub struct StatusBody {
     live_sstable_count: usize,
     capacity_pressure_events: u64,
     uptime_secs: f64,
+    /// ADR-SST-01: the background data-block verification and its findings (ids, relative paths and counts only).
+    sstable_integrity: SstableIntegrityBody,
+}
+
+#[derive(Serialize)]
+pub struct SstableIntegrityBody {
+    state: &'static str,
+    tables_total: u64,
+    /// Tables whose scan has ended (clean, damaged, or retired by a compaction): `== tables_total` when the pass
+    /// has finished.
+    tables_verified: u64,
+    bytes_verified: u64,
+    damaged: Vec<DamagedTableBody>,
+}
+
+#[derive(Serialize)]
+pub struct DamagedTableBody {
+    id: u64,
+    path: String,
+    records_before_failure: u64,
+    records_total: u64,
 }
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusBody> {
@@ -34,6 +55,25 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusBody> {
         live_sstable_count: engine.live_sstable_ids().len(),
         capacity_pressure_events: engine.capacity_pressure_events(),
         uptime_secs: uptime(&state).as_secs_f64(),
+        sstable_integrity: {
+            let s = state.sstable_integrity.snapshot();
+            SstableIntegrityBody {
+                state: s.state.as_str(),
+                tables_total: s.tables_total,
+                tables_verified: s.tables_verified,
+                bytes_verified: s.bytes_verified,
+                damaged: s
+                    .damaged
+                    .into_iter()
+                    .map(|d| DamagedTableBody {
+                        id: d.id,
+                        path: d.path,
+                        records_before_failure: d.records_before_failure,
+                        records_total: d.records_total,
+                    })
+                    .collect(),
+            }
+        },
     })
 }
 

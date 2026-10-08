@@ -6,6 +6,19 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### F-08: a damaged SSTable is found before any file is changed, and reported while it is serving (ADR-SST-01, 2026-10-08)
+
+**Added**
+- **SSTable preflight at start.** The startup-only guard (`rubixdb gui`, `rubixdb-api`) now checks, read-only and before the F-07 attestation is consumed, that every Manifest-live table exists, has the size and sequence range the Manifest recorded and opens with the engine's own validation (footer, bloom, index); every other `*.sst` the engine would adopt must open. A failure refuses the start with exit 1 and `SSTABLE_CORRUPT`, `SSTABLE_MISSING` or `SSTABLE_MISMATCH` (the engine's text and the file named), leaves the directory unmodified and has no override. A valid file that is not the one the Manifest recorded (previously accepted, serving a missing catalog) is now refused.
+- **Background data-block verification.** After the server is serving, one throttled, cancellable thread reads every data block of the tables live at start. `GET /readyz` gains `sstable_verification` (`disabled` | `running` | `complete` | `damaged`); `GET /v1/status` gains `sstable_integrity` (`state`, `tables_total`, `tables_verified`, `bytes_verified`, `damaged: [{id, path, records_before_failure, records_total}]`); a damaged table writes the security event `sstable.damaged` and one stderr line. `ready` is unchanged (constant true). Reads of the damaged block still fail with the typed corruption error.
+- **`RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC`**: digits only; unset or empty = 64 (an unvalidated default: its effect on foreground latency is not measured); `0` disables the pass; at most 1024; anything else stops startup naming the variable.
+
+**Fixed**
+- **A refused start no longer consumes `WAL_CLEAN_STOP`.** Before, any SSTable refusal had already removed the F-07 attestation, so after the operator repaired the table a damaged WAL tail was silently truncated (one acknowledged record lost in the reproducer); now the next start is still attested and refuses with `WAL_TAIL_DAMAGED`.
+
+**Changed**
+- The refusal wording for a damaged table is now `engine open refused: <CODE>: <engine text>; refusing to open: ... The directory has not been modified.` (was `engine open failed: <engine text>`). A truncated table is reported as `SSTABLE_MISMATCH` (its length no longer matches the Manifest). When a damaged table and a damaged WAL tail coexist, the SSTable refusal is reported first.
+
 ### F-08: a failing compaction no longer leaks temp files, and says so (ADR-COMPACTION-LEAK-01, 2026-10-08)
 
 **Fixed**

@@ -146,13 +146,18 @@ fn wal_preflight(dir: &Path) -> Result<Option<crate::wal::WalReplaySummary>, Ops
 pub struct StartupGuard {
     pub format_state: FormatState,
     pub tail: crate::ops::wal_tail::TailReport,
+    /// ADR-SST-01 (F-08): the Manifest-live tables the read-only preflight validated; the background verification
+    /// reads exactly these.
+    pub sstables: crate::ops::sstable_integrity::PreflightReport,
     /// Wall time of the whole guard (format decision, WAL replay, tail policy, attestation removal).
     pub guard_micros: u128,
 }
 
 /// **Startup-only successor of [`startup_guard`]** (ADR-WAL-01, F-07), used by `rubixdb gui` (`cli/src/host.rs`) and
 /// the standalone `rubixdb-api`. Order: the format decision and the unchanged `WAL_CORRUPT` preflight first (their
-/// refusals take precedence), then the attestation / quarantine tail policy (`ops::wal_tail`).
+/// refusals take precedence), then the read-only SSTable preflight (ADR-SST-01, F-08: `ops::sstable_integrity`), then
+/// the attestation / quarantine tail policy (`ops::wal_tail`). The SSTable preflight sits before the first mutation so a
+/// start it refuses has not consumed `WAL_CLEAN_STOP` (which a refused start used to do).
 ///
 /// **Deliberately not shared with `ops::open::open_engine_for_ops`**, which `rubixdb check` (its logical pass) and
 /// `restore` use: the tail policy writes (quarantine files) and deletes (the attestation), and `check` is documented
@@ -177,6 +182,7 @@ pub(crate) fn startup_guard_with_tail_policy_inner(
     let started = std::time::Instant::now();
     let format_state = ensure_compatible(dir)?;
     let summary = wal_preflight(dir)?;
+    let sstables = crate::ops::sstable_integrity::preflight(dir)?;
     let tail = match summary {
         Some(s) => {
             crate::ops::wal_tail::apply_tail_policy(dir, &s, allow_truncate_corrupt_wal, fault)?
@@ -186,6 +192,7 @@ pub(crate) fn startup_guard_with_tail_policy_inner(
     Ok(StartupGuard {
         format_state,
         tail,
+        sstables,
         guard_micros: started.elapsed().as_micros(),
     })
 }

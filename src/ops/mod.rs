@@ -14,6 +14,7 @@ pub mod format;
 pub mod maintenance;
 pub mod open;
 pub mod restore;
+pub mod sstable_integrity;
 pub mod storage;
 pub mod wal_tail;
 
@@ -23,6 +24,8 @@ mod fuzz_tests;
 mod integration_tests;
 #[cfg(test)]
 mod physical_tests;
+#[cfg(test)]
+mod sstable_integrity_tests;
 #[cfg(test)]
 mod wal_tail_tests;
 
@@ -74,6 +77,12 @@ pub mod codes {
     pub const WAL_TAIL_DAMAGED: &str = "WAL_TAIL_DAMAGED";
     /// ADR-WAL-01: a damaged WAL tail that recovery would remove could not be preserved first.
     pub const WAL_TAIL_QUARANTINE_FAILED: &str = "WAL_TAIL_QUARANTINE_FAILED";
+    /// ADR-SST-01: a table the Manifest lists as live (or one the engine would adopt) is damaged / not valid.
+    pub const SSTABLE_CORRUPT: &str = "SSTABLE_CORRUPT";
+    /// ADR-SST-01: a table the Manifest lists as live has no file.
+    pub const SSTABLE_MISSING: &str = "SSTABLE_MISSING";
+    /// ADR-SST-01: a valid file disagrees with the size or sequence range the Manifest recorded for it.
+    pub const SSTABLE_MISMATCH: &str = "SSTABLE_MISMATCH";
     pub const ENGINE: &str = "ENGINE";
     pub const BAD_MAGIC: &str = "BACKUP_BAD_MAGIC";
     pub const UNSUPPORTED_VERSION: &str = "BACKUP_UNSUPPORTED_VERSION";

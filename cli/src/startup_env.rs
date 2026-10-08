@@ -33,6 +33,7 @@ pub fn load() -> Result<LocalServerEnv, String> {
     let env = parse(read(RPS_ENV)?.as_deref(), read(BURST_ENV)?.as_deref())?;
     load_max_blocking_threads()?;
     load_allow_truncate_corrupt_wal()?;
+    load_sstable_verify_mib_per_sec()?;
     Ok(env)
 }
 
@@ -44,6 +45,19 @@ pub const ALLOW_TRUNCATE_ENV: &str = rubixdb::ops::wal_tail::OVERRIDE_ENV;
 
 pub fn load_allow_truncate_corrupt_wal() -> Result<bool, String> {
     rubixdb::ops::wal_tail::parse_override(read(ALLOW_TRUNCATE_ENV)?.as_deref())
+}
+
+/// `RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC` (ADR-SST-01, F-08): the read budget of the background pass that verifies
+/// every data block of the tables that were live at start. Digits only; unset or empty = 64 (**an unvalidated
+/// default**: its effect on foreground latency under load is unmeasured); `0` = the pass is disabled (`/readyz`
+/// `sstable_verification: disabled`); at most 1024. Anything else stops startup naming the variable.
+pub const SSTABLE_VERIFY_ENV: &str = "RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC";
+
+pub fn load_sstable_verify_mib_per_sec() -> Result<u64, String> {
+    rubixdb::ops::sstable_integrity::parse_verify_mib_per_sec(
+        SSTABLE_VERIFY_ENV,
+        read(SSTABLE_VERIFY_ENV)?.as_deref(),
+    )
 }
 
 /// Cap on the embedded server's tokio **blocking thread pool** (`ADR-ITEM-C-01`, `PHASE_ITEM_C_ADR.md`).
@@ -178,6 +192,41 @@ mod tests {
         ] {
             let err = rubixdb::ops::wal_tail::parse_override(Some(v)).unwrap_err();
             assert!(err.contains(ALLOW_TRUNCATE_ENV), "{v:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_sstable_verify_budget_defaults_to_64_zero_disables_and_every_bad_value_names_the_variable(
+    ) {
+        let p =
+            |v| rubixdb::ops::sstable_integrity::parse_verify_mib_per_sec(SSTABLE_VERIFY_ENV, v);
+        assert_eq!(
+            SSTABLE_VERIFY_ENV,
+            "RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC"
+        );
+        assert_eq!(p(None), Ok(64));
+        assert_eq!(p(Some("0")), Ok(0));
+        assert_eq!(p(Some("1")), Ok(1));
+        assert_eq!(p(Some("1024")), Ok(1024));
+        assert_eq!(p(Some("007")), Ok(7));
+        for v in [
+            "",
+            "1025",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.5",
+            "1e2",
+            "0x10",
+            "abc",
+            "64,1",
+            "99999999999999999999",
+            "١",
+        ] {
+            let err = p(Some(v)).unwrap_err();
+            assert!(err.contains(SSTABLE_VERIFY_ENV), "{v:?}: {err}");
+            assert!(err.contains("1024"), "{v:?}: {err}");
         }
     }
 

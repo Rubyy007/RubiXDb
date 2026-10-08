@@ -137,6 +137,9 @@ pub struct AppState {
     /// Progress of the startup recovery of interrupted index operations
     /// (`crate::recovery`); reported by `GET /readyz`.
     pub index_recovery: crate::recovery::IndexRecovery,
+    /// State and findings of the background SSTable data-block verification (ADR-SST-01, F-08); `disabled` until
+    /// the host starts the pass. Reported by `GET /readyz` and `GET /v1/status`; never part of `ready`.
+    pub sstable_integrity: rubixdb::ops::sstable_integrity::SstableIntegrity,
     /// Background sampler output, bounded time series, query / event registries and the
     /// counters added by the observability layer.
     pub obs: crate::observability::Observability,
@@ -198,6 +201,7 @@ impl AppState {
             started_at: SystemTime::now(),
             admin: AdminOps::default(),
             index_recovery: crate::recovery::IndexRecovery::default(),
+            sstable_integrity: rubixdb::ops::sstable_integrity::SstableIntegrity::default(),
             obs: crate::observability::Observability::default(),
         }
     }

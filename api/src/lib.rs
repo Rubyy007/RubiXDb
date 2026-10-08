@@ -26,6 +26,7 @@ pub mod shutdown;
 pub mod sql_metrics;
 pub mod sql_params;
 pub mod sql_session;
+pub mod sstable_integrity;
 pub mod state;
 
 pub use config::Config;

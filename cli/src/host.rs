@@ -77,6 +77,12 @@ pub struct EmbeddedServer {
     server_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// ADR-SST-01 (F-08): one stderr line per damaged table, from the background verification thread. The security-log
+/// event (`sstable.damaged`) is emitted by `rubixdb_api::sstable_integrity`.
+fn report_damaged_sstable(d: &rubixdb::ops::sstable_integrity::DamagedTable) {
+    eprintln!("{}", d.stderr_line());
+}
+
 /// ADR-WAL-01 (F-07): reports what the startup tail policy did on its channels - stderr and the security log. Only
 /// segment / offset / byte count / sequence numbers are ever reported, never the preserved bytes.
 fn report_tail_guard(g: &rubixdb::ops::format::StartupGuard) {
@@ -132,6 +138,8 @@ impl EmbeddedServer {
         let local_env = crate::startup_env::load()?;
         // ADR-WAL-01: validated here too (it is part of `load`), so a bad value never reaches the guard.
         let allow_truncate_corrupt_wal = crate::startup_env::load_allow_truncate_corrupt_wal()?;
+        // ADR-SST-01: likewise validated before anything is created.
+        let sstable_verify_mib_per_sec = crate::startup_env::load_sstable_verify_mib_per_sec()?;
         // Defense in depth: never serve with a credential the loader would refuse.
         rubixdb_instance::credentials::validate_admin_key(&owned.credentials.admin_key)
             .map_err(|why| format!("instance credential is unusable: {why}"))?;
@@ -236,13 +244,15 @@ impl EmbeddedServer {
                         // ADR-WAL-01: the startup-only guard (the format decision and the unchanged `WAL_CORRUPT`
                         // preflight, then the clean-stop attestation / tail quarantine policy). It only reads until
                         // every refusal is decided; a refused start leaves the directory untouched.
-                        let format_state = match rubixdb::ops::format::startup_guard_with_tail_policy(
+                        // ADR-SST-01 (F-08): the guard also runs the read-only SSTable preflight, between the `WAL_CORRUPT`
+                        // preflight and the tail policy, so a start it refuses has not consumed `WAL_CLEAN_STOP`.
+                        let (format_state, preflight_tables) = match rubixdb::ops::format::startup_guard_with_tail_policy(
                             &data_dir_for_thread,
                             allow_truncate_corrupt_wal,
                         ) {
                             Ok(g) => {
                                 report_tail_guard(&g);
-                                g.format_state
+                                (g.format_state, g.sstables.tables)
                             }
                             Err(e) => {
                                 let _ = ready_tx.send(Err(format!("engine open refused: {e}")));
@@ -283,6 +293,17 @@ impl EmbeddedServer {
                         // `GET /readyz` never reports a stale `not_started`.
                         let recovery =
                             rubixdb_api::recovery::spawn_index_recovery(&state, report_recovery);
+                        // ADR-SST-01 (F-08): the throttled background verification of every data block of the tables
+                        // that were live at start. It runs after the server is serving (a synchronous scan would hit
+                        // the 30 s readiness bound on a large database), only reports, and is joined by graceful
+                        // shutdown before the engine stops.
+                        let sstable_verification = rubixdb_api::sstable_integrity::spawn_sstable_verification(
+                            &state,
+                            data_dir_for_thread.clone(),
+                            preflight_tables,
+                            sstable_verify_mib_per_sec,
+                            report_damaged_sstable,
+                        );
                         let router = build_router(state.clone());
                         // `tokio::net::TcpListener::from_std` requires
                         // the socket already be non-blocking -- a std
@@ -356,6 +377,7 @@ impl EmbeddedServer {
                                     // (ADR-LIFECYCLE-001), in parallel with the
                                     // request drain, instead of after it.
                                     st.index_recovery.request_cancel();
+                                    st.sstable_integrity.request_cancel();
                                 }
                             },
                             shutdown_drain,
@@ -368,6 +390,11 @@ impl EmbeddedServer {
                             if !handle.is_finished() {
                                 eprintln!("rubixdb: stopping the interrupted index recovery (it restarts at the next start)...");
                             }
+                            let _ = handle.join();
+                        }
+                        // The verification reads the table files through its own handles: it has been asked to stop at
+                        // its next block; join it before the engine goes.
+                        if let Some(handle) = sstable_verification {
                             let _ = handle.join();
                         }
                         // The sampler reads the engine: stop and join it before the engine goes.
