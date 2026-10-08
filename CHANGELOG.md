@@ -6,6 +6,17 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### F-08: a failing compaction no longer leaks temp files, and says so (ADR-COMPACTION-LEAK-01, 2026-10-08)
+
+**Fixed**
+- **Partial compaction output is removed.** `write_from_sorted_records` removes its own `<id>.sst.tmp` on every failure path (guard disarmed after the rename). Before, one ~2 MB file was leaked every ~5 s while a compaction input was damaged (24 files / 47.8 MB after 120 s); nothing but the process restart removed them. The flush path shares the writer and gets the same cleanup (not separately tested).
+
+**Added**
+- **Compaction failures are classified, counted and shown.** `state` (`idle`/`running`/`failing`/`blocked`), `failures_total`, `consecutive_failures`, `blocked` and `last_failure {at_unix_ms, kind, message}` on `/v1/compaction/status`, `/v1/compaction/metrics`, `/v1/admin/status.compaction` and `/v1/metrics/system.compaction` (additive). Security events `compaction.failing` and `compaction.blocked` on state change only.
+
+**Changed**
+- **The worker stops retrying what cannot succeed.** After `max_flush_retries` (3) consecutive permanent-class failures (Corruption, Unsupported, panic) the compaction worker is `blocked` until the process restarts; transient failures (I/O incl. disk full) never block. `StorageState` and `/readyz` are unchanged. The stderr line now reads `compaction: failed (attempt k of 3), will retry: ...`, then `compaction: blocked after 3 consecutive permanent failures (...); restore the damaged table and restart`; it still names no table.
+
 ### F-07: a damaged WAL tail after a clean stop is no longer opened silently (ADR-WAL-01, 2026-10-08)
 
 **Added**

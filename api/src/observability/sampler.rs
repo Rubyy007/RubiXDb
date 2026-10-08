@@ -114,6 +114,13 @@ pub struct Snapshot {
     pub compaction_cycles: u64,
     pub live_sstable_count: u64,
     pub last_compaction_ms: Option<f64>,
+    /// ADR-COMPACTION-LEAK-01: `idle` | `running` | `failing` | `blocked`, and the failure record.
+    pub compaction_state: &'static str,
+    pub compaction_failures_total: u64,
+    pub compaction_consecutive_failures: u64,
+    pub compaction_blocked: bool,
+    /// (unix ms, kind, engine error text) of the most recent failed compaction attempt.
+    pub compaction_last_failure: Option<(u64, &'static str, String)>,
     pub flush_queue_depth: u64,
     pub index_build_state: &'static str,
 
@@ -256,6 +263,9 @@ struct Prev {
     /// Probes that have answered at least once; if one later stops answering the sampler is
     /// `degraded` (a probe that never existed on this platform is just `null`).
     ever_ok: [bool; 6],
+    /// ADR-COMPACTION-LEAK-01: security-log events are written on state CHANGES only, never per retry.
+    compaction_failing_reported: bool,
+    compaction_blocked_reported: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -440,6 +450,8 @@ fn collect(
     let ps = state.engine.pool_stats();
     let g = &ps.committer_stats;
     let cm = state.engine.compaction_metrics();
+    let compaction_state = state.engine.compaction_state();
+    report_compaction_state_changes(prev, &cm);
     let storage = state.engine.storage_state();
     let storage_state = match storage {
         rubixdb::lsm::StorageState::Healthy => "Healthy",
@@ -530,6 +542,14 @@ fn collect(
             .last_cycle
             .as_ref()
             .map(|cy| cy.duration.as_secs_f64() * 1000.0),
+        compaction_state: compaction_state.as_str(),
+        compaction_failures_total: cm.failures_total,
+        compaction_consecutive_failures: cm.consecutive_failures,
+        compaction_blocked: cm.blocked,
+        compaction_last_failure: cm
+            .last_failure
+            .as_ref()
+            .map(|f| (f.at_unix_ms, f.kind.as_str(), f.message.clone())),
         flush_queue_depth: state.engine.immutable_count() as u64,
         index_build_state: state.index_recovery.state().as_str(),
         storage_state,
@@ -558,6 +578,49 @@ fn collect(
     prev.sql_total = sql_api.requests;
     prev.commits_total = commits_total;
     snap
+}
+
+/// Security-log event codes for the compaction worker's state changes (ADR-COMPACTION-LEAK-01).
+pub const EVENT_COMPACTION_FAILING: &str = "compaction.failing";
+pub const EVENT_COMPACTION_BLOCKED: &str = "compaction.blocked";
+
+/// Writes `compaction.failing` once when a failure streak starts and `compaction.blocked` once when the worker
+/// gives up - observed from the sampler tick, so the engine never calls the api crate, and never once per retry
+/// (every attempt is still on stderr). The object carries only the failure class and counters, never bytes.
+fn report_compaction_state_changes(prev: &mut Prev, cm: &rubixdb::lsm::CompactionMetrics) {
+    let failing = cm.consecutive_failures > 0;
+    let kind = cm
+        .last_failure
+        .as_ref()
+        .map_or("unknown", |f| f.kind.as_str());
+    if failing && !prev.compaction_failing_reported {
+        prev.compaction_failing_reported = true;
+        crate::security_log::emit(&crate::security_log::SecurityEvent {
+            code: EVENT_COMPACTION_FAILING,
+            outcome: "failed",
+            object_kind: Some("compaction"),
+            object: Some(&format!(
+                "kind={kind} consecutive={} failures_total={}",
+                cm.consecutive_failures, cm.failures_total
+            )),
+            ..Default::default()
+        });
+    } else if !failing {
+        prev.compaction_failing_reported = false;
+    }
+    if cm.blocked && !prev.compaction_blocked_reported {
+        prev.compaction_blocked_reported = true;
+        crate::security_log::emit(&crate::security_log::SecurityEvent {
+            code: EVENT_COMPACTION_BLOCKED,
+            outcome: "failed",
+            object_kind: Some("compaction"),
+            object: Some(&format!(
+                "kind={kind} consecutive={} failures_total={}",
+                cm.consecutive_failures, cm.failures_total
+            )),
+            ..Default::default()
+        });
+    }
 }
 
 /// Series values of a snapshot, in `SERIES_NAMES` order.

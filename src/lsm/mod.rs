@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::compaction::CompactionStats;
 use crate::error::{EngineError, Result};
@@ -592,10 +592,131 @@ pub struct CompactionMetrics {
     pub duration_max: Duration,
     pub peak_temp_disk_bytes_max: u64,
     pub last_cycle: Option<CompactionStats>,
+    /// ADR-COMPACTION-LEAK-01: every failed compaction attempt made by the background worker (any
+    /// kind), since the engine opened. `cycles_completed` still counts successful cycles only.
+    pub failures_total: u64,
+    /// Failed attempts since the last successful cycle (0 after a success).
+    pub consecutive_failures: u64,
+    /// `true` once the worker has given up on a permanently failing source until the process
+    /// restarts (see [`CompactionHealth::Blocked`]).
+    pub blocked: bool,
+    /// The most recent failure: when, its class and the `EngineError` text (never record bytes).
+    pub last_failure: Option<CompactionFailure>,
+}
+
+/// ADR-COMPACTION-LEAK-01: the class of a failed compaction attempt, derived from the structured
+/// `EngineError` variant - never from its text (the ADR-WE-SP-001 section 7 rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionFailureKind {
+    /// `EngineError::Corruption`: an input table cannot be read. Permanent-candidate.
+    Corruption,
+    /// `EngineError::Unsupported`: an input table the build does not understand. Permanent-candidate.
+    Unsupported,
+    /// A panic inside the attempt. Permanent-candidate (a deterministic panic will not heal).
+    Panic,
+    /// `EngineError::Io`, including ENOSPC (`is_storage_exhausted()`). Transient.
+    Io,
+    /// Any other error. Transient.
+    Other,
+}
+
+impl CompactionFailureKind {
+    pub fn classify(e: &EngineError) -> Self {
+        match e {
+            EngineError::Corruption { .. } => CompactionFailureKind::Corruption,
+            EngineError::Unsupported { .. } => CompactionFailureKind::Unsupported,
+            EngineError::Io(_) => CompactionFailureKind::Io,
+            _ => CompactionFailureKind::Other,
+        }
+    }
+
+    /// Permanent-candidate kinds count toward the block budget; transient kinds never do.
+    pub fn is_permanent(self) -> bool {
+        matches!(
+            self,
+            CompactionFailureKind::Corruption
+                | CompactionFailureKind::Unsupported
+                | CompactionFailureKind::Panic
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionFailureKind::Corruption => "corruption",
+            CompactionFailureKind::Unsupported => "unsupported",
+            CompactionFailureKind::Panic => "panic",
+            CompactionFailureKind::Io => "io",
+            CompactionFailureKind::Other => "other",
+        }
+    }
+}
+
+/// The most recent failed compaction attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionFailure {
+    pub at_unix_ms: u64,
+    pub kind: CompactionFailureKind,
+    pub message: String,
+}
+
+/// ADR-COMPACTION-LEAK-01: the compaction worker's own health, deliberately NOT a value of
+/// [`StorageState`] (that state gates writes and defers compaction itself, and its `from_u8` maps an unknown
+/// value to `StorageFull`). Follows ADR-WE-SP-001's pattern: a named state in an `AtomicU8`, defined
+/// transitions, a defined exit.
+///
+/// * `Healthy -> Failing`: any failed attempt.
+/// * `Failing -> Healthy`: a successful cycle.
+/// * `Failing -> Blocked`: `max_flush_retries` CONSECUTIVE permanent-class failures (a transient failure or a
+///   success in between resets the permanent count).
+/// * `Blocked` is left only by restarting the process (the in-memory state is not persisted; a restarted worker
+///   makes at most that many further attempts, each cleaned up, and blocks again if the source is still bad).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum CompactionHealth {
+    #[default]
+    Healthy = 0,
+    Failing = 1,
+    Blocked = 2,
+}
+
+impl CompactionHealth {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => CompactionHealth::Healthy,
+            1 => CompactionHealth::Failing,
+            _ => CompactionHealth::Blocked,
+        }
+    }
+}
+
+/// What an operator sees: [`CompactionHealth`] plus whether a cycle is executing right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionState {
+    Idle,
+    Running,
+    Failing,
+    Blocked,
+}
+
+impl CompactionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionState::Idle => "idle",
+            CompactionState::Running => "running",
+            CompactionState::Failing => "failing",
+            CompactionState::Blocked => "blocked",
+        }
+    }
 }
 
 #[derive(Default)]
 struct CompactionMetricCounters {
+    failures_total: AtomicU64,
+    consecutive_failures: AtomicU64,
+    /// Consecutive permanent-class failures (reset by a success or a transient failure).
+    permanent_streak: AtomicU64,
+    health: AtomicU8,
+    last_failure: Mutex<Option<CompactionFailure>>,
     cycles_completed: AtomicU64,
     input_sstables_total: AtomicU64,
     input_bytes_total: AtomicU64,
@@ -611,13 +732,89 @@ struct CompactionMetricCounters {
     last_cycle: Mutex<Option<CompactionStats>>,
 }
 
+/// What the worker does after recording one failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureOutcome {
+    /// Keep the current cadence. `permanent_attempt` is `Some(k)` for the k-th consecutive permanent-class
+    /// failure (k < budget), `None` for a transient one.
+    Retry { permanent_attempt: Option<u64> },
+    /// The permanent-failure budget is spent: stop attempting until the process restarts.
+    Blocked,
+}
+
+/// ADR-COMPACTION-LEAK-01: records one failed attempt and applies the state machine documented on
+/// [`CompactionHealth`]. `budget` is `LsmConfig::max_flush_retries`.
+fn record_compaction_failure(
+    counters: &CompactionMetricCounters,
+    kind: CompactionFailureKind,
+    message: String,
+    budget: u32,
+) -> FailureOutcome {
+    counters.failures_total.fetch_add(1, Ordering::Relaxed);
+    counters
+        .consecutive_failures
+        .fetch_add(1, Ordering::Relaxed);
+    *counters
+        .last_failure
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(CompactionFailure {
+        at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        kind,
+        message,
+    });
+    if kind.is_permanent() {
+        let streak = counters.permanent_streak.fetch_add(1, Ordering::AcqRel) + 1;
+        if streak >= u64::from(budget.max(1)) {
+            counters
+                .health
+                .store(CompactionHealth::Blocked as u8, Ordering::Release);
+            return FailureOutcome::Blocked;
+        }
+        let _ = counters.health.compare_exchange(
+            CompactionHealth::Healthy as u8,
+            CompactionHealth::Failing as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        FailureOutcome::Retry {
+            permanent_attempt: Some(streak),
+        }
+    } else {
+        counters.permanent_streak.store(0, Ordering::Relaxed);
+        let _ = counters.health.compare_exchange(
+            CompactionHealth::Healthy as u8,
+            CompactionHealth::Failing as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        FailureOutcome::Retry {
+            permanent_attempt: None,
+        }
+    }
+}
+
 /// Records one successful cycle's `CompactionStats` into the running
 /// totals. Called from `compact_once_impl` only on the `Ok(Some(..))`
-/// path — a failed/deferred/no-op cycle contributes nothing (there is
-/// no partial cycle to report; §11 of `ADR-COMPACTION-001`'s crash
-/// protocol already establishes a failure leaves no observable partial
-/// state, and this mirrors that for metrics).
+/// path — a failed/deferred/no-op cycle contributes nothing to these
+/// totals (there is no partial cycle to report; §11 of
+/// `ADR-COMPACTION-001`'s crash protocol already establishes a failure
+/// leaves no observable partial state, and this mirrors that for
+/// metrics). Failures are recorded separately, by
+/// `record_compaction_failure` (`ADR-COMPACTION-LEAK-01`).
 fn record_compaction_cycle(counters: &CompactionMetricCounters, stats: &CompactionStats) {
+    // ADR-COMPACTION-LEAK-01: a success ends a failure streak (`Failing -> Healthy`); it never lifts
+    // `Blocked` - that state is left only by restarting the process.
+    counters.consecutive_failures.store(0, Ordering::Relaxed);
+    counters.permanent_streak.store(0, Ordering::Relaxed);
+    let _ = counters.health.compare_exchange(
+        CompactionHealth::Failing as u8,
+        CompactionHealth::Healthy as u8,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     counters.cycles_completed.fetch_add(1, Ordering::Relaxed);
     counters
         .input_sstables_total
@@ -1471,6 +1668,7 @@ impl LsmEngine {
                 Arc::clone(&compaction_stop),
                 lsm_config.storage_pressure_retry_interval,
                 Arc::clone(&compaction_metrics),
+                lsm_config.max_flush_retries,
             ))
         } else {
             None
@@ -2268,6 +2466,23 @@ impl LsmEngine {
         self.compaction_running.load(Ordering::Relaxed)
     }
 
+    /// ADR-COMPACTION-LEAK-01: the compaction worker's operator-facing state - `Blocked` / `Failing` from
+    /// [`CompactionHealth`], otherwise `Running` while a cycle executes and `Idle` when not. Purely
+    /// observational; never consulted by any engine decision.
+    pub fn compaction_state(&self) -> CompactionState {
+        match CompactionHealth::from_u8(self.compaction_metrics.health.load(Ordering::Acquire)) {
+            CompactionHealth::Blocked => CompactionState::Blocked,
+            CompactionHealth::Failing => CompactionState::Failing,
+            CompactionHealth::Healthy => {
+                if self.compaction_running() {
+                    CompactionState::Running
+                } else {
+                    CompactionState::Idle
+                }
+            }
+        }
+    }
+
     /// Increment 3: a point-in-time snapshot of cumulative Compaction
     /// health metrics — see `CompactionMetrics`'s own doc comment.
     /// Cheap (atomic loads plus one small `Mutex` lock for `last_
@@ -2292,6 +2507,15 @@ impl LsmEngine {
             peak_temp_disk_bytes_max: c.peak_temp_disk_bytes_max.load(Ordering::Relaxed),
             last_cycle: c
                 .last_cycle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+            failures_total: c.failures_total.load(Ordering::Relaxed),
+            consecutive_failures: c.consecutive_failures.load(Ordering::Relaxed),
+            blocked: CompactionHealth::from_u8(c.health.load(Ordering::Acquire))
+                == CompactionHealth::Blocked,
+            last_failure: c
+                .last_failure
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
@@ -2850,6 +3074,12 @@ fn compact_once_impl(
 /// timer beyond the existing periodic fallback tick — wait for the
 /// next real trigger or fallback tick, exactly like `Ok(None)`'s own
 /// "nothing to do right now" outcome, just logged differently).
+///
+/// `ADR-COMPACTION-LEAK-01` amends the `Err` arm: the failure is classified by `EngineError` variant, recorded in
+/// `CompactionMetrics` (`record_compaction_failure`), and the writer has already removed its own temp file. A
+/// transient failure keeps the retry above exactly; a permanent-class one (`Corruption`, `Unsupported`, a panic)
+/// counts toward `max_flush_retries` consecutive failures, after which the worker is `Blocked` and stays idle
+/// (it still drains messages and honours shutdown) until the process restarts.
 #[allow(clippy::too_many_arguments)]
 fn spawn_compaction_thread(
     receiver: mpsc::Receiver<CompactionMsg>,
@@ -2869,6 +3099,7 @@ fn spawn_compaction_thread(
     stop: Arc<AtomicBool>,
     fallback_interval: Duration,
     compaction_metrics: Arc<CompactionMetricCounters>,
+    failure_budget: u32,
 ) -> JoinHandle<()> {
     thread::spawn(move || loop {
         match receiver.recv_timeout(fallback_interval) {
@@ -2891,6 +3122,13 @@ fn spawn_compaction_thread(
         }
         if stop.load(Ordering::Acquire) {
             return;
+        }
+        // ADR-COMPACTION-LEAK-01: a worker that has spent its permanent-failure budget stays idle (it still
+        // wakes, drains messages and honours shutdown) until the process restarts.
+        if CompactionHealth::from_u8(compaction_metrics.health.load(Ordering::Acquire))
+            == CompactionHealth::Blocked
+        {
+            continue;
         }
         // Catch-up loop: keep compacting while real work remains and
         // shutdown hasn't been requested.
@@ -2947,7 +3185,9 @@ fn spawn_compaction_thread(
                 }
                 Ok(Ok(None)) => break, // nothing to do right now
                 Ok(Err(e)) => {
-                    eprintln!("compaction: failed, will retry on the next trigger: {e}");
+                    let kind = CompactionFailureKind::classify(&e);
+                    let message = e.to_string();
+                    report_compaction_failure(&compaction_metrics, kind, message, failure_budget);
                     break;
                 }
                 Err(panic_payload) => {
@@ -2956,12 +3196,39 @@ fn spawn_compaction_thread(
                         .map(|s| s.to_string())
                         .or_else(|| panic_payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "non-string panic payload".to_string());
-                    eprintln!("compaction: panicked, will retry on the next trigger: {detail}");
+                    report_compaction_failure(
+                        &compaction_metrics,
+                        CompactionFailureKind::Panic,
+                        format!("panic: {detail}"),
+                        failure_budget,
+                    );
                     break;
                 }
             }
         }
     })
+}
+
+/// Records a failed attempt and prints the operator line for its outcome (stderr, as before; the security
+/// log is written by the api layer when it observes the state change).
+fn report_compaction_failure(
+    counters: &CompactionMetricCounters,
+    kind: CompactionFailureKind,
+    message: String,
+    budget: u32,
+) {
+    match record_compaction_failure(counters, kind, message.clone(), budget) {
+        FailureOutcome::Blocked => eprintln!(
+            "compaction: blocked after {budget} consecutive permanent failures ({message}); \
+             restore the damaged table and restart"
+        ),
+        FailureOutcome::Retry {
+            permanent_attempt: Some(k),
+        } => eprintln!("compaction: failed (attempt {k} of {budget}), will retry: {message}"),
+        FailureOutcome::Retry {
+            permanent_attempt: None,
+        } => eprintln!("compaction: failed, will retry on the next trigger: {message}"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

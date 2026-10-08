@@ -145,6 +145,14 @@ pub async fn system(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "cycles_since_start": s.compaction_cycles,
                     "live_sstable_count": s.live_sstable_count,
                     "last_duration_ms": s.last_compaction_ms,
+                    // ADR-COMPACTION-LEAK-01 (additive)
+                    "state": s.compaction_state,
+                    "failures_total": s.compaction_failures_total,
+                    "consecutive_failures": s.compaction_consecutive_failures,
+                    "blocked": s.compaction_blocked,
+                    "last_failure": s.compaction_last_failure.as_ref().map(|(at, kind, message)| json!({
+                        "at_unix_ms": at, "kind": kind, "message": message,
+                    })),
                 },
                 "background": {
                     "flush_queue_depth": s.flush_queue_depth,

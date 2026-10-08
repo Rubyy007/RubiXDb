@@ -5571,6 +5571,456 @@ mod compaction_tests {
             let _ = fs::remove_dir_all(&dir);
         }
     }
+
+    /// ADR-COMPACTION-LEAK-01 (F-08 compaction retry leak): what the compaction worker does after a
+    /// merge has failed on an unreadable input. Real engine, real background worker, real files; the
+    /// damage is one flipped bit inside the first data block of the OLDEST of four live SSTables.
+    mod compaction_failure_tests {
+        use super::*;
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn failing_worker_config() -> LsmConfig {
+            LsmConfig {
+                memtable_max_size_bytes: 200,
+                max_immutable_memtables: 32,
+                compaction_trigger_count: 4,
+                compaction_auto_trigger: true,
+                storage_pressure_retry_interval: Duration::from_millis(100),
+                ..LsmConfig::default()
+            }
+        }
+
+        /// Exactly four live SSTables, built offline with the worker off (the pattern of
+        /// `shutdown_lets_an_in_progress_automatic_compaction_finish_before_returning`), then the
+        /// oldest table's first data block gets one flipped bit. Returns the directory, the damaged
+        /// file and its original bytes (so a test can "repair" it).
+        fn four_tables_oldest_damaged(tag: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+            let dir = temp_dir(tag);
+            {
+                let engine = open(&dir, small_flush_config(4));
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+                engine.shutdown();
+            }
+            let mut ssts: Vec<PathBuf> = fs::read_dir(dir.join("sstables"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "sst"))
+                .collect();
+            ssts.sort();
+            assert_eq!(ssts.len(), 4, "the fixture needs exactly four live tables");
+            let victim = ssts[0].clone();
+            let original = fs::read(&victim).unwrap();
+            let mut damaged = original.clone();
+            damaged[6] ^= 0x01; // inside the first data block (the block checksum covers it)
+            fs::write(&victim, &damaged).unwrap();
+            (dir, victim, original)
+        }
+
+        fn tmp_files(sstables_dir: &Path) -> Vec<String> {
+            let mut v: Vec<String> = fs::read_dir(sstables_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.ends_with(".sst.tmp"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        }
+
+        /// DOCUMENTATION OF THE BUG, kept on purpose and `#[ignore]`d. It asserts the PRE-FIX
+        /// behaviour found by the F-08 compaction-leak discovery: every failed compaction attempt leaves
+        /// a partial `.sst.tmp` behind, nothing reports the failure (`cycles_completed` stays 0 and no
+        /// other field exists), and a clean shutdown does not reclaim the pile. It PASSES on a tree
+        /// without ADR-COMPACTION-LEAK-01 and is EXPECTED TO FAIL on a tree with it (run it with
+        /// `--ignored` to see which kind of tree you have). The acceptance test below is its inverse.
+        #[test]
+        #[ignore = "documents the pre-fix leak (ADR-COMPACTION-LEAK-01); passes only on a tree without the fix"]
+        fn documented_prefix_bug_failed_compaction_leaves_tmp_files_and_reports_nothing() {
+            let (dir, _, _) = four_tables_oldest_damaged("leak_documented_bug");
+            let engine = open(&dir, failing_worker_config());
+            let sst = engine.sstables_dir().to_path_buf();
+            assert!(
+                wait_until(|| tmp_files(&sst).len() >= 3, Duration::from_secs(20)),
+                "pre-fix behaviour expected: at least 3 leftover .sst.tmp files from 3 failed attempts, found {:?}",
+                tmp_files(&sst)
+            );
+            assert_eq!(
+                engine.compaction_metrics().cycles_completed,
+                0,
+                "no cycle completed; and pre-fix there is no other observable at all"
+            );
+            let seen = tmp_files(&sst).len();
+            engine.shutdown();
+            drop(engine);
+            assert!(
+                tmp_files(&sst).len() >= seen,
+                "pre-fix behaviour expected: a clean shutdown does not reclaim the pile"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// THE ACCEPTANCE TEST (compiles and runs on both the pre-fix and the fixed tree): after the
+        /// worker has attempted compaction over an unreadable input at least twice, and has been shut
+        /// down (so no attempt is in flight), no partial output may remain. ADR-COMPACTION-001's own
+        /// test plan promised "corrupt input (fail closed, no partial output)". On the pre-fix tree
+        /// this fails with the discovery's finding: one leftover `.sst.tmp` per attempt.
+        #[test]
+        fn a_failed_compaction_attempt_leaves_no_partial_output_behind() {
+            let (dir, _, _) = four_tables_oldest_damaged("leak_acceptance");
+            let engine = open(&dir, failing_worker_config());
+            let sst = engine.sstables_dir().to_path_buf();
+            let id0 = engine.next_sstable_id();
+            assert!(
+                wait_until(
+                    || engine.next_sstable_id() >= id0 + 2,
+                    Duration::from_secs(20)
+                ),
+                "the worker must have attempted (and failed) compaction at least twice \
+                 (each attempt consumes a table id)"
+            );
+            engine.shutdown(); // joins the worker: nothing is in flight afterwards
+            drop(engine);
+            let left = tmp_files(&sst);
+            assert!(
+                left.is_empty(),
+                "a failed compaction attempt must not leave partial output behind \
+                 (ADR-COMPACTION-001 test plan: corrupt input -> fail closed, no partial output); \
+                 the discovery saw one leftover .sst.tmp per attempt (1,991,320 bytes each on the \
+                 real fixture, `compaction: failed, will retry on the next trigger: corruption: \
+                 block: checksum mismatch` on stderr); found {} file(s): {:?}",
+                left.len(),
+                left
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// A damaged table is reported, not silent: the failure is counted and described, `cycles_completed`
+        /// stays 0, the worker spends exactly its budget (`max_flush_retries`, 3) of attempts and then stops
+        /// (no more table ids consumed, no more failures counted, nothing left on disk).
+        #[test]
+        fn a_permanently_unreadable_input_is_reported_and_the_worker_stops_after_its_budget() {
+            let (dir, _, _) = four_tables_oldest_damaged("leak_reported_and_blocked");
+            let engine = open(&dir, failing_worker_config());
+            let sst = engine.sstables_dir().to_path_buf();
+            let before = engine.compaction_metrics();
+            assert_eq!(
+                (
+                    before.failures_total,
+                    before.consecutive_failures,
+                    before.blocked
+                ),
+                (0, 0, false)
+            );
+            assert!(before.last_failure.is_none(), "nothing has failed yet");
+
+            assert!(
+                wait_until(
+                    || engine.compaction_metrics().failures_total >= 1,
+                    Duration::from_secs(20)
+                ),
+                "the first failure must be recorded"
+            );
+            let first = engine.compaction_metrics();
+            assert_eq!(
+                first.cycles_completed, 0,
+                "a failure is not a completed cycle"
+            );
+            let failure = first.last_failure.expect("last_failure is populated");
+            assert_eq!(failure.kind, CompactionFailureKind::Corruption);
+            assert!(failure.kind.is_permanent());
+            assert!(
+                failure.message.contains("checksum mismatch"),
+                "the message carries the engine error: {}",
+                failure.message
+            );
+            assert!(failure.at_unix_ms > 0);
+
+            assert!(
+                wait_until(
+                    || engine.compaction_metrics().blocked,
+                    Duration::from_secs(20)
+                ),
+                "after max_flush_retries consecutive corruption failures the worker must block"
+            );
+            let blocked = engine.compaction_metrics();
+            assert_eq!(blocked.cycles_completed, 0);
+            assert_eq!(blocked.failures_total, 3, "exactly the budget of attempts");
+            assert_eq!(blocked.consecutive_failures, 3);
+            assert_eq!(engine.compaction_state(), CompactionState::Blocked);
+            assert_eq!(engine.compaction_state().as_str(), "blocked");
+
+            // Blocked means no further attempts: no ids consumed, no failures counted, no files left,
+            // even though the periodic tick keeps firing (100 ms) and the trigger condition still holds.
+            let id_after_block = engine.next_sstable_id();
+            thread::sleep(Duration::from_millis(1200));
+            let later = engine.compaction_metrics();
+            assert_eq!(
+                later.failures_total, 3,
+                "a blocked worker must not attempt again"
+            );
+            assert_eq!(engine.next_sstable_id(), id_after_block);
+            assert!(tmp_files(&sst).is_empty(), "{:?}", tmp_files(&sst));
+            assert_eq!(
+                engine.sstable_count(),
+                4,
+                "compaction never published anything"
+            );
+
+            engine.shutdown();
+            drop(engine);
+            assert!(tmp_files(&sst).is_empty());
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// The defined exit from `Blocked` is a process restart (ADR-COMPACTION-LEAK-01): a new engine on the
+        /// same directory starts healthy. Still damaged -> exactly the budget of attempts, then blocked again;
+        /// repaired -> the compaction succeeds, the state is idle and the failure counters are fresh.
+        #[test]
+        fn a_restart_is_the_defined_exit_from_blocked() {
+            let (dir, victim, original) = four_tables_oldest_damaged("leak_restart_exit");
+            {
+                let engine = open(&dir, failing_worker_config());
+                assert!(wait_until(
+                    || engine.compaction_metrics().blocked,
+                    Duration::from_secs(20)
+                ));
+                engine.shutdown();
+            }
+            // Still damaged: a fresh process makes at most the budget of attempts and blocks again.
+            {
+                let engine = open(&dir, failing_worker_config());
+                let m0 = engine.compaction_metrics();
+                assert_eq!(
+                    (m0.failures_total, m0.blocked),
+                    (0, false),
+                    "state is not persisted"
+                );
+                assert!(wait_until(
+                    || engine.compaction_metrics().blocked,
+                    Duration::from_secs(20)
+                ));
+                assert_eq!(engine.compaction_metrics().failures_total, 3);
+                engine.shutdown();
+            }
+            // Repaired (the damaged table restored to its original bytes): the restart compacts.
+            fs::write(&victim, &original).unwrap();
+            let engine = open(&dir, failing_worker_config());
+            assert!(
+                wait_until(
+                    || engine.compaction_metrics().cycles_completed >= 1,
+                    Duration::from_secs(20)
+                ),
+                "with a readable source the restarted worker must compact"
+            );
+            let m = engine.compaction_metrics();
+            assert_eq!(
+                (m.failures_total, m.consecutive_failures, m.blocked),
+                (0, 0, false)
+            );
+            assert!(
+                wait_until(
+                    || engine.compaction_state() == CompactionState::Idle,
+                    Duration::from_secs(10)
+                ),
+                "state after a successful cycle: {:?}",
+                engine.compaction_state()
+            );
+            assert_eq!(engine.sstable_count(), 1);
+            engine.shutdown();
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// A transient failure (an I/O error, e.g. ENOSPC) never blocks - it is retried at the existing
+        /// cadence, cleaned up, counted, and a later success ends the streak (`Failing -> Healthy`).
+        #[test]
+        fn a_transient_failure_is_counted_never_blocks_and_a_success_ends_the_streak() {
+            let dir = temp_dir("leak_transient");
+            {
+                let engine = open(&dir, small_flush_config(4));
+                let mut seed = 0u64;
+                put_and_wait_for_sstable_count(&engine, 4, &mut seed);
+                engine.shutdown();
+            }
+            let engine = open(&dir, failing_worker_config());
+            let injected = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&injected);
+            engine.install_compaction_io_fault_hook(move || {
+                if counter.fetch_add(1, Ordering::SeqCst) < 5 {
+                    Some(io::Error::other("injected transient failure"))
+                } else {
+                    None
+                }
+            });
+            assert!(wait_until(
+                || engine.compaction_metrics().failures_total >= 5,
+                Duration::from_secs(30)
+            ));
+            let m = engine.compaction_metrics();
+            assert!(
+                !m.blocked,
+                "five transient failures must not block (budget is 3)"
+            );
+            assert_eq!(
+                m.last_failure.as_ref().unwrap().kind,
+                CompactionFailureKind::Io
+            );
+            assert!(!m.last_failure.as_ref().unwrap().kind.is_permanent());
+            assert!(
+                wait_until(
+                    || engine.compaction_metrics().cycles_completed >= 1,
+                    Duration::from_secs(30)
+                ),
+                "after the transient failures the cycle must succeed"
+            );
+            let m = engine.compaction_metrics();
+            assert_eq!(m.consecutive_failures, 0, "a success ends the streak");
+            assert_eq!(m.failures_total, 5, "history is kept");
+            assert!(!m.blocked);
+            assert!(wait_until(
+                || engine.compaction_state() == CompactionState::Idle,
+                Duration::from_secs(10)
+            ));
+            engine.shutdown();
+            drop(engine);
+            assert!(tmp_files(&dir.join("sstables")).is_empty());
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// The classification is by structured variant, and the state machine is exactly the one documented on
+        /// `CompactionHealth`.
+        #[test]
+        fn the_classification_and_the_state_machine_follow_the_adr() {
+            use CompactionFailureKind as K;
+            let corruption = EngineError::Corruption { detail: "x".into() };
+            assert_eq!(K::classify(&corruption), K::Corruption);
+            assert_eq!(
+                K::classify(&EngineError::Unsupported {
+                    operation: "x".into()
+                }),
+                K::Unsupported
+            );
+            assert_eq!(K::classify(&EngineError::Io(io::Error::other("x"))), K::Io);
+            // ENOSPC is an Io error: transient
+            assert!(!K::classify(&EngineError::Io(io::Error::from(
+                io::ErrorKind::StorageFull
+            )))
+            .is_permanent());
+            for other in [
+                EngineError::NotFound,
+                EngineError::WalUnavailable { detail: "x".into() },
+                EngineError::CapacityExceeded {
+                    requested: 1,
+                    max: 0,
+                },
+                EngineError::Aborted { detail: "x".into() },
+                EngineError::Timeout { detail: "x".into() },
+                EngineError::StorageExhausted { detail: "x".into() },
+                EngineError::InvalidArgument { detail: "x".into() },
+            ] {
+                assert_eq!(K::classify(&other), K::Other, "{other:?}");
+                assert!(!K::classify(&other).is_permanent());
+            }
+            for (k, permanent) in [
+                (K::Corruption, true),
+                (K::Unsupported, true),
+                (K::Panic, true),
+                (K::Io, false),
+                (K::Other, false),
+            ] {
+                assert_eq!(k.is_permanent(), permanent, "{k:?}");
+            }
+
+            let run = |seq: &[K], budget: u32| {
+                let c = CompactionMetricCounters::default();
+                let mut outcomes = Vec::new();
+                for k in seq {
+                    outcomes.push(record_compaction_failure(&c, *k, "m".into(), budget));
+                }
+                (c, outcomes)
+            };
+            let health = |c: &CompactionMetricCounters| {
+                CompactionHealth::from_u8(c.health.load(Ordering::SeqCst))
+            };
+            // three consecutive permanent failures block, the third being the Blocked outcome
+            let (c, o) = run(&[K::Corruption, K::Corruption, K::Corruption], 3);
+            assert_eq!(
+                o,
+                vec![
+                    FailureOutcome::Retry {
+                        permanent_attempt: Some(1)
+                    },
+                    FailureOutcome::Retry {
+                        permanent_attempt: Some(2)
+                    },
+                    FailureOutcome::Blocked
+                ]
+            );
+            assert_eq!(health(&c), CompactionHealth::Blocked);
+            // a transient failure in between resets the permanent streak: never blocked
+            let (c, o) = run(
+                &[
+                    K::Corruption,
+                    K::Corruption,
+                    K::Io,
+                    K::Corruption,
+                    K::Corruption,
+                ],
+                3,
+            );
+            assert!(!o.contains(&FailureOutcome::Blocked));
+            assert_eq!(health(&c), CompactionHealth::Failing);
+            assert_eq!(c.failures_total.load(Ordering::SeqCst), 5);
+            assert_eq!(c.consecutive_failures.load(Ordering::SeqCst), 5);
+            // panics and Unsupported count as permanent-candidates
+            let (c, _) = run(&[K::Panic, K::Corruption, K::Unsupported], 3);
+            assert_eq!(health(&c), CompactionHealth::Blocked);
+            // only transient failures: any number, never blocked
+            let (c, o) = run(&[K::Io; 12], 3);
+            assert!(o.iter().all(|x| *x
+                == FailureOutcome::Retry {
+                    permanent_attempt: None
+                }));
+            assert_eq!(health(&c), CompactionHealth::Failing);
+            // a success ends the streak (Failing -> Healthy) and resets the permanent count
+            let (c, _) = run(&[K::Corruption, K::Corruption], 3);
+            let stats = CompactionStats {
+                input_sstable_count: 4,
+                output_sstable_count: 1,
+                input_bytes: 1,
+                output_bytes: 1,
+                records_read: 1,
+                records_retained: 1,
+                records_dropped: 0,
+                tombstones_dropped: 0,
+                versions_dropped: 0,
+                duration: Duration::from_millis(1),
+                peak_temp_disk_bytes: 2,
+            };
+            record_compaction_cycle(&c, &stats);
+            assert_eq!(health(&c), CompactionHealth::Healthy);
+            assert_eq!(c.consecutive_failures.load(Ordering::SeqCst), 0);
+            assert_eq!(c.permanent_streak.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                record_compaction_failure(&c, K::Corruption, "m".into(), 3),
+                FailureOutcome::Retry {
+                    permanent_attempt: Some(1)
+                },
+                "two failures before the success do not count toward the next streak"
+            );
+            // Blocked is not lifted by a success (only a restart leaves it)
+            let (c, _) = run(&[K::Corruption, K::Corruption, K::Corruption], 3);
+            record_compaction_cycle(&c, &stats);
+            assert_eq!(health(&c), CompactionHealth::Blocked);
+            // a budget of 0 behaves as 1
+            let (c, _) = run(&[K::Corruption], 0);
+            assert_eq!(health(&c), CompactionHealth::Blocked);
+        }
+    }
 }
 
 /// `LsmEngine::write_batch` — `RELATIONAL ADR AMENDMENT 001` AA.1–AA.9

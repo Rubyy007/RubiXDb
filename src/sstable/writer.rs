@@ -5,7 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::memtable::{MemTable, MemtableValue};
@@ -14,6 +14,36 @@ use crate::sstable::format::{
     self, DEFAULT_BLOOM_BITS_PER_KEY, DEFAULT_TARGET_BLOCK_SIZE, OP_DELETE, OP_PUT,
 };
 use crate::sstable::{sstable_filename, sstable_tmp_filename, RecordValue, SstableMeta};
+
+/// ADR-COMPACTION-LEAK-01: removes the writer's OWN temp file on every failure path. Armed when created,
+/// disarmed only after the `.sst.tmp` -> `.sst` rename succeeded; every other exit (an `Err` from the record
+/// iterator - e.g. an unreadable compaction input -, an encode / write / fsync / rename error, or a panic
+/// unwinding through the writer) drops it armed and the partial file is deleted. Best effort: a failed removal
+/// is ignored and the startup sweep (`reconcile_sstables_with_manifest`) stays the backstop for a kill. It must
+/// be declared BEFORE the file handle so the handle is closed first when both drop (Windows cannot delete an
+/// open file).
+struct TmpFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TmpFileGuard {
+    fn new(path: PathBuf) -> Self {
+        TmpFileGuard { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SsTableWriterConfig {
@@ -108,6 +138,8 @@ where
     let tmp_path = sstables_dir.join(sstable_tmp_filename(id));
     let final_path = sstables_dir.join(sstable_filename(id));
 
+    // Declared before `file` on purpose (see `TmpFileGuard`).
+    let mut tmp_guard = TmpFileGuard::new(tmp_path.clone());
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -193,6 +225,9 @@ where
     drop(file);
 
     fs::rename(&tmp_path, &final_path)?;
+    // Published: nothing left to clean up (a failure of the directory fsync below leaves the published
+    // table for the next open's sweep, exactly as before).
+    tmp_guard.disarm();
     crate::wal::fsync_dir(sstables_dir)?;
 
     Ok(SstableMeta {

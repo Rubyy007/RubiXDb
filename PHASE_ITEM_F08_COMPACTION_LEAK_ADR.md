@@ -1,6 +1,6 @@
 # ADR-COMPACTION-LEAK-01 — A failed compaction must clean up after itself, say so, and stop retrying what can never succeed
 
-**Status: PROPOSED — awaiting maintainer approval. Do not apply.** Nothing in this ADR has been implemented; no engine, protected-path, test, `Cargo.toml` or `Cargo.lock` change was made in the mission that wrote it. Every change it proposes is under a protected path (`src/sstable/writer.rs`, `src/lsm/mod.rs`, possibly `src/compaction/mod.rs`) and therefore needs an explicit engine-change authorisation (CLAUDE.md, Protected Engine Boundary). Evidence: `PHASE_ITEM_F08_COMPACTION_LEAK_DISCOVERY.md` (2026-10-08, tree `13dc534`). Related: ADR-WE-SP-001 (`PHASE_WRITE_ENGINE_STORAGE_PRESSURE_ADR.md`), ADR-COMPACTION-001 (`PHASE_COMPACTION_ADR.md`), ADR-SST-01 (`PHASE_ITEM_F08_ADR.md`, PROPOSED).
+**Status: ACCEPTED (2026-10-08) — implemented; see "Implementation notes" at the end.** The text below is the approved proposal and is unchanged. When it was written no engine, protected-path, test, `Cargo.toml` or `Cargo.lock` change had been made. Every change it proposes is under a protected path (`src/sstable/writer.rs`, `src/lsm/mod.rs`, possibly `src/compaction/mod.rs`) and therefore needs an explicit engine-change authorisation (CLAUDE.md, Protected Engine Boundary). Evidence: `PHASE_ITEM_F08_COMPACTION_LEAK_DISCOVERY.md` (2026-10-08, tree `13dc534`). Related: ADR-WE-SP-001 (`PHASE_WRITE_ENGINE_STORAGE_PRESSURE_ADR.md`), ADR-COMPACTION-001 (`PHASE_COMPACTION_ADR.md`), ADR-SST-01 (`PHASE_ITEM_F08_ADR.md`, PROPOSED).
 
 ## Decision
 
@@ -91,3 +91,14 @@ Classification is by variant, never by parsing text (the ADR-WE-SP-001 section 7
 ## Out of scope
 
 Compacting around the damaged table (unsafe: dropping tombstones needs every table); repairing, quarantining or excluding a table; ENOSPC behaviour of compaction beyond cleanup and counting; the manual `compact_once` path (it benefits from the writer fix); any change to `StorageState`, `/readyz` or decision D5; the flush thread's retry policy; a periodic or shutdown-time tmp sweep; the severity of the `UNEXPECTED_FILE` info in `rubixdb check`; naming the failing input table in the compaction error (a possible small follow-up if the cursor exposes the table id); F-11, F-18 and everything else.
+
+## Implementation notes (2026-10-08, appended; the ADR above is unchanged)
+
+Implemented as approved (P3), by the commit that carries `PHASE_ITEM_F08_COMPACTION_LEAK_IMPLEMENTATION.md`. Evidence, before/after timeline, tests, mutation check and regression are in that document.
+
+* Writer: `TmpFileGuard` in `src/sstable/writer.rs`, disarmed after the successful rename.
+* Worker and state: `CompactionFailureKind`, `CompactionHealth` (`AtomicU8`), derived `CompactionState` in `src/lsm/mod.rs`; budget `max_flush_retries` (3) consecutive permanent-class failures; a success never lifts Blocked; the exit is a process restart. `StorageState` and `/readyz` untouched.
+* Surfaces: additive fields on `/v1/compaction/status`, `/v1/compaction/metrics`, `/v1/admin/status.compaction`, `/v1/metrics/system.compaction`; security events `compaction.failing` and `compaction.blocked` on state change only.
+* Measured, case A: before, 1/6/12/24 tmp files (1.99 MB each) at t = 0/30/60/120 s; after, 0 at every sample and the worker blocked at ~10.1 s (3 attempts).
+* Not covered, as the ADR said: the error line still names no table (ADR-SST-01); no real-disk-full test; manual `compact_once` is not recorded by the worker arm.
+* Deviation from the ADR text: none.

@@ -270,6 +270,12 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
             "tombstones_dropped_total": cm.tombstones_dropped_total,
             "duration_max_ms": cm.duration_max.as_secs_f64() * 1000.0,
             "last_cycle_ms": cm.last_cycle.as_ref().map(|c| c.duration.as_secs_f64() * 1000.0),
+            // ADR-COMPACTION-LEAK-01 (additive)
+            "state": engine.compaction_state().as_str(),
+            "failures_total": cm.failures_total,
+            "consecutive_failures": cm.consecutive_failures,
+            "blocked": cm.blocked,
+            "last_failure": crate::routes::compaction::last_failure_value(&cm.last_failure),
         },
         "reads": {
             "requests": rs.read_requests,
