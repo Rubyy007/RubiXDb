@@ -6,6 +6,10 @@ release yet, so everything so far lives under `[Unreleased]`.
 
 ## [Unreleased]
 
+### Item C: operator-settable cap on the blocking thread pool (2026-10-07)
+
+Added `RUBIXDB_LOCAL_MAX_BLOCKING_THREADS` (integer 16..=512; unset or empty = 512, tokio's default, i.e. the behaviour before this change). It bounds the thread pool every SQL statement runs on (`spawn_blocking`) in the embedded host (`rubixdb gui`); a bad value stops startup and names the variable. Measured (`PHASE_ITEM_C_DISCOVERY.md`, `PHASE_ITEM_C_CERTIFICATION.md`): with 16 clients connecting inside the timed window the server created 165-530 threads in the first fraction of a second and ran at 24.0-29.2k req/s; capped at 16 or 64 the thread count is exactly 18 + cap, throughput 29.5-30.6k req/s and p99 1.14-1.24 ms; warm reads and writes are unchanged. **The default is not changed**, so an operator who sets nothing sees the previous behaviour. ADR-ITEM-C-01. Not changed: `api/`, timeouts, cancellation, sessions, snapshot semantics, error shapes, response schemas, engine (`src/`), `Cargo.toml`, `Cargo.lock`.
+
 ### Observability coverage-gap closure (2026-10-07)
 
 Tests only: three observability rows that were NOT TESTED for want of a test are now covered (`errors.*`, `limits.*` and `storage_state` of `/v1/metrics/system`; the freshness response before any snapshot exists; five consecutive sampler panics driving the state to `failed` and back to `running`, in the new test file `api/tests/observability_sampler_failure.rs`). No production code changed. Section A of the certification is 72 PASS, 0 FAIL, 0 OPEN, 6 NOT REQUIRED, 7 NOT TESTED (85 rows); two value-trigger cases stay NOT TESTED inside row A12. See certification section 28.
