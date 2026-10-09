@@ -2762,3 +2762,14 @@ Port contract (127.0.0.1:302), bind address, identity handshake semantics, engin
 - When the 30 s (or 15 s) startup bound fires, one line is printed at once: `rubixdb gui: engine open has not finished after 30s; waiting up to 60s more for it to complete before exiting`. The final error keeps its leading phrase and now carries the true elapsed time, e.g. `server did not signal readiness within 30s (open took 67.3s)`, or `... (open took 91.2s; grace expired, the process was terminated)` when the grace ran out. Before, the process stayed alive for as long as the open took (60.9-122.8 s measured, port bound and silent) and the message named a bound it had already exceeded.
 ### Not changed
 The 30 s and 15 s bounds, the normal startup path, `/readyz`, the engine (`src/`) and every protected path.
+
+## 2026-10-10 -- F-11 production closure: the startup deadline no longer depends on a thread that can fail to start; interrupted startups are proven recoverable (under [Unreleased])
+### Changed
+- **The startup grace is enforced on the calling thread.** When a startup bound fires, `rubixdb gui` / the plain CLI now waits for the server thread for at most `RUBIXDB_STARTUP_GRACE_MS` itself and then ends the process with exit code 1 (`... within 30s (open took N.Ns; grace expired, the process was terminated)`), instead of arming a separate watchdog thread. Messages, exit code, the 30 s and 15 s bounds, the default grace (60 s) and its range (5-3600 s) are unchanged. The old watchdog could fail to start and then print "waiting without a bound"; that fallback no longer exists.
+- `rubixdb gui --help` now says that the grace covers both startup bounds and that the exit is a process termination, not a shutdown.
+### Added (test seam, not in any product build)
+- Cargo feature `startup-probe` (`rubixdb` and `rubixdb-cli`): 14 named pause points on the startup / recovery path (`src/startup_probe.rs`), driven by `RUBIXDB_TEST_STARTUP_PAUSE`, `RUBIXDB_TEST_STARTUP_PAUSE_MS`, `RUBIXDB_TEST_STARTUP_PROBE_FILE`. Compiled to nothing without the feature; the release binary contains none of it.
+- `cli/tests/f11_startup_interruption_integration.rs`: the real binary is ended by the real deadline at each of those points (WAL replay on 2.65 MB and 8.0 MB logs, tail quarantine, truncation of a torn WAL / Manifest tail, orphan-table adoption, ...) and the same instance is restarted and checked; plus the deadline race, the default grace, the plain-CLI owner path and a random-instant kill sweep.
+- `PHASE_ITEM_F11_ADR.md` (ADR-STARTUP-01, PROPOSED) and `PHASE_ITEM_F11_CLOSURE.md`.
+### Not changed
+The engine and every protected path (`src/wal`, `src/manifest`, `src/sstable`, `src/compaction`, `src/error.rs`); `/readyz`; the normal startup path; graceful shutdown; the clean-stop attestation (still written only after the engine stopped).

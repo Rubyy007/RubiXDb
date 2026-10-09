@@ -1,0 +1,93 @@
+# ADR-STARTUP-01 — a hard process-lifetime bound on a stuck startup (F-11)
+
+**Date:** 2026-10-10. **Status:** PROPOSED by the F-11 production-closure mission, whose text ("If a hard-exit policy is necessary, document its safety assumptions, alternatives, trade-offs, and explicit acceptance criteria in an ADR before ... retaining that policy as certified behavior") asks for exactly this record. It is in effect for the CLI layer only (`cli/src/host.rs`); the maintainer's ratification is NOT recorded here and F-11's closure document says so. No protected path is touched by this ADR or by its implementation.
+
+Related: `PHASE_ITEM_F11_DISCOVERY.md` (the defect and how it was reproduced), `PHASE_ITEM_F11_CLOSURE.md` (the evidence for the acceptance criteria below), `PHASE_ITEM_F07_ADR.md` (ADR-WAL-01: attestation, quarantine), `PHASE_ITEM_F08_ADR.md` (ADR-SST-01), `PHASE_RUBIXDB_LIFECYCLE_ADR_INDEX_RECOVERY_CANCELLATION.md` (the only cooperative cancellation that exists: index recovery).
+
+## 1. Context
+
+`EmbeddedServer::start` (`cli/src/host.rs`) runs the guard (`startup_guard_with_tail_policy`) and `LsmEngine::open` on the server thread and waits for it: 30 s for the engine (`READINESS_BOUND`), then 15 s for `/healthz` (`HEALTHZ_BOUND`). Before F-11 a bound that fired only ended the *wait*: `fail()` signalled shutdown and then **joined** the server thread, which cannot see the signal until it is out of the open, so the process lived exactly as long as the slow step (measured 60.9-122.8 s with the port bound and silent). The first F-11 change (`aad45d0`) added a notice line, `RUBIXDB_STARTUP_GRACE_MS` (default 60 s, 5-3600 s) and a *watchdog thread* that called `process::exit(1)` when the grace ran out.
+
+Two questions were left open by that change and are this ADR's subject:
+
+1. Is ending the process while the startup is active safe for the data directory and consistent with the engine's lifecycle guarantees?
+2. Is the bound really a bound? (The watchdog was a separate thread; if it could not be spawned the code printed "waiting without a bound" and fell back to the old unbounded join.)
+
+## 2. What a startup can modify (traced from the source, `aad45d0` + this change)
+
+Order of events on the server thread, with what each step may change on disk, whether a re-run after an interruption converges, and the test that interrupts it. "Point" names are those of `rubixdb::startup_probe` (section 6).
+
+| # | Step (file) | Changes | Interrupted state / re-run | Probe point(s) interrupted at |
+|---|---|---|---|---|
+| 1 | `ensure_compatible` (`src/ops/format.rs`) | nothing (read-only) | n/a | (covered by the first row of step 2) |
+| 2 | `wal_preflight`: read-only WAL replay, shared lock (`format.rs`) | nothing | n/a, the lock is released by the OS | `guard_wal_preflight_record` (inside the replay, at record n/2: of 2,500 records / 2.65 MB, and of 7,540 rows / 8.0 MB) |
+| 3 | `sstable_integrity::preflight` (`src/ops/sstable_integrity.rs`) | nothing (read-only, Manifest-authoritative) | n/a | not separately (read-only); `guard_wal_preflight_record` precedes it |
+| 4 | `apply_tail_policy`, decisions (`src/ops/wal_tail.rs`) | nothing: every refusal is decided before the first mutation | n/a | n/a |
+| 5 | quarantine copy of a torn tail: temp file, write, `fsync`, atomic rename (`wal_tail.rs`) | adds one file under `wal-quarantine/`; never overwrites; a complete entry with the same evidence is reused | before the rename: one stray `*.tail.tmp` (never cleaned, see section 5); after: a complete entry that the next start reuses | `quarantine_temp_written`, `quarantine_renamed` |
+| 6 | removal of `WAL_CLEAN_STOP` (`wal_tail.rs`) | removes the attestation, only after every refusal was decided and the quarantine succeeded | the next start is *unattested* (the same as after any kill) | `attestation_consumed` |
+| 7 | `LsmEngine::open`: read-only Manifest replay, then read-only WAL replay into the memtable (`src/lsm/mod.rs`) | nothing on disk | n/a | `engine_wal_replay_record` (record n/2, 2.65 MB and 8.0 MB WALs), `engine_wal_replayed` |
+| 8 | `FileWal::open_for_recovery` (`src/wal/mod.rs`, protected, not modified) | exclusive lock; `set_len(valid_end_offset)` + `sync_all` of a torn tail (ONE syscall that changes the size field); on an empty directory, creates segment 1 | before: the torn bytes are still there and are replayed/truncated again; after: gone (they were quarantined first, step 5) | `engine_wal_opened` (after the truncation: file shorter by the 5 torn bytes, asserted) |
+| 9 | `Manifest::open_after_exclusive_lock` (`src/manifest/mod.rs`, protected, not modified) | `set_len(valid_length)` of a torn Manifest tail | same shape as step 8 | `manifest_opened` (after the truncation: file shorter by the 3 stray bytes, asserted) |
+| 10 | `reconcile_sstables_with_manifest` (`src/lsm/mod.rs`) | deletes stale `*.sst.tmp`; for a table the Manifest does not know: opens it and `append_sync`s an `ADD_SSTABLE` edit | the temp files are gone / the edit is either appended or not; the next start repeats the sweep and adopts what is still unknown | `reconcile_tmp_swept`, `reconcile_before_adopt`, `reconcile_after_adopt` |
+| 11 | flush and compaction threads started | background work begins (a replayed memtable over its bound is flushed right after open) | a flush interrupted by a kill is the engine's certified crash case | `engine_opened`; the random-instant sweep samples the flush window of the adoption fixture; NOT separately injected |
+| 12 | `stamp_if_fresh` (`format.rs`) | writes `DATA_FORMAT` (temp file + rename) for a first start | a first start interrupted here leaves `DATA_FORMAT.tmp` and no marker: the next start sees a non-empty directory without a marker, which is the "legacy" state that is accepted and never stamped (section 5) | `format_marker_temp_written` |
+| 13 | index recovery thread, SSTable verification, router, listener, readiness (`host.rs`) | the index recovery rewrites index rows (restart-not-resume by design) and is cancelable | a kill leaves `Building` indexes that restart at the next start (certified, `index_backfill_crash_integration`) | `host_ready_sent` (readiness sent, server not serving: the `/healthz` bound fires) |
+
+No step writes anything that is not written by a process that is killed at the same instant for any other reason, and no step's re-run depends on a "completed" flag that only a successful startup sets. The clean-stop attestation, the only completion marker, is written by `EmbeddedServer::shutdown` after the engine has stopped (`host.rs`), never on the failed-start path.
+
+## 3. Decision
+
+1. **Retain the hard exit.** When a startup bound has fired and the server thread has not ended within `RUBIXDB_STARTUP_GRACE_MS`, print the final error once (`... (open took N.Ns; grace expired, the process was terminated)`) and end the process with `std::process::exit(1)`. The process lifetime of a stuck startup is therefore bounded by: the bound (30 s of the engine open, counted from the creation of the server thread) plus the grace; or, for a stuck server start after the engine signalled readiness, that signal (at most 30 s after the thread started) plus the 15 s `/healthz` bound plus up to 2 s (the last probe's own timeout) plus the grace. The pre-thread work (config parsing, instance lock, listener bind, runtime construction) is outside both bounds and is not claimed to be bounded by this ADR.
+2. **Do the waiting on the calling thread.** The watchdog thread of `aad45d0` is removed. The server thread owns the sender of a value-less channel (`done_tx`); the calling thread does `done_rx.recv_timeout(grace)` after it has signalled shutdown. `Disconnected` means the thread ended (normally or by unwinding): it is joined and the runtime shut down exactly as before. `Timeout` ends the process. There is no step that can fail to arm (the "could not start the startup watchdog; waiting without a bound" fallback no longer exists) and no second party to race with (the `claimed` flag is gone).
+3. **The hard exit is process termination, nothing else.** It is not a graceful shutdown (no engine shutdown, no attestation, exit code 1, the final line says "terminated"), not a simulated crash and not a power loss. Documentation, tests and reports must keep those four words apart. Power loss during startup is NOT TESTED.
+4. **No cooperative cancellation in this change.** See alternative B.
+
+### What makes the exit safe (the argument, with its assumptions)
+
+* *A1. Every mutation of step 5-10 is an atomic-at-the-syscall step or an idempotent re-doable one* (temp file + `fsync` + rename; one `set_len` + `sync_all`; an append-only synced Manifest edit; a delete of a file nobody references), and every refusal is decided before the first mutation (`apply_tail_policy`). For the user-mode steps a process end falls between two calls into the kernel (the kernel, not rubiXDb, decides where a terminated thread stops); the safety of the multi-write sequences does not depend on that, it depends on the temp-file / rename / idempotent design, and the single-call steps (`set_len`, an append of one Manifest record) rely on the file system's own atomicity of one metadata operation, which is the same assumption the engine's certified crash tests make. The directory is therefore always one of the states in the table's "interrupted state" column.
+* *A2. The next start recovers from each of those states by running the same code,* which is the claim the tests below check at each point, rather than argue.
+* *A3. Nothing is acknowledged during a failed start*: the listener is bound but nothing is served before readiness, so no client holds a durability promise from that process.
+* *A4. Locks are held by the OS on behalf of the process* (`instance.lock`, the WAL's exclusive lock), so the exit releases them; a restart cannot meet a stale lock.
+* *A5. Windows `ExitProcess` (what `process::exit` calls) is, for file state, equivalent to `TerminateProcess`* (which the F-07 / crash tests and the random-instant sweep use): the other threads are terminated, then DLL detach runs on the caller; nothing in rubiXDb writes through C stdio or a buffered writer whose flush `exit` could be expected to perform (the standard-library `File` is unbuffered; `stderr` is unbuffered). The phase tests exercise the real `process::exit`; the sweep exercises `TerminateProcess`.
+* *Not assumed and not claimed:* write ordering after a power loss or an OS crash (the `fsync` ordering is the engine's certified subject, power loss is NOT TESTED); anything about platforms other than the Windows host of the evidence; that a startup killed inside the *body* of a protected function at a finer grain than its syscalls (inside `create_new_segment_file`, inside the `set_len` call) is covered more than by the random-instant sweep.
+
+## 4. Alternatives considered
+
+| | Alternative | Why not (now) |
+|---|---|---|
+| A | Keep waiting (the pre-F-11 join with a notice only) | The original defect: the process outlives its bound by the open's duration, silently, with the port bound and nothing answering. Rejected by F-11. |
+| B | A cooperative cancel token through `LsmEngine::open` / `wal::replay_streaming` / `FileWal::open_for_recovery` / `Manifest::open_after_exclusive_lock` / reconcile | The only way to make the *open* itself stoppable without ending the process. It changes `src/wal`, `src/manifest` (protected) and `src/lsm`, needs its own ADR, an explicit engine-change authorisation, and a partially-open engine cleanup path (locks, a created segment, a half-adopted table) that does not exist today. Every cancellation point would also have to be proved safe, which is the same proof as section 2 plus the cleanup. Not authorised in this mission; still the remedy if a bound on the open that is independent of the process is ever required (the discovery's follow-up). The Ctrl+C / admin shutdown of a *running* server is a different, existing, cooperative path and is unchanged. |
+| C | Abandon the thread and return the error to the caller | Leaves the engine, its locks and a bound listener alive in a process that has declared "failed to start": the exact "orphaned server thread/engine/listening socket" the `fail` comment forbids, and it can still write after the failure was reported. Ends in `process::exit` anyway in this binary (`gui::run` returns 1). |
+| D | `process::abort()` instead of `exit(1)` | Adds a crash dump / abnormal status for no safety gain; the documented contract is exit code 1 with a diagnostic. |
+| E | Shorter bounds | Changes the accepted configuration range and the default without evidence. Not done: default 60 s, range 5-3600 s unchanged (source inspection found nothing that requires a change). |
+| F | Keep the separate watchdog thread | Its "could not start the watchdog; waiting without a bound" fallback made the bound conditional, and it needed a claim flag to arbitrate with the join. Replaced (decision 2). |
+
+## 5. Consequences and recorded trade-offs
+
+* After a hard exit the next start is **unattested** (no `WAL_CLEAN_STOP`): ADR-WAL-01's refusal of a damaged acknowledged tail cannot apply to that start, exactly as after any kill. This is not new: the attestation is consumed (step 6) by the *start*, before the exit. The guard decides its refusal first, so a start that reached step 6 had already established that no acknowledged record is missing.
+* A hard exit between the quarantine temp write and its rename leaves a stray `wal-quarantine/*.tail.tmp` that no later start removes (`rubixdb check` does not report it: exit 0). Harmless to data; recorded in `OPEN_ITEMS.md`; the owner is the F-07 code (`src/ops/wal_tail.rs`), not this mission.
+* A first start that is ended between the engine open and `stamp_if_fresh` leaves no `DATA_FORMAT` marker, and the next start classifies the directory as legacy (accepted, never stamped). Recorded in `OPEN_ITEMS.md`; behaviour of the existing code after any kill at that instant.
+* The probe seam (`src/startup_probe.rs`) is compiled to empty inline functions unless the `startup-probe` cargo feature is on; the product build does not enable it, and a string search confirms that the product binary does not contain the probe's environment variable names while the probe build does (`PHASE_ITEM_F11_CLOSURE.md`).
+* `fail_after_bound` can end the process from a library-like module. `rubixdb-cli` is a binary crate and `EmbeddedServer` is used only by `gui` and the plain CLI's become-the-owner path; a future caller that embeds it in a longer-lived process must not rely on `start()` returning after a bound.
+
+## 6. Test seam
+
+`rubixdb::startup_probe::hit(Point)` is called at the 14 points of section 2. With `--features startup-probe` and the environment variables `RUBIXDB_TEST_STARTUP_PAUSE=<point>[:<n>]`, `RUBIXDB_TEST_STARTUP_PAUSE_MS` (default: forever) and `RUBIXDB_TEST_STARTUP_PROBE_FILE`, the calling thread parks at the n-th hit of one point after writing (and syncing) the sentinel file. The pause alters no work around it, so the state on disk at the pause is the state the real code leaves at that instruction, and the sentinel plus the on-disk assertions are the evidence that the phase was reached (every phase test asserts both). Instrumentation was added to `src/lsm/mod.rs`, `src/ops/format.rs` and `src/ops/wal_tail.rs` (none of them a protected path); nothing under `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/` or `src/error.rs` changed. Because those protected functions are only called, not edited, "inside" them means "between the two calls that surround them"; the truncations are single syscalls, and the probe asserts the state on both sides of each (`engine_wal_replayed` / `engine_wal_opened`, `manifest_opened`).
+
+## 7. Acceptance criteria
+
+The verdict for each is in `PHASE_ITEM_F11_CLOSURE.md` with the commands and counts; this list is the contract.
+
+| ID | Criterion |
+|---|---|
+| AC-1 | The startup-timeout contract is explicit: variable, default 60 s, range 5-3600 s, digits only, empty/unset = default, invalid refused before the instance lock is taken and before anything is created; the notice line; the final line shape; exit code 1; documented in `rubixdb gui --help`. |
+| AC-2 | A stuck startup ends the process by itself within the bound plus the grace (plus the documented `/healthz` granularity) at every one of the 14 probe points (16 scenarios: two of them replay an 8.0 MB WAL), through `rubixdb gui` and through the plain CLI's become-the-owner path; a process still alive past that limit fails the test. |
+| AC-3 | The bound has no conditional fallback: no step that can fail to arm. |
+| AC-4 | After each of the 16 phase scenarios the same instance restarts, holds exactly the committed rows (byte-equal values), accepts a write, stops gracefully with exit 0, restarts again, and `rubixdb check` of a copy exits 0. |
+| AC-5 | The exit is never reported as a shutdown: exit code 1, one final line containing "terminated", no "shutting down" / "stopped" output. |
+| AC-6 | An open that finishes inside the grace takes the normal path (join, exit 1, "open took N.Ns" without "grace expired"); a start inside the bound prints nothing new and exits 0 on a graceful stop. |
+| AC-7 | At the deadline itself (the open finishing a few hundred milliseconds either side of it) there is exactly one final line, exit 1, a bounded lifetime and intact data, for both outcomes of the race. |
+| AC-8 | Random-instant process kills during startup of every damaged fixture never damage the database (N per fixture recorded). |
+| AC-9 | The product binary does not contain the probe; the feature is off by default. |
+| AC-10 | No protected path changed. |
+| AC-11 | Documentation (this ADR, the closure document, `PROGRESS.md`, `CHANGELOG.md`, `OPEN_ITEMS.md`, `gui --help`) states the same contract as the code. |
