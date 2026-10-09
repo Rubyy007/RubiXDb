@@ -443,6 +443,12 @@ mod interruption {
         M,
         /// Manifest-adoption: an SSTable on disk the Manifest does not know, plus a stale `*.sst.tmp`.
         O,
+        /// Killed under 16 concurrent writers at the moment the WAL was at its largest (>= `F11_BIG_WAL_MIN_BYTES`,
+        /// default 8 MB: the largest tail the shipped 4 MiB memtable leaves is about 8.4 MB, discovery section 5.1),
+        /// i.e. a sealed segment waiting for its purge plus the active one. Its expected rows are what an
+        /// UNINTERRUPTED recovery of an identical copy yields (acknowledged rows are checked to be a subset, and the
+        /// rest to be rows that were in flight at the kill).
+        L,
         /// K started and stopped gracefully: a valid clean-stop attestation, torn nothing.
         G,
         /// An empty instance root: the very first start.
@@ -539,12 +545,133 @@ mod interruption {
         }
     }
 
+    /// One request that tolerates a server that is going away (the writers of `build_l` outlive the kill).
+    fn try_sql(port: u16, key: &str, sql: &str) -> bool {
+        use std::net::TcpStream;
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+            return false;
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+        let body = json!({ "sql": sql }).to_string();
+        let req = format!(
+            "POST /v1/sql HTTP/1.1
+Host: x
+Authorization: Bearer {key}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}",
+            body.len()
+        );
+        if s.write_all(req.as_bytes()).is_err() {
+            return false;
+        }
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf)
+            .split_whitespace()
+            .nth(1)
+            .map(|c| c == "200")
+            .unwrap_or(false)
+    }
+
+    fn build_l() -> Fixture {
+        use std::sync::atomic::AtomicBool;
+        let target: u64 = std::env::var("F11_BIG_WAL_MIN_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8_000_000);
+        let root = fresh_root("fxL");
+        let mut s = running(&root);
+        assert_eq!(
+            s.sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").0,
+            200
+        );
+        let stop = AtomicBool::new(false);
+        let attempted = Mutex::new(Vec::<i64>::new());
+        let acked = Mutex::new(Vec::<i64>::new());
+        let started = Instant::now();
+        let mut peak = 0u64;
+        let mut reached = false;
+        std::thread::scope(|scope| {
+            for k in 0..16i64 {
+                let (port, key) = (s.port, s.key.clone());
+                let (stop, attempted, acked) = (&stop, &attempted, &acked);
+                scope.spawn(move || {
+                    let mut n = 0i64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let id = 1 + k + 16 * n;
+                        n += 1;
+                        attempted.lock().unwrap().push(id);
+                        let sql = format!("INSERT INTO t (id, v) VALUES ({id}, '{}')", val(id));
+                        if try_sql(port, &key, &sql) {
+                            acked.lock().unwrap().push(id);
+                        } else {
+                            break;
+                        }
+                    }
+                });
+            }
+            while started.elapsed() < Duration::from_secs(90) {
+                let w = facts(&root).wal_total();
+                peak = peak.max(w);
+                if w >= target {
+                    reached = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // kill at once: the writers then fail their next request and stop
+            let _ = s.child.kill();
+            let _ = s.child.wait();
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(
+            reached,
+            "the WAL never reached {target} bytes under 16 writers in 90 s (peak seen {peak})"
+        );
+        let wal_at_kill = facts(&root).wal_total();
+        let (mut acked, attempted) = (acked.into_inner().unwrap(), attempted.into_inner().unwrap());
+        acked.sort();
+        // The truth: what an uninterrupted recovery of an identical copy holds.
+        let scratch = fresh_root("fxL_truth");
+        copy_dir(&root, &scratch);
+        let t = running(&scratch);
+        let rows = t.rows();
+        let (code, err) = t.stop_graceful();
+        assert_eq!(code, 0, "{err}");
+        let _ = fs::remove_dir_all(&scratch);
+        for id in &acked {
+            assert!(
+                rows.get(id) == Some(&val(*id)),
+                "acknowledged row {id} is not in the recovered database"
+            );
+        }
+        let attempted: std::collections::BTreeSet<i64> = attempted.into_iter().collect();
+        let extras = rows.len() - acked.len();
+        for (id, v) in &rows {
+            assert!(
+                attempted.contains(id) && *v == val(*id),
+                "row {id} was never written"
+            );
+        }
+        eprintln!(
+            "F11_INT_EVIDENCE {}",
+            json!({"scenario":"fixture_L_large_wal","wal_bytes_at_kill":wal_at_kill,"peak_seen":peak,
+                   "acked":acked.len(),"recovered_rows":rows.len(),"in_flight_rows_present":extras,
+                   "build_s":started.elapsed().as_secs_f64(),"facts":facts(&root).json()})
+        );
+        Fixture { root, rows }
+    }
+
     fn fixture(kind: Kind) -> &'static Fixture {
         static K: OnceLock<Fixture> = OnceLock::new();
         static T: OnceLock<Fixture> = OnceLock::new();
         static M: OnceLock<Fixture> = OnceLock::new();
         static O: OnceLock<Fixture> = OnceLock::new();
         static G: OnceLock<Fixture> = OnceLock::new();
+        static L: OnceLock<Fixture> = OnceLock::new();
         static FRESH: OnceLock<Fixture> = OnceLock::new();
         static EMPTY: OnceLock<Fixture> = OnceLock::new();
         let k = || K.get_or_init(build_k);
@@ -574,6 +701,7 @@ mod interruption {
                 }
             }),
             Kind::O => O.get_or_init(build_o),
+            Kind::L => L.get_or_init(build_l),
             Kind::G => G.get_or_init(|| {
                 let root = fresh_root("fxG");
                 copy_dir(&k().root, &root);
@@ -882,6 +1010,28 @@ facts {:?}",
             },
         },
         Phase {
+            name: "guard_wal_preflight_replay_large_wal",
+            kind: Kind::L,
+            point: "guard_wal_preflight_record",
+            nth: Nth::HalfOfFrames,
+            bound: Bound::Ready,
+            at_pause: |b, n, _| same_wal(b, n),
+        },
+        Phase {
+            name: "engine_wal_replay_large_wal",
+            kind: Kind::L,
+            point: "engine_wal_replay_record",
+            nth: Nth::HalfOfFrames,
+            bound: Bound::Ready,
+            at_pause: |b, n, _| {
+                same_wal(b, n)?;
+                if n.attestation {
+                    return Err("the guard has run: the attestation must be consumed".into());
+                }
+                Ok(())
+            },
+        },
+        Phase {
             name: "quarantine_temp_written",
             kind: Kind::T,
             point: "quarantine_temp_written",
@@ -1180,35 +1330,46 @@ facts {:?}",
         ev
     }
 
+    fn phase(name: &str) -> &'static Phase {
+        PHASES
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no phase named {name}"))
+    }
+
     macro_rules! phase_tests {
-        ($($fn_name:ident => $idx:expr),* $(,)?) => {
+        ($($fn_name:ident => $phase_name:literal),* $(,)?) => {
             $(
                 #[test]
                 fn $fn_name() {
                     let _s = serial();
                     for rep in 1..=reps() {
-                        run_phase(&PHASES[$idx], rep);
+                        run_phase(phase($phase_name), rep);
                     }
                 }
             )*
+            /// Every phase of the table has a test above (a phase added without one fails here).
+            const TESTED: &[&str] = &[$($phase_name),*];
         };
     }
 
     phase_tests! {
-        interrupted_in_the_guards_wal_preflight_replay => 0,
-        interrupted_between_the_quarantine_copy_and_its_rename => 1,
-        interrupted_after_the_quarantine_rename_before_the_attestation_is_consumed => 2,
-        interrupted_after_the_attestation_is_consumed_before_the_engine_opens => 3,
-        interrupted_inside_the_engines_wal_replay => 4,
-        interrupted_after_wal_replay_before_the_wal_is_opened => 5,
-        interrupted_after_the_wal_tail_was_truncated => 6,
-        interrupted_after_the_manifest_tail_was_truncated => 7,
-        interrupted_after_the_stale_sst_tmp_was_swept => 8,
-        interrupted_before_the_manifest_adopts_an_orphan_table => 9,
-        interrupted_after_the_manifest_adopted_an_orphan_table => 10,
-        interrupted_at_the_end_of_engine_open => 11,
-        interrupted_between_the_format_marker_temp_and_its_rename => 12,
-        interrupted_after_ready_was_signalled_before_serving => 13,
+        interrupted_in_the_guards_wal_preflight_replay => "guard_wal_preflight_replay",
+        interrupted_in_the_guards_wal_preflight_replay_of_a_large_wal => "guard_wal_preflight_replay_large_wal",
+        interrupted_inside_the_engines_wal_replay_of_a_large_wal => "engine_wal_replay_large_wal",
+        interrupted_between_the_quarantine_copy_and_its_rename => "quarantine_temp_written",
+        interrupted_after_the_quarantine_rename_before_the_attestation_is_consumed => "quarantine_renamed",
+        interrupted_after_the_attestation_is_consumed_before_the_engine_opens => "attestation_consumed",
+        interrupted_inside_the_engines_wal_replay => "engine_wal_replay",
+        interrupted_after_wal_replay_before_the_wal_is_opened => "engine_wal_replayed",
+        interrupted_after_the_wal_tail_was_truncated => "engine_wal_opened_tail_truncated",
+        interrupted_after_the_manifest_tail_was_truncated => "manifest_opened_tail_truncated",
+        interrupted_after_the_stale_sst_tmp_was_swept => "reconcile_tmp_swept",
+        interrupted_before_the_manifest_adopts_an_orphan_table => "reconcile_before_adopt",
+        interrupted_after_the_manifest_adopted_an_orphan_table => "reconcile_after_adopt",
+        interrupted_at_the_end_of_engine_open => "engine_opened_before_return",
+        interrupted_between_the_format_marker_temp_and_its_rename => "format_marker_temp_written",
+        interrupted_after_ready_was_signalled_before_serving => "host_ready_sent_before_serving",
     }
 
     #[test]
@@ -1218,7 +1379,11 @@ facts {:?}",
         for p in rubixdb::startup_probe::Point::ALL {
             assert!(covered.contains(p.name()), "no scenario for {}", p.name());
         }
-        assert_eq!(PHASES.len(), 14);
+        assert_eq!(PHASES.len(), 16);
+        for p in PHASES {
+            assert!(TESTED.contains(&p.name), "phase {} has no test", p.name);
+        }
+        assert_eq!(TESTED.len(), PHASES.len());
     }
 
     // -----------------------------------------------------------------------------------------------------------
