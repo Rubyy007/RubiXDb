@@ -8,8 +8,9 @@
 //! code `api/src/main.rs` calls. `PHASE_RUBIXDB_GUI_ARCHITECTURE.md`
 //! §1/§4.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rubixdb::execution::batch_coordinator::BatchCoordinatorConfig;
 use rubixdb::lsm::{LsmConfig, LsmEngine};
@@ -83,6 +84,132 @@ fn report_damaged_sstable(d: &rubixdb::ops::sstable_integrity::DamagedTable) {
     eprintln!("{}", d.stderr_line());
 }
 
+/// F-11: the startup readiness bounds (30 s for the engine to open, then 15 s for `/healthz`) used to bound only the
+/// *wait*: `fail()` joined the server thread, which may still be inside `LsmEngine::open`, so the process lived as long
+/// as the open took (measured 60.9-122.8 s with the port bound and silent, `PHASE_ITEM_F11_DISCOVERY.md`). Now the
+/// moment a bound fires one stderr line says so, and a watchdog thread ends the process (`process::exit(1)`) once
+/// `RUBIXDB_STARTUP_GRACE_MS` has passed. The join itself is unchanged: when the open finishes inside the grace the
+/// process still exits through the normal path. A hard exit during startup is the same as a kill during startup, which
+/// the crash-recovery tests cover; the clean-stop attestation is only ever written after the engine has stopped.
+struct StartupBound {
+    /// The leading phrase of the final error (unchanged from before F-11).
+    summary: &'static str,
+    /// What had not finished, for the notice line.
+    what: &'static str,
+    /// The bound that fired.
+    after: Duration,
+}
+
+const READINESS_BOUND: StartupBound = StartupBound {
+    summary: "server did not signal readiness within 30s",
+    what: "engine open",
+    after: Duration::from_secs(30),
+};
+
+const HEALTHZ_BOUND: StartupBound = StartupBound {
+    summary: "server bound but /healthz never became ready",
+    what: "server startup",
+    after: Duration::from_secs(15),
+};
+
+/// `5` seconds as `5s`, `5.5` as `5.5s` (a bound or a grace, never an elapsed time).
+fn fmt_bound(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+/// An elapsed time, always with one decimal.
+fn fmt_elapsed(d: Duration) -> String {
+    format!("{:.1}s", d.as_secs_f64())
+}
+
+/// The process name in front of the line, the same one the caller would use: `rubixdb gui` for the `gui` subcommand,
+/// `rubixdb` for the plain CLI's own become-the-owner path.
+fn label() -> &'static str {
+    match std::env::args().nth(1).as_deref() {
+        Some("gui") => "rubixdb gui",
+        _ => "rubixdb",
+    }
+}
+
+fn startup_notice(label: &str, bound: &StartupBound, grace: Duration) -> String {
+    format!(
+        "{label}: {} has not finished after {}; waiting up to {} more for it to complete before exiting",
+        bound.what,
+        fmt_bound(bound.after),
+        fmt_bound(grace)
+    )
+}
+
+/// The final error text: the leading phrase is unchanged, the parenthetical carries the true elapsed time since the
+/// server thread was started.
+fn startup_failure(bound: &StartupBound, elapsed: Duration, grace_expired: bool) -> String {
+    if grace_expired {
+        format!(
+            "{} (open took {}; grace expired, the process was terminated)",
+            bound.summary,
+            fmt_elapsed(elapsed)
+        )
+    } else {
+        format!("{} (open took {})", bound.summary, fmt_elapsed(elapsed))
+    }
+}
+
+/// The path of a startup bound that fired while the server thread had not yet signalled: say so, arm the watchdog,
+/// then do exactly what `fail` always did (signal shutdown, join, shut the runtime down). Only the watchdog abandons
+/// the thread, and only once `grace` has expired. `claimed` is the one decision between the two outcomes: whichever
+/// side takes it first speaks for the process, so the error is printed once and the exit code is always 1.
+fn fail_after_bound(
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    server_thread: std::thread::JoinHandle<()>,
+    runtime: tokio::runtime::Runtime,
+    bound: &'static StartupBound,
+    spawned_at: Instant,
+    grace: Duration,
+) -> String {
+    let label = label();
+    eprintln!("{}", startup_notice(label, bound, grace));
+    let claimed = Arc::new(AtomicBool::new(false));
+    let armed = {
+        let claimed = claimed.clone();
+        std::thread::Builder::new()
+            .name("rubixdb-startup-watchdog".to_string())
+            .spawn(move || {
+                std::thread::sleep(grace);
+                if claimed
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    eprintln!(
+                        "{label}: failed to start: {}",
+                        startup_failure(bound, spawned_at.elapsed(), true)
+                    );
+                    std::process::exit(1);
+                }
+            })
+    };
+    if let Err(e) = armed {
+        eprintln!("{label}: could not start the startup watchdog ({e}); waiting without a bound");
+    }
+    let _ = shutdown_tx.send(());
+    let _ = server_thread.join();
+    let took = spawned_at.elapsed();
+    if claimed
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        // The watchdog won the race a moment before the join returned and is ending the process.
+        loop {
+            std::thread::park();
+        }
+    }
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    startup_failure(bound, took, false)
+}
+
 /// ADR-WAL-01 (F-07): reports what the startup tail policy did on its channels - stderr and the security log. Only
 /// segment / offset / byte count / sequence numbers are ever reported, never the preserved bytes.
 fn report_tail_guard(g: &rubixdb::ops::format::StartupGuard) {
@@ -140,6 +267,8 @@ impl EmbeddedServer {
         let allow_truncate_corrupt_wal = crate::startup_env::load_allow_truncate_corrupt_wal()?;
         // ADR-SST-01: likewise validated before anything is created.
         let sstable_verify_mib_per_sec = crate::startup_env::load_sstable_verify_mib_per_sec()?;
+        // F-11: likewise; how long a slow engine open may be waited for after a startup bound has fired.
+        let startup_grace = Duration::from_millis(crate::startup_env::load_startup_grace_ms()?);
         // Defense in depth: never serve with a credential the loader would refuse.
         rubixdb_instance::credentials::validate_admin_key(&owned.credentials.admin_key)
             .map_err(|why| format!("instance credential is unusable: {why}"))?;
@@ -407,6 +536,9 @@ impl EmbeddedServer {
                 .map_err(|e| format!("could not spawn server thread: {e}"))?
         };
 
+        // The clock of "open took": from the moment the server thread exists.
+        let spawned_at = Instant::now();
+
         // On any failure past this point the server thread may already
         // be running (or about to start) -- always signal shutdown and
         // join before returning, so a failed `start()` never leaves an
@@ -421,25 +553,29 @@ impl EmbeddedServer {
             msg
         };
 
-        match ready_rx.recv_timeout(Duration::from_secs(30)) {
+        match ready_rx.recv_timeout(READINESS_BOUND.after) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(fail(shutdown_tx, server_thread, runtime, e)),
             Err(_) => {
-                return Err(fail(
+                return Err(fail_after_bound(
                     shutdown_tx,
                     server_thread,
                     runtime,
-                    "server did not signal readiness within 30s".to_string(),
+                    &READINESS_BOUND,
+                    spawned_at,
+                    startup_grace,
                 ))
             }
         }
 
-        if !rubixdb_instance::handshake::wait_until_ready(port, Duration::from_secs(15)) {
-            return Err(fail(
+        if !rubixdb_instance::handshake::wait_until_ready(port, HEALTHZ_BOUND.after) {
+            return Err(fail_after_bound(
                 shutdown_tx,
                 server_thread,
                 runtime,
-                "server bound but /healthz never became ready".to_string(),
+                &HEALTHZ_BOUND,
+                spawned_at,
+                startup_grace,
             ));
         }
 
@@ -510,4 +646,78 @@ fn install_security_log(instance_dir: &std::path::Path) {
     let subscriber =
         tracing_subscriber::registry().with(rubixdb_api::security_log::SecurityLogLayer::new(log));
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bounds_are_the_contract_f11_documents() {
+        assert_eq!(READINESS_BOUND.after, Duration::from_secs(30));
+        assert_eq!(HEALTHZ_BOUND.after, Duration::from_secs(15));
+        assert_eq!(
+            READINESS_BOUND.summary,
+            "server did not signal readiness within 30s"
+        );
+        assert_eq!(
+            HEALTHZ_BOUND.summary,
+            "server bound but /healthz never became ready"
+        );
+    }
+
+    #[test]
+    fn the_notice_names_the_bound_the_grace_and_what_happens() {
+        assert_eq!(
+            startup_notice("rubixdb gui", &READINESS_BOUND, Duration::from_secs(60)),
+            "rubixdb gui: engine open has not finished after 30s; waiting up to 60s more for it to complete before exiting"
+        );
+        assert_eq!(
+            startup_notice("rubixdb", &HEALTHZ_BOUND, Duration::from_millis(5_500)),
+            "rubixdb: server startup has not finished after 15s; waiting up to 5.5s more for it to complete before exiting"
+        );
+    }
+
+    #[test]
+    fn the_final_error_keeps_its_leading_phrase_and_adds_the_true_elapsed_time() {
+        let d = Duration::from_millis(67_340);
+        assert_eq!(
+            startup_failure(&READINESS_BOUND, d, false),
+            "server did not signal readiness within 30s (open took 67.3s)"
+        );
+        assert_eq!(
+            startup_failure(&READINESS_BOUND, Duration::from_millis(60_400), true),
+            "server did not signal readiness within 30s (open took 60.4s; grace expired, the process was terminated)"
+        );
+        assert_eq!(
+            startup_failure(&HEALTHZ_BOUND, Duration::from_secs(83), false),
+            "server bound but /healthz never became ready (open took 83.0s)"
+        );
+    }
+
+    /// The join is not skipped: a server thread that finishes inside the grace is joined, the error carries the
+    /// elapsed time, and the process is NOT ended (this test process would not survive the watchdog).
+    #[test]
+    fn a_thread_that_finishes_inside_the_grace_is_joined_and_reported_without_the_watchdog_firing()
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        let spawned_at = Instant::now();
+        let thread = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(300)));
+        let msg = fail_after_bound(
+            tx,
+            thread,
+            runtime,
+            &READINESS_BOUND,
+            spawned_at,
+            Duration::from_secs(3600),
+        );
+        assert!(
+            msg.starts_with("server did not signal readiness within 30s (open took 0."),
+            "{msg}"
+        );
+        assert!(!msg.contains("grace expired"), "{msg}");
+    }
 }

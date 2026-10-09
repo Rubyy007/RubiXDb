@@ -25,6 +25,9 @@ ENVIRONMENT (a bad value is an error, never ignored; unset or empty = default):
     RUBIXDB_LOCAL_RATE_LIMIT_RPS          sustained requests/second per principal, > 0 (default 100000)
     RUBIXDB_LOCAL_RATE_LIMIT_BURST        burst size, integer >= 1 (default 200000)
     RUBIXDB_INSTANCE_RETRY_BUDGET_MS      how long to wait for a running instance to answer, 0-600000 (default 10000)
+    RUBIXDB_STARTUP_GRACE_MS              how long, after the 30 s startup readiness bound fires, the process may keep waiting
+                                          for a slow engine open before it exits hard (code 1), 5000-3600000 (default 60000);
+                                          the data directory is safe to restart after that exit
 "#;
 
 pub fn run(args: &[String]) -> i32 {

@@ -34,6 +34,7 @@ pub fn load() -> Result<LocalServerEnv, String> {
     load_max_blocking_threads()?;
     load_allow_truncate_corrupt_wal()?;
     load_sstable_verify_mib_per_sec()?;
+    load_startup_grace_ms()?;
     Ok(env)
 }
 
@@ -94,6 +95,40 @@ pub fn parse_max_blocking_threads(v: Option<&str>) -> Result<usize, String> {
     }
     let n = v.parse::<usize>().map_err(|_| bad())?;
     if !(MIN_MAX_BLOCKING_THREADS..=MAX_MAX_BLOCKING_THREADS).contains(&n) {
+        return Err(bad());
+    }
+    Ok(n)
+}
+
+/// `RUBIXDB_STARTUP_GRACE_MS` (F-11): the longest time, after the 30 s startup readiness bound (or the 15 s `/healthz`
+/// bound) has fired, that the process keeps waiting for the in-progress engine open to finish before it exits hard
+/// (`std::process::exit(1)`). The data directory is safe to restart after that exit: it ends the process exactly as
+/// a kill during startup would. Digits only; unset or empty = [`DEFAULT_STARTUP_GRACE_MS`]; within the bounds below.
+/// Anything else stops startup naming the variable (before the instance lock is taken).
+pub const STARTUP_GRACE_ENV: &str = "RUBIXDB_STARTUP_GRACE_MS";
+pub const DEFAULT_STARTUP_GRACE_MS: u64 = 60_000;
+pub const MIN_STARTUP_GRACE_MS: u64 = 5_000;
+pub const MAX_STARTUP_GRACE_MS: u64 = 3_600_000;
+
+pub fn load_startup_grace_ms() -> Result<u64, String> {
+    parse_startup_grace_ms(read(STARTUP_GRACE_ENV)?.as_deref())
+}
+
+/// Digits only (no sign, no space, no fraction, no exponent, no radix prefix), within the documented bounds.
+pub fn parse_startup_grace_ms(v: Option<&str>) -> Result<u64, String> {
+    let Some(v) = v else {
+        return Ok(DEFAULT_STARTUP_GRACE_MS);
+    };
+    let bad = || {
+        format!(
+            "{STARTUP_GRACE_ENV} must be an integer number of milliseconds between {MIN_STARTUP_GRACE_MS} and {MAX_STARTUP_GRACE_MS}, got {v:?}"
+        )
+    };
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n = v.parse::<u64>().map_err(|_| bad())?;
+    if !(MIN_STARTUP_GRACE_MS..=MAX_STARTUP_GRACE_MS).contains(&n) {
         return Err(bad());
     }
     Ok(n)
@@ -269,6 +304,46 @@ mod tests {
             let err = parse_max_blocking_threads(Some(v)).unwrap_err();
             assert!(err.contains(BLOCKING_ENV), "{v:?}: {err}");
             assert!(err.contains("16") && err.contains("512"), "{v:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_startup_grace_defaults_to_60_seconds_and_accepts_exactly_its_range() {
+        assert_eq!(STARTUP_GRACE_ENV, "RUBIXDB_STARTUP_GRACE_MS");
+        assert_eq!(parse_startup_grace_ms(None), Ok(60_000));
+        for n in [5_000u64, 5_001, 60_000, 120_000, 3_599_999, 3_600_000] {
+            assert_eq!(parse_startup_grace_ms(Some(&n.to_string())), Ok(n));
+        }
+        // leading zeros are digits: accepted as the number they spell
+        assert_eq!(parse_startup_grace_ms(Some("05000")), Ok(5_000));
+    }
+
+    #[test]
+    fn every_bad_startup_grace_is_an_error_naming_the_variable_and_the_bounds() {
+        for v in [
+            "",
+            "0",
+            "1",
+            "4999",
+            "3600001",
+            "abc",
+            "-1",
+            "+5000",
+            " 5000",
+            "5000 ",
+            "3.5",
+            "5e3",
+            "0x1388",
+            "5000,6000",
+            "4294967296",
+            "99999999999999999999",
+        ] {
+            let err = parse_startup_grace_ms(Some(v)).unwrap_err();
+            assert!(err.contains(STARTUP_GRACE_ENV), "{v:?}: {err}");
+            assert!(
+                err.contains("5000") && err.contains("3600000"),
+                "{v:?}: {err}"
+            );
         }
     }
 }

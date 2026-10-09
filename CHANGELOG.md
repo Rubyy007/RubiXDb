@@ -2754,3 +2754,11 @@ WAL, manifest, SSTable, compaction, `src/error.rs`, `Cargo.toml`, `Cargo.lock`, 
 
 ### Not changed
 Port contract (127.0.0.1:302), bind address, identity handshake semantics, engine (`src/`), `Cargo.toml`, `Cargo.lock`.
+
+## 2026-10-09 -- F-11: a startup that outlasts the readiness bound now ends in bounded time (under [Unreleased])
+### Added
+- **`RUBIXDB_STARTUP_GRACE_MS`** (integer milliseconds, default `60000`, `5000`..`3600000`; unset or empty = default; anything else stops startup naming the variable, before the instance lock is taken): the longest time, after the 30 s startup readiness bound (or the 15 s `/healthz` bound) has fired, that `rubixdb gui` / the plain CLI keeps waiting for a slow engine open before it exits with code 1. The data directory is safe to restart after that exit (it ends the process as a kill during startup would).
+### Changed
+- When the 30 s (or 15 s) startup bound fires, one line is printed at once: `rubixdb gui: engine open has not finished after 30s; waiting up to 60s more for it to complete before exiting`. The final error keeps its leading phrase and now carries the true elapsed time, e.g. `server did not signal readiness within 30s (open took 67.3s)`, or `... (open took 91.2s; grace expired, the process was terminated)` when the grace ran out. Before, the process stayed alive for as long as the open took (60.9-122.8 s measured, port bound and silent) and the message named a bound it had already exceeded.
+### Not changed
+The 30 s and 15 s bounds, the normal startup path, `/readyz`, the engine (`src/`) and every protected path.
