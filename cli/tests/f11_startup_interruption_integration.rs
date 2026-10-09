@@ -778,12 +778,30 @@ Connection: close
         pause_ms: Option<u64>,
         grace_ms: Option<u64>,
     ) -> Paused {
+        spawn_paused_with(
+            root,
+            &["gui", "--no-browser"],
+            point,
+            nth,
+            pause_ms,
+            grace_ms,
+        )
+    }
+
+    fn spawn_paused_with(
+        root: &Path,
+        args: &[&str],
+        point: &str,
+        nth: u64,
+        pause_ms: Option<u64>,
+        grace_ms: Option<u64>,
+    ) -> Paused {
         let n = RUN.fetch_add(1, Ordering::Relaxed);
         let out = root.join(format!("paused-{n}.out"));
         let err = root.join(format!("paused-{n}.err"));
         let probe = root.join(format!("probe-{n}.reached"));
         let mut c = base_cmd(root);
-        c.args(["gui", "--no-browser"])
+        c.args(args)
             .env("RUBIXDB_TEST_STARTUP_PAUSE", format!("{point}:{nth}"))
             .env("RUBIXDB_TEST_STARTUP_PROBE_FILE", &probe)
             .stdin(Stdio::null())
@@ -1443,6 +1461,49 @@ facts {:?}",
             "F11_INT_EVIDENCE {}",
             json!({"scenario":"join_inside_grace","exit_code":code,"exit_s":took.as_secs_f64(),
                    "final_line":finals[0],"restart_ready_s":ready})
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The plain CLI's own "no instance exists, become the owner" path hosts the same server through the same
+    /// `EmbeddedServer::start`: a parked open ends it at the same deadline, with `rubixdb:` (not `rubixdb gui:`) as the
+    /// prefix of its lines.
+    #[test]
+    fn the_plain_cli_owner_path_is_bounded_by_the_same_grace() {
+        let _s = serial();
+        let (root, exp) = copy_of(Kind::K, "ctl_cli_owner");
+        let mut p = spawn_paused_with(
+            &root,
+            &["-c", "SELECT 1"],
+            "engine_wal_replayed",
+            1,
+            None,
+            Some(GRACE_MS),
+        );
+        wait_probe(&mut p, Duration::from_secs(60)).unwrap();
+        let (code, took) = wait_exit(&mut p, Duration::from_secs(60)).expect("no hard deadline");
+        let se = p.stderr();
+        assert_eq!(code, 1, "{se}");
+        assert!(
+            took >= Duration::from_secs(34) && took < Duration::from_secs(45),
+            "{took:?}"
+        );
+        assert!(
+            se.contains("rubixdb: engine open has not finished after 30s; waiting up to 5s more"),
+            "{se}"
+        );
+        assert!(
+            se.contains(
+                "rubixdb: failed to start: server did not signal readiness within 30s (open took "
+            ) && se.contains("; grace expired, the process was terminated)"),
+            "{se}"
+        );
+        assert!(!se.contains("rubixdb gui:"), "{se}");
+        drop(p);
+        let (ready, _, _) = restart_and_verify(&root, &exp, "cli owner");
+        eprintln!(
+            "F11_INT_EVIDENCE {}",
+            json!({"scenario":"cli_owner_path","exit_code":code,"exit_s":took.as_secs_f64(),"restart_ready_s":ready})
         );
         let _ = fs::remove_dir_all(&root);
     }
