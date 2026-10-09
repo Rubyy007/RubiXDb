@@ -16,6 +16,7 @@ pub mod memtable;
 pub mod ops;
 pub mod relational;
 pub mod sstable;
+pub mod startup_probe;
 pub mod wal;
 
 pub use error::{EngineError, Result};

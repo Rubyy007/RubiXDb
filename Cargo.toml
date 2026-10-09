@@ -10,6 +10,9 @@ publish = false
 
 [features]
 test-util = []
+# F-11: named pause points on the startup / recovery path (`src/startup_probe.rs`), driven by environment variables. Off
+# in every product build; the interruption tests of `cli/tests/f11_startup_interruption_integration.rs` turn it on.
+startup-probe = []
 bench = []
 # TEMPORARY, experiment-only — see PHASE1_ADR.md (window-size sweep ADR)
 # and PHASE1_TEST_RESULTS.md's window-size sweep section. Not enabled by

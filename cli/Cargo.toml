@@ -9,6 +9,11 @@ publish = false
 name = "rubixdb"
 path = "src/main.rs"
 
+[features]
+# F-11 test seam only (never part of a product build): turns on the named startup pause points of
+# `rubixdb::startup_probe`, used by `tests/f11_startup_interruption_integration.rs`.
+startup-probe = ["rubixdb/startup-probe"]
+
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

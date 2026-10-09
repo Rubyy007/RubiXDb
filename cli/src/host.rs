@@ -8,7 +8,6 @@
 //! code `api/src/main.rs` calls. `PHASE_RUBIXDB_GUI_ARCHITECTURE.md`
 //! §1/§4.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -87,10 +86,16 @@ fn report_damaged_sstable(d: &rubixdb::ops::sstable_integrity::DamagedTable) {
 /// F-11: the startup readiness bounds (30 s for the engine to open, then 15 s for `/healthz`) used to bound only the
 /// *wait*: `fail()` joined the server thread, which may still be inside `LsmEngine::open`, so the process lived as long
 /// as the open took (measured 60.9-122.8 s with the port bound and silent, `PHASE_ITEM_F11_DISCOVERY.md`). Now the
-/// moment a bound fires one stderr line says so, and a watchdog thread ends the process (`process::exit(1)`) once
-/// `RUBIXDB_STARTUP_GRACE_MS` has passed. The join itself is unchanged: when the open finishes inside the grace the
-/// process still exits through the normal path. A hard exit during startup is the same as a kill during startup, which
-/// the crash-recovery tests cover; the clean-stop attestation is only ever written after the engine has stopped.
+/// moment a bound fires one stderr line says so, and the process ends (`process::exit(1)`) once
+/// `RUBIXDB_STARTUP_GRACE_MS` has passed without the server thread finishing. When the thread finishes inside the
+/// grace the process still exits through the normal path (join, runtime shutdown, the error returned to the caller).
+///
+/// The hard exit is, for the data directory, a process kill during startup: no engine code runs, nothing is flushed,
+/// the clean-stop attestation is only ever written after the engine has stopped (`EmbeddedServer::shutdown`), and the
+/// OS releases the instance lock and the WAL lock. Every startup mutation is crash-safe by design and was interrupted
+/// at its phase boundaries by `cli/tests/f11_startup_interruption_integration.rs`; the policy, its alternatives and its
+/// acceptance criteria are `PHASE_ITEM_F11_ADR.md` (ADR-STARTUP-01). It is process termination, never a graceful
+/// shutdown and never a power loss (power loss: NOT TESTED).
 struct StartupBound {
     /// The leading phrase of the final error (unchanged from before F-11).
     summary: &'static str,
@@ -158,54 +163,42 @@ fn startup_failure(bound: &StartupBound, elapsed: Duration, grace_expired: bool)
     }
 }
 
-/// The path of a startup bound that fired while the server thread had not yet signalled: say so, arm the watchdog,
-/// then do exactly what `fail` always did (signal shutdown, join, shut the runtime down). Only the watchdog abandons
-/// the thread, and only once `grace` has expired. `claimed` is the one decision between the two outcomes: whichever
-/// side takes it first speaks for the process, so the error is printed once and the exit code is always 1.
+/// Waits for the server thread to end (its `done` sender disconnecting) for at most `grace`: `true` only when the grace
+/// ran out with the thread still running.
+fn grace_expired(done_rx: &std::sync::mpsc::Receiver<()>, grace: Duration) -> bool {
+    matches!(
+        done_rx.recv_timeout(grace),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
+/// The path of a startup bound that fired while the server thread had not yet signalled: say so, ask the thread to
+/// stop, and wait for it for at most `grace`. A thread that finishes inside the grace is joined and the runtime shut
+/// down exactly as `fail` always did; a thread still running when the grace ends is abandoned by ending the process
+/// (code 1, the error printed once, here, on the calling thread). `done_rx` carries no value: its sender is owned by the
+/// server thread and dropped when that thread ends, so "disconnected" means "finished". Waiting on the calling thread
+/// (rather than on a separate watchdog thread) leaves no step that can fail to arm and no second party to race with.
 fn fail_after_bound(
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_thread: std::thread::JoinHandle<()>,
     runtime: tokio::runtime::Runtime,
+    done_rx: &std::sync::mpsc::Receiver<()>,
     bound: &'static StartupBound,
     spawned_at: Instant,
     grace: Duration,
 ) -> String {
     let label = label();
     eprintln!("{}", startup_notice(label, bound, grace));
-    let claimed = Arc::new(AtomicBool::new(false));
-    let armed = {
-        let claimed = claimed.clone();
-        std::thread::Builder::new()
-            .name("rubixdb-startup-watchdog".to_string())
-            .spawn(move || {
-                std::thread::sleep(grace);
-                if claimed
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    eprintln!(
-                        "{label}: failed to start: {}",
-                        startup_failure(bound, spawned_at.elapsed(), true)
-                    );
-                    std::process::exit(1);
-                }
-            })
-    };
-    if let Err(e) = armed {
-        eprintln!("{label}: could not start the startup watchdog ({e}); waiting without a bound");
-    }
     let _ = shutdown_tx.send(());
+    if grace_expired(done_rx, grace) {
+        eprintln!(
+            "{label}: failed to start: {}",
+            startup_failure(bound, spawned_at.elapsed(), true)
+        );
+        std::process::exit(1);
+    }
     let _ = server_thread.join();
     let took = spawned_at.elapsed();
-    if claimed
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        // The watchdog won the race a moment before the join returned and is ending the process.
-        loop {
-            std::thread::park();
-        }
-    }
     runtime.shutdown_timeout(Duration::from_secs(5));
     startup_failure(bound, took, false)
 }
@@ -359,6 +352,9 @@ impl EmbeddedServer {
         };
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        // F-11: never carries a value; the server thread owns the sender, so the receiver disconnects exactly when that
+        // thread ends (normally or by unwinding). See `fail_after_bound`.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let data_dir_for_thread = config.data_dir.clone();
         let data_dir_for_attestation = config.data_dir.clone();
         let start_name = instance_name.clone();
@@ -369,6 +365,7 @@ impl EmbeddedServer {
             std::thread::Builder::new()
                 .name("rubixdb-embedded-server".to_string())
                 .spawn(move || {
+                    let _done = done_tx;
                     rt_handle.block_on(async move {
                         // ADR-WAL-01: the startup-only guard (the format decision and the unchanged `WAL_CORRUPT`
                         // preflight, then the clean-stop attestation / tail quarantine policy). It only reads until
@@ -467,6 +464,7 @@ impl EmbeddedServer {
                             ..Default::default()
                         });
                         let _ = ready_tx.send(Ok(()));
+                        rubixdb::startup_probe::hit(rubixdb::startup_probe::Point::HostReadySent);
 
                         // Start the observability sampler (1 Hz, one thread) and the SQL
                         // session reaper before the server reports ready; both stop with it.
@@ -561,6 +559,7 @@ impl EmbeddedServer {
                     shutdown_tx,
                     server_thread,
                     runtime,
+                    &done_rx,
                     &READINESS_BOUND,
                     spawned_at,
                     startup_grace,
@@ -573,6 +572,7 @@ impl EmbeddedServer {
                 shutdown_tx,
                 server_thread,
                 runtime,
+                &done_rx,
                 &HEALTHZ_BOUND,
                 spawned_at,
                 startup_grace,
@@ -705,11 +705,16 @@ mod tests {
             .unwrap();
         let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
         let spawned_at = Instant::now();
-        let thread = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(300)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _done = done_tx;
+            std::thread::sleep(Duration::from_millis(300))
+        });
         let msg = fail_after_bound(
             tx,
             thread,
             runtime,
+            &done_rx,
             &READINESS_BOUND,
             spawned_at,
             Duration::from_secs(3600),
@@ -719,5 +724,47 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("grace expired"), "{msg}");
+    }
+
+    /// The decision the process exit hangs on: a thread still running when the grace ends is "expired"; a thread that
+    /// ends first (normally or by unwinding) is not, and a thread that ended long before is not either.
+    #[test]
+    fn the_grace_is_expired_only_while_the_server_thread_is_still_running() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _done = tx;
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+        assert!(
+            grace_expired(&rx, Duration::from_millis(100)),
+            "running past the grace"
+        );
+        t.join().unwrap();
+        assert!(
+            !grace_expired(&rx, Duration::from_millis(100)),
+            "finished: disconnected"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _done = tx;
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        assert!(
+            !grace_expired(&rx, Duration::from_secs(30)),
+            "finishes inside the grace"
+        );
+        t.join().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _done = tx;
+            panic!("a server thread that unwinds still disconnects the channel");
+        });
+        assert!(t.join().is_err());
+        assert!(
+            !grace_expired(&rx, Duration::from_secs(30)),
+            "unwound: disconnected"
+        );
     }
 }

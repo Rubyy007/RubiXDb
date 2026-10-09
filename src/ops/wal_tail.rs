@@ -626,6 +626,7 @@ pub fn quarantine_tail_with(
         fault.hit(QuarantineStage::Sync)?;
         out.sync_all()?;
         drop(out);
+        crate::startup_probe::hit(crate::startup_probe::Point::QuarantineTempWritten);
         fault.hit(QuarantineStage::Rename)?;
         fs::rename(&tmp_path, &final_path)
     })();
@@ -854,7 +855,10 @@ pub fn apply_tail_policy(
             if bytes > 0 {
                 report.tail = Some((last_id, offset, bytes));
                 match quarantine_tail_with(data_dir, last_id, offset, now_ms(), fault) {
-                    Ok(q) => report.quarantine = Some(q),
+                    Ok(q) => {
+                        crate::startup_probe::hit(crate::startup_probe::Point::QuarantineRenamed);
+                        report.quarantine = Some(q)
+                    }
                     Err(err) => {
                         if !allow_override {
                             return Err(OpsError::new(
@@ -881,6 +885,7 @@ pub fn apply_tail_policy(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => report.attestation_removal_error = Some(e.to_string()),
     }
+    crate::startup_probe::hit(crate::startup_probe::Point::AttestationConsumed);
     Ok(report)
 }
 

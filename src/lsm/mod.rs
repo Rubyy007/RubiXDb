@@ -1557,6 +1557,7 @@ impl LsmEngine {
         let mut checkpoint_markers_replayed: u64 = 0;
         let _summary = wal::replay_streaming(dir, &wal_config, |seq, op| {
             wal_records_visited += 1;
+            crate::startup_probe::hit(crate::startup_probe::Point::EngineWalReplayRecord);
             if seq <= checkpoint_at_replay {
                 wal_records_skipped_by_checkpoint += 1;
                 return Ok(());
@@ -1570,13 +1571,16 @@ impl LsmEngine {
             }
             Ok(())
         })?;
+        crate::startup_probe::hit(crate::startup_probe::Point::EngineWalReplayed);
 
         let (file_wal, _replay) = FileWal::open_for_recovery(dir, wal_config)?;
+        crate::startup_probe::hit(crate::startup_probe::Point::EngineWalOpened);
         let committer = GroupCommitter::new(file_wal)?;
         let pool = Arc::new(BatchCoordinatorPool::new(committer, pool_config)?);
 
         let sstables_dir = dir.join("sstables");
         let (mut manifest_handle, replay_result) = Manifest::open_after_exclusive_lock(dir)?;
+        crate::startup_probe::hit(crate::startup_probe::Point::ManifestOpened);
         let manifest_edits_replayed = replay_result.edit_count;
         let mut manifest_state = replay_result.state;
         let checkpoint_seq_value = manifest_state.checkpoint_seq();
@@ -1682,6 +1686,7 @@ impl LsmEngine {
             manifest_edits_replayed,
             recovery_duration: recovery_started.elapsed(),
         };
+        crate::startup_probe::hit(crate::startup_probe::Point::EngineOpened);
 
         Ok(LsmEngine {
             pool,
@@ -2705,6 +2710,7 @@ fn reconcile_sstables_with_manifest(
         };
         if name.ends_with(".sst.tmp") {
             std::fs::remove_file(&path)?;
+            crate::startup_probe::hit(crate::startup_probe::Point::ReconcileTmpSwept);
             continue;
         }
         let Some(id) = sstable::parse_sstable_id(name) else {
@@ -2730,7 +2736,9 @@ fn reconcile_sstables_with_manifest(
                 max_seq: table.max_seq(),
                 file_size,
             };
+            crate::startup_probe::hit(crate::startup_probe::Point::ReconcileBeforeAdopt);
             manifest.append_sync(edit)?;
+            crate::startup_probe::hit(crate::startup_probe::Point::ReconcileAfterAdopt);
             state.apply(edit)?;
             opened.insert(id, Arc::new(table));
         }

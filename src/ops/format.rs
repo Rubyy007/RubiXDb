@@ -119,7 +119,10 @@ pub fn startup_guard(dir: &Path) -> Result<FormatState, OpsError> {
 fn wal_preflight(dir: &Path) -> Result<Option<crate::wal::WalReplaySummary>, OpsError> {
     if dir.join("wal").is_dir() {
         let cfg = crate::wal::WalConfig::default();
-        match crate::wal::replay_streaming(dir, &cfg, |_, _| Ok(())) {
+        match crate::wal::replay_streaming(dir, &cfg, |_, _| {
+            crate::startup_probe::hit(crate::startup_probe::Point::GuardWalPreflightRecord);
+            Ok(())
+        }) {
             Ok(s) if s.corrupted_segments_count == 0 => return Ok(Some(s)),
             Ok(s) => {
                 return Err(OpsError::new(
@@ -214,6 +217,7 @@ pub fn stamp_if_fresh(dir: &Path, state: FormatState) -> Result<(), OpsError> {
             "rubixdb-data-format={CURRENT_DATA_FORMAT}\nwal-segment=1\nsstable=1\ncatalog-row=1\n"
         ),
     )?;
+    crate::startup_probe::hit(crate::startup_probe::Point::FormatMarkerTempWritten);
     std::fs::rename(&tmp, &marker)?;
     Ok(())
 }
