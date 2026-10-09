@@ -22,6 +22,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+/// One server at a time. Every test here starts `default` instances that all prefer
+/// port 302 and are killed and restarted, and `start_owner_and_wait_ready` reads the
+/// port from the `instance.json` a killed server left behind; with the tests in
+/// parallel another test's server can own that port and answer `/healthz` (a 401 later).
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 const ROW_COUNT: i64 = 200_000;
 const BATCH_SIZE: i64 = 100;
 
@@ -183,6 +193,7 @@ fn list_indexes(client: &reqwest::blocking::Client, base_url: &str, admin_key: &
 /// partial.
 #[test]
 fn create_index_killed_mid_backfill_recovers_correctly_on_restart() {
+    let _serial = serial();
     let root = fresh_root("mid_backfill");
     let owner = start_owner_and_wait_ready(&root);
     let client = reqwest::blocking::Client::builder()
@@ -410,6 +421,7 @@ fn readyz(client: &reqwest::blocking::Client, owner: &RunningOwner) -> Value {
 
 #[test]
 fn readyz_reports_index_recovery_running_then_complete_and_ready_stays_true() {
+    let _serial = serial();
     let root = fresh_root("readyz_recovery");
     seed_and_kill_mid_backfill(&root);
 
@@ -449,6 +461,7 @@ fn readyz_reports_index_recovery_running_then_complete_and_ready_stays_true() {
 
 #[test]
 fn a_graceful_stop_during_recovery_cancels_it_quickly_and_the_next_start_finishes_it() {
+    let _serial = serial();
     let root = fresh_root("stop_recovery");
     seed_and_kill_mid_backfill(&root);
 
