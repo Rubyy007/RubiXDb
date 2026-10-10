@@ -2773,3 +2773,11 @@ The 30 s and 15 s bounds, the normal startup path, `/readyz`, the engine (`src/`
 - `PHASE_ITEM_F11_ADR.md` (ADR-STARTUP-01, PROPOSED) and `PHASE_ITEM_F11_CLOSURE.md`.
 ### Not changed
 The engine and every protected path (`src/wal`, `src/manifest`, `src/sstable`, `src/compaction`, `src/error.rs`); `/readyz`; the normal startup path; graceful shutdown; the clean-stop attestation (still written only after the engine stopped).
+
+## 2026-10-10 -- F-11 closure disposition: ratification package and tracked observations (documentation only, under [Unreleased])
+### Added
+- `PHASE_ITEM_F11_RATIFICATION.md`: the package the maintainer needs to ratify, amend or reject ADR-STARTUP-01 (still PROPOSED; F-11 is "evidence complete, policy pending").
+- `PHASE_ITEM_F11_CLOSURE.md` section 13: the windows-sys determination, the second-reader review of the one relaxed test assertion with an independent re-run and a negative control, the regression comparison.
+- `OPEN_ITEMS.md`: `OI-F11-02` .. `OI-F11-05`.
+### Not changed
+Every source file, the product behaviour, every protected path, `docs/PROJECT_STATE.md`, `PHASE_ITEM_F11_ADR.md`, `missions/ACTIVE.md`.

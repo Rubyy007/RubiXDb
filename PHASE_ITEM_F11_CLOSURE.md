@@ -202,3 +202,82 @@ git archive 4f2f3e1 | tar -x -C E:/rubixdb_f11c/baseline_tree
 bash E:/rubixdb_f11c/ab_disconnect.sh 100 ; bash E:/rubixdb_f11c/ab_gc.sh 5
 ```
 `F11_REPS` repeats every phase; `F11_SWEEP` sets the kills per fixture; `F11_BIG_WAL_MIN_BYTES` (default 8,000,000) sets the size of fixture L. Every scenario prints one `F11_INT_EVIDENCE {json}` line.
+
+## 13. Addendum — closure disposition, 2026-10-10
+
+Mission: "F-11 Closure Disposition + ADR-STARTUP-01 Ratification Package". Started at `09082c23601f7d0b75b659d12acf7133f7dc1b01`, `master`, `git status --short` empty, rustc / cargo 1.98.1, Windows 10 Home 19045. Sections 1-12 above are unchanged history. No source file, protected path, test, `docs/PROJECT_STATE.md`, `PHASE_ITEM_F11_ADR.md` or `missions/ACTIVE.md` was edited.
+
+**Status after this addendum: F-11 evidence complete, policy pending.** ADR-STARTUP-01 is still PROPOSED. F-11 is not closed in the sense of `CLAUDE.md` and stays in `docs/PROJECT_STATE.md`'s blocker list until the maintainer ratifies (`PHASE_ITEM_F11_RATIFICATION.md`). Until then the hard exit is "in effect, unratified".
+
+### 13.1 The windows-sys dependency question
+
+The F-11 mission text as it was given to the session contains no windows-sys requirement; the only repository mention is the `OPEN_ITEMS.md` line of 2026-10-09 about the `cfg(windows)` dev-dependency. It is answered here anyway.
+
+Determination: **a direct dependency in two places, never a new package, no action needed.** It matches none of the three offered cases literally ((a) absent, (b) transitive with no direct use, (c) must be pinned / removed / replaced): it is directly used, and no pin / removal / replacement is required, so no `OPEN_ITEMS.md` row is opened for it.
+
+Commands and what they show (all at HEAD `09082c2`):
+
+* `cargo tree --workspace --locked -i windows-sys@0.61.2 --depth 2`: pulled directly by `rubixdb-instance` (normal dependency) and by `rubixdb-cli` (dev-dependency), and transitively by `fs4`, `home`, `mio`, `nu-ansi-term`, `rpassword`, `rtoolbox`, `socket2`, `stacker`, `tempfile`, `tokio`, `winapi-util`. `cargo tree -i windows-sys@0.52.0`: only `fd-lock` and `rustyline`. Two versions are therefore in the graph; `windows-targets 0.52.6` and `winapi 0.3.9` are transitive only.
+* `cargo metadata --locked` (workspace members' own declarations): `rubixdb-instance -> windows-sys ^0.61, kind normal, target cfg(windows), features Win32_Foundation / Win32_Security / Win32_Security_Authorization` (used by `instance/src/winacl.rs`, product code, predates F-11); `rubixdb-cli -> windows-sys ^0.61, kind dev, target cfg(windows), features Win32_Foundation / Win32_System_JobObjects / Win32_System_Threading / Win32_System_Diagnostics_ToolHelp` (used only by `cli/tests/f11_startup_grace_integration.rs`, with `unsafe` FFI in that test file).
+* The one `Cargo.lock` line at `aad45d0` (`git diff 4f2f3e1 aad45d0 -- Cargo.lock`): `+ "windows-sys 0.61.2",` in the dependency list of `rubixdb-cli`. It names a package and version already locked (used by `rubixdb-instance`), so no package was added or re-resolved. The same commit added the `[target.'cfg(windows)'.dev-dependencies]` block to `cli/Cargo.toml`.
+* This mission's predecessor work after `aad45d0` (watchdog removal, `recv_timeout`, the probe): `git diff aad45d0 HEAD -- Cargo.lock` is empty (0 lines); `Cargo.toml` and `cli/Cargo.toml` gained 8 lines, all `startup-probe` feature entries, no dependency.
+* Both versions were already in the baseline lock (`git show 4f2f3e1:Cargo.lock`: `windows-sys` 0.52.0 and 0.61.2). `cargo deny --workspace --all-features check bans licenses sources`: exit 0, "bans ok, licenses ok, sources ok", with the existing `multiple-versions = "warn"` duplicate warning for `windows-sys` (0.52.0 from `rustyline`, unrelated to F-11). The advisories check was not run (it needs the network): NOT TESTED.
+* The product binary is unaffected by the dev-dependency: it is `cfg(windows)` + dev only, absent from `cargo build --release`.
+
+### 13.2 Ratification package
+
+`PHASE_ITEM_F11_RATIFICATION.md`: the decision in one sentence, scope, non-scope, alternatives, accepted consequences with their rows, the AC-1..AC-11 evidence index with raw-log pointers, the exact lines to add to the ADR and remove from section 1 and section 11 of this file, and the consequence of not ratifying. Not self-ratified.
+
+### 13.3 Rows opened in `OPEN_ITEMS.md`
+
+`OI-F11-02` (stray `*.tail.tmp`, P2, `src/ops/wal_tail.rs`), `OI-F11-03` (unstamped first start, P1, `src/ops/format.rs`), `OI-F11-04` (racing stop aborts the start's recovery flush and the attestation is declined, P2, engine `src/lsm`), `OI-F11-05` (the phase matrix is manual and feature-gated, P2, owner to be named by the maintainer). `OI-F11-01` was reserved for windows-sys and is deliberately not used (13.1: case (c) not met). Nothing was fixed. Priorities P1 / P2 are the maintainer's assignment in the mission text; the rows record the facts behind them (for example that the instance in the unstamped state opens and serves normally in 3 of 3 runs).
+
+### 13.4 Second-reader review of the one corrected assertion
+
+*What the history can and cannot show.* `git log --oneline aad45d0..HEAD -- cli/tests/f11_startup_interruption_integration.rs` lists `4b4bd39`, `f7f4843`, `06e4958`. The assertion was changed before the first of them was committed, so **git contains only the corrected form**; the "before" below is the text the session had in the working tree (recorded in the session, not reproducible from git). This addendum therefore marks the "before" as NOT REPRODUCIBLE FROM THE REPOSITORY.
+
+Before (working tree only, `restart_and_verify`):
+```
+assert!(facts(root).attestation,
+        "{label}: a graceful stop writes the attestation; the first restart's stderr:\n{err1}\nfacts {:?}", facts(root));
+```
+After (committed, `cli/tests/f11_startup_interruption_integration.rs`, `restart_and_verify`, after `stop_graceful`):
+```
+let attested = facts(root).attestation;
+assert!(
+    attested || err1.contains("the clean-stop attestation was not written"),
+    "{label}: no attestation and no explanation; the first restart's stderr:\n{err1}\nfacts {:?}",
+    facts(root)
+);
+```
+The line it now requires is the one `EmbeddedServer::shutdown` prints for the `NotEligible` outcome of `write_attestation` (`cli/src/host.rs`): `rubixdb: the clean-stop attestation was not written ({why})`; the observed `{why}` is `the replay summary does not match the newest segment (last valid position segment N offset M, newest segment N+1 length 24)`. The `Failed` outcome prints a different text (`... could not be written`) and is NOT accepted by the assertion. Every other check of `restart_and_verify` is unchanged: exact row equality, a write accepted, graceful stop exit 0, second start with the same rows, `rubixdb check` exit 0.
+
+*Precision on the closure's wording.* Section 9 says the assertion "was proven wrong, not weakened". That is imprecise: the assertion **was relaxed** (unconditional attestation -> attestation or an explained decline). What was proven wrong is the expectation that a graceful stop always attests; the relaxation is limited to the one explained outcome and keeps "never silent".
+
+*Occurrence.* In the certification run (`cert_final_all.log`) 2 of 48 phase runs declined, both on fixture O (2 of the 9 O runs), each with the `flush attempt 1 failed (published=Some(...)): aborted: BatchCoordinatorPool is shutting down` line and the `was not written` line. Other runs on O: 4 of 9 (`cert_matrix_reps3.log`, the 14-scenario 3-repetition run) and 3 of 6 (`o_scenarios.log`, the run right after the fix, counted from the stderr text).
+
+*Independent re-run (this mission).* Only the three fixture-O phase tests, `F11_REPS=5`, `--test-threads=1`, `--include-ignored`, HEAD code, `E:\rubixdb_f11c\logs\addendum_O_reps5_repo.log`: `3 passed; 0 failed`, 557.6 s, 15 O runs, **9 of 15 declined the attestation** (3 of 5 in each of the three phases), **9 of 9 declines carried both the flush-abort line and the explaining line**, all 15 restarts held 4,000 rows exactly and `rubixdb check` exited 0. The rate is higher than the 2 of 9 of the certification run and inside the 2/9-9/15 spread of the O runs so far: it is timing-dependent (the test stops the restarted server right after one write, while the start's recovery flush of the replayed 4 MiB memtable is running), so no single rate is claimed; what is claimed is that on O the decline is common, never silent, and never accompanied by lost or altered rows.
+
+*Negative control* (scratch copy, not in the repository): `git archive HEAD` into `E:\rubixdb_f11c\scratch_mut`, the required string replaced by `MUTATED-LINE-THAT-THE-ENGINE-NEVER-PRINTS` (the only difference, verified with `diff`), built to its own target directory, same three tests, `F11_REPS=5`: `0 passed; 3 failed`, each at its first decline, panicking at `f11_startup_interruption_integration.rs:930` with `no attestation and no explanation; the first restart's stderr: ...` (`addendum_O_reps5_mutated.log`). So the assertion fails loudly when the explaining line is absent.
+
+*Verdict: both.* The assertion is a genuine invariant: **a graceful stop never leaves the attestation absent without saying why** (that is checkable, and checked 48 of 48 plus 15 of 15, and it fails when violated). The *decline itself* is current engine behaviour that depends on a race (a stop arriving during the start's own recovery flush); it is a recorded engine item, `OI-F11-04`, not only a test comment.
+
+### 13.5 Regression for this mission
+
+Commands run at HEAD `09082c2` (tree: only the untracked `PHASE_ITEM_F11_RATIFICATION.md`); logs in `E:\rubixdb_f11c\logs\addendum_workspace_debug.log`.
+
+| Command | Exit | Result | Baseline (section 9) |
+|---|---|---|---|
+| `cargo fmt --all -- --check` | 0 | clean | clean |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | 0 | clean | clean |
+| `cargo test --locked --workspace --no-fail-fast` (debug, 20 min 47 s) | 101 | 1,444 passed, 2 failed, 32 ignored; failures `repo_hygiene::no_tracked_credentials_json` and `repo_hygiene::no_tracked_file_contains_a_64_hex_admin_key_literal` | identical: 1,444 / 2 / 32, same two tests |
+
+Every failure is in the section 9 table; none is new. The tracked file is still `frontend/.e2e-crossbrowser-data/default/credentials.json` (`git ls-files | grep credentials`). The release-only items of section 9 (M1.3 throughput, the disconnect test) are not exercised by a debug run and were NOT re-run here (not requested); their baseline numbers stand (14 / 100 vs 13 / 100; 2 of 5 vs 0 of 5).
+
+Also re-run with its log kept: the plain-CLI owner-path test (`addendum_owner_path.log`): exit 1 at 35.05 s, restart ready 0.16 s (section 8's AC-2 had it from a terminal run only).
+
+### 13.6 Found while doing this, named and not fixed
+
+* The mission prompt's description of the ADR differs from the file in three places, none of which affects a verdict: ADR section 5 does **not** contain the racing-stop flush abort (it is closure section 10.3; section 5 instead also records the unattested next start and the exit-from-a-library-like-module note); ADR section 4 lists six alternatives A-F, not three; ADR section 3 has numbered decisions, not a section 3.1. The ratification package states where each item really lives.
+* The closure's headline "2 of 48" understates how often the decline occurs on fixture O (2 of 9 there; 9 of 15 in the re-run). The statement "only on O" stands.
+* `docs/PROJECT_STATE.md` line 37 still lists F-11 as a blocker (not edited, by instruction).
