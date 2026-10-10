@@ -2792,3 +2792,10 @@ Every source file, the product behaviour, every protected path, `docs/PROJECT_ST
 - `OI-F11-04`: a graceful stop that races the start's own recovery flush can still decline the clean-stop attestation (explained on stderr, data intact); the fix reverses an approved F-07 test and waits for the maintainer (`PHASE_ITEM_F11_OI04_ADR.md`).
 ### Not changed
 Every protected path, the engine, `/readyz`, graceful shutdown, the startup grace policy (ADR-STARTUP-01 is still PROPOSED).
+
+## 2026-10-10 -- F-11 ratification readiness (documentation only, under [Unreleased])
+### Changed
+- `PHASE_ITEM_F11_ADR.md` section 5: two consequences that the OI-F11-02 / OI-F11-03 fixes removed are marked historical and superseded (status line unchanged: PROPOSED).
+- `PHASE_ITEM_F11_RATIFICATION.md`: section 5c (ratification is against the amended ADR), section 6.1 (which of the 29 added or strengthened tests were seen failing on the unfixed tree, which pass by design and how they were mutation-checked, which were not run and why), section 7 amended.
+### Not changed
+Every source file, test, protected path; `docs/PROJECT_STATE.md`; the closure sections 1-14.

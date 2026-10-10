@@ -14,7 +14,7 @@ When a startup bound has fired and the server thread has not ended within `RUBIX
 * The lifetime contract of ADR section 3, decision 1: an engine open that outlasts the 30 s bound ends at 30 s + grace after the server thread starts; a server start that outlasts the 15 s `/healthz` bound after readiness ends at (readiness, at most 30 s) + 15 s + up to 2 s (the last probe's own timeout) + grace (measured 22.0 s with a 5 s grace).
 * The test seam (`startup-probe` feature, 14 named pause points, absent from the product binary) and its 14 feature-gated calls in `src/lsm/mod.rs`, `src/ops/format.rs`, `src/ops/wal_tail.rs` (none a protected path).
 
-Also in the tree since this package was first written, **not part of the decision ratified here** (each has its own record and evidence): the stamp-before-open and interrupted-stamp recognition (`PHASE_ITEM_F11_OI03_ADR.md`, `src/ops/format.rs`, `cli/src/host.rs`), the stale quarantine temp sweep and the `check` wording (`PHASE_ITEM_F11_OI02_ADR.md`, `src/ops/wal_tail.rs`, `src/ops/check.rs`) and a 15th probe point.
+Also in the tree since this package was first written, and referred to by the amended ADR section 5 (bullets 2 and 3): the stamp-before-open and interrupted-stamp recognition (`PHASE_ITEM_F11_OI03_ADR.md`, `src/ops/format.rs`, `cli/src/host.rs`), the stale quarantine temp sweep and the `check` wording (`PHASE_ITEM_F11_OI02_ADR.md`, `src/ops/wal_tail.rs`, `src/ops/check.rs`) and a 15th probe point. The amended ADR records their outcome (FIXED); their designs are those two mini-ADRs (status IMPLEMENTED), each with its own evidence, and are **not** the decision ratified in section 1.
 
 ## 3. Explicitly NOT in scope
 
@@ -51,6 +51,10 @@ ADR section 5 also records two further consequences that ratification accepts: a
 
 Ratifying ADR-STARTUP-01 accepts the timeout policy and the consequences remaining in section 5. It does not close any OI-F11-* row; does not remove F-11 from the blocker list in `docs/PROJECT_STATE.md`; and does not imply whole-product production readiness. Each is a separate disposition on its own evidence.
 
+## 5c. Ratification is against the amended ADR
+
+`PHASE_ITEM_F11_ADR.md` section 5 bullets 2 and 3 now read as historical, superseded by `PHASE_ITEM_F11_OI02_ADR.md` and `PHASE_ITEM_F11_OI03_ADR.md`. The maintainer is ratifying the ADR as amended, not the pre-amendment text. The two tracked consequences this package still asks the maintainer to accept are: (a) after a hard exit the next start is unattested (as after any kill, unchanged from before F-11); (b) `fail_after_bound` can end the process from a library-like module (`rubixdb-cli` is a binary crate; only `gui` and the become-the-owner path call it). Neither is a defect; both are properties of the retained design. (`OI-F11-04` is not among them: it is NOT FIXED, stays open and is not accepted by ratifying; see section 5b.)
+
 ## 6. Evidence index (closure section 8; raw logs in `E:\rubixdb_f11c\logs\`)
 
 | ID | Status | File | Count | Raw log |
@@ -71,12 +75,50 @@ Ratifying ADR-STARTUP-01 accepts the timeout policy and the consequences remaini
 
 Regression and baseline comparison: closure section 9, the section 13 addendum and section 14.
 
+### 6.1 Non-vacuity of the tests added or strengthened by the real-closure mission
+
+**9 of 29 added or strengthened test functions were observed to fail on the unfixed `92f8774` tree. 6 more were run there and passed by design (controls, a coverage ratchet, a test of a function that did not exist) and each of those 6 was shown to fail under a deliberate mutation of the fixed code. 14 were not run on `92f8774`: 13 pre-existing phase tests whose added after-restart assertions have nothing to catch in their scenario, and the random-kill sweep.** (`92f8774` = the tree before any of the fixes; the new test files were copied into it unchanged, with definition-only shims where a test names a helper that did not exist; HEAD `33a91da`'s code with the same tests is the passing side, section 14.3 of the closure.)
+
+Observed to FAIL on `92f8774` (non-vacuity checked) - 9:
+
+| Test | Failure on `92f8774` |
+|---|---|
+| `src/ops/format.rs` `a_lone_interrupted_stamp_is_still_a_fresh_directory_and_gets_stamped` | `format.rs:308` `left: Legacy` |
+| `src/ops/format.rs` `data_beside_this_builds_own_stamp_temp_is_stamped_not_left_legacy` | `format.rs:334` `left: Legacy` |
+| `src/ops/format.rs` `stamping_creates_a_missing_directory_and_never_overwrites_a_marker` | `format.rs:377` `IO ... The system cannot find the path specified` |
+| `src/ops/wal_tail_tests.rs` `the_guard_sweeps_stale_quarantine_temp_files_and_nothing_else` | `wal_tail_tests.rs:1221` `left: []` |
+| `src/ops/wal_tail_tests.rs` `check_names_a_stale_quarantine_temp_and_its_exit_counters_do_not_change` | `wal_tail_tests.rs:1293` old text "unrecognised or incomplete quarantine entry" |
+| `cli/tests/f11_startup_interruption_integration.rs` `data_left_beside_this_builds_stamp_temp_is_stamped_at_the_next_start` | `:1608` `marker: false, marker_tmp: true` after the restart |
+| same file `interrupted_after_stale_quarantine_temp_files_were_swept` (the new phase) | `:1320` the probe point was never reached in 60 s |
+| same file `interrupted_between_the_format_marker_temp_and_its_rename` (strengthened: stamp before engine files; stamped after restart) | `:1329` the engine's WAL file exists at the stamp pause; with that clause skipped in the scratch copy: `:985` "the directory must be stamped after the restart" (`nv_B6_old_skip_S1.log`) |
+| same file `interrupted_between_the_quarantine_copy_and_its_rename` (strengthened: no stale temp after a restart) | `:1398` `wal-1.2652920.<ms>.tail.tmp` survived the restart |
+
+Run on `92f8774` and PASSED, by design; shown non-vacuous by mutation of the fixed code - 6:
+
+| Test | Why it passes on `92f8774` | Mutation (scratch copy of HEAD) and result |
+|---|---|---|
+| `format.rs` `data_beside_a_temp_file_this_build_did_not_write_stays_legacy_and_unmodified` (control) | the unfixed code never stamped a legacy directory | B1 (naive fix: every legacy directory counts as an interrupted stamp): FAILS |
+| `cli/tests/...` `data_beside_a_foreign_temp_file_is_not_stamped_and_nothing_is_lost` (control) | same | B1: FAILS |
+| `wal_tail_tests.rs` `a_refused_start_does_not_sweep_and_leaves_the_directory_unmodified` (control) | the unfixed code never swept | B2 (sweep runs before the refusals): FAILS |
+| `wal_tail_tests.rs` `only_the_exact_quarantine_temp_name_is_a_stale_temp_file` | pure predicate; it did not exist, run only with a shim holding HEAD's text, so passing there proves nothing | B3 (predicate accepts every `wal-*` name): FAILS |
+| `cli/tests/...` `interrupted_after_the_quarantine_rename_before_the_attestation_is_consumed` (strengthened: a complete entry present at the pause survives the restart) | the unfixed code had no sweep to lose it | B3: FAILS |
+| `cli/tests/...` `every_phase_has_a_test_and_every_probe_point_is_covered` (ratchet, 17 scenarios) | the unfixed point set (14) is covered by the 17 scenarios | B5 (the `quarantine_tmp_swept` scenario removed from the table): FAILS, "no scenario for quarantine_tmp_swept" |
+
+Additionally mutation B4 (`stamp_if_fresh` overwrites an existing marker) fails `stamping_creates_a_missing_directory_and_never_overwrites_a_marker`'s second half.
+
+NOT run on `92f8774` - 14, with the reason:
+
+* 13 pre-existing phase tests, each strengthened by the same two after-restart assertions (no stale temp survives; a complete entry present at the pause is not lost), which **cannot fail on `92f8774` in these scenarios** because there is no stale temp and, with one exception, no complete entry for them to catch: `interrupted_in_the_guards_wal_preflight_replay`, `..._of_a_large_wal`, `interrupted_inside_the_engines_wal_replay`, `..._of_a_large_wal`, `interrupted_after_the_attestation_is_consumed_before_the_engine_opens`, `interrupted_after_wal_replay_before_the_wal_is_opened`, `interrupted_after_the_wal_tail_was_truncated`, `interrupted_after_the_manifest_tail_was_truncated`, `interrupted_after_the_stale_sst_tmp_was_swept`, `interrupted_before_the_manifest_adopts_an_orphan_table`, `interrupted_after_the_manifest_adopted_an_orphan_table`, `interrupted_at_the_end_of_engine_open`, `interrupted_after_ready_was_signalled_before_serving`. In `interrupted_after_the_wal_tail_was_truncated` (verified by running it under mutation B3: it PASSES) and, by the same sequence, `interrupted_after_wal_replay_before_the_wal_is_opened` (NOT run under B3), a complete entry exists at the pause in the unmutated code, but the mutated sweep removes it at the first start, before the pause, so the kept-entry assertion cannot catch that mutation there. The strengthened clauses are regression guards in these 13, not detectors of OI-F11-02 / OI-F11-03; the tests' own earlier assertions are unchanged.
+* `random_instant_kills_during_startup_never_damage_the_database` (strengthened through `restart_and_verify_fresh`, the 40 empty-directory kills): probabilistic (a kill must land in the stamp window), so not run on `92f8774`; the same helper clause is the one that failed in the format-marker phase above.
+
+Evidence: `nv_unit_old_panics.txt`, `nv_integration_old.log`, `nv_B6_old_skip_S1.log`, `nv_mutations.txt` in `E:\rubixdb_f11c\logs\`; scratch trees `E:\rubixdb_f11c\nv_old` (`92f8774` + HEAD's tests + shims, built by `make_nv_old.py`) and `nv_head` (mutations, `mutations.py`). Nothing in the repository was changed to obtain them.
+
 ## 7. The exact lines for the maintainer
 
 **Add to `PHASE_ITEM_F11_ADR.md`** — replace, in line 3, everything from `**Status:** PROPOSED` through `... and F-11's closure document says so.` with:
 
 ```
-**Status:** ACCEPTED -- ratified <YYYY-MM-DD> by <name>, <role>; scope exactly as in PHASE_ITEM_F11_RATIFICATION.md section 2-3.
+**Status:** ACCEPTED -- ratified <YYYY-MM-DD> by <name>, <role>; scope exactly as in PHASE_ITEM_F11_RATIFICATION.md section 2-3; ADR section 5 as amended (bullets 2 and 3 historical), per package section 5c.
 ```
 
 **Remove from `PHASE_ITEM_F11_CLOSURE.md` section 1** (line 9) the first three sentences, i.e. exactly:
@@ -85,9 +127,11 @@ Regression and baseline comparison: closure section 9, the section 13 addendum a
 One condition is stated, not resolved: **ADR-STARTUP-01 is PROPOSED.** The mission text asks for the ADR before the hard-exit policy is retained as certified behaviour and it is written, but this mission has no maintainer ratification to record. Until the maintainer ratifies it, "certified" in the sense of `CLAUDE.md` applies to the evidence, not to the policy decision.
 ```
 
-(keep the sentence that follows it, "Not declared: whole-product production readiness ..."), and remove the last bullet of section 11, `* The maintainer's ratification of ADR-STARTUP-01.` (line 182). Do not rewrite sections 1-12 otherwise: append the ratification as a dated line in section 13.
+(keep the sentence that follows it, "Not declared: whole-product production readiness ..."), and remove the last bullet of section 11, `* The maintainer's ratification of ADR-STARTUP-01.` (line 182). Do not rewrite sections 1-14 otherwise: append the ratification as a dated line after section 14.
 
 Whether to remove "F-11" from the blocker list in `docs/PROJECT_STATE.md` (line 37) is a separate decision; ratification does not do it by itself.
+
+This amendment (ADR section 5 bullets 2 and 3 marked historical, section 5c added here) is part of what is being ratified and must be noted in the ratification line.
 
 ## 8. If the maintainer does NOT ratify
 
