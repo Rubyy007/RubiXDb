@@ -1167,6 +1167,143 @@ fn check_recognises_the_new_entries_lists_the_quarantine_and_keeps_wal_torn_tail
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// F-11 / OI-F11-02: stale quarantine temp files
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn only_the_exact_quarantine_temp_name_is_a_stale_temp_file() {
+    for yes in [
+        "wal-1.24.1700000000000.tail.tmp",
+        "wal-12.2652920.1.tail.tmp",
+    ] {
+        assert!(is_quarantine_tmp_name(yes), "{yes}");
+    }
+    for no in [
+        "wal-1.24.1700000000000.tail",
+        "wal-1.24.tail.tmp",
+        "wal-1.24.5.6.tail.tmp",
+        "wal-a.24.5.tail.tmp",
+        "wal-1.24.5.tail.tmp.bak",
+        "wal-1..5.tail.tmp",
+        "x-1.24.5.tail.tmp",
+        "wal-1.24.5.tmp",
+        ".tail.tmp",
+        "",
+    ] {
+        assert!(!is_quarantine_tmp_name(no), "{no}");
+    }
+}
+
+#[test]
+fn the_guard_sweeps_stale_quarantine_temp_files_and_nothing_else() {
+    let dir = wal_dir_with(6);
+    tear_last_frame_body(&dir);
+    // an earlier start was interrupted after its quarantine copy completed (a complete entry), and an even earlier
+    // one between the temp write and the rename (stale temp files, one of them empty, one partial)
+    let first = guard(&dir, false).unwrap();
+    let kept = first.tail.quarantine.as_ref().unwrap().path.clone();
+    let qdir = dir.join(QUARANTINE_DIR);
+    let stale = [
+        "wal-1.24.1700000000000.tail.tmp",
+        "wal-1.999.1700000000001.tail.tmp",
+    ];
+    fs::write(qdir.join(stale[0]), b"").unwrap();
+    fs::write(qdir.join(stale[1]), vec![7u8; 100]).unwrap();
+    // things that must survive: an unrelated file, a near-miss name, a directory with a stale name
+    fs::write(qdir.join("notes.txt"), b"keep").unwrap();
+    fs::write(qdir.join("wal-1.24.1700000000000.tail.bak"), b"keep").unwrap();
+    fs::create_dir(qdir.join("wal-1.5.6.tail.tmp")).unwrap();
+    let kept_bytes = fs::read(&kept).unwrap();
+
+    let g = guard(&dir, false).unwrap();
+    let mut removed = g.tail.stale_tmp_removed.clone();
+    removed.sort();
+    assert_eq!(removed, stale.map(String::from).to_vec());
+    assert!(g.tail.stale_tmp_errors.is_empty());
+    let lines = g.tail.stderr_lines().join(
+        "
+",
+    );
+    assert!(
+        lines.contains("removed 2 stale quarantine temp file(s)"),
+        "{lines}"
+    );
+    for n in stale {
+        assert!(!qdir.join(n).exists(), "{n} must be gone");
+    }
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        kept_bytes,
+        "a complete entry is untouched"
+    );
+    assert_eq!(fs::read(qdir.join("notes.txt")).unwrap(), b"keep");
+    assert!(qdir.join("wal-1.24.1700000000000.tail.bak").exists());
+    assert!(
+        qdir.join("wal-1.5.6.tail.tmp").is_dir(),
+        "a directory is never removed"
+    );
+    // idempotent, and quiet when there is nothing to remove
+    let again = guard(&dir, false).unwrap();
+    assert!(again.tail.stale_tmp_removed.is_empty());
+    assert!(!again
+        .tail
+        .stderr_lines()
+        .join(
+            "
+"
+        )
+        .contains("stale quarantine temp"));
+}
+
+#[test]
+fn a_refused_start_does_not_sweep_and_leaves_the_directory_unmodified() {
+    let dir = wal_dir_with(8);
+    attest(&dir);
+    tear_last_frame_body(&dir);
+    let qdir = dir.join(QUARANTINE_DIR);
+    fs::create_dir_all(&qdir).unwrap();
+    fs::write(qdir.join("wal-1.24.1700000000000.tail.tmp"), b"stale").unwrap();
+    let before = digest(&dir);
+    assert_eq!(
+        guard(&dir, false).unwrap_err().code,
+        codes::WAL_TAIL_DAMAGED
+    );
+    assert_eq!(
+        digest(&dir),
+        before,
+        "the refusal promises an unmodified directory"
+    );
+}
+
+#[test]
+fn check_names_a_stale_quarantine_temp_and_its_exit_counters_do_not_change() {
+    let dir = wal_dir_with(6);
+    let base = check_physical(&dir);
+    let qdir = dir.join(QUARANTINE_DIR);
+    fs::create_dir_all(&qdir).unwrap();
+    fs::write(qdir.join("wal-1.24.1700000000000.tail.tmp"), vec![1u8; 50]).unwrap();
+    let with = check_physical(&dir);
+    let named: Vec<_> = with
+        .findings
+        .iter()
+        .filter(|f| f.object.ends_with("wal-1.24.1700000000000.tail.tmp"))
+        .collect();
+    assert_eq!(named.len(), 1, "{:#?}", with.findings);
+    assert_eq!(named[0].severity, Severity::Info);
+    assert!(
+        named[0].detail.contains("stale quarantine temp")
+            && named[0].detail.contains("removed at the next start"),
+        "{}",
+        named[0].detail
+    );
+    assert_eq!((with.errors, with.warnings), (base.errors, base.warnings));
+    assert!(
+        qdir.join("wal-1.24.1700000000000.tail.tmp").exists(),
+        "check is read-only"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Measurement harness for `PHASE_ITEM_F07_IMPLEMENTATION.md` (not a correctness test)
 // ---------------------------------------------------------------------------------------------------------------
 

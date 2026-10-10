@@ -644,6 +644,59 @@ pub fn quarantine_tail_with(
     })
 }
 
+/// `wal-<segment>.<offset>.<unix_ms>.tail.tmp`: exactly the temporary name `quarantine_tail_with` writes before its
+/// atomic rename (three digit groups). Nothing else in `wal-quarantine/` matches, in particular no `*.tail`.
+pub fn is_quarantine_tmp_name(name: &str) -> bool {
+    let Some(core) = name
+        .strip_prefix("wal-")
+        .and_then(|n| n.strip_suffix(".tail.tmp"))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The stale temp files of interrupted quarantine writes (regular files only), sorted. Read-only (also used by
+/// `check`).
+pub fn list_stale_quarantine_tmp(data_dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(rd) = fs::read_dir(data_dir.join(QUARANTINE_DIR)) else {
+        return Vec::new();
+    };
+    let mut v: Vec<(String, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            is_quarantine_tmp_name(&name).then(|| (name, e.path()))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Removes the stale temp files. Safe because a temp file is never referenced by a complete entry (`find_existing`
+/// and `inspect_quarantine_file` only ever accept a `*.tail`), the only writer of one is `quarantine_tail_with` of the
+/// process that owns the instance (and it has finished before this runs: it renames or removes its temp file), and it
+/// is called only after every refusal of the start has been decided. A failed removal is reported, never fatal; if
+/// another process were writing one (two starts of the same directory, which the instance lock forbids), its rename
+/// would fail and its quarantine would fail closed (the start is refused), never silently succeed.
+fn sweep_stale_quarantine_tmp(data_dir: &Path, report: &mut TailReport) {
+    for (name, path) in list_stale_quarantine_tmp(data_dir) {
+        match fs::remove_file(&path) {
+            Ok(()) => report.stale_tmp_removed.push(name),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => report.stale_tmp_errors.push(format!("{name}: {e}")),
+        }
+    }
+    if !report.stale_tmp_removed.is_empty() {
+        crate::startup_probe::hit(crate::startup_probe::Point::QuarantineTmpSwept);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Startup policy
 // ---------------------------------------------------------------------------------------------------------------
@@ -682,6 +735,11 @@ pub struct TailReport {
     /// Where a torn tail was found: (segment, offset, bytes).
     pub tail: Option<(u64, u64, u64)>,
     pub override_effects: Vec<OverrideEffect>,
+    /// F-11 (OI-F11-02): stale `wal-<segment>.<offset>.<ms>.tail.tmp` files of an interrupted quarantine write that
+    /// this start removed (names only).
+    pub stale_tmp_removed: Vec<String>,
+    /// Stale temp files that could not be removed (`name: error`); never fatal.
+    pub stale_tmp_errors: Vec<String>,
 }
 
 impl TailReport {
@@ -723,6 +781,18 @@ impl TailReport {
         if let Some(e) = &self.attestation_removal_error {
             v.push(format!(
                 "rubixdb: could not remove {ATTESTATION_FILE} ({e}); a stale file is harmless"
+            ));
+        }
+        if !self.stale_tmp_removed.is_empty() {
+            v.push(format!(
+                "rubixdb: removed {} stale quarantine temp file(s) left by an interrupted start: {}",
+                self.stale_tmp_removed.len(),
+                self.stale_tmp_removed.join(", ")
+            ));
+        }
+        for e in &self.stale_tmp_errors {
+            v.push(format!(
+                "rubixdb: could not remove a stale quarantine temp file ({e}); it is harmless and is retried at the next start"
             ));
         }
         v
@@ -877,6 +947,10 @@ pub fn apply_tail_policy(
             }
         }
     }
+
+    // 2b. F-11 (OI-F11-02): temp files of interrupted quarantine writes of earlier starts. After every refusal (a refused
+    //     start leaves the directory unmodified) and after this start's own quarantine write has finished.
+    sweep_stale_quarantine_tmp(data_dir, &mut report);
 
     // 3. The guard has passed: the attestation is consumed (best effort; a stale file is harmless, because the rule
     //    compares sequence numbers and a log that has grown or been purged below the checkpoint never trips it).

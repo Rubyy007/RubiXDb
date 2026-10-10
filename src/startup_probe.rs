@@ -24,6 +24,9 @@ pub enum Point {
     QuarantineTempWritten,
     /// The quarantine copy exists under its final name; the clean-stop attestation is not yet consumed.
     QuarantineRenamed,
+    /// The guard removed stale `*.tail.tmp` files of an earlier interrupted quarantine write (only hit when it
+    /// removed at least one).
+    QuarantineTmpSwept,
     /// The guard consumed (removed) the clean-stop attestation; the engine has not been opened.
     AttestationConsumed,
     /// Inside `LsmEngine::open`'s WAL replay (once per record visited).
@@ -49,10 +52,11 @@ pub enum Point {
 }
 
 impl Point {
-    pub const ALL: [Point; 14] = [
+    pub const ALL: [Point; 15] = [
         Point::GuardWalPreflightRecord,
         Point::QuarantineTempWritten,
         Point::QuarantineRenamed,
+        Point::QuarantineTmpSwept,
         Point::AttestationConsumed,
         Point::EngineWalReplayRecord,
         Point::EngineWalReplayed,
@@ -72,6 +76,7 @@ impl Point {
             Point::GuardWalPreflightRecord => "guard_wal_preflight_record",
             Point::QuarantineTempWritten => "quarantine_temp_written",
             Point::QuarantineRenamed => "quarantine_renamed",
+            Point::QuarantineTmpSwept => "quarantine_tmp_swept",
             Point::AttestationConsumed => "attestation_consumed",
             Point::EngineWalReplayRecord => "engine_wal_replay_record",
             Point::EngineWalReplayed => "engine_wal_replayed",

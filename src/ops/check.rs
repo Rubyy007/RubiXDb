@@ -848,6 +848,12 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
                     h.tail_crc32c
                 ),
             ),
+            Err(why) if crate::ops::wal_tail::is_quarantine_tmp_name(&name) => sink.add(
+                Severity::Info,
+                fc::WAL_TAIL_QUARANTINED,
+                object,
+                format!("stale quarantine temp at {} ({why}): a start was interrupted between writing a preserved tail and renaming it; it is not a preserved tail and is removed at the next start", path.display()),
+            ),
             Err(why) => sink.add(
                 Severity::Info,
                 fc::WAL_TAIL_QUARANTINED,

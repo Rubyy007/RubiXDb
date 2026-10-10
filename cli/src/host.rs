@@ -385,6 +385,15 @@ impl EmbeddedServer {
                                 return;
                             }
                         };
+                        // F-11 (OI-F11-03): a fresh directory is stamped BEFORE the engine creates anything, so that
+                        // no instant exists at which data is on disk without `DATA_FORMAT` (an interrupted first start
+                        // used to leave a directory that was classified legacy and never stamped).
+                        if let Err(e) =
+                            rubixdb::ops::format::stamp_if_fresh(&data_dir_for_thread, format_state)
+                        {
+                            let _ = ready_tx.send(Err(format!("data-format marker: {e}")));
+                            return;
+                        }
                         let engine = match LsmEngine::open(
                             &data_dir_for_thread,
                             wal_config(),
@@ -397,12 +406,6 @@ impl EmbeddedServer {
                                 return;
                             }
                         };
-                        if let Err(e) =
-                            rubixdb::ops::format::stamp_if_fresh(&data_dir_for_thread, format_state)
-                        {
-                            let _ = ready_tx.send(Err(format!("data-format marker: {e}")));
-                            return;
-                        }
                         let state = Arc::new(AppState::new(engine.clone(), lsm_config, config));
                         // Recovery of an interrupted CREATE INDEX re-runs the
                         // whole backfill. Measured: on a 600,000-row table that

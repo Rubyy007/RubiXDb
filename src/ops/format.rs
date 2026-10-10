@@ -26,12 +26,16 @@ use std::path::Path;
 use crate::ops::{codes, OpsError};
 
 pub const DATA_FORMAT_FILE: &str = "DATA_FORMAT";
+/// The temporary name `stamp_if_fresh` writes before the atomic rename.
+pub const DATA_FORMAT_TMP: &str = "DATA_FORMAT.tmp";
 /// The directory-level format this build writes and reads.
 pub const CURRENT_DATA_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatState {
-    /// Directory absent or empty: the caller creates it and then `stamp`s it.
+    /// Directory absent or empty, or one whose only content this build's own interrupted stamp explains (a lone
+    /// `DATA_FORMAT.tmp`, or a `DATA_FORMAT.tmp` with exactly the text this build writes next to data created
+    /// after it): the caller stamps it (`stamp_if_fresh`), before the engine creates anything.
     Fresh,
     /// Marker present and supported.
     Marked(u32),
@@ -79,11 +83,19 @@ pub fn ensure_compatible(dir: &Path) -> Result<FormatState, OpsError> {
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // A restore's own in-progress marker does not make the staging
-            // directory "non-empty": it is still a brand-new database.
-            let only_restore_marker = std::fs::read_dir(dir)?
-                .flatten()
-                .all(|e| e.file_name() == crate::ops::restore::MARKER_FILE);
-            if only_restore_marker {
+            // directory "non-empty": it is still a brand-new database. Neither
+            // does this build's own interrupted stamp (F-11, OI-F11-03).
+            let only_ours = std::fs::read_dir(dir)?.flatten().all(|e| {
+                e.file_name() == crate::ops::restore::MARKER_FILE
+                    || e.file_name() == DATA_FORMAT_TMP
+            });
+            if only_ours {
+                Ok(FormatState::Fresh)
+            } else if is_our_interrupted_stamp(dir) {
+                // Data next to a temp file holding exactly the text only `stamp_if_fresh` of this format writes:
+                // the directory was created by this build as a fresh one (provenance proven by the file, nothing
+                // guessed), and a kill kept the rename from happening. A directory from an earlier release has no
+                // such file and stays legacy, unmodified.
                 Ok(FormatState::Fresh)
             } else {
                 Ok(FormatState::Legacy)
@@ -91,6 +103,23 @@ pub fn ensure_compatible(dir: &Path) -> Result<FormatState, OpsError> {
         }
         Err(e) => Err(OpsError::new(codes::IO, e.to_string())),
     }
+}
+
+/// The exact text `stamp_if_fresh` writes for the format this build supports.
+fn marker_text() -> String {
+    format!(
+        "rubixdb-data-format={CURRENT_DATA_FORMAT}
+wal-segment=1
+sstable=1
+catalog-row=1
+"
+    )
+}
+
+/// A `DATA_FORMAT.tmp` that is byte-for-byte what this build writes: proof that this build's `stamp_if_fresh` ran on
+/// the directory.
+fn is_our_interrupted_stamp(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(DATA_FORMAT_TMP)).is_ok_and(|t| t == marker_text())
 }
 
 /// Product-layer startup guard: the directory-format decision **plus** a
@@ -200,8 +229,12 @@ pub(crate) fn startup_guard_with_tail_policy_inner(
     })
 }
 
-/// Writes the marker (atomically) iff the directory is `Fresh`/empty or
-/// already marked; never touches a legacy directory.
+/// Writes the marker (temp file, `fsync`, atomic rename) iff the directory is `Fresh`; never touches a legacy or an
+/// already marked directory and never overwrites an existing marker.
+///
+/// Callers stamp **before** the engine creates anything (F-11, OI-F11-03): then no instant exists at which data is on
+/// disk without the marker, and a kill leaves either an empty directory (still `Fresh`), or `DATA_FORMAT.tmp` alone
+/// (still `Fresh`), or the marker. The directory is created if it does not exist yet.
 pub fn stamp_if_fresh(dir: &Path, state: FormatState) -> Result<(), OpsError> {
     if state != FormatState::Fresh {
         return Ok(());
@@ -210,13 +243,14 @@ pub fn stamp_if_fresh(dir: &Path, state: FormatState) -> Result<(), OpsError> {
     if marker.exists() {
         return Ok(());
     }
-    let tmp = dir.join(format!("{DATA_FORMAT_FILE}.tmp"));
-    std::fs::write(
-        &tmp,
-        format!(
-            "rubixdb-data-format={CURRENT_DATA_FORMAT}\nwal-segment=1\nsstable=1\ncatalog-row=1\n"
-        ),
-    )?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(DATA_FORMAT_TMP);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(marker_text().as_bytes())?;
+        f.sync_all()?;
+    }
     crate::startup_probe::hit(crate::startup_probe::Point::FormatMarkerTempWritten);
     std::fs::rename(&tmp, &marker)?;
     Ok(())
@@ -288,5 +322,103 @@ mod tests {
                 content
             );
         }
+    }
+
+    // ---- F-11 / OI-F11-03: an interrupted first start must not leave a directory that no build ever stamps ----
+
+    #[test]
+    fn a_lone_interrupted_stamp_is_still_a_fresh_directory_and_gets_stamped() {
+        // killed between the temp write and the rename, before the engine created anything
+        let d = tmp("tmp_only");
+        std::fs::write(d.join(DATA_FORMAT_TMP), marker_text()).unwrap();
+        assert_eq!(ensure_compatible(&d).unwrap(), FormatState::Fresh);
+        // killed while the temp file itself was being written (partial text)
+        let d2 = tmp("tmp_partial");
+        std::fs::write(d2.join(DATA_FORMAT_TMP), "rubixdb-data-fo").unwrap();
+        assert_eq!(ensure_compatible(&d2).unwrap(), FormatState::Fresh);
+        for dir in [&d, &d2] {
+            stamp_if_fresh(dir, ensure_compatible(dir).unwrap()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.join(DATA_FORMAT_FILE)).unwrap(),
+                marker_text()
+            );
+            assert!(!dir.join(DATA_FORMAT_TMP).exists(), "the temp file is gone");
+            assert_eq!(
+                ensure_compatible(dir).unwrap(),
+                FormatState::Marked(CURRENT_DATA_FORMAT)
+            );
+        }
+    }
+
+    #[test]
+    fn data_beside_this_builds_own_stamp_temp_is_stamped_not_left_legacy() {
+        // the state the old order (stamp after the engine open) could leave
+        let d = tmp("tmp_and_data");
+        std::fs::write(d.join("MANIFEST"), b"x").unwrap();
+        std::fs::write(d.join(DATA_FORMAT_TMP), marker_text()).unwrap();
+        let st = ensure_compatible(&d).unwrap();
+        assert_eq!(st, FormatState::Fresh);
+        stamp_if_fresh(&d, st).unwrap();
+        assert_eq!(
+            ensure_compatible(&d).unwrap(),
+            FormatState::Marked(CURRENT_DATA_FORMAT)
+        );
+        assert_eq!(
+            std::fs::read(d.join("MANIFEST")).unwrap(),
+            b"x",
+            "data untouched"
+        );
+    }
+
+    #[test]
+    fn data_beside_a_temp_file_this_build_did_not_write_stays_legacy_and_unmodified() {
+        // provenance is not proven: nothing is guessed, nothing is stamped
+        for text in [
+            "rubixdb-data-format=2
+wal-segment=1
+",
+            "rubixdb-data-fo",
+            "",
+            "junk",
+        ] {
+            let d = tmp("tmp_foreign");
+            std::fs::write(d.join("MANIFEST"), b"x").unwrap();
+            std::fs::write(d.join(DATA_FORMAT_TMP), text).unwrap();
+            let st = ensure_compatible(&d).unwrap();
+            assert_eq!(st, FormatState::Legacy, "{text:?}");
+            stamp_if_fresh(&d, st).unwrap();
+            assert!(!d.join(DATA_FORMAT_FILE).exists(), "{text:?}");
+            assert_eq!(
+                std::fs::read_to_string(d.join(DATA_FORMAT_TMP)).unwrap(),
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn stamping_creates_a_missing_directory_and_never_overwrites_a_marker() {
+        let base = tmp("create");
+        let d = base.join("not-yet");
+        assert_eq!(ensure_compatible(&d).unwrap(), FormatState::Fresh);
+        stamp_if_fresh(&d, FormatState::Fresh).unwrap();
+        assert_eq!(
+            ensure_compatible(&d).unwrap(),
+            FormatState::Marked(CURRENT_DATA_FORMAT)
+        );
+        // an existing marker is never rewritten, even when asked as Fresh
+        std::fs::write(
+            d.join(DATA_FORMAT_FILE),
+            "rubixdb-data-format=1
+kept=1
+",
+        )
+        .unwrap();
+        stamp_if_fresh(&d, FormatState::Fresh).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join(DATA_FORMAT_FILE)).unwrap(),
+            "rubixdb-data-format=1
+kept=1
+"
+        );
     }
 }

@@ -439,6 +439,9 @@ mod interruption {
         K,
         /// K plus 5 zero bytes after the last valid WAL frame: a torn tail the guard quarantines and open truncates.
         T,
+        /// T plus a stale `*.tail.tmp` in `wal-quarantine/`, as an earlier start interrupted between the quarantine
+        /// temp write and its rename leaves it (OI-F11-02).
+        S,
         /// K plus 3 stray bytes after the last valid Manifest record: a torn Manifest tail open truncates.
         M,
         /// Manifest-adoption: an SSTable on disk the Manifest does not know, plus a stale `*.sst.tmp`.
@@ -669,6 +672,7 @@ Connection: close
         static K: OnceLock<Fixture> = OnceLock::new();
         static T: OnceLock<Fixture> = OnceLock::new();
         static M: OnceLock<Fixture> = OnceLock::new();
+        static S: OnceLock<Fixture> = OnceLock::new();
         static O: OnceLock<Fixture> = OnceLock::new();
         static G: OnceLock<Fixture> = OnceLock::new();
         static L: OnceLock<Fixture> = OnceLock::new();
@@ -686,6 +690,21 @@ Connection: close
                     .unwrap()
                     .0;
                 append(&wal_dir(&root).join(seg), &[0u8; 5]);
+                Fixture {
+                    root,
+                    rows: k().rows.clone(),
+                }
+            }),
+            Kind::S => S.get_or_init(|| {
+                let root = fresh_root("fxS");
+                copy_dir(&fixture(Kind::T).root, &root);
+                let q = data_dir(&root).join("wal-quarantine");
+                fs::create_dir_all(&q).unwrap();
+                fs::write(
+                    q.join("wal-1.2652920.1700000000000.tail.tmp"),
+                    vec![0x5Au8; 777],
+                )
+                .unwrap();
                 Fixture {
                     root,
                     rows: k().rows.clone(),
@@ -961,6 +980,12 @@ facts {:?}",
         );
         let (code, err1) = s.stop_graceful();
         assert_eq!(code, 0, "{label}: {err1}");
+        // OI-F11-03: whatever instant the first start was ended at, the directory ends up stamped
+        let f = facts(root);
+        assert!(
+            f.marker && !f.marker_tmp,
+            "{label}: the directory must be stamped after the restart: {f:?}"
+        );
         let s2 = running(root);
         assert!(s2.rows() == expected(&[1]), "{label}");
         let (code, err2) = s2.stop_graceful();
@@ -1078,6 +1103,35 @@ facts {:?}",
                     return Err(format!(
                         "expected exactly one final quarantine file and no temporary one: tmp {:?} final {:?}",
                         n.quarantine_tmp, n.quarantine_tail
+                    ));
+                }
+                Ok(())
+            },
+        },
+        Phase {
+            name: "quarantine_tmp_swept",
+            kind: Kind::S,
+            point: "quarantine_tmp_swept",
+            nth: Nth::One,
+            bound: Bound::Ready,
+            at_pause: |b, n, _| {
+                same_wal(b, n)?;
+                if b.quarantine_tmp.len() != 1 {
+                    return Err(format!(
+                        "the fixture must start with one stale temp file: {:?}",
+                        b.quarantine_tmp
+                    ));
+                }
+                if !n.quarantine_tmp.is_empty() {
+                    return Err(format!(
+                        "the stale temp file must be gone at the pause: {:?}",
+                        n.quarantine_tmp
+                    ));
+                }
+                if n.quarantine_tail.len() != 1 {
+                    return Err(format!(
+                        "this start's own quarantine entry must exist: {:?}",
+                        n.quarantine_tail
                     ));
                 }
                 Ok(())
@@ -1224,6 +1278,13 @@ facts {:?}",
                 if !n.marker_tmp || n.marker {
                     return Err("the marker must exist under its temporary name only".into());
                 }
+                // OI-F11-03: the stamp comes before the engine creates anything
+                if !n.wal_segments.is_empty() || n.manifest_len != 0 {
+                    return Err(format!(
+                        "the engine must not have created its files before the stamp: {:?}",
+                        n.wal_segments
+                    ));
+                }
                 Ok(())
             },
         },
@@ -1331,6 +1392,22 @@ facts {:?}",
         } else {
             restart_and_verify(&root, &exp, ph.name)
         };
+        // OI-F11-02: whatever the interruption left, no stale quarantine temp survives a start, and no complete
+        // quarantine entry that existed at the pause is lost or replaced.
+        let after_restart = facts(&root);
+        assert!(
+            after_restart.quarantine_tmp.is_empty(),
+            "{}: stale quarantine temp files survived the restart: {:?}",
+            ph.name,
+            after_restart.quarantine_tmp
+        );
+        for kept in &now.quarantine_tail {
+            assert!(
+                after_restart.quarantine_tail.contains(kept),
+                "{}: the complete quarantine entry {kept} disappeared",
+                ph.name
+            );
+        }
         let ev = json!({
             "scenario": ph.name, "rep": rep, "kind": format!("{:?}", ph.kind), "point": ph.point, "nth": nth,
             "probe": probe_line, "reached_s": reached_at.as_secs_f64(), "exit_code": code, "exit_s": took.as_secs_f64(),
@@ -1377,6 +1454,7 @@ facts {:?}",
         interrupted_inside_the_engines_wal_replay_of_a_large_wal => "engine_wal_replay_large_wal",
         interrupted_between_the_quarantine_copy_and_its_rename => "quarantine_temp_written",
         interrupted_after_the_quarantine_rename_before_the_attestation_is_consumed => "quarantine_renamed",
+        interrupted_after_stale_quarantine_temp_files_were_swept => "quarantine_tmp_swept",
         interrupted_after_the_attestation_is_consumed_before_the_engine_opens => "attestation_consumed",
         interrupted_inside_the_engines_wal_replay => "engine_wal_replay",
         interrupted_after_wal_replay_before_the_wal_is_opened => "engine_wal_replayed",
@@ -1397,7 +1475,7 @@ facts {:?}",
         for p in rubixdb::startup_probe::Point::ALL {
             assert!(covered.contains(p.name()), "no scenario for {}", p.name());
         }
-        assert_eq!(PHASES.len(), 16);
+        assert_eq!(PHASES.len(), 17);
         for p in PHASES {
             assert!(TESTED.contains(&p.name), "phase {} has no test", p.name);
         }
@@ -1504,6 +1582,63 @@ facts {:?}",
         eprintln!(
             "F11_INT_EVIDENCE {}",
             json!({"scenario":"cli_owner_path","exit_code":code,"exit_s":took.as_secs_f64(),"restart_ready_s":ready})
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    const OUR_STAMP: &str = "rubixdb-data-format=1
+wal-segment=1
+sstable=1
+catalog-row=1
+";
+
+    /// The state the OLD order (stamp after the engine open) could leave: data, no marker, and the temp file this build
+    /// writes. The next start must complete the stamp (OI-F11-03), with every row intact.
+    #[test]
+    fn data_left_beside_this_builds_stamp_temp_is_stamped_at_the_next_start() {
+        let _s = serial();
+        let (root, exp) = copy_of(Kind::G, "oi03_old_window");
+        let d = data_dir(&root);
+        fs::remove_file(d.join("DATA_FORMAT")).unwrap();
+        fs::write(d.join("DATA_FORMAT.tmp"), OUR_STAMP).unwrap();
+        let before = facts(&root);
+        assert!(!before.marker && before.marker_tmp);
+        restart_and_verify(&root, &exp, "oi03 old window");
+        let after = facts(&root);
+        assert!(
+            after.marker && !after.marker_tmp,
+            "stamped at the next start: {after:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(d.join("DATA_FORMAT")).unwrap(),
+            OUR_STAMP
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Control: a temp file this build did not write proves nothing, so nothing is stamped (and nothing is lost).
+    #[test]
+    fn data_beside_a_foreign_temp_file_is_not_stamped_and_nothing_is_lost() {
+        let _s = serial();
+        let (root, exp) = copy_of(Kind::G, "oi03_foreign");
+        let d = data_dir(&root);
+        fs::remove_file(d.join("DATA_FORMAT")).unwrap();
+        fs::write(
+            d.join("DATA_FORMAT.tmp"),
+            "rubixdb-data-format=2
+",
+        )
+        .unwrap();
+        restart_and_verify(&root, &exp, "oi03 foreign tmp");
+        let after = facts(&root);
+        assert!(
+            !after.marker,
+            "a legacy directory is never stamped: {after:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(d.join("DATA_FORMAT.tmp")).unwrap(),
+            "rubixdb-data-format=2
+"
         );
         let _ = fs::remove_dir_all(&root);
     }
