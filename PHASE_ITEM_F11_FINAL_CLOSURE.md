@@ -1,0 +1,87 @@
+# PHASE ITEM F-11 — FINAL CLOSURE
+
+**Date:** 2026-10-11. **Written at HEAD** `2d4af50f173e68ce819500794ca250bc51778d33` (the Shape A commit) plus this document. This is the single document to open to understand F-11. It summarises and indexes; the detailed history stays in `PHASE_ITEM_F11_DISCOVERY.md`, `PHASE_ITEM_F11_CLOSURE.md` (sections 1-14), `PHASE_ITEM_F11_ADR.md`, `PHASE_ITEM_F11_RATIFICATION.md`, the mini-ADRs `PHASE_ITEM_F11_OI02_ADR.md`, `..._OI03_ADR.md`, `..._OI04_ADR.md`, `PHASE_ITEM_F07_CHECKPATH_ADR.md`, `PHASE_ITEM_F07_OI04_ADR.md`, and `OPEN_ITEMS.md` / `PROGRESS.md` / `CHANGELOG.md`.
+
+## 4.1 Verdict
+
+**UNRESOLVED CONSEQUENCES REMAIN (named).** Every F-11 defect that was found has a fix with evidence (startup grace, `OI-F11-02`, `OI-F11-03`, `OI-F11-04`, and the F-07 check-path gap), and every acceptance criterion in 4.6 is PASS at the scope stated in 4.2. Three consequences remain and are named: (1) **ADR-STARTUP-01 is still PROPOSED**; the maintainer has not ratified the hard-exit policy, so it is in effect but unratified; (2) **`OI-F11-05` has no owner**: the interruption suite is manual and feature-gated and nobody is recorded as responsible for running it; (3) the NOT TESTED limits of 4.4 (power loss, a WAL above 8.0 MB, pre-thread work, other platforms). Production readiness is not claimed.
+
+## 4.2 What F-11 was
+
+A startup that outlasted its 30 s readiness bound (a slow `LsmEngine::open`) ended only the *wait*, not the process: the process stayed alive, port bound and silent, for as long as the open took (measured 60.9-122.8 s). The fix is at the CLI layer (`cli/src/host.rs`): the calling thread waits for the server thread for at most `RUBIXDB_STARTUP_GRACE_MS` and then ends the process (`process::exit(1)`), with the failure model "process termination during startup", proven by stopping the real binary at 15 named startup points and restarting the same instance. It does **not** cover power loss, the work before the server thread exists (config parsing, instance lock, listener bind, runtime construction), or platforms other than Windows.
+
+## 4.3 Fixes that landed
+
+| Item | Status | What changed | Evidence | Record |
+|---|---|---|---|---|
+| Startup grace enforcement | FIXED | the unbounded join became a timed wait on the calling thread; the watchdog thread (whose spawn failure fell back to "waiting without a bound") is gone; `grace_expired` is unit-tested | `f11_startup_grace_integration` 6 of 6 (`sa_recert_grace.log`); matrix below; `git grep "waiting without a bound" -- cli src` empty | ADR-STARTUP-01 (PROPOSED), commits `aad45d0`, `4b4bd39` |
+| Probe seam and interruption suite | FIXED (test infrastructure) | `startup-probe` feature (absent from the product binary), **15 named pause points**, **17 phase scenarios**; **51 phase runs** under `F11_REPS=3` (the matrix before `quarantine_tmp_swept` existed: 14 points, 16 scenarios, 48 runs, historical) | `sa_recert_matrix.log`: 26 passed, 0 failed, 3,063 s; every run exit 1 at 35.03-35.07 s (22.0 s on the `/healthz` path); every restart exact (2,500 / 4,000 / 7,540 rows), write accepted, graceful stop 0, `rubixdb check` 0; deadline race 24 runs (12 joined / 12 hard); sweep 200 kills (73 during startup); default grace 90.09 s; plain-CLI owner path in the same file | `PHASE_ITEM_F11_CLOSURE.md` sections 6-8, 14 |
+| `OI-F11-02` stray `wal-quarantine/*.tail.tmp` | FIXED | the next start removes the files after every refusal is decided; `check` names them; probe point 15 | 0 of 51 restarts left one; 4 unit tests; fails on the unfixed tree | `PHASE_ITEM_F11_OI02_ADR.md` |
+| `OI-F11-03` unstamped first start | FIXED | the data-format stamp now precedes the engine open (unconditionally on a first start); this build's own interrupted stamp is recognised and completed; a legacy directory of an earlier release is never touched | 4 unit tests, 3 real-binary tests, stamped after 3 of 3 first-start interruptions and every empty-directory sweep kill; fails on the unfixed tree | `PHASE_ITEM_F11_OI03_ADR.md` |
+| **`OI-F11-04`** attestation declined after an aborted recovery flush | **FIXED** (this mission, Shape A) | `write_attestation` also accepts a log whose newest segment(s) hold only their 24-byte header when the segment holding the last record ends exactly at it; it then attests the end of that segment. Torn tail, corrupt segment, a newest segment longer than its header, an inconsistent header and header-only-after-a-torn-older-segment still refuse with the same text. Commit `2d4af50` | fixture O x5 (real binary): **15 of 15 attested** (before, same fixture x5: 6 of 15 attested, 9 of 15 declined; earlier runs 2 of 9, 4 of 9, 3 of 6); over the whole matrix **0 of 51** declined (before: 4 of 51 and 2 of 48); the flush-abort line still appears (8 of 51 runs; the engine is unchanged) but the stop attests; rows exact and `rubixdb check` 0 in every run (`sa_recert_fixtureO_reps5.log`, `sa_recert_matrix.log`) | `PHASE_ITEM_F11_OI04_ADR.md` sections 6-7, `PHASE_ITEM_F07_OI04_ADR.md` |
+| F-07 check-path gap (`rubixdb check` truncated a damaged WAL tail in place) | FIXED (earlier mission, same safety net) | `plan_tail` + informational findings; the logical pass runs on a private copy when a torn tail exists | 3 real-binary tests (F-07 file 16 of 16, `sa_recert_f07.log`), 6 unit tests | `PHASE_ITEM_F07_CHECKPATH_ADR.md`, commit `852e0df` |
+| ADR section 5 bullets 2 and 3 | SUPERSEDED (marked historical in place) | refer to `OI-F11-02` / `OI-F11-03` | `PHASE_ITEM_F11_ADR.md` section 5 | commit `3e1d3b3` |
+
+**Shape A, non-vacuity.** The 3 fix-dependent tests (the reversed header-only assertion in `the_attestation_is_not_written_for_a_corrupt_torn_or_inconsistent_directory`, `shape_a_attests_the_end_of_the_last_segment_that_holds_records`, `shape_a_attestation_still_catches_acknowledged_records_that_later_disappear`) FAIL on the pre-Shape-A source and pass on the fixed one (`shapeA_on_current_code.txt`). The 5 retained-refusal tests and the clause table (`shape_a_each_clause_of_the_predicate_is_needed`) are regression guards: they PASS on the pre-Shape-A source, by necessity (that source refuses everything they assert), so they cannot "fail on the current code"; their sensitivity was shown instead by 11 mutants of the Shape A source, **all 11 killed** (`shapeA_mutations.txt`: removing the corruption gate, the torn gate, wrong attested values, ignoring the record count / sequence number / segment order / segment existence, a longer-than-record last-valid segment, longer or unmeasurable newer segments, and restoring the old predicate). One mutant (segment existence) survived the first test design and was killed after the existence case was strengthened. `shape_a_leaves_a_log_that_never_held_a_record_exactly_as_it_was` is a control (passes before and after). Mutation evidence shows sensitivity to those faults only, not complete correctness.
+
+## 4.4 What is NOT fixed, and why
+
+| Item | Priority | Why it is not fixed | What a fix needs | Lives in |
+|---|---|---|---|---|
+| ADR-STARTUP-01 ratification | decision | the ADR status is the maintainer's to change; the package is `PHASE_ITEM_F11_RATIFICATION.md` | the maintainer's signed line (package section 7) | `PHASE_ITEM_F11_ADR.md` |
+| `OI-F11-05` the interruption suite is manual and feature-gated (ignored placeholder in a default build; port 302, one server at a time, about 51 min) | P2 | **owner NOT ASSIGNED**: the repository records no authorised owner and none was assigned here | the maintainer names an owner and a trigger | `OPEN_ITEMS.md` |
+| Power loss / OS crash during any startup phase | - | NOT TESTED; every test is a process termination, never a power loss | a power-loss harness | closure section 11 |
+| A WAL above 8.0 MB, many SSTables, large catalogs, a genuinely slow disk | - | NOT TESTED; the largest fixture is 8.0 MB (the largest tail the shipped 4 MiB memtable is known to leave is about 8.4 MB) | fixtures and time | closure section 11 |
+| The pre-thread work (config parsing, instance lock, listener bind, runtime construction) | - | outside both startup bounds; never claimed bounded | a separate design | ADR-STARTUP-01 section 3 |
+| Platforms other than Windows; the standalone `rubixdb-api` binary (no startup bound, unsupported) | - | evidence is Windows only | per-platform runs | closure section 11 |
+| A kill inside the body of a protected function at finer-than-call grain; the exit during an engine recovery flush or index recovery at a named point | - | NOT TESTED at a named point (sampled only by the random-kill sweep) | engine fault injection under a protected-path authorisation | closure section 11 |
+| `rubixdb check`'s logical pass can still modify the inspected directory for recovery work other than the WAL tail (torn Manifest tail, stale `*.sst.tmp`, an adopted orphan table, a recovery flush) | P3 | found by code reading, NOT TESTED; only the WAL tail is covered | extend the copy-on-recovery rule of `open_engine_for_inspection` | `OPEN_ITEMS.md` (2026-10-10, F-07 check path) |
+| The manifest-checkpoint reading of "inconsistent sequence" | - | `write_attestation` never consults the manifest (0 references), so a log ending below the checkpoint is **not** refused today and Shape A does not change that; it is not in the authorised retained-refusal list and was not added | an explicit new rule, a separate authorisation | this document |
+| The flush abort is reported as `flush attempt 1 failed (published=Some(...))`, which reads like a fault; the abort still leaves the published table for the next start's orphan adoption (data intact) | P3 cosmetic | engine behaviour, outside the authorised scope | an engine wording/semantics change | `OPEN_ITEMS.md` (OI-F11-04 rows) |
+| 13 pre-existing phase tests whose added after-restart assertions are inert in their scenario | - | regression guards only, not detectors; mutation evidence exists for 1 of the 13 (it stayed passing = inert); the six baseline-passing controls were mutation-verified separately | none required | ratification package section 6.1-6.2 |
+| Baseline failures: `repo_hygiene` x2 (a tracked credentials file), intermittent M1.3 throughput, intermittent disconnect test | - | independent of F-11 (reproduced on the baseline tree); M1.3 failed in the last two full-suite runs (39,937 and 26,301 ops/s) and passed 3 of 3 in isolation (109k, 81k, 114k ops/s) | the credentials file is a code-and-history change | `OPEN_ITEMS.md` |
+| The evidence logs live outside the repository (`E:\rubixdb_f11c\logs`) | - | not versioned; documents cite them by path | the maintainer decides whether to archive them | this document |
+
+## 4.5 Authorisations and their status
+
+| Item | Recorded | By / where | Covers | Does not cover |
+|---|---|---|---|---|
+| **Shape A** (`OI-F11-04`) | **yes** | Manik, Admin, 2026-10-11; `PHASE_ITEM_F11_OI04_ADR.md` section 6 (recorded in the file by the session on the maintainer's instruction) | the Shape A predicate change in `write_attestation` and the single header-only assertion reversal; torn, corrupt, length-mismatch, 25+-byte newest and header-only-after-torn-older keep refusing | any other rule, test or protected path; the F-07 refusal path, quarantine, check-path fix, cleanup sweep, the F-11 grace |
+| ADR-STARTUP-01 (hard-exit policy) | **no** | PROPOSED | - | everything: the policy is in effect, unratified |
+| `OI-F11-02`, `OI-F11-03` mini-ADRs | partly | the mini-ADRs state "IMPLEMENTED by the F-11 real-closure mission"; no approver is named in the files (the work followed the maintainer's mission instruction of 2026-10-10) | the sweep; the stamp-first order | - |
+| F-07 check-path ADR | partly | same; one call site in `cli/src/ops_cmd.rs` outside that mission's file list is named in the ADR | Shape A for `check` | other in-place recovery work |
+| Removal of the F-11 row from `docs/PROJECT_STATE.md` | **no** | no written instruction exists | - | the row **stands** and the file was not edited |
+| `OI-F11-05` owner | **no** | - | - | unassigned |
+
+## 4.6 Evidence index (ADR section 7 criteria plus the added ones)
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-1 contract explicit | PASS | `startup_env.rs` unit tests; `f11_startup_grace_integration` 6 of 6 (`sa_recert_grace.log`); `gui --help` test |
+| AC-2 hard bound at the named points (15 points, 17 scenarios, through `gui` and the plain CLI; narrowed text in ADR section 7) | PASS | `sa_recert_matrix.log`: 51 of 51, exit 35.03-35.07 s (21.99-22.02 s `/healthz` path), owner-path test passed, default grace 90.09 s |
+| AC-3 no conditional fallback | PASS | `grace_expired` unit test (in the workspace runs); `git grep "waiting without a bound" -- cli src` empty |
+| AC-4 restart integrity after each of 17 scenarios | PASS | 51 of 51 (`sa_recert_matrix.log`) |
+| AC-5 never reported as a shutdown | PASS | asserted in all 51 runs |
+| AC-6 normal paths unchanged | PASS | controls and join test (33.17 s) in the matrix; `sa_recert_grace.log`; workspace runs |
+| AC-7 the deadline race | PASS | 24 runs, 12 joined / 12 hard exit, 34.32-35.06 s, one final line each |
+| AC-8 random-instant kills | PASS | 200 kills (73 during startup), all recoverable |
+| AC-9 product binary free of the probe | PASS | `grep -c -a RUBIXDB_TEST_STARTUP_PAUSE target/release/rubixdb.exe` = 0 (SHA-256 `6fb6f914b96d72f12ca481b010847ffd565fb37065bed1d6965ba346fb5e1ba2`) |
+| AC-10 no protected path changed | PASS | `git diff aad45d0..HEAD --stat -- src/wal src/manifest src/sstable src/compaction src/error.rs` empty |
+| AC-11 documentation consistent | PASS with caveats | ADR, package, closure, OPEN_ITEMS agree except the items listed in 4.7 (the package predates Shape A; `PHASE_ITEM_F07_OI04_ADR.md` header still says NOT AUTHORISED) |
+| AC-12 `OI-F11-02` | PASS | 0 of 51 restarts left a stale temp; unit tests; fails on the unfixed tree |
+| AC-13 `OI-F11-03` | PASS | stamped after every first-start restart; unit + real-binary tests; fails on the unfixed tree |
+| AC-14 `OI-F11-04` (Shape A) | PASS | fixture O x5 15 of 15 attested; 0 of 51 declined; refusals retained (5 tests, 11 of 11 mutants killed); acknowledged data survives restart in all runs; `PHASE_ITEM_F11_OI04_ADR.md` |
+| AC-15 F-07 check path | PASS | F-07 integration 16 of 16 (`sa_recert_f07.log`); `PHASE_ITEM_F07_CHECKPATH_ADR.md` |
+| Workspace regression (debug / release) | PASS apart from baseline failures | debug 1,470 passed, 2 failed (`repo_hygiene` x2); release 1,471 passed, 3 failed (`repo_hygiene` x2, M1.3); fmt, clippy (default and probe), `rubixdb-api` observability 38 of 38 clean (`sa_recert_*.log`) |
+
+## 4.7 The decision the maintainer owes
+
+To **close F-11 in the project records** the maintainer decides, in this order: (1) ratify, amend or reject ADR-STARTUP-01 using `PHASE_ITEM_F11_RATIFICATION.md` section 7 (exact lines to add and remove; the ratification line must note the section 5c amendment). (2) Name an owner and a trigger for `OI-F11-05`. (3) Only then, and with a written instruction, remove F-11 from the blocker list in `docs/PROJECT_STATE.md`. **None of these blocks F-08.** Two documents are stale because this mission's file list did not allow editing them, and the reader should apply these corrections: the ratification package (sections 5 and 5d, and 5c's list) still describes `OI-F11-04` as OPEN / NOT FIXED; it is FIXED (4.3), so ratification no longer has that open consequence; and `PHASE_ITEM_F07_OI04_ADR.md` still says "NOT AUTHORISED"; the authorisation is in `PHASE_ITEM_F11_OI04_ADR.md` section 6.
+
+## 4.8 Handoff to F-08
+
+The maintainer named F-08 as the next mission. F-08 ("a damaged SSTable reports ready") is already **implemented**: ADR-SST-01 was accepted and implemented on 2026-10-08 (`PHASE_ITEM_F08_DISCOVERY.md`, `PHASE_ITEM_F08_ADR.md`, `PHASE_ITEM_F08_IMPLEMENTATION.md`), together with the compaction retry-leak fix (`PHASE_ITEM_F08_COMPACTION_LEAK_*`). What remains is recorded in `OPEN_ITEMS.md` (the 2026-10-08 F-08 lines): the verification pass's default of 64 MiB/s is unvalidated (needs a multi-GiB fixture), a footer `record_count` disagreement is not a finding of the pass, footer/bloom/index damage and deleted files under a RUNNING instance are found only at the next start, with a damaged table and a damaged WAL tail together the SSTable refusal is reported first, the SQL route maps typed corruption to the generic `STORAGE_ERROR`, and `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` section 3.5 is stale. The F-08 mission should read first: `OPEN_ITEMS.md` (those lines), `PHASE_ITEM_F08_IMPLEMENTATION.md`, `PHASE_ITEM_F08_ADR.md`, then `src/ops/sstable_integrity.rs` and the sstable and compaction protected-path rules in `CLAUDE.md`. F-08 is not started by this mission.
+
+## 4.9 Nothing is faked
+
+Not claimed: production readiness; power-loss safety; that the hard exit is ratified; that F-11 is closed in `docs/PROJECT_STATE.md` (**the row stands**, no written instruction to remove it exists, and the file was not edited); that mutation testing proves correctness; that the 13 inert guards are mutation-validated; that the pre-thread work, other platforms, a WAL above 8.0 MB or a slow disk were tested; that `rubixdb check` is read-only for every recovery case (only the WAL tail). Reported as found: the three baseline failures, the evidence logs being outside the repository, and the two stale documents in 4.7.

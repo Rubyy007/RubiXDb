@@ -2814,3 +2814,11 @@ Every source file, test, protected path; the closure; `docs/PROJECT_STATE.md`; t
 - `OI-F11-04` (the clean-stop attestation can be declined after an aborted recovery flush): waiting for a written authorisation of the eligibility-rule change (`PHASE_ITEM_F07_OI04_ADR.md`).
 ### Not changed
 Every protected path; the attestation eligibility rule; ADR-STARTUP-01 (PROPOSED).
+
+## 2026-10-11 -- OI-F11-04: the clean-stop attestation is written after a rotation that no record followed (under [Unreleased])
+### Fixed
+- **A graceful stop that arrives right after a WAL rotation (for example while the start's own recovery flush is running and is aborted) now writes the clean-stop attestation.** The WAL then ends in a header-only segment after the segment that holds the last record; that is a clean log, not a damaged one, and the attestation names the end of the segment that holds the last record. Before, the stop declined the attestation ("the replay summary does not match the newest segment") in up to 9 of 15 stops of the test fixture and the next start was unattested. Authorised by the maintainer (Manik, Admin, 2026-10-11). Torn tails, corrupt segments, a newest segment longer than its header, inconsistent headers and a header-only segment after a torn older segment are still refused, with unchanged text; only the sequence number of the attestation is compared at the next start, so a later loss of acknowledged records is still detected.
+### Added
+- `PHASE_ITEM_F11_FINAL_CLOSURE.md`, the single document describing F-11's state.
+### Not changed
+Every protected path; the F-07 refusal path, quarantine, `check` path and cleanup sweep; the startup grace; ADR-STARTUP-01 (PROPOSED).
