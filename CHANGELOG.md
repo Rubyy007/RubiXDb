@@ -2799,3 +2799,10 @@ Every protected path, the engine, `/readyz`, graceful shutdown, the startup grac
 - `PHASE_ITEM_F11_RATIFICATION.md`: section 5c (ratification is against the amended ADR), section 6.1 (which of the 29 added or strengthened tests were seen failing on the unfixed tree, which pass by design and how they were mutation-checked, which were not run and why), section 7 amended.
 ### Not changed
 Every source file, test, protected path; `docs/PROJECT_STATE.md`; the closure sections 1-14.
+
+## 2026-10-10 -- F-11 decision-package consistency amendment (documentation only, under [Unreleased])
+### Changed
+- `PHASE_ITEM_F11_ADR.md` sections 2 and 7: the startup-sequence table now shows the data-format stamp before the engine open (row 6b), the stale-quarantine-temp sweep (row 5b), the corrected row 5 and a pointer at row 12; AC-4 counts 17 scenarios. Section 5 names the two items that stay open. Status line unchanged (PROPOSED).
+- `PHASE_ITEM_F11_RATIFICATION.md`: sections 5d (open items, the OI-F11-04 policy question, OI-F11-05 unassigned), 6.2 (baseline-test policy and the regression-guard exception; limits of the mutation evidence) and 6.3 (canonical counts: 15 pause points, 17 scenarios, 51 runs; 14 / 16 / 48 are the earlier matrix).
+### Not changed
+Every source file, test, protected path; the closure; `docs/PROJECT_STATE.md`; the ADR status line; the statuses of OI-F11-04 and OI-F11-05.

@@ -12,7 +12,7 @@ When a startup bound has fired and the server thread has not ended within `RUBIX
 * Failure model: **process termination during startup** (the product's own `process::exit(1)`), and the same state reached by `TerminateProcess`.
 * The Windows host of the evidence (Windows 10 build 19045, rustc 1.98.1).
 * The lifetime contract of ADR section 3, decision 1: an engine open that outlasts the 30 s bound ends at 30 s + grace after the server thread starts; a server start that outlasts the 15 s `/healthz` bound after readiness ends at (readiness, at most 30 s) + 15 s + up to 2 s (the last probe's own timeout) + grace (measured 22.0 s with a 5 s grace).
-* The test seam (`startup-probe` feature, 14 named pause points, absent from the product binary) and its 14 feature-gated calls in `src/lsm/mod.rs`, `src/ops/format.rs`, `src/ops/wal_tail.rs` (none a protected path).
+* The test seam (`startup-probe` feature, 15 named pause points, absent from the product binary) and its 15 feature-gated calls in `src/lsm/mod.rs`, `src/ops/format.rs`, `src/ops/wal_tail.rs` (none a protected path).
 
 Also in the tree since this package was first written, and referred to by the amended ADR section 5 (bullets 2 and 3): the stamp-before-open and interrupted-stamp recognition (`PHASE_ITEM_F11_OI03_ADR.md`, `src/ops/format.rs`, `cli/src/host.rs`), the stale quarantine temp sweep and the `check` wording (`PHASE_ITEM_F11_OI02_ADR.md`, `src/ops/wal_tail.rs`, `src/ops/check.rs`) and a 15th probe point. The amended ADR records their outcome (FIXED); their designs are those two mini-ADRs (status IMPLEMENTED), each with its own evidence, and are **not** the decision ratified in section 1.
 
@@ -54,6 +54,14 @@ Ratifying ADR-STARTUP-01 accepts the timeout policy and the consequences remaini
 ## 5c. Ratification is against the amended ADR
 
 `PHASE_ITEM_F11_ADR.md` section 5 bullets 2 and 3 now read as historical, superseded by `PHASE_ITEM_F11_OI02_ADR.md` and `PHASE_ITEM_F11_OI03_ADR.md`. The maintainer is ratifying the ADR as amended, not the pre-amendment text. The two tracked consequences this package still asks the maintainer to accept are: (a) after a hard exit the next start is unattested (as after any kill, unchanged from before F-11); (b) `fail_after_bound` can end the process from a library-like module (`rubixdb-cli` is a binary crate; only `gui` and the become-the-owner path call it). Neither is a defect; both are properties of the retained design. (`OI-F11-04` is not among them: it is NOT FIXED, stays open and is not accepted by ratifying; see section 5b.)
+
+## 5d. Items that stay open and are not decided by this ratification
+
+| Item | Status recorded in `OPEN_ITEMS.md` | What a maintainer decision would be |
+|---|---|---|
+| `OI-F11-04` attestation declined after an aborted recovery flush | **OPEN, NOT FIXED** (P2) | A policy question separate from ADR-STARTUP-01, for the owner of ADR-WAL-01 (F-07): *should the clean-stop attestation be written when the newest WAL segment holds only its header and the last valid record ends exactly at the end of the preceding segment?* Today the rule says no, and an approved F-07 unit test (`the_attestation_is_not_written_for_a_corrupt_torn_or_inconsistent_directory`, the header-only case) pins that. A scratch prototype that says yes attested 15 of 15 where the shipped rule attested 6 of 15 (`PHASE_ITEM_F11_OI04_ADR.md`); nothing was applied. Nothing in this package changes the rule or the test. |
+| `OI-F11-05` the interruption suite is manual and feature-gated | **OPEN, owner NOT ASSIGNED** (P2) | The repository records no authorised owner; none is assigned here. The maintainer names an owner and a trigger (the row proposes one: before any release and after a change to the files it lists). |
+| `OI-F11-01` | intentionally unused (windows-sys sub-task, answered in closure 13.1) | none |
 
 ## 6. Evidence index (closure section 8; raw logs in `E:\rubixdb_f11c\logs\`)
 
@@ -112,6 +120,27 @@ NOT run on `92f8774` - 14, with the reason:
 * `random_instant_kills_during_startup_never_damage_the_database` (strengthened through `restart_and_verify_fresh`, the 40 empty-directory kills): probabilistic (a kill must land in the stamp window), so not run on `92f8774`; the same helper clause is the one that failed in the format-marker phase above.
 
 Evidence: `nv_unit_old_panics.txt`, `nv_integration_old.log`, `nv_B6_old_skip_S1.log`, `nv_mutations.txt` in `E:\rubixdb_f11c\logs\`; scratch trees `E:\rubixdb_f11c\nv_old` (`92f8774` + HEAD's tests + shims, built by `make_nv_old.py`) and `nv_head` (mutations, `mutations.py`). Nothing in the repository was changed to obtain them.
+
+### 6.2 The baseline-test policy, the named regression-guard exception, and what the mutation evidence does and does not show
+
+**Policy.** A test added for a fix must fail on the unfixed baseline (`92f8774`). That is the check in the strict sense and 9 tests meet it (6.1, first table). Three kinds of test legitimately **pass** on the baseline and are not defects for doing so: (a) a **control** that pins behaviour the fix must leave unchanged (a legacy directory stays unstamped; a refused start does not sweep); (b) a **coverage ratchet** that counts scenarios and probe points; (c) a test of a function that did not exist on the baseline. For these the evidence is not a baseline failure but a **mutation of the fixed code** that the test must catch. The six tests in 6.1's second table are of these kinds and each failed under a named mutation (B1, B2, B3, B5; `nv_mutations.txt`).
+
+**Named exception: the 13 inert regression-guard clauses.** 13 pre-existing phase tests received two added after-restart assertions (no stale quarantine temp survives; a complete entry present at the pause is not lost). In those 13 scenarios the unfixed code produces nothing for the assertions to catch, so they could not fail on `92f8774`, and **they are not claimed to detect OI-F11-02 or OI-F11-03**: they are regression guards against a future change that would leave a stale temp or lose an entry in those scenarios. They are listed by name in 6.1.
+
+**Verification status of the 13, stated plainly.** The repository records the 13 names and the reason they are inert (6.1; `OPEN_ITEMS.md` 2026-10-10 note; `PROGRESS.md`). The repository records **no mutation result for 12 of them**. For one, `interrupted_after_the_wal_tail_was_truncated`, the sweep-everything mutation B3 was run and the test PASSED, which confirms that its added clause is inert there. `nv_mutations.txt` records B3's real-binary run of four selected tests, two FAILED (named) and two passed; that the passing two include this test follows from the selection, and a separate manual run that printed it by name was not logged. That is the whole of the repository's mutation evidence about the 13. The statement that the 13 are "mutation-validated" is therefore **NOT supported by the repository and is not made here**; what is recorded is "inert, not run on the baseline". The assertions are not weakened and not removed.
+
+**What the mutation evidence establishes:** for each of the six tests in 6.1's second table, a specific, plausible wrong implementation (B1 stamp every legacy directory; B2 sweep before the refusals; B3 sweep every `wal-*` name; B5 drop a scenario) makes the test fail, so the test is not satisfied by any implementation. **What it does not establish:** that the fixes are correct beyond the tests' assertions; that the mutations cover every way the code could be wrong; that tests not mutated (the 13, the sweep) would catch any particular regression; or that vacuity risk is eliminated. It is evidence of sensitivity to four named faults, nothing more.
+
+### 6.3 Canonical counts used in this package, and where older documents differ
+
+| Figure | Value | Evidence |
+|---|---|---|
+| Named pause points | **15** | `Point::ALL: [Point; 15]` at `src/startup_probe.rs:55`; 15 `startup_probe::hit(` call sites in `src/` and `cli/` outside the module |
+| Phase scenarios | **17** | 17 `Phase {` entries in `cli/tests/f11_startup_interruption_integration.rs`; `assert_eq!(PHASES.len(), 17)` in `every_phase_has_a_test_and_every_probe_point_is_covered` |
+| Phase runs under `F11_REPS=3` | **51** (17 x 3) | `recert_matrix.log` (`summarize.py`: "phase runs: 51 across 17 phases") |
+| Earlier matrix, before `quarantine_tmp_swept` existed | **48** (16 scenarios x 3, 14 points) | `cert_final_all.log` ("phase runs: 48 across 16 phases") |
+
+The closure (sections 6, 8, 9, 13), `PROGRESS.md` and `OPEN_ITEMS.md` entries dated before the `OI-F11-02` fix state 14 points / 16 scenarios / 48 runs. Those are **historical and accurate for the matrix they describe** (HEAD `f7f4843`, `cert_final_all.log`); they are superseded as current-state figures by this table and by closure section 14.3 (51 runs). The ADR's section 6 sentence "14 points" is likewise the original count (see the note at the start of ADR section 2).
 
 ## 7. The exact lines for the maintainer
 
