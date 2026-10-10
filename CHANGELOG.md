@@ -2781,3 +2781,14 @@ The engine and every protected path (`src/wal`, `src/manifest`, `src/sstable`, `
 - `OPEN_ITEMS.md`: `OI-F11-02` .. `OI-F11-05`.
 ### Not changed
 Every source file, the product behaviour, every protected path, `docs/PROJECT_STATE.md`, `PHASE_ITEM_F11_ADR.md`, `missions/ACTIVE.md`.
+
+## 2026-10-10 -- F-11 real closure: a first start can no longer leave an unstamped directory; stale quarantine temp files are removed at start (under [Unreleased])
+### Fixed
+- **A fresh data directory is now stamped (`DATA_FORMAT`, temp file + fsync + rename) before the engine creates anything.** Before, a first start ended between the engine open and the stamp left data without a marker and a `DATA_FORMAT.tmp` that made the directory "legacy" for good. A directory carrying this build's own interrupted stamp is recognised (the temp text must be exactly what this build writes) and stamped at the next start; a legacy directory of an earlier release is still never modified. (`OI-F11-03`)
+- **A start interrupted between writing a preserved WAL tail and renaming it no longer leaves a `wal-quarantine/*.tail.tmp` forever:** the next start removes it, after every refusal has been decided (a refused start still leaves the directory unmodified). `rubixdb check` names such a file as a stale quarantine temp (informational, exit code unchanged). (`OI-F11-02`)
+### Added (test seam, not in any product build)
+- Probe point `quarantine_tmp_swept` (15 points now).
+### Not fixed
+- `OI-F11-04`: a graceful stop that races the start's own recovery flush can still decline the clean-stop attestation (explained on stderr, data intact); the fix reverses an approved F-07 test and waits for the maintainer (`PHASE_ITEM_F11_OI04_ADR.md`).
+### Not changed
+Every protected path, the engine, `/readyz`, graceful shutdown, the startup grace policy (ADR-STARTUP-01 is still PROPOSED).
