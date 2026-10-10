@@ -2806,3 +2806,11 @@ Every source file, test, protected path; `docs/PROJECT_STATE.md`; the closure se
 - `PHASE_ITEM_F11_RATIFICATION.md`: sections 5d (open items, the OI-F11-04 policy question, OI-F11-05 unassigned), 6.2 (baseline-test policy and the regression-guard exception; limits of the mutation evidence) and 6.3 (canonical counts: 15 pause points, 17 scenarios, 51 runs; 14 / 16 / 48 are the earlier matrix).
 ### Not changed
 Every source file, test, protected path; the closure; `docs/PROJECT_STATE.md`; the ADR status line; the statuses of OI-F11-04 and OI-F11-05.
+
+## 2026-10-10 -- F-07 check path: `rubixdb check` no longer truncates a damaged WAL tail in place (under [Unreleased])
+### Fixed
+- **`rubixdb check --data-dir DIR` on a stopped directory whose WAL tail is damaged leaves the directory byte-for-byte unchanged.** It used to cut the tail in place (the last acknowledged record could be lost) without preserving it. It now reports, as informational findings that change no exit code, what a start would do: `WAL_TAIL_WOULD_BE_QUARANTINED` (bytes, offset, segment, last good sequence) and, after a clean stop whose acknowledged tail is damaged, `WAL_TAIL_START_WOULD_REFUSE` (attested vs reached sequence). The logical pass of the check runs on a private temporary copy in that case (temp-directory space equal to the data directory; if the copy cannot be made the check fails with an error and the directory is untouched). Directories without a torn tail are checked in place as before; `WAL_CORRUPT` directories keep exit 2 and are untouched. The startup path (quarantine, truncate, refusals, override) is unchanged.
+### Not fixed
+- `OI-F11-04` (the clean-stop attestation can be declined after an aborted recovery flush): waiting for a written authorisation of the eligibility-rule change (`PHASE_ITEM_F07_OI04_ADR.md`).
+### Not changed
+Every protected path; the attestation eligibility rule; ADR-STARTUP-01 (PROPOSED).
