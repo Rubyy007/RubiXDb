@@ -22,3 +22,17 @@ The maintainer (owner of ADR-WAL-01) decides: amend the eligibility rule as in s
 
 ## 5. What stays true meanwhile
 The F-11 test assertion stays exactly as it is ("attested, or the stop says why"; mutation-proven non-vacuous, `addendum_O_reps5_mutated.log`); data outcome unchanged; the decline is never silent.
+
+## 6. Authorisation (written)
+
+Shape A is AUTHORISED for OI-F11-04.
+
+Authorised by: Manik  
+Role: Admin  
+Date: 2026-10-11
+
+Scope: Exactly the Shape A predicate change and the single header-only assertion reversal described in this ADR. Torn, corrupt, length-mismatch, 25+-byte newest segment, and header-only-after-a-torn-older-segment cases must continue to refuse attestation.
+
+No other rule, test, or protected path change is authorised.
+
+*Shape text (the maintainer's message of 2026-10-11, identical to `PHASE_ITEM_F07_OI04_ADR.md` section 4):* the attestation is also eligible when `records_replayed > 0`, `lvp.seq > 0`, the last-valid segment exists, its file length equals `lvp.offset`, and every newer segment is exactly 24 bytes; attest `{segment: lvp.segment_id, length: lvp.offset, last_seq: lvp.seq}`. The header-only case of `the_attestation_is_not_written_for_a_corrupt_torn_or_inconsistent_directory` is replaced by "eligible". Scope: exactly the predicate change and the one assertion reversal; no change to the F-07 refusal path, the quarantine, the check-path fix, the cleanup sweep, the F-11 startup grace, or any other file. *Recorded in this file by the session on the maintainer's instruction; the name, role and date are the maintainer's, as given.*
