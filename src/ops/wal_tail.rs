@@ -253,11 +253,45 @@ fn wal_segment_path(data_dir: &Path, id: u64) -> PathBuf {
     data_dir.join("wal").join(format!("wal-{id:020}.log"))
 }
 
+/// Shape A (OI-F11-04; `PHASE_ITEM_F11_OI04_ADR.md` section 6): does the log end in a segment that is followed only by
+/// header-only segments? True iff at least one record was replayed, the last valid record has a sequence number, the
+/// segment that holds it is older than the newest one and exists, that segment ends exactly at the last valid record,
+/// and EVERY newer segment is exactly its 24-byte header. Pure (the lengths come in through `segment_len`) so that each
+/// clause is tested on its own; the caller has already required a clean replay (no corrupted segment, no torn tail).
+pub(crate) fn ends_before_header_only_segments(
+    has_records: bool,
+    lvp: &crate::wal::WalPosition,
+    last_id: u64,
+    ids: &[u64],
+    segment_len: impl Fn(u64) -> Option<u64>,
+) -> bool {
+    has_records
+        && lvp.seq > 0
+        && lvp.segment_id < last_id
+        && ids.contains(&lvp.segment_id)
+        && segment_len(lvp.segment_id) == Some(lvp.offset)
+        && ids
+            .iter()
+            .filter(|id| **id > lvp.segment_id)
+            .all(|id| segment_len(*id) == Some(SEGMENT_HEADER_LEN))
+}
+
 /// Writes `WAL_CLEAN_STOP` for a **stopped** data directory (call it only after the engine has fully shut down and
 /// its WAL lock is released: the read-only replay takes the shared lock, so a still-held exclusive lock makes it
-/// fail and nothing is written). Eligible only when the replay is clean (no corrupted segment, no torn tail), the
-/// newest segment exists, and its length equals the end of the last valid record. Temp file + fsync + atomic rename;
-/// a failure leaves no completed-looking file.
+/// fail and nothing is written). Temp file + fsync + atomic rename; a failure leaves no completed-looking file.
+///
+/// Eligible only when the replay is clean (no corrupted segment, no torn tail) and the log ends consistently, i.e. one of:
+/// 1. the last valid record ends exactly at the end of the newest segment (the original rule, unchanged); or
+/// 2. **Shape A** (OI-F11-04; authorised in writing by Manik, Admin, 2026-10-11, `PHASE_ITEM_F11_OI04_ADR.md` section 6;
+///    design and alternatives `PHASE_ITEM_F07_OI04_ADR.md`): at least one record was replayed, the segment holding the
+///    last valid record ends exactly at it, and every newer segment is exactly its 24-byte header (a rotation that no
+///    record followed, for example the one an aborted recovery flush leaves). Nothing is missing there, so it is clean;
+///    the attestation then names the end of the segment that holds the last record
+///    ([`ends_before_header_only_segments`]).
+///
+/// Every other shape (torn tail, corrupt segment, a newest segment longer than its header, an inconsistent position)
+/// is `NotEligible` with the same text as before. Only the sequence number of the attestation is compared at the next
+/// start (`missing_records`); its `segment` and `length` appear in messages only.
 pub fn write_attestation(data_dir: &Path) -> AttestWrite {
     if !data_dir.join("wal").is_dir() {
         return AttestWrite::NotEligible("there is no WAL directory".to_string());
@@ -301,20 +335,48 @@ pub fn write_attestation(data_dir: &Path) -> AttestWrite {
     };
     let lvp = summary.last_valid_position;
     // Internally consistent: the last valid record ends exactly at the end of the newest segment.
-    let consistent = lvp.segment_id == last_id
+    let ends_at_newest = lvp.segment_id == last_id
         && lvp.offset == len
         && len >= SEGMENT_HEADER_LEN
         && (summary.records_replayed > 0 || lvp.seq == 0);
-    if !consistent {
+    // OI-F11-04, Shape A (authorised by Manik, Admin, 2026-10-11: `PHASE_ITEM_F11_OI04_ADR.md` section 6; design
+    // `PHASE_ITEM_F07_OI04_ADR.md`): a rotation that no record followed (an aborted recovery flush, a stop right after a
+    // rotation) leaves header-only segments after the one that holds the last record. That is a clean log, not a damaged
+    // one: no byte of any record is missing. Eligible when the replay was clean (checked above: no corrupted segment, no
+    // torn tail), at least one record was replayed, the last-valid segment exists and ends exactly at the last valid
+    // record, and EVERY newer segment is exactly its 24-byte header. The attestation then names the end of the segment
+    // that holds the last record. Every other shape keeps its refusal, with the same text.
+    let segment_len = |id: u64| {
+        fs::metadata(wal_segment_path(data_dir, id))
+            .map(|m| m.len())
+            .ok()
+    };
+    let ends_before_empty_segments = !ends_at_newest
+        && ends_before_header_only_segments(
+            summary.records_replayed > 0,
+            &lvp,
+            last_id,
+            &ids,
+            segment_len,
+        );
+    if !(ends_at_newest || ends_before_empty_segments) {
         return AttestWrite::NotEligible(format!(
             "the replay summary does not match the newest segment (last valid position segment {} offset {}, newest segment {last_id} length {len})",
             lvp.segment_id, lvp.offset
         ));
     }
-    let att = Attestation {
-        segment: last_id,
-        length: len,
-        last_seq: lvp.seq,
+    let att = if ends_at_newest {
+        Attestation {
+            segment: last_id,
+            length: len,
+            last_seq: lvp.seq,
+        }
+    } else {
+        Attestation {
+            segment: lvp.segment_id,
+            length: lvp.offset,
+            last_seq: lvp.seq,
+        }
     };
     let tmp = data_dir.join(ATTESTATION_TMP);
     let final_path = data_dir.join(ATTESTATION_FILE);

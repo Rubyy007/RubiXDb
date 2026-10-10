@@ -370,7 +370,9 @@ fn the_attestation_is_not_written_for_a_corrupt_torn_or_inconsistent_directory()
         AttestWrite::NotEligible(_)
     ));
     assert!(!corrupt.join(ATTESTATION_FILE).exists());
-    // the newest segment is a header-only file after earlier ones: the final length check fails
+    // OI-F11-04, Shape A (authorised by Manik, Admin, 2026-10-11; PHASE_ITEM_F11_OI04_ADR.md section 6): the newest
+    // segment is a header-only file after earlier ones and the log ends exactly at the end of the older segment: the
+    // directory is clean, the attestation is written for the end of the segment that holds the last record.
     let rotated = wal_dir_with(4);
     let mut header = fs::read(seg(&rotated)).unwrap()[..24].to_vec();
     header[12..20].copy_from_slice(&2u64.to_le_bytes());
@@ -379,11 +381,17 @@ fn the_attestation_is_not_written_for_a_corrupt_torn_or_inconsistent_directory()
         header,
     )
     .unwrap();
-    assert!(matches!(
-        write_attestation(&rotated),
-        AttestWrite::NotEligible(_)
-    ));
-    assert!(!rotated.join(ATTESTATION_FILE).exists());
+    let a = match write_attestation(&rotated) {
+        AttestWrite::Written(a) => a,
+        other => {
+            panic!("a header-only newest segment after a clean one is eligible, got {other:?}")
+        }
+    };
+    assert_eq!(
+        (a.segment, a.length, a.last_seq),
+        (1, fs::metadata(seg(&rotated)).unwrap().len(), 4)
+    );
+    assert!(rotated.join(ATTESTATION_FILE).exists());
     // no WAL at all
     assert!(matches!(
         write_attestation(&temp_dir("f07_nowal")),
@@ -1489,6 +1497,251 @@ fn the_inspection_open_of_a_valid_directory_is_in_place_as_before() {
     assert!(!inspected.on_copy(), "no torn tail: no copy is made");
     assert!(inspected.engine.get(b"k0005").unwrap().is_some());
     let _ = inspected.engine.shutdown();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// OI-F11-04, Shape A: a header-only newest segment is clean; every other refusal stays
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Adds a header-only segment `id` (the 24-byte header of segment 1 with its id field set), as a rotation leaves it.
+fn add_header_only_segment(dir: &Path, id: u64) -> PathBuf {
+    let mut header = fs::read(seg(dir)).unwrap()[..24].to_vec();
+    header[12..20].copy_from_slice(&id.to_le_bytes());
+    let p = dir.join("wal").join(format!("wal-{id:020}.log"));
+    fs::write(&p, header).unwrap();
+    p
+}
+
+fn not_eligible_text(dir: &Path) -> String {
+    match write_attestation(dir) {
+        AttestWrite::NotEligible(why) => {
+            assert!(
+                !dir.join(ATTESTATION_FILE).exists(),
+                "nothing is written when not eligible"
+            );
+            why
+        }
+        other => panic!("expected NotEligible, got {other:?}"),
+    }
+}
+
+#[test]
+fn shape_a_attests_the_end_of_the_last_segment_that_holds_records() {
+    let dir = wal_dir_with(4);
+    let seg1_len = fs::metadata(seg(&dir)).unwrap().len();
+    // one, then two header-only newer segments (a rotation, then another rotation before any record)
+    for ids in [vec![2u64], vec![2, 3]] {
+        for id in &ids {
+            add_header_only_segment(&dir, *id);
+        }
+        let a = attest(&dir);
+        assert_eq!(
+            (a.segment, a.length, a.last_seq),
+            (1, seg1_len, 4),
+            "{ids:?}"
+        );
+        // the attestation is what a clean stop would have recorded: the next start passes the guard and refuses nothing
+        let g = guard(&dir, false).unwrap();
+        assert!(g.tail.tail.is_none());
+        fs::remove_file(dir.join(ATTESTATION_FILE)).ok();
+    }
+}
+
+#[test]
+fn shape_a_attestation_still_catches_acknowledged_records_that_later_disappear() {
+    // the safety net works with an attestation written under Shape A: records 4 is attested, then the log loses it
+    let dir = wal_dir_with(4);
+    add_header_only_segment(&dir, 2);
+    let a = attest(&dir);
+    assert_eq!(a.last_seq, 4);
+    let f = frames(&seg(&dir));
+    // drop the last record cleanly at a frame boundary and the empty newer segment: the log now ends at sequence 3
+    fs::OpenOptions::new()
+        .write(true)
+        .open(seg(&dir))
+        .unwrap()
+        .set_len(f[2].1 as u64)
+        .unwrap();
+    fs::remove_file(dir.join("wal").join("wal-00000000000000000002.log")).unwrap();
+    let err = guard(&dir, false).unwrap_err();
+    assert_eq!(err.code, codes::WAL_TAIL_DAMAGED);
+    assert!(
+        err.to_string()
+            .contains("the log ends at sequence 3, but the last clean shutdown recorded 4"),
+        "{err}"
+    );
+}
+
+#[test]
+fn shape_a_a_corrupt_older_segment_with_a_header_only_newest_still_refuses() {
+    let plain = wal_dir_with(4);
+    let f = frames(&seg(&plain));
+    flip(&seg(&plain), f[1].1 - 3); // a middle frame
+    let baseline = not_eligible_text(&plain);
+    let dir = wal_dir_with(4);
+    add_header_only_segment(&dir, 2);
+    flip(&seg(&dir), frames(&seg(&dir))[1].1 - 3);
+    assert_eq!(
+        not_eligible_text(&dir),
+        baseline,
+        "the same refusal, the same text"
+    );
+    assert!(
+        baseline.contains("corrupted WAL segment(s) found in the stopped directory"),
+        "{baseline}"
+    );
+}
+
+#[test]
+fn shape_a_a_torn_older_segment_with_a_header_only_newest_still_refuses() {
+    let dir = wal_dir_with(4);
+    cut_tail(&dir, 3); // the 4th (last acknowledged) record of segment 1 is now torn
+    add_header_only_segment(&dir, 2);
+    let why = not_eligible_text(&dir);
+    assert!(
+        why.contains("corrupted WAL segment(s) found in the stopped directory"),
+        "{why}"
+    );
+}
+
+#[test]
+fn shape_a_a_torn_tail_in_the_newest_segment_still_refuses() {
+    let dir = wal_dir_with(4);
+    let p = add_header_only_segment(&dir, 2);
+    // a header followed by the start of a frame that never completed
+    let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+    std::io::Write::write_all(&mut f, &[0u8; 3]).unwrap();
+    drop(f);
+    let why = not_eligible_text(&dir);
+    assert!(
+        why.contains("a torn tail was found in the stopped directory"),
+        "{why}"
+    );
+}
+
+#[test]
+fn shape_a_a_newest_segment_longer_than_its_header_still_refuses() {
+    for extra in [1usize, 5, 9] {
+        let dir = wal_dir_with(4);
+        let p = add_header_only_segment(&dir, 2);
+        let mut f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        std::io::Write::write_all(&mut f, &vec![0u8; extra]).unwrap();
+        drop(f);
+        assert_eq!(fs::metadata(&p).unwrap().len(), 24 + extra as u64);
+        let why = not_eligible_text(&dir);
+        assert!(
+            why.contains("a torn tail was found") || why.contains("corrupted WAL segment(s)"),
+            "{extra} extra bytes: {why}"
+        );
+    }
+}
+
+#[test]
+fn shape_a_a_header_only_segment_with_an_inconsistent_header_still_refuses() {
+    // a header-only newest segment whose own header names another id
+    let dir = wal_dir_with(4);
+    add_header_only_segment(&dir, 2);
+    let p = dir.join("wal").join("wal-00000000000000000002.log");
+    let mut b = fs::read(&p).unwrap();
+    b[12..20].copy_from_slice(&7u64.to_le_bytes());
+    fs::write(&p, b).unwrap();
+    let why = not_eligible_text(&dir);
+    assert!(
+        why.contains("corrupted WAL segment(s)") || why.contains("does not match"),
+        "{why}"
+    );
+}
+
+#[test]
+fn shape_a_leaves_a_log_that_never_held_a_record_exactly_as_it_was() {
+    // CONTROL: unchanged by Shape A. A log without any record plus a header-only segment is attested for sequence 0
+    // today (nothing is missing, nothing was acknowledged); it must stay that way.
+    let empty = temp_dir("f07_shapea_empty");
+    drop(FileWal::open_for_recovery(&empty, WalConfig::default()).unwrap());
+    add_header_only_segment(&empty, 2);
+    let a = attest(&empty);
+    assert_eq!((a.segment, a.length, a.last_seq), (2, 24, 0));
+}
+
+#[test]
+fn shape_a_each_clause_of_the_predicate_is_needed() {
+    use crate::wal::WalPosition;
+    // log: segment 1 holds the records and ends at offset 100; segments 2 and 3 are header-only
+    let lens =
+        |m: &'static [(u64, u64)]| move |id: u64| m.iter().find(|(i, _)| *i == id).map(|(_, l)| *l);
+    let good: &'static [(u64, u64)] = &[(1, 100), (2, 24), (3, 24)];
+    let lvp = WalPosition {
+        segment_id: 1,
+        offset: 100,
+        seq: 4,
+    };
+    let ids = [1u64, 2, 3];
+    assert!(
+        ends_before_header_only_segments(true, &lvp, 3, &ids, lens(good)),
+        "the clean shape"
+    );
+    // no record was replayed
+    assert!(!ends_before_header_only_segments(
+        false,
+        &lvp,
+        3,
+        &ids,
+        lens(good)
+    ));
+    // the last valid record has no sequence number
+    let z = WalPosition { seq: 0, ..lvp };
+    assert!(!ends_before_header_only_segments(
+        true,
+        &z,
+        3,
+        &ids,
+        lens(good)
+    ));
+    // the last valid record is in the newest segment (that is the unchanged rule's business, not Shape A's)
+    assert!(!ends_before_header_only_segments(
+        true,
+        &lvp,
+        1,
+        &[1],
+        lens(good)
+    ));
+    // the segment named by the last valid position does not exist
+    let ghost = WalPosition {
+        segment_id: 9,
+        ..lvp
+    };
+    // (the length lookup would succeed, but the segment is not in the directory listing)
+    let with_ghost: &'static [(u64, u64)] = &[(1, 100), (2, 24), (9, 100), (10, 24)];
+    assert!(!ends_before_header_only_segments(
+        true,
+        &ghost,
+        10,
+        &[1, 2, 10],
+        lens(with_ghost)
+    ));
+    // that segment is longer / shorter than the last valid record (bytes after it, or a position past its end)
+    for bad in [
+        &[(1u64, 101u64), (2, 24), (3, 24)][..],
+        &[(1, 99), (2, 24), (3, 24)][..],
+    ] {
+        let bad: &'static [(u64, u64)] = Box::leak(bad.to_vec().into_boxed_slice());
+        assert!(
+            !ends_before_header_only_segments(true, &lvp, 3, &ids, lens(bad)),
+            "{bad:?}"
+        );
+    }
+    // a newer segment holds more than its header, less than its header, or cannot be measured
+    for bad in [
+        &[(1u64, 100u64), (2, 25), (3, 24)][..],
+        &[(1, 100), (2, 24), (3, 23)][..],
+        &[(1, 100), (2, 24)][..],
+    ] {
+        let bad: &'static [(u64, u64)] = Box::leak(bad.to_vec().into_boxed_slice());
+        assert!(
+            !ends_before_header_only_segments(true, &lvp, 3, &ids, lens(bad)),
+            "{bad:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
