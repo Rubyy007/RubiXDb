@@ -1304,6 +1304,194 @@ fn check_names_a_stale_quarantine_temp_and_its_exit_counters_do_not_change() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// F-07 check path: `plan_tail`, the informational findings, and the inspection open
+// ---------------------------------------------------------------------------------------------------------------
+
+fn cut_tail(dir: &Path, n: u64) {
+    let len = fs::metadata(seg(dir)).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(seg(dir))
+        .unwrap()
+        .set_len(len - n)
+        .unwrap();
+}
+
+#[test]
+fn the_plan_describes_exactly_the_cut_a_start_makes_and_writes_nothing() {
+    // two kinds of torn tail; the plan must equal what the real guard then does
+    for damage in [0u8, 1] {
+        let dir = wal_dir_with(6);
+        // the independent expectation: the 6th record is the damaged one, the valid prefix ends where the 5th ends
+        let valid_end = frames(&seg(&dir))[4].1 as u64;
+        if damage == 0 {
+            tear_last_frame_body(&dir);
+        } else {
+            cut_tail(&dir, 10);
+        }
+        let file_len = fs::metadata(seg(&dir)).unwrap().len();
+        let before = digest(&dir);
+        let plan = plan_tail(&dir).unwrap();
+        assert_eq!(
+            plan.tail,
+            Some((1, valid_end, file_len - valid_end)),
+            "the cut is where the valid prefix ends, computed from outside"
+        );
+        assert_eq!(digest(&dir), before, "planning must not modify anything");
+        assert!(!dir.join(QUARANTINE_DIR).exists());
+        let g = guard(&dir, false).unwrap();
+        assert_eq!(plan.tail, g.tail.tail, "plan == what the start quarantines");
+        assert_eq!(plan.last_good_seq, g.tail.last_good_seq);
+        assert!(plan.tail.is_some() && plan.would_refuse.is_none());
+    }
+    // a clean directory: nothing to cut, nothing to refuse
+    let clean = wal_dir_with(6);
+    let p = plan_tail(&clean).unwrap();
+    assert_eq!((p.tail, p.would_refuse, p.last_good_seq), (None, None, 6));
+    // no WAL directory at all
+    let none = plan_tail(&temp_dir("f07_plan_nowal")).unwrap();
+    assert_eq!((none.tail, none.would_refuse), (None, None));
+}
+
+#[test]
+fn the_plan_reports_the_refusal_a_start_would_make_with_the_same_numbers() {
+    let dir = wal_dir_with(8);
+    let a = attest(&dir);
+    assert_eq!(a.last_seq, 8);
+    // untouched: attested and reached -> no refusal
+    assert_eq!(plan_tail(&dir).unwrap().would_refuse, None);
+    tear_last_frame_body(&dir);
+    let before = digest(&dir);
+    let plan = plan_tail(&dir).unwrap();
+    assert_eq!(digest(&dir), before);
+    assert_eq!(plan.would_refuse, Some((8, 7)), "attested 8, reached 7");
+    let err = guard(&dir, false).unwrap_err();
+    assert_eq!(err.code, codes::WAL_TAIL_DAMAGED);
+    assert!(err
+        .to_string()
+        .contains("the log ends at sequence 7, but the last clean shutdown recorded 8"));
+}
+
+#[test]
+fn the_plan_does_not_classify_a_corrupt_wal() {
+    let dir = wal_dir_with(6);
+    let f = frames(&seg(&dir));
+    flip(&seg(&dir), f[2].1 - 3); // a middle frame: corruption, not a torn tail
+    assert!(plan_tail(&dir).is_err());
+}
+
+#[test]
+fn check_says_what_a_start_would_do_and_changes_nothing() {
+    // valid directory: no such finding
+    let clean = wal_dir_with(6);
+    let r = check_physical(&clean);
+    assert!(r
+        .findings
+        .iter()
+        .all(|f| f.code != fc::WAL_TAIL_WOULD_BE_QUARANTINED
+            && f.code != fc::WAL_TAIL_START_WOULD_REFUSE));
+    // damaged directory
+    let dir = wal_dir_with(6);
+    cut_tail(&dir, 10);
+    let before = digest(&dir);
+    let r = check_physical(&dir);
+    assert_eq!(digest(&dir), before, "check_physical is read only");
+    let plan = plan_tail(&dir).unwrap();
+    let (segment, offset, bytes) = plan.tail.unwrap();
+    let f: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.code == fc::WAL_TAIL_WOULD_BE_QUARANTINED)
+        .collect();
+    assert_eq!(f.len(), 1, "{:#?}", r.findings);
+    assert_eq!(f[0].severity, Severity::Info);
+    assert!(
+        f[0].detail.contains(&format!(
+            "{bytes} byte(s) at offset {offset} of WAL segment {segment}"
+        )),
+        "{}",
+        f[0].detail
+    );
+    // exit-code counters are what the torn tail alone gives: one warning, no error
+    assert_eq!((r.errors, r.warnings), (0, 1));
+    // an attested directory that lost its acknowledged tail: the refusal is named too
+    let att = wal_dir_with(8);
+    attest(&att);
+    tear_last_frame_body(&att);
+    let r = check_physical(&att);
+    let f: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.code == fc::WAL_TAIL_START_WOULD_REFUSE)
+        .collect();
+    assert_eq!(f.len(), 1, "{:#?}", r.findings);
+    assert_eq!(f[0].severity, Severity::Info);
+    assert!(
+        f[0].detail
+            .contains("recorded sequence 8 and the log reaches 7"),
+        "{}",
+        f[0].detail
+    );
+}
+
+fn check_copies_in_temp() -> usize {
+    fs::read_dir(std::env::temp_dir())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("rubixdb_check_")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn the_inspection_open_leaves_a_torn_directory_byte_identical_and_removes_its_copy() {
+    use crate::ops::open::open_engine_for_inspection;
+    let dir = wal_dir_with(6);
+    cut_tail(&dir, 10);
+    let before = digest(&dir);
+    let copies_before = check_copies_in_temp();
+    {
+        let inspected = open_engine_for_inspection(&dir).unwrap();
+        assert!(
+            inspected.on_copy(),
+            "a torn tail is opened on a private copy"
+        );
+        // the copy was recovered exactly as a start would: the five intact records are there, the torn sixth is not
+        assert!(inspected.engine.get(b"k0004").unwrap().is_some());
+        assert!(inspected.engine.get(b"k0005").unwrap().is_none());
+        let _ = inspected.engine.shutdown();
+    }
+    assert_eq!(
+        digest(&dir),
+        before,
+        "the inspected directory is byte-for-byte unchanged"
+    );
+    assert_eq!(
+        check_copies_in_temp(),
+        copies_before,
+        "the private copy is removed"
+    );
+    // the real start afterwards still quarantines and truncates exactly as before
+    let g = guard(&dir, false).unwrap();
+    assert!(g.tail.quarantine.is_some());
+}
+
+#[test]
+fn the_inspection_open_of_a_valid_directory_is_in_place_as_before() {
+    use crate::ops::open::open_engine_for_inspection;
+    let dir = wal_dir_with(6);
+    let inspected = open_engine_for_inspection(&dir).unwrap();
+    assert!(!inspected.on_copy(), "no torn tail: no copy is made");
+    assert!(inspected.engine.get(b"k0005").unwrap().is_some());
+    let _ = inspected.engine.shutdown();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Measurement harness for `PHASE_ITEM_F07_IMPLEMENTATION.md` (not a correctness test)
 // ---------------------------------------------------------------------------------------------------------------
 

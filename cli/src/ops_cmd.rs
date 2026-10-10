@@ -741,9 +741,10 @@ fn check(args: &[String]) -> i32 {
     //    (exactly what the next start would do), then scans one snapshot.
     let mut merged = physical.clone();
     if physical.errors == 0 {
-        match rubixdb::ops::open::open_engine_for_ops(&data_dir) {
-            Ok(engine) => {
-                let logical = rubixdb::ops::check::check_engine(&engine, &Default::default());
+        match rubixdb::ops::open::open_engine_for_inspection(&data_dir) {
+            Ok(inspected) => {
+                let engine = &inspected.engine;
+                let logical = rubixdb::ops::check::check_engine(engine, &Default::default());
                 let _ = engine.shutdown();
                 merged.findings.extend(logical.findings.clone());
                 merged.errors += logical.errors;

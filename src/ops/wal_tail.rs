@@ -902,48 +902,26 @@ pub fn apply_tail_policy(
     }
 
     // 2. Quarantine the tail recovery is about to remove (decides the quarantine refusal; mutates only its own dir).
-    if summary.truncated {
-        let ids = wal_segment_ids(data_dir).map_err(|e| {
-            OpsError::new(
-                codes::IO,
-                format!("the WAL directory cannot be listed ({e})"),
-            )
-        })?;
-        if let Some(&last_id) = ids.last() {
-            let lvp = summary.last_valid_position;
-            // `last_valid_position` names the newest segment with a valid record; when the newest segment holds none
-            // the valid prefix is its header alone.
-            let offset = if lvp.segment_id == last_id {
-                lvp.offset
-            } else {
-                SEGMENT_HEADER_LEN
-            };
-            let len = fs::metadata(wal_segment_path(data_dir, last_id))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let bytes = len.saturating_sub(offset);
-            if bytes > 0 {
-                report.tail = Some((last_id, offset, bytes));
-                match quarantine_tail_with(data_dir, last_id, offset, now_ms(), fault) {
-                    Ok(q) => {
-                        crate::startup_probe::hit(crate::startup_probe::Point::QuarantineRenamed);
-                        report.quarantine = Some(q)
-                    }
-                    Err(err) => {
-                        if !allow_override {
-                            return Err(OpsError::new(
-                                codes::WAL_TAIL_QUARANTINE_FAILED,
-                                format!(
-                                    "recovery would remove {bytes} damaged byte(s) at offset {offset} of WAL segment {last_id}, but they could not be preserved ({err}); refusing to open so that the evidence is not destroyed silently. Fix the cause (disk space, permissions on the {QUARANTINE_DIR} directory) or, if you accept losing them, start once with {OVERRIDE_ENV}=1. The WAL has not been modified."
-                                ),
-                            ));
-                        }
-                        report.quarantine_error = Some(err);
-                        report
-                            .override_effects
-                            .push(OverrideEffect::QuarantineFailure);
-                    }
+    if let Some((last_id, offset, bytes)) = torn_tail_location(data_dir, summary)? {
+        report.tail = Some((last_id, offset, bytes));
+        match quarantine_tail_with(data_dir, last_id, offset, now_ms(), fault) {
+            Ok(q) => {
+                crate::startup_probe::hit(crate::startup_probe::Point::QuarantineRenamed);
+                report.quarantine = Some(q)
+            }
+            Err(err) => {
+                if !allow_override {
+                    return Err(OpsError::new(
+                        codes::WAL_TAIL_QUARANTINE_FAILED,
+                        format!(
+                            "recovery would remove {bytes} damaged byte(s) at offset {offset} of WAL segment {last_id}, but they could not be preserved ({err}); refusing to open so that the evidence is not destroyed silently. Fix the cause (disk space, permissions on the {QUARANTINE_DIR} directory) or, if you accept losing them, start once with {OVERRIDE_ENV}=1. The WAL has not been modified."
+                        ),
+                    ));
                 }
+                report.quarantine_error = Some(err);
+                report
+                    .override_effects
+                    .push(OverrideEffect::QuarantineFailure);
             }
         }
     }
@@ -961,6 +939,93 @@ pub fn apply_tail_policy(
     }
     crate::startup_probe::hit(crate::startup_probe::Point::AttestationConsumed);
     Ok(report)
+}
+
+/// Where recovery cuts a torn tail of the newest segment, as `(segment, offset, bytes)`; `None` when the replay found no
+/// torn tail or there is nothing to remove. Read-only. Shared by the startup policy (which then quarantines and lets the
+/// engine truncate) and by [`plan_tail`] (which only reports), so that a report can never describe a different cut than the
+/// start will make.
+fn torn_tail_location(
+    data_dir: &Path,
+    summary: &WalReplaySummary,
+) -> Result<Option<(u64, u64, u64)>, OpsError> {
+    if !summary.truncated {
+        return Ok(None);
+    }
+    let ids = wal_segment_ids(data_dir).map_err(|e| {
+        OpsError::new(
+            codes::IO,
+            format!("the WAL directory cannot be listed ({e})"),
+        )
+    })?;
+    let Some(&last_id) = ids.last() else {
+        return Ok(None);
+    };
+    let lvp = summary.last_valid_position;
+    // `last_valid_position` names the newest segment with a valid record; when the newest segment holds none the valid
+    // prefix is its header alone.
+    let offset = if lvp.segment_id == last_id {
+        lvp.offset
+    } else {
+        SEGMENT_HEADER_LEN
+    };
+    let len = fs::metadata(wal_segment_path(data_dir, last_id))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let bytes = len.saturating_sub(offset);
+    Ok((bytes > 0).then_some((last_id, offset, bytes)))
+}
+
+/// What a start would do with the WAL tail of a stopped directory (F-07 check path). Computed without modifying anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailPlan {
+    /// The torn tail a start would copy to `wal-quarantine/` and then let the engine truncate: `(segment, offset, bytes)`.
+    pub tail: Option<(u64, u64, u64)>,
+    pub last_good_seq: u64,
+    /// `Some((attested_seq, reached_seq))` when a start would refuse with `WAL_TAIL_DAMAGED`.
+    pub would_refuse: Option<(u64, u64)>,
+}
+
+/// The read-only counterpart of [`apply_tail_policy`] for `rubixdb check`: replays the WAL read-only, locates the tail the
+/// start would quarantine, and applies the same attestation rule. Writes nothing and removes nothing. `Err` when the WAL
+/// cannot be classified (corrupt, unreadable): `check`'s physical pass reports those on its own.
+pub fn plan_tail(data_dir: &Path) -> Result<TailPlan, String> {
+    if !data_dir.join("wal").is_dir() {
+        return Ok(TailPlan {
+            tail: None,
+            last_good_seq: 0,
+            would_refuse: None,
+        });
+    }
+    let summary = crate::wal::replay_streaming(data_dir, &WalConfig::default(), |_, _| Ok(()))
+        .map_err(|e| format!("the WAL cannot be read ({e})"))?;
+    if summary.corrupted_segments_count != 0 {
+        return Err(format!(
+            "{} corrupted WAL segment(s)",
+            summary.corrupted_segments_count
+        ));
+    }
+    let wal_seq = summary.last_valid_position.seq;
+    let tail = torn_tail_location(data_dir, &summary).map_err(|e| e.to_string())?;
+    let mut would_refuse = None;
+    if let AttestationState::Valid(att) = read_attestation(data_dir) {
+        let checkpoint = if wal_seq >= att.last_seq {
+            0
+        } else {
+            crate::manifest::replay_readonly(data_dir)
+                .map_err(|e| format!("the manifest cannot be read ({e})"))?
+                .state
+                .checkpoint_seq()
+        };
+        if let Some((reached, _)) = missing_records(&att, wal_seq, checkpoint) {
+            would_refuse = Some((att.last_seq, reached));
+        }
+    }
+    Ok(TailPlan {
+        tail,
+        last_good_seq: wal_seq,
+        would_refuse,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------------------------

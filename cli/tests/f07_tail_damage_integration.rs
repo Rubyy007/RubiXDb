@@ -1429,3 +1429,156 @@ fn a_damaged_tail_that_cannot_be_preserved_refuses_the_start_unless_the_override
     s.stop_graceful();
     cleanup(&p);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// F-07 check path (F-11 follow-up): `rubixdb check --data-dir` on the REAL stopped directory must not modify it, must say
+// what a start would do with the damaged tail, and must leave the startup path exactly as it was.
+// ---------------------------------------------------------------------------------------------------------------
+
+/// `rubixdb check --data-dir <the real directory>` (not a copy): (exit code, stdout).
+fn check_in_place(root: &Path) -> (i32, String) {
+    let o = base_cmd(root, &[])
+        .args(["check", "--data-dir"])
+        .arg(data_dir(root))
+        .output()
+        .unwrap();
+    (
+        o.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&o.stdout).to_string(),
+    )
+}
+
+#[test]
+fn check_of_a_damaged_stopped_directory_modifies_nothing_names_the_cut_and_the_start_then_does_exactly_that(
+) {
+    let _s = serial();
+    for m in [
+        Mutation::A1LastBody,
+        Mutation::A2LastCrc,
+        Mutation::A5Torn10,
+    ] {
+        let p = prepare("chk_damaged", Stop::Kill);
+        m.apply(&p);
+        let last = *p.frames.last().unwrap();
+        let wal_len = fs::metadata(wal_path(&p.root)).unwrap().len();
+        let before = dir_digest(&data_dir(&p.root));
+        let (code, out) = check_in_place(&p.root);
+        assert_eq!(
+            dir_digest(&data_dir(&p.root)),
+            before,
+            "{m:?}: rubixdb check must leave the stopped directory byte-for-byte unchanged
+{out}"
+        );
+        assert!(
+            quarantine_files(&p.root).is_empty(),
+            "{m:?}: check writes no quarantine"
+        );
+        let bytes = wal_len - last.offset as u64;
+        let want = format!(
+            "a start would copy the {bytes} byte(s) at offset {} of WAL segment 1",
+            last.offset
+        );
+        assert!(
+            out.contains("WAL_TAIL_WOULD_BE_QUARANTINED"),
+            "{m:?}: {out}"
+        );
+        assert!(
+            out.contains(&want),
+            "{m:?}: expected `{want}` in
+{out}"
+        );
+        assert_eq!(
+            code, 1,
+            "{m:?}: the torn-tail warning keeps its exit code
+{out}"
+        );
+        assert!(
+            out.contains("check complete") && out.contains("0 error(s)"),
+            "{m:?}: {out}"
+        );
+        // the startup path, on the very bytes the check just inspected, does exactly what the check said
+        let Attempt::Running(s) = attempt(&p.root, &[]) else {
+            panic!("{m:?}: an unattested damaged tail starts")
+        };
+        let q = quarantine_files(&p.root);
+        assert_eq!(q.len(), 1, "{m:?}");
+        assert_eq!(
+            fs::metadata(&q[0]).unwrap().len(),
+            44 + bytes,
+            "{m:?}: preserved exactly the bytes the check named"
+        );
+        s.stop_graceful();
+        assert_eq!(
+            fs::metadata(wal_path(&p.root)).unwrap().len(),
+            last.offset as u64,
+            "{m:?}: the start truncated the WAL at exactly the offset the check named"
+        );
+        cleanup(&p);
+    }
+}
+
+#[test]
+fn check_of_an_attested_damaged_directory_names_the_refusal_and_modifies_nothing() {
+    let _s = serial();
+    let p = prepare("chk_attested", Stop::Clean);
+    Mutation::A2LastCrc.apply(&p);
+    let (q, sattest) = seqs(&p);
+    let (att, reached) = (q, sattest); // (attested last seq, the one before it)
+    let before = dir_digest(&data_dir(&p.root));
+    let (code, out) = check_in_place(&p.root);
+    assert_eq!(
+        dir_digest(&data_dir(&p.root)),
+        before,
+        "the attestation and the WAL are untouched
+{out}"
+    );
+    assert!(
+        attestation(&p.root).is_some(),
+        "check does not consume the attestation"
+    );
+    assert!(
+        out.contains(&format!("a start would refuse with WAL_TAIL_DAMAGED: the last clean shutdown recorded sequence {att} and the log reaches {reached}")),
+        "{out}"
+    );
+    assert_eq!(code, 1, "{out}");
+    // and the start does refuse, with the unchanged text, leaving the directory as the check left it
+    match attempt(&p.root, &[]) {
+        Attempt::Refused { stderr, stdout, .. } => {
+            let text = format!("{stderr}{stdout}");
+            assert!(text.contains("WAL_TAIL_DAMAGED"), "{text}");
+        }
+        Attempt::Running(s) => {
+            s.kill();
+            panic!("a damaged acknowledged tail after a clean stop must be refused");
+        }
+    }
+    assert_eq!(dir_digest(&data_dir(&p.root)), before);
+    cleanup(&p);
+}
+
+#[test]
+fn check_distinguishes_valid_corrupt_and_damaged_directories() {
+    let _s = serial();
+    // valid: clean exit, no cut named
+    let p = prepare("chk_valid", Stop::Clean);
+    let (code, out) = check_in_place(&p.root);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("WAL_TAIL_"), "{out}");
+    cleanup(&p);
+    // corrupt (a middle frame; and a last frame whose length field is wrong, which the engine also classifies as
+    // corruption and not as a torn tail): the physical error stands, no cut is named, nothing is modified
+    for m in [Mutation::B1MidBody, Mutation::A3LastLenDown] {
+        let p = prepare("chk_corrupt", Stop::Kill);
+        m.apply(&p);
+        let before = dir_digest(&data_dir(&p.root));
+        let (code, out) = check_in_place(&p.root);
+        assert_eq!(code, 2, "{m:?}: {out}");
+        assert!(out.contains("WAL_CORRUPT"), "{m:?}: {out}");
+        assert!(
+            !out.contains("WAL_TAIL_WOULD_BE_QUARANTINED"),
+            "{m:?}: {out}"
+        );
+        assert_eq!(dir_digest(&data_dir(&p.root)), before, "{m:?}: {out}");
+        cleanup(&p);
+    }
+}

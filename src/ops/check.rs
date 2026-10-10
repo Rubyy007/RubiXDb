@@ -70,6 +70,8 @@ pub mod finding_codes {
     pub const SSTABLE_ORPHAN: &str = "SSTABLE_ORPHAN";
     pub const WAL_CORRUPT: &str = "WAL_CORRUPT";
     pub const WAL_TORN_TAIL: &str = "WAL_TORN_TAIL";
+    pub const WAL_TAIL_WOULD_BE_QUARANTINED: &str = "WAL_TAIL_WOULD_BE_QUARANTINED";
+    pub const WAL_TAIL_START_WOULD_REFUSE: &str = "WAL_TAIL_START_WOULD_REFUSE";
     /// ADR-WAL-01: a damaged WAL tail that recovery removed was preserved in `wal-quarantine/` (informational).
     pub const WAL_TAIL_QUARANTINED: &str = "WAL_TAIL_QUARANTINED";
     pub const WAL_UNREADABLE: &str = "WAL_UNREADABLE";
@@ -981,6 +983,28 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
             }
             if r.truncated {
                 sink.add(Severity::Warning, fc::WAL_TORN_TAIL, "wal", "a torn tail was found in the newest segment; recovery truncates it (expected after a crash)");
+            }
+            // F-07 check path: say what a START would do with this tail, without doing any of it (informational: no
+            // exit-code counter changes). Only meaningful when the WAL could be classified.
+            if r.corrupted_segments.is_empty() {
+                if let Ok(plan) = crate::ops::wal_tail::plan_tail(data_dir) {
+                    if let Some((segment, offset, bytes)) = plan.tail {
+                        sink.add(
+                            Severity::Info,
+                            fc::WAL_TAIL_WOULD_BE_QUARANTINED,
+                            "wal",
+                            format!("a start would copy the {bytes} byte(s) at offset {offset} of WAL segment {segment} (last good sequence {}) to wal-quarantine/ and then truncate them; this check did not modify the directory (its logical pass runs on a private copy)", plan.last_good_seq),
+                        );
+                    }
+                    if let Some((attested, reached)) = plan.would_refuse {
+                        sink.add(
+                            Severity::Info,
+                            fc::WAL_TAIL_START_WOULD_REFUSE,
+                            "wal",
+                            format!("a start would refuse with WAL_TAIL_DAMAGED: the last clean shutdown recorded sequence {attested} and the log reaches {reached}; this check did not modify the directory"),
+                        );
+                    }
+                }
             }
         }
         Err(e) => {
