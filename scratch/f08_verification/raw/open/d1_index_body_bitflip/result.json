@@ -1,0 +1,29 @@
+{
+ "scenario": "d1_index_body_bitflip",
+ "exe": "E:\\rubixdb_f08b\\rubixdb_head.exe",
+ "mutation": "1 bit flipped in the index block body (offset 4002848; index block 4002808+27732)",
+ "damaged_block_ids": null,
+ "files_before_start": {
+  "DATA_FORMAT": "c7c602f2187f",
+  "MANIFEST": "1b2b90fc7c66",
+  "WAL_CLEAN_STOP": "37064a153451",
+  "sstables/00000000000000000001.sst": "79c68e089cbe",
+  "sstables/00000000000000000002.sst": "053765da08b1",
+  "wal/LOCK": "e3b0c44298fc",
+  "wal/wal-00000000000000000002.log": "b66af7aa7532",
+  "wal/wal-00000000000000000003.log": "12302f8e38b4"
+ },
+ "check_offline": {
+  "exit": 2,
+  "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\d1_index_body_bitflip_checkcopy\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         corruption: index: checksum mismatch\nresult: 1 error(s), 0 warning(s), check complete\n",
+  "stderr": ""
+ },
+ "opened": false,
+ "ready_seconds": null,
+ "exit": 1,
+ "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_CORRUPT: corruption: sstable E:\\rubixdb_f08b\\runs\\d1_index_body_bitflip\\recon\\data\\sstables\\00000000000000000001.sst: index: checksum mismatch; refusing to open: a table the Manifest lists as live is damaged and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.\n",
+ "stdout": "",
+ "directory_unchanged": true,
+ "changed_files": [],
+ "server_err": "rubixdb gui: failed to start: engine open refused: SSTABLE_CORRUPT: corruption: sstable E:\\rubixdb_f08b\\runs\\d1_index_body_bitflip\\recon\\data\\sstables\\00000000000000000001.sst: index: checksum mismatch; refusing to open: a table the Manifest lists as live is damaged and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.\n"
+}

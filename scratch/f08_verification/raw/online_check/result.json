@@ -1,0 +1,200 @@
+{
+ "m1_running_data_block": {
+  "mutation": "data block bit flipped while running",
+  "check_instance": {
+   "args": [
+    "check",
+    "--instance",
+    "recon"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  online logical check at one snapshot (instance recon is running)\nERROR    CHECK_INCOMPLETE           table[1]           row scan failed: corruption: block: checksum mismatch\nresult: 1 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "check_datadir_live": {
+   "args": [
+    "check",
+    "--data-dir",
+    "E:\\rubixdb_f08b\\runs\\oc_m1_running_data_block\\recon\\data"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\oc_m1_running_data_block\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         data block failed verification: corruption: block: checksum mismatch\nERROR    WAL_UNREADABLE             wal                WAL unavailable: a writer currently holds the exclusive WAL lock (\\\\?\\E:\\rubixdb_f08b\\runs\\oc_m1_running_data_block\\recon\\data\\wal\\LOCK)\nresult: 2 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ },
+ "m2_running_footer": {
+  "mutation": "footer magic bit flipped while running",
+  "check_instance": {
+   "args": [
+    "check",
+    "--instance",
+    "recon"
+   ],
+   "exit": 0,
+   "stdout": "INSPECTION  online logical check at one snapshot (instance recon is running)\nresult: 0 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "check_datadir_live": {
+   "args": [
+    "check",
+    "--data-dir",
+    "E:\\rubixdb_f08b\\runs\\oc_m2_running_footer\\recon\\data"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\oc_m2_running_footer\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         corruption: footer: bad magic\nERROR    WAL_UNREADABLE             wal                WAL unavailable: a writer currently holds the exclusive WAL lock (\\\\?\\E:\\rubixdb_f08b\\runs\\oc_m2_running_footer\\recon\\data\\wal\\LOCK)\nresult: 2 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ },
+ "m3_running_bloom": {
+  "mutation": "bloom bit flipped while running",
+  "check_instance": {
+   "args": [
+    "check",
+    "--instance",
+    "recon"
+   ],
+   "exit": 0,
+   "stdout": "INSPECTION  online logical check at one snapshot (instance recon is running)\nresult: 0 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "check_datadir_live": {
+   "args": [
+    "check",
+    "--data-dir",
+    "E:\\rubixdb_f08b\\runs\\oc_m3_running_bloom\\recon\\data"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\oc_m3_running_bloom\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         corruption: bloom: checksum mismatch\nERROR    WAL_UNREADABLE             wal                WAL unavailable: a writer currently holds the exclusive WAL lock (\\\\?\\E:\\rubixdb_f08b\\runs\\oc_m3_running_bloom\\recon\\data\\wal\\LOCK)\nresult: 2 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ },
+ "m4_running_index": {
+  "mutation": "index byte flipped while running",
+  "check_instance": {
+   "args": [
+    "check",
+    "--instance",
+    "recon"
+   ],
+   "exit": 0,
+   "stdout": "INSPECTION  online logical check at one snapshot (instance recon is running)\nresult: 0 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "check_datadir_live": {
+   "args": [
+    "check",
+    "--data-dir",
+    "E:\\rubixdb_f08b\\runs\\oc_m4_running_index\\recon\\data"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\oc_m4_running_index\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         corruption: index: checksum mismatch\nERROR    WAL_UNREADABLE             wal                WAL unavailable: a writer currently holds the exclusive WAL lock (\\\\?\\E:\\rubixdb_f08b\\runs\\oc_m4_running_index\\recon\\data\\wal\\LOCK)\nresult: 2 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ },
+ "m5_running_truncate": {
+  "mutation": "file truncated to half while running",
+  "check_instance": {
+   "args": [
+    "check",
+    "--instance",
+    "recon"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  online logical check at one snapshot (instance recon is running)\nERROR    CHECK_INCOMPLETE           table[1]           row scan failed: I/O error: read_exact_at: seek_read returned 0 before buffer was full\nresult: 1 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "check_datadir_live": {
+   "args": [
+    "check",
+    "--data-dir",
+    "E:\\rubixdb_f08b\\runs\\oc_m5_running_truncate\\recon\\data"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\oc_m5_running_truncate\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_SIZE_MISMATCH      sstable[1]         file is 2015306 bytes, manifest says 4030612\nERROR    SSTABLE_CORRUPT            sstable[1]         corruption: footer: bad magic\nERROR    WAL_UNREADABLE             wal                WAL unavailable: a writer currently holds the exclusive WAL lock (\\\\?\\E:\\rubixdb_f08b\\runs\\oc_m5_running_truncate\\recon\\data\\wal\\LOCK)\nresult: 3 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ },
+ "m6_running_delete": {
+  "mutation": "file deleted while running (delete succeeded; the engine still holds an open handle)",
+  "check_instance": {
+   "args": [
+    "check",
+    "--instance",
+    "recon"
+   ],
+   "exit": 0,
+   "stdout": "INSPECTION  online logical check at one snapshot (instance recon is running)\nresult: 0 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "check_datadir_live": {
+   "args": [
+    "check",
+    "--data-dir",
+    "E:\\rubixdb_f08b\\runs\\oc_m6_running_delete\\recon\\data"
+   ],
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\oc_m6_running_delete\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_MISSING            sstable[1]         listed live by the manifest but the file is absent\nERROR    WAL_UNREADABLE             wal                WAL unavailable: a writer currently holds the exclusive WAL lock (\\\\?\\E:\\rubixdb_f08b\\runs\\oc_m6_running_delete\\recon\\data\\wal\\LOCK)\nresult: 2 error(s), 0 warning(s), check complete\n",
+   "stderr": ""
+  },
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ }
+}

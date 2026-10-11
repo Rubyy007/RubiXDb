@@ -1,0 +1,74 @@
+{
+ "scenario": "m2_running_footer",
+ "before": {
+  "damaged_block_ids": {
+   "correct": 18
+  },
+  "sample": {
+   "correct": 1082
+  },
+  "readyz": [
+   200,
+   {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "complete"
+   }
+  ]
+ },
+ "mutation": "footer magic bit flipped while running",
+ "after_mutation": {
+  "damaged_block_ids": {
+   "correct": 18
+  },
+  "first_non_correct": null,
+  "sample": {
+   "correct": 1082
+  },
+  "count_star": 200,
+  "endpoints": {
+   "/healthz": 200,
+   "/readyz": 200,
+   "/v1/status": 200,
+   "/v1/metrics/system": 200,
+   "/v1/admin/status": 200,
+   "/v1/compaction/status": 200,
+   "/v1/instance": 200
+  },
+  "readyz_body": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "status_body": {
+   "storage_state": "Healthy",
+   "storage_pressure_events": 0,
+   "sstable_count": 2,
+   "checkpoint_seq": 175,
+   "manifest_record_count": 4,
+   "manifest_size_bytes": 148,
+   "live_sstable_count": 2,
+   "capacity_pressure_events": 0,
+   "uptime_secs": 22.851225,
+   "sstable_integrity": {
+    "state": "complete",
+    "tables_total": 2,
+    "tables_verified": 2,
+    "bytes_verified": 8060036,
+    "damaged": []
+   }
+  }
+ },
+ "stop": [
+  "graceful",
+  0
+ ],
+ "server_err_after_stop": "",
+ "restart": {
+  "opened": false,
+  "exit": 1,
+  "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_CORRUPT: corruption: sstable E:\\rubixdb_f08b\\runs\\m2_running_footer\\recon\\data\\sstables\\00000000000000000001.sst: footer: bad magic; refusing to open: a table the Manifest lists as live is damaged and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.\n"
+ }
+}

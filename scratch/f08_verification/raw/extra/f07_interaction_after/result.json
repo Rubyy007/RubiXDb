@@ -1,0 +1,19 @@
+{
+ "scenario": "f07_interaction_after",
+ "exe": "E:\\rubixdb_f08b\\rubixdb_f08_impl_after.exe",
+ "wal_clean_stop_sha_initial": "37064a153451...",
+ "step1_sstable_refused": {
+  "opened": false,
+  "exit": 1,
+  "stderr": "t: engine open refused: SSTABLE_CORRUPT: corruption: sstable E:\\rubixdb_f08b\\runs\\f07_interaction_after\\recon\\data\\sstables\\00000000000000000001.sst: bloom: checksum mismatch; refusing to open: a table the Manifest lists as live is damaged and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.\n"
+ },
+ "step1_changed_files": [],
+ "step1_wal_clean_stop_exists": true,
+ "step1_wal_clean_stop_sha_unchanged": true,
+ "step2_damaged_wal_tail": {
+  "opened": false,
+  "exit": 1,
+  "stderr": "rubixdb gui: failed to start: engine open refused: WAL_TAIL_DAMAGED: the log ends at sequence 203, but the last clean shutdown recorded 204 (segment 3, 1160195 bytes); 1 acknowledged record(s) are missing from the end of the WAL. Opening would discard them permanently. Run `rubixdb check`, restore a verified backup into a new instance, or, if you accept losing them, start once with RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL=1. The directory has not been modified.\n"
+ },
+ "step2_changed_files": []
+}

@@ -419,6 +419,31 @@ Manifest/purge phase exists — this property is a direct, temporary
 consequence of this phase's specific WAL-untouched decision, and must
 be re-examined the moment WAL purging is introduced.
 
+> **ERRATUM (2026-10-11, F-08 verification, additive; the section above is kept unchanged as history). The conclusion of
+> section 3.5 is SUPERSEDED for every tree from Phase 5 onward.** It was written for Phase 4B, when the WAL was never purged.
+> Today a successful flush records a checkpoint and then calls `pool.purge_before(meta.max_seq)` (`src/lsm/mod.rs`, the flush
+> job), so rows that were flushed exist only in their SSTable. Consequently, measured on the real binary
+> (`PHASE_ITEM_F08_VERIFICATION.md`, `scratch/f08_verification/`):
+>
+> 1. A damaged **data block** is a *durability* problem, not an availability one: with one bit flipped in a middle block the
+>    instance still opens (`ready: true`), the 18 rows of that block fail every read, `COUNT(*)` fails, and the rows exist
+>    nowhere else in the directory (ADR-SST-01, `PHASE_ITEM_F08_ADR.md`).
+> 2. Damage the engine validates at open (footer, bloom, index, size, missing live table) still refuses the start, but
+>    "removing the offending file" does **not** let the engine open with one fewer table: the Manifest lists the table as
+>    live, so the start is refused again (`SSTABLE_MISSING`), and there is no override. The recovery path is a verified backup
+>    restored into a new instance (`rubixdb restore`).
+> 3. Section 6's "Reader behavior" column quotes detail texts that differ from the code (classification is unchanged):
+>    "index/bloom: offset out of file bounds" is, in the code, `footer: bloom block extends past the file` /
+>    `footer: index block extends past the file`; "index: overlapping blocks" is `index: block_offset is not contiguous with
+>    the preceding block (gap or overlap detected)`; "footer: file shorter than FOOTER_SIZE" carries a `(<len> < 72)` suffix.
+> 4. The footer `record_count` (section 2.7: "total across all data blocks") is not validated by the engine at open or read;
+>    `rubixdb check` reports a mismatch as `SSTABLE_CORRUPT`; the background pass of ADR-SST-01 does not. What a mismatch
+>    must mean is an open policy decision (`OPEN_ITEMS.md`, 2026-10-11).
+> 5. Sections 3.1-3.3 (directory-scan liveness, no Manifest) are likewise superseded by the Manifest (Phase 5).
+>
+> The same stale statement is in the module comment of `src/sstable/mod.rs` (lines 6-16); that file is a protected path and
+> was not edited.
+
 ### 3.6 Flush does not shrink WAL retention (explicit non-goal, not an oversight)
 
 **PHASE-4B DECISION (direct consequence of the chosen option).** A

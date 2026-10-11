@@ -2822,3 +2822,10 @@ Every protected path; the attestation eligibility rule; ADR-STARTUP-01 (PROPOSED
 - `PHASE_ITEM_F11_FINAL_CLOSURE.md`, the single document describing F-11's state.
 ### Not changed
 Every protected path; the F-07 refusal path, quarantine, `check` path and cleanup sweep; the startup grace; ADR-STARTUP-01 (PROPOSED).
+
+## 2026-10-11 -- F-08 verification: specification erratum (documentation only)
+### Added
+- An additive, dated ERRATUM after section 3.5 of `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md`: since Phase 5 the WAL is purged after a flush, so SSTable damage is a durability concern and removing a damaged table does not let the engine open; section 6 detail texts and the unvalidated `record_count` are noted. The original text is unchanged.
+- `PHASE_ITEM_F08_VERIFICATION.md` and `scratch/f08_verification/` (scripts, raw evidence).
+### Not changed
+Every source file, test and protected path; ADR-SST-01 behaviour.

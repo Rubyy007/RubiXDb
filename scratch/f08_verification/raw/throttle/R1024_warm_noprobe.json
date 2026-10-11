@@ -1,0 +1,222 @@
+{
+ "label": "R1024_warm_noprobe",
+ "setting": "1024",
+ "exe": "E:\\rubixdb_f08b\\rubixdb_head.exe",
+ "sstables": [
+  [
+   "00000000000000000001.sst",
+   1160465903
+  ],
+  [
+   "00000000000000000002.sst",
+   1160465903
+  ],
+  [
+   "00000000000000000003.sst",
+   1160465903
+  ]
+ ],
+ "total_sstable_bytes": 3481397709,
+ "ready_seconds": 0.662,
+ "samples": [
+  {
+   "t": 0.0,
+   "state": "running",
+   "tables_verified": 0,
+   "bytes_verified": 0,
+   "proc_read_bytes": 0,
+   "proc_cpu_s": 0.0,
+   "rss_mb": 79.7
+  },
+  {
+   "t": 0.5,
+   "state": "running",
+   "tables_verified": 0,
+   "bytes_verified": 528331512,
+   "proc_read_bytes": 533038170,
+   "proc_cpu_s": 0.531,
+   "rss_mb": 90.0
+  },
+  {
+   "t": 1.03,
+   "state": "running",
+   "tables_verified": 0,
+   "bytes_verified": 1056321248,
+   "proc_read_bytes": 1057032146,
+   "proc_cpu_s": 1.031,
+   "rss_mb": 90.0
+  },
+  {
+   "t": 1.53,
+   "state": "running",
+   "tables_verified": 1,
+   "bytes_verified": 1564050336,
+   "proc_read_bytes": 1569788041,
+   "proc_cpu_s": 1.547,
+   "rss_mb": 90.5
+  },
+  {
+   "t": 2.04,
+   "state": "running",
+   "tables_verified": 1,
+   "bytes_verified": 2081124080,
+   "proc_read_bytes": 2082933289,
+   "proc_cpu_s": 2.078,
+   "rss_mb": 90.5
+  },
+  {
+   "t": 2.57,
+   "state": "running",
+   "tables_verified": 2,
+   "bytes_verified": 2571276712,
+   "proc_read_bytes": 2578260080,
+   "proc_cpu_s": 2.578,
+   "rss_mb": 90.0
+  },
+  {
+   "t": 3.07,
+   "state": "running",
+   "tables_verified": 2,
+   "bytes_verified": 3095244328,
+   "proc_read_bytes": 3098213184,
+   "proc_cpu_s": 3.094,
+   "rss_mb": 90.0
+  },
+  {
+   "t": 3.59,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.3
+  },
+  {
+   "t": 4.11,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.3
+  },
+  {
+   "t": 4.61,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.3
+  },
+  {
+   "t": 5.14,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.3
+  },
+  {
+   "t": 5.66,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.3
+  },
+  {
+   "t": 6.18,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.3
+  },
+  {
+   "t": 6.71,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.4
+  },
+  {
+   "t": 7.23,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.4
+  },
+  {
+   "t": 7.75,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.4
+  },
+  {
+   "t": 8.28,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.4
+  },
+  {
+   "t": 8.8,
+   "state": "complete",
+   "tables_verified": 3,
+   "bytes_verified": 3481188624,
+   "proc_read_bytes": 3481049616,
+   "proc_cpu_s": 3.469,
+   "rss_mb": 74.4
+  }
+ ],
+ "final_status": {
+  "state": "complete",
+  "tables_total": 3,
+  "tables_verified": 3,
+  "bytes_verified": 3481188624,
+  "damaged": []
+ },
+ "readyz": {
+  "ready": true,
+  "storage_state": "Healthy",
+  "index_recovery": "complete",
+  "sstable_verification": "complete"
+ },
+ "pass_seconds_from_ready": 3.5854837894439697,
+ "probe_threads": 0,
+ "probe": {
+  "n_total": 0,
+  "non_200": 0,
+  "during_pass": {
+   "n": 0,
+   "p50": null,
+   "p95": null,
+   "p99": null,
+   "max": null
+  },
+  "after_pass": {
+   "n": 0,
+   "p50": null,
+   "p95": null,
+   "p99": null,
+   "max": null
+  }
+ },
+ "stop": [
+  "graceful",
+  0
+ ]
+}

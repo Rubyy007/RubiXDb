@@ -1,0 +1,28 @@
+{
+ "cancel_at_scale": {
+  "status_before_stop": {
+   "state": "running",
+   "tables_total": 3,
+   "tables_verified": 0,
+   "bytes_verified": 10503360,
+   "damaged": []
+  },
+  "stop": [
+   "graceful",
+   0
+  ],
+  "stop_seconds": 0.4
+ },
+ "override_with_bloom_damage": {
+  "opened": false,
+  "exit": 1,
+  "dir_unchanged": true,
+  "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_CORRUPT: corruption: sstable E:\\rubixdb_f08b\\runs\\ovr_override_with_bloom_damage\\recon\\data\\sstables\\00000000000000000001.sst: bloom: checksu"
+ },
+ "override_with_missing_table": {
+  "opened": false,
+  "exit": 1,
+  "dir_unchanged": true,
+  "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_MISSING: corruption: manifest: sstable id 1 is recorded live but E:\\rubixdb_f08b\\runs\\ovr_override_with_missing_table\\recon\\data\\sstables\\000"
+ }
+}

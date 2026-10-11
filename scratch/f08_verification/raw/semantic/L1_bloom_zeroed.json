@@ -1,0 +1,33 @@
+{
+ "scenario": "L1_bloom_zeroed",
+ "mutation": "SSTable 1 bloom bit array zeroed (21513 bytes), bloom CRC recomputed",
+ "check_offline": {
+  "exit": 0,
+  "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nresult: 0 error(s), 0 warning(s), check complete\n"
+ },
+ "opened": true,
+ "readyz": {
+  "ready": true,
+  "storage_state": "Healthy",
+  "index_recovery": "complete",
+  "sstable_verification": "complete"
+ },
+ "integrity": {
+  "state": "complete",
+  "tables_total": 2,
+  "tables_verified": 2,
+  "bytes_verified": 8060036,
+  "damaged": []
+ },
+ "lookups_all_40000": {
+  "error": 40000
+ },
+ "count_star": [
+  500,
+  null
+ ],
+ "stop": [
+  "graceful",
+  0
+ ]
+}

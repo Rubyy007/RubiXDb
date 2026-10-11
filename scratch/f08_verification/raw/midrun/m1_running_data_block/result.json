@@ -1,0 +1,91 @@
+{
+ "scenario": "m1_running_data_block",
+ "before": {
+  "damaged_block_ids": {
+   "correct": 18
+  },
+  "sample": {
+   "correct": 1082
+  },
+  "readyz": [
+   200,
+   {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "complete"
+   }
+  ]
+ },
+ "mutation": "data block bit flipped while running",
+ "after_mutation": {
+  "damaged_block_ids": {
+   "error": 18
+  },
+  "first_non_correct": {
+   "id": 8603,
+   "status": 500,
+   "info": {
+    "code": "STORAGE_ERROR",
+    "message": "a storage error occurred"
+   }
+  },
+  "sample": {
+   "correct": 1082
+  },
+  "count_star": 500,
+  "endpoints": {
+   "/healthz": 200,
+   "/readyz": 200,
+   "/v1/status": 200,
+   "/v1/metrics/system": 200,
+   "/v1/admin/status": 200,
+   "/v1/compaction/status": 200,
+   "/v1/instance": 200
+  },
+  "readyz_body": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "status_body": {
+   "storage_state": "Healthy",
+   "storage_pressure_events": 0,
+   "sstable_count": 2,
+   "checkpoint_seq": 175,
+   "manifest_record_count": 4,
+   "manifest_size_bytes": 148,
+   "live_sstable_count": 2,
+   "capacity_pressure_events": 0,
+   "uptime_secs": 20.2021957,
+   "sstable_integrity": {
+    "state": "complete",
+    "tables_total": 2,
+    "tables_verified": 2,
+    "bytes_verified": 8060036,
+    "damaged": []
+   }
+  }
+ },
+ "stop": [
+  "graceful",
+  0
+ ],
+ "server_err_after_stop": "",
+ "restart": {
+  "opened": true,
+  "damaged_block_ids": {
+   "error": 18
+  },
+  "readyz": [
+   200,
+   {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "damaged"
+   }
+  ]
+ }
+}

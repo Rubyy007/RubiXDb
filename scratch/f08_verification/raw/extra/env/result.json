@@ -1,0 +1,97 @@
+{
+ "scenario": "env",
+ "exe": "E:\\rubixdb_f08b\\rubixdb_f08_impl_after.exe",
+ "cases": [
+  {
+   "value": null,
+   "opened": true,
+   "readyz": {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "complete"
+   },
+   "integrity": {
+    "state": "complete",
+    "tables_total": 2,
+    "tables_verified": 2,
+    "bytes_verified": 8060036,
+    "damaged": []
+   },
+   "stop": [
+    "graceful",
+    0
+   ]
+  },
+  {
+   "value": "0",
+   "opened": true,
+   "readyz": {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "disabled"
+   },
+   "integrity": {
+    "state": "disabled",
+    "tables_total": 0,
+    "tables_verified": 0,
+    "bytes_verified": 0,
+    "damaged": []
+   },
+   "stop": [
+    "graceful",
+    0
+   ]
+  },
+  {
+   "value": "abc",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC must be an integer between 0 (disabled) and 1024, got \"abc\"\n",
+   "directory_unchanged": true
+  },
+  {
+   "value": "1025",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC must be an integer between 0 (disabled) and 1024, got \"1025\"\n",
+   "directory_unchanged": true
+  },
+  {
+   "value": "-1",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC must be an integer between 0 (disabled) and 1024, got \"-1\"\n",
+   "directory_unchanged": true
+  },
+  {
+   "value": "",
+   "opened": true,
+   "readyz": {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "complete"
+   },
+   "integrity": {
+    "state": "complete",
+    "tables_total": 2,
+    "tables_verified": 2,
+    "bytes_verified": 8060036,
+    "damaged": []
+   },
+   "stop": [
+    "graceful",
+    0
+   ]
+  },
+  {
+   "value": " 5",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: RUBIXDB_LOCAL_SSTABLE_VERIFY_MIB_PER_SEC must be an integer between 0 (disabled) and 1024, got \" 5\"\n",
+   "directory_unchanged": true
+  }
+ ]
+}

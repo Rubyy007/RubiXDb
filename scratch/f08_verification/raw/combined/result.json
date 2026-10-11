@@ -1,0 +1,130 @@
+{
+ "C1_bloom_plus_tail": {
+  "mutations": [
+   "SSTable 1 bloom: 1 bit flipped",
+   "last WAL frame: 1 CRC bit flipped (a clean stop wrote WAL_CLEAN_STOP)"
+  ],
+  "check_offline_both_damaged": {
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         corruption: bloom: checksum mismatch\nWARNING  WAL_TORN_TAIL              wal                a torn tail was found in the newest segment; recovery truncates it (expected after a crash)\nINFO     WAL_TAIL_WOULD_BE_QUARANTINED wal                a start would copy the 44621 byte(s) at offset 1115574 of WAL segment 3 (last good sequence 203) to wal-quarantine/ and then truncate them; this check did not modify the directory (its logical pass runs on a private copy)\nINFO     WAL_TAIL_START_WOULD_REFUSE wal                a start would refuse with WAL_TAIL_DAMAGED: the last clean shutdown recorded sequence 204 and the log reaches 203; this check did not modify the directory\nresult: 1 error(s), 1 warning(s), check complete\n"
+  },
+  "start_1": {
+   "label": "both damaged",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_CORRUPT: corruption: sstable E:\\rubixdb_f08b\\runs\\cmb_C1_bloom_plus_tail\\recon\\data\\sstables\\00000000000000000001.sst: bloom: checksum mismatch; refusing to open: a table the Manifest lists as live is damaged and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.",
+   "changed_files": []
+  },
+  "start_2_after_sst_repair": {
+   "label": "SSTable repaired, WAL damage remains",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_TAIL_DAMAGED: the log ends at sequence 203, but the last clean shutdown recorded 204 (segment 3, 1160195 bytes); 1 acknowledged record(s) are missing from the end of the WAL. Opening would discard them permanently. Run `rubixdb check`, restore a verified backup into a new instance, or, if you accept losing them, start once with RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL=1. The directory has not been modified.",
+   "changed_files": []
+  }
+ },
+ "C2_missing_plus_tail": {
+  "mutations": [
+   "SSTable 1 deleted",
+   "last WAL frame: 1 CRC bit flipped (a clean stop wrote WAL_CLEAN_STOP)"
+  ],
+  "check_offline_both_damaged": {
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_MISSING            sstable[1]         listed live by the manifest but the file is absent\nWARNING  WAL_TORN_TAIL              wal                a torn tail was found in the newest segment; recovery truncates it (expected after a crash)\nINFO     WAL_TAIL_WOULD_BE_QUARANTINED wal                a start would copy the 44621 byte(s) at offset 1115574 of WAL segment 3 (last good sequence 203) to wal-quarantine/ and then truncate them; this check did not modify the directory (its logical pass runs on a private copy)\nINFO     WAL_TAIL_START_WOULD_REFUSE wal                a start would refuse with WAL_TAIL_DAMAGED: the last clean shutdown recorded sequence 204 and the log reaches 203; this check did not modify the directory\nresult: 1 error(s), 1 warning(s), check complete\n"
+  },
+  "start_1": {
+   "label": "both damaged",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_MISSING: corruption: manifest: sstable id 1 is recorded live but E:\\rubixdb_f08b\\runs\\cmb_C2_missing_plus_tail\\recon\\data\\sstables\\00000000000000000001.sst is missing from disk; refusing to open: a table the Manifest lists as live is missing and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.",
+   "changed_files": []
+  },
+  "start_2_after_sst_repair": {
+   "label": "SSTable repaired, WAL damage remains",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_TAIL_DAMAGED: the log ends at sequence 203, but the last clean shutdown recorded 204 (segment 3, 1160195 bytes); 1 acknowledged record(s) are missing from the end of the WAL. Opening would discard them permanently. Run `rubixdb check`, restore a verified backup into a new instance, or, if you accept losing them, start once with RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL=1. The directory has not been modified.",
+   "changed_files": []
+  }
+ },
+ "C3_block_plus_tail": {
+  "mutations": [
+   "SSTable 1 data block 478: 1 bit flipped",
+   "last WAL frame: 1 CRC bit flipped (a clean stop wrote WAL_CLEAN_STOP)"
+  ],
+  "check_offline_both_damaged": {
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         data block failed verification: corruption: block: checksum mismatch\nWARNING  WAL_TORN_TAIL              wal                a torn tail was found in the newest segment; recovery truncates it (expected after a crash)\nINFO     WAL_TAIL_WOULD_BE_QUARANTINED wal                a start would copy the 44621 byte(s) at offset 1115574 of WAL segment 3 (last good sequence 203) to wal-quarantine/ and then truncate them; this check did not modify the directory (its logical pass runs on a private copy)\nINFO     WAL_TAIL_START_WOULD_REFUSE wal                a start would refuse with WAL_TAIL_DAMAGED: the last clean shutdown recorded sequence 204 and the log reaches 203; this check did not modify the directory\nresult: 1 error(s), 1 warning(s), check complete\n"
+  },
+  "start_1": {
+   "label": "both damaged",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_TAIL_DAMAGED: the log ends at sequence 203, but the last clean shutdown recorded 204 (segment 3, 1160195 bytes); 1 acknowledged record(s) are missing from the end of the WAL. Opening would discard them permanently. Run `rubixdb check`, restore a verified backup into a new instance, or, if you accept losing them, start once with RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL=1. The directory has not been modified.",
+   "changed_files": []
+  },
+  "start_2_after_sst_repair": {
+   "label": "SSTable repaired, WAL damage remains",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_TAIL_DAMAGED: the log ends at sequence 203, but the last clean shutdown recorded 204 (segment 3, 1160195 bytes); 1 acknowledged record(s) are missing from the end of the WAL. Opening would discard them permanently. Run `rubixdb check`, restore a verified backup into a new instance, or, if you accept losing them, start once with RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL=1. The directory has not been modified.",
+   "changed_files": []
+  }
+ },
+ "C4_bloom_plus_walcorrupt": {
+  "mutations": [
+   "SSTable 1 bloom: 1 bit flipped",
+   "wal-00000000000000000002.log: 1 bit flipped at offset 124 (inside an early frame of the older segment)"
+  ],
+  "check_offline_both_damaged": {
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         corruption: bloom: checksum mismatch\nERROR    WAL_CORRUPT                wal                corrupted segment id(s): [2]\nresult: 2 error(s), 0 warning(s), check complete\n"
+  },
+  "start_1": {
+   "label": "both damaged",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_CORRUPT: 1 corrupted WAL segment(s) found; refusing to open: the engine would                          silently discard them and everything after them. Run `rubixdb check`                          and restore a verified backup into a new instance. The directory has                          not been modified.",
+   "changed_files": []
+  },
+  "start_2_after_sst_repair": {
+   "label": "SSTable repaired, WAL damage remains",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_CORRUPT: 1 corrupted WAL segment(s) found; refusing to open: the engine would                          silently discard them and everything after them. Run `rubixdb check`                          and restore a verified backup into a new instance. The directory has                          not been modified.",
+   "changed_files": []
+  }
+ },
+ "C5_walcorrupt_only": {
+  "mutations": [
+   "wal-00000000000000000002.log: 1 bit flipped at offset 124 (inside an early frame of the older segment)"
+  ],
+  "check_offline_both_damaged": {
+   "exit": 2,
+   "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    WAL_CORRUPT                wal                corrupted segment id(s): [2]\nresult: 1 error(s), 0 warning(s), check complete\n"
+  },
+  "start_1": {
+   "label": "both damaged",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_CORRUPT: 1 corrupted WAL segment(s) found; refusing to open: the engine would                          silently discard them and everything after them. Run `rubixdb check`                          and restore a verified backup into a new instance. The directory has                          not been modified.",
+   "changed_files": []
+  }
+ },
+ "C6_tail_only": {
+  "mutations": [
+   "last WAL frame: 1 CRC bit flipped (a clean stop wrote WAL_CLEAN_STOP)"
+  ],
+  "check_offline_both_damaged": {
+   "exit": 1,
+   "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nWARNING  WAL_TORN_TAIL              wal                a torn tail was found in the newest segment; recovery truncates it (expected after a crash)\nINFO     WAL_TAIL_WOULD_BE_QUARANTINED wal                a start would copy the 44621 byte(s) at offset 1115574 of WAL segment 3 (last good sequence 203) to wal-quarantine/ and then truncate them; this check did not modify the directory (its logical pass runs on a private copy)\nINFO     WAL_TAIL_START_WOULD_REFUSE wal                a start would refuse with WAL_TAIL_DAMAGED: the last clean shutdown recorded sequence 204 and the log reaches 203; this check did not modify the directory\nresult: 0 error(s), 1 warning(s), check complete\n"
+  },
+  "start_1": {
+   "label": "both damaged",
+   "opened": false,
+   "exit": 1,
+   "stderr": "rubixdb gui: failed to start: engine open refused: WAL_TAIL_DAMAGED: the log ends at sequence 203, but the last clean shutdown recorded 204 (segment 3, 1160195 bytes); 1 acknowledged record(s) are missing from the end of the WAL. Opening would discard them permanently. Run `rubixdb check`, restore a verified backup into a new instance, or, if you accept losing them, start once with RUBIXDB_ALLOW_TRUNCATE_CORRUPT_WAL=1. The directory has not been modified.",
+   "changed_files": []
+  }
+ }
+}

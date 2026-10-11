@@ -1,0 +1,40 @@
+{
+ "scenario": "L2_index_lastkey",
+ "mutation": "SSTable 1 index entry 478: last byte of last_key flipped, index CRC recomputed",
+ "check_offline": {
+  "exit": 0,
+  "stdout": "INSPECTION  offline check of <copy>\\recon\\data\nresult: 0 error(s), 0 warning(s), check complete\n"
+ },
+ "opened": true,
+ "readyz": {
+  "ready": true,
+  "storage_state": "Healthy",
+  "index_recovery": "complete",
+  "sstable_verification": "complete"
+ },
+ "integrity": {
+  "state": "complete",
+  "tables_total": 2,
+  "tables_verified": 2,
+  "bytes_verified": 8060036,
+  "damaged": []
+ },
+ "lookups_all_40000": {
+  "correct": 40000
+ },
+ "count_star": [
+  200,
+  [
+   [
+    {
+     "type": "bigint",
+     "value": "40000"
+    }
+   ]
+  ]
+ ],
+ "stop": [
+  "graceful",
+  0
+ ]
+}

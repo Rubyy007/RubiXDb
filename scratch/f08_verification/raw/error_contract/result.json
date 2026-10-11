@@ -1,0 +1,139 @@
+{
+ "mutation": "1 bit flipped in data block 478 of SSTable 1; rows 8603..8620 are in it",
+ "readyz": {
+  "ready": true,
+  "storage_state": "Healthy",
+  "index_recovery": "complete",
+  "sstable_verification": "damaged"
+ },
+ "sql": {
+  "point_in_damaged_block": {
+   "status": 500,
+   "body": {
+    "error": {
+     "code": "STORAGE_ERROR",
+     "message": "a storage error occurred"
+    }
+   }
+  },
+  "point_in_intact_block": {
+   "status": 200,
+   "body": {
+    "session_id": null,
+    "result": {
+     "kind": "rows",
+     "columns": [
+      {
+       "name": "v",
+       "type": "text",
+       "nullable": true
+      }
+     ],
+     "rows": [
+      [
+       {
+        "type": "text",
+        "value": "row-000001-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+       }
+      ]
+     ],
+     "row_count": 1
+    }
+   }
+  },
+  "count_star": {
+   "status": 500,
+   "body": {
+    "error": {
+     "code": "STORAGE_ERROR",
+     "message": "a storage error occurred"
+    }
+   }
+  },
+  "range_over_damaged_block": {
+   "status": 500,
+   "body": {
+    "error": {
+     "code": "STORAGE_ERROR",
+     "message": "a storage error occurred"
+    }
+   }
+  },
+  "insert_new_row": {
+   "status": 200,
+   "body": {
+    "session_id": null,
+    "result": {
+     "kind": "write",
+     "statement": "INSERT",
+     "rows_affected": 1
+    }
+   }
+  }
+ },
+ "range_first_page": {
+  "pages_scanned": 1,
+  "status": 200
+ },
+ "row_key_samples_hex": {
+  "1": "01000000010000000080000001",
+  "2": "01000000010000000080000002"
+ },
+ "pk_byte_positions": [
+  12
+ ],
+ "constructed_key_hex": "0100000001000000008000219b",
+ "kv_get_damaged_key": {
+  "status": 500,
+  "body": {
+   "error": {
+    "code": "CORRUPTION",
+    "message": "the engine detected on-disk corruption",
+    "detail": "block: checksum mismatch"
+   }
+  }
+ },
+ "kv_get_intact_key": {
+  "status": 200,
+  "ok": true
+ },
+ "range_over_damaged": {
+  "status": 500,
+  "body": {
+   "error": {
+    "code": "CORRUPTION",
+    "message": "the engine detected on-disk corruption",
+    "detail": "block: checksum mismatch"
+   }
+  }
+ },
+ "kv_exists_damaged_key": {
+  "status": 500,
+  "body": {
+   "error": {
+    "code": "CORRUPTION",
+    "message": "the engine detected on-disk corruption",
+    "detail": "block: checksum mismatch"
+   }
+  }
+ },
+ "status_integrity": {
+  "state": "damaged",
+  "tables_total": 2,
+  "tables_verified": 2,
+  "bytes_verified": 6044788,
+  "damaged": [
+   {
+    "id": 1,
+    "path": "sstables/00000000000000000001.sst",
+    "records_before_failure": 8612,
+    "records_total": 17210
+   }
+  ]
+ },
+ "stop": [
+  "graceful",
+  0
+ ],
+ "server_err": "rubixdb: SSTABLE DAMAGED: sstables/00000000000000000001.sst failed verification after 8612 of 17210 records; the rows stored in the damaged block cannot be read. Run `rubixdb check`, then restore a verified backup into a new instance.\n"
+}

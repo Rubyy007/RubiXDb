@@ -1,0 +1,893 @@
+{
+ "scenario": "k_data_block_other_table",
+ "exe": "E:\\rubixdb_f08b\\rubixdb_head.exe",
+ "mutation": "1 bit flipped in a data block of SSTable 2 (ids 22925..22942)",
+ "damaged_block_ids": [
+  22925,
+  22942,
+  18
+ ],
+ "files_before_start": {
+  "DATA_FORMAT": "c7c602f2187f",
+  "MANIFEST": "1b2b90fc7c66",
+  "WAL_CLEAN_STOP": "37064a153451",
+  "sstables/00000000000000000001.sst": "502416d26d85",
+  "sstables/00000000000000000002.sst": "d2cf8b7b1f11",
+  "wal/LOCK": "e3b0c44298fc",
+  "wal/wal-00000000000000000002.log": "b66af7aa7532",
+  "wal/wal-00000000000000000003.log": "12302f8e38b4"
+ },
+ "check_offline": {
+  "exit": 2,
+  "stdout": "INSPECTION  offline check of E:\\rubixdb_f08b\\runs\\k_data_block_other_table_checkcopy\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[2]         data block failed verification: corruption: block: checksum mismatch\nresult: 1 error(s), 0 warning(s), check complete\n",
+  "stderr": ""
+ },
+ "opened": true,
+ "ready_seconds": 0.502,
+ "pass_wait": {
+  "state": "damaged",
+  "seconds": 0.015
+ },
+ "endpoints_before_queries": {
+  "/healthz": {
+   "status": 200,
+   "body": {
+    "status": "ok"
+   }
+  },
+  "/readyz": {
+   "status": 200,
+   "body": {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "damaged"
+   }
+  },
+  "/v1/status": {
+   "status": 200,
+   "body": {
+    "storage_state": "Healthy",
+    "storage_pressure_events": 0,
+    "sstable_count": 2,
+    "checkpoint_seq": 175,
+    "manifest_record_count": 4,
+    "manifest_size_bytes": 148,
+    "live_sstable_count": 2,
+    "capacity_pressure_events": 0,
+    "uptime_secs": 0.409529,
+    "sstable_integrity": {
+     "state": "damaged",
+     "tables_total": 2,
+     "tables_verified": 2,
+     "bytes_verified": 5370866,
+     "damaged": [
+      {
+       "id": 2,
+       "path": "sstables/00000000000000000002.sst",
+       "records_before_failure": 5724,
+       "records_total": 17200
+      }
+     ]
+    }
+   }
+  },
+  "/v1/metrics/system": {
+   "status": 200,
+   "body": {
+    "background": {
+     "flush_queue_depth": 0,
+     "index_build_state": "complete",
+     "last_flush_ms": null,
+     "pending_groups": 0
+    },
+    "compaction": {
+     "blocked": false,
+     "consecutive_failures": 0,
+     "cycles_since_start": 0,
+     "failures_total": 0,
+     "last_duration_ms": null,
+     "last_failure": null,
+     "live_sstable_count": 2,
+     "running": false,
+     "state": "idle"
+    },
+    "cpu": {
+     "peak_percent": null,
+     "process_percent": null,
+     "vcpu_count": 8
+    },
+    "disk": {
+     "db_bytes": 13014014,
+     "free_advisory": "ok",
+     "free_advisory_threshold_percent": 10.0,
+     "sizes_age_ms": 1,
+     "sstable_bytes": 8060777,
+     "volume_free_bytes": 26735095808,
+     "volume_total_bytes": 127355359232,
+     "volume_used_percent": 79.00748270883727,
+     "wal_bytes": 4953029
+    },
+    "errors": {
+     "http_server_errors_since_start": 0,
+     "sql_errors_since_start": 0,
+     "wal_sync_failures": null,
+     "wal_write_errors": 0
+    },
+    "instance": {
+     "coordinator_state": "alive",
+     "healthy": "healthy",
+     "id": "9b23764a-48cd-43f5-ab73-eb38421393c7",
+     "lock_state": "held",
+     "name": "recon",
+     "readiness": "ready",
+     "uptime_seconds": 0.4235773
+    },
+    "latency": {
+     "query_p50_ms": null,
+     "query_p95_ms": null,
+     "query_p99_ms": null
+    },
+    "latency_of_response_ms": 0.0399,
+    "limits": {
+     "rate_limited_since_start": 0,
+     "sessions_rejected_since_start": 0,
+     "sql_resource_limit_hits": 0,
+     "wal_backpressure_rejections": 0
+    },
+    "memory": {
+     "peak_rss_bytes": 16293888,
+     "rss_bytes": 10919936,
+     "system_total_bytes": 17060876288,
+     "system_used_bytes": 7989784576,
+     "system_used_percent": 46.83103283281952
+    },
+    "process": {
+     "read_mb_per_sec": null,
+     "read_ops_per_sec": null,
+     "write_mb_per_sec": null,
+     "write_ops_per_sec": null
+    },
+    "sample_freshness": {
+     "age_ms": 420,
+     "last_sample_ms": 1791699397237,
+     "stale": false,
+     "state": "running",
+     "tick_ms": 1000
+    },
+    "sample_generation": 1,
+    "security": {
+     "admin_actions_since_start": 0,
+     "auth_failures_since_start": 0,
+     "forbidden_since_start": 0,
+     "last_admin_action": null
+    },
+    "storage_state": "Healthy",
+    "throughput": {
+     "active_connections": 0,
+     "active_queries": 0,
+     "active_sessions": 0,
+     "active_transactions": 0,
+     "http_requests_per_sec": null,
+     "sql_queries_per_sec": null,
+     "write_commits_per_sec": null
+    },
+    "timestamp_unix_ms": 1791699397657,
+    "wal": {
+     "bytes": 4953029,
+     "segment_count": 2,
+     "state": "Running"
+    }
+   }
+  },
+  "/v1/admin/status": {
+   "status": 200,
+   "body": {
+    "background": {
+     "backup_running": false,
+     "check_running": false,
+     "last_check": null,
+     "maintenance_running": false
+    },
+    "backups": {
+     "configured": true,
+     "failed_total": 0,
+     "last": null,
+     "ok_total": 0,
+     "running": false
+    },
+    "compaction": {
+     "auto_trigger_enabled": true,
+     "blocked": false,
+     "consecutive_failures": 0,
+     "cycles_completed": 0,
+     "duration_max_ms": 0.0,
+     "failures_total": 0,
+     "input_bytes_total": 0,
+     "last_cycle_ms": null,
+     "last_failure": null,
+     "live_sstable_count": 2,
+     "output_bytes_total": 0,
+     "state": "idle",
+     "tombstones_dropped_total": 0,
+     "trigger_count": 4
+    },
+    "disk": {
+     "data_dir_bytes": 13014014,
+     "manifest_bytes": 148,
+     "sstable_bytes": 8060777,
+     "volume_free_bytes": 26735091712,
+     "wal_bytes": 4953029
+    },
+    "instance": {
+     "id": "9b23764a-48cd-43f5-ab73-eb38421393c7",
+     "name": "recon",
+     "uptime_secs": 0.4475442,
+     "version": "0.1.0"
+    },
+    "queries": {
+     "active_http_requests": 1,
+     "authorization_denials": 0,
+     "bind_errors": 0,
+     "cancellations": 0,
+     "errors": 0,
+     "latency_ms": null,
+     "parse_errors": 0,
+     "requests": 0,
+     "rows_affected": 0,
+     "rows_returned": 0,
+     "success": 0,
+     "timeouts": 0
+    },
+    "reads": {
+     "blocks_read": 4,
+     "bloom_negatives": 0,
+     "hits": 2,
+     "misses": 0,
+     "requests": 2
+    },
+    "recovery": {
+     "duration_ms": 62.8308,
+     "manifest_edits_replayed": 4,
+     "wal_records_applied": 28,
+     "wal_records_visited": 113
+    },
+    "resources": {
+     "cpu_seconds": 0.109375,
+     "handles": 112,
+     "rss_bytes": 13258752,
+     "threads": 19
+    },
+    "sessions": {
+     "active_transactions": 0
+    },
+    "storage": {
+     "capacity_pressure_events": 0,
+     "checkpoint_seq": 175,
+     "manifest_bytes": 148,
+     "manifest_records": 4,
+     "memtable_active_bytes": 1377600,
+     "memtable_active_entries": 5600,
+     "memtable_immutable_bytes": 0,
+     "memtable_immutable_count": 0,
+     "oldest_live_snapshot_seq": null,
+     "sstable_count": 2,
+     "state": "Healthy",
+     "storage_pressure_events": 0
+    },
+    "wal": {
+     "avg_batch_bytes": 0.0,
+     "avg_batch_processing_ms": 0.0,
+     "avg_batch_records": 0.0,
+     "completed_err": 0,
+     "completed_ok": 0,
+     "coordinator_alive": true,
+     "durable_through": 204,
+     "highest_sequence": 204,
+     "max_batch_records": 0,
+     "pending_waiters": 0,
+     "poisoned": false,
+     "pool_state": "Running",
+     "queue_capacity": 4096,
+     "queue_depth": 0,
+     "queued_bytes": 0,
+     "rejected_backpressure": 0,
+     "segment_rotations": 0,
+     "submitted": 0,
+     "sync_attempts": 0,
+     "sync_failures": null,
+     "writes_timed_out": 0
+    }
+   }
+  },
+  "/v1/compaction/status": {
+   "status": 200,
+   "body": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 2,
+    "cycles_completed": 0,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   }
+  },
+  "/v1/instance": {
+   "status": 200,
+   "body": {
+    "instance_id": "9b23764a-48cd-43f5-ab73-eb38421393c7",
+    "name": "recon"
+   }
+  }
+ },
+ "queries": {
+  "damaged_block_ids": {
+   "n": 18,
+   "classes": {
+    "error": 18
+   },
+   "first_non_correct": {
+    "error": {
+     "id": 22925,
+     "status": 500,
+     "info": {
+      "code": "STORAGE_ERROR",
+      "message": "a storage error occurred"
+     }
+    }
+   }
+  },
+  "sample_every_37th": {
+   "n": 1082,
+   "classes": {
+    "correct": 1081,
+    "error": 1
+   },
+   "first_non_correct": {
+    "error": {
+     "id": 22941,
+     "status": 500,
+     "info": {
+      "code": "STORAGE_ERROR",
+      "message": "a storage error occurred"
+     }
+    }
+   }
+  },
+  "count_star": {
+   "status": 500,
+   "body": {
+    "error": {
+     "code": "STORAGE_ERROR",
+     "message": "a storage error occurred"
+    }
+   }
+  },
+  "range_100_400": {
+   "status": 500,
+   "rows": {
+    "error": {
+     "code": "STORAGE_ERROR",
+     "message": "a storage error occurred"
+    }
+   }
+  },
+  "insert_new_row": {
+   "status": 200,
+   "body": "ok"
+  }
+ },
+ "endpoints_after_queries": {
+  "/healthz": {
+   "status": 200,
+   "body": {
+    "status": "ok"
+   }
+  },
+  "/readyz": {
+   "status": 200,
+   "body": {
+    "ready": true,
+    "storage_state": "Healthy",
+    "index_recovery": "complete",
+    "sstable_verification": "damaged"
+   }
+  },
+  "/v1/status": {
+   "status": 200,
+   "body": {
+    "storage_state": "Healthy",
+    "storage_pressure_events": 0,
+    "sstable_count": 2,
+    "checkpoint_seq": 175,
+    "manifest_record_count": 4,
+    "manifest_size_bytes": 148,
+    "live_sstable_count": 2,
+    "capacity_pressure_events": 0,
+    "uptime_secs": 12.4639763,
+    "sstable_integrity": {
+     "state": "damaged",
+     "tables_total": 2,
+     "tables_verified": 2,
+     "bytes_verified": 5370866,
+     "damaged": [
+      {
+       "id": 2,
+       "path": "sstables/00000000000000000002.sst",
+       "records_before_failure": 5724,
+       "records_total": 17200
+      }
+     ]
+    }
+   }
+  },
+  "/v1/metrics/system": {
+   "status": 200,
+   "body": {
+    "background": {
+     "flush_queue_depth": 0,
+     "index_build_state": "complete",
+     "last_flush_ms": null,
+     "pending_groups": 0
+    },
+    "compaction": {
+     "blocked": false,
+     "consecutive_failures": 0,
+     "cycles_since_start": 0,
+     "failures_total": 0,
+     "last_duration_ms": null,
+     "last_failure": null,
+     "live_sstable_count": 2,
+     "running": false,
+     "state": "idle"
+    },
+    "cpu": {
+     "peak_percent": 1.9430574365042406,
+     "process_percent": 1.3545216390575012,
+     "vcpu_count": 8
+    },
+    "disk": {
+     "db_bytes": 13014014,
+     "free_advisory": "ok",
+     "free_advisory_threshold_percent": 10.0,
+     "sizes_age_ms": 2007,
+     "sstable_bytes": 8060777,
+     "volume_free_bytes": 26735091712,
+     "volume_total_bytes": 127355359232,
+     "volume_used_percent": 79.00748592503487,
+     "wal_bytes": 4953029
+    },
+    "errors": {
+     "http_server_errors_since_start": 19,
+     "sql_errors_since_start": 19,
+     "wal_sync_failures": null,
+     "wal_write_errors": 0
+    },
+    "instance": {
+     "coordinator_state": "alive",
+     "healthy": "healthy",
+     "id": "9b23764a-48cd-43f5-ab73-eb38421393c7",
+     "lock_state": "held",
+     "name": "recon",
+     "readiness": "ready",
+     "uptime_seconds": 12.4644056
+    },
+    "latency": {
+     "query_p50_ms": 1.1689,
+     "query_p95_ms": 1.3290000000000002,
+     "query_p99_ms": 1.5411
+    },
+    "latency_of_response_ms": 0.0209,
+    "limits": {
+     "rate_limited_since_start": 0,
+     "sessions_rejected_since_start": 0,
+     "sql_resource_limit_hits": 0,
+     "wal_backpressure_rejections": 0
+    },
+    "memory": {
+     "peak_rss_bytes": 16293888,
+     "rss_bytes": 14991360,
+     "system_total_bytes": 17060876288,
+     "system_used_bytes": 7975784448,
+     "system_used_percent": 46.74897299155658
+    },
+    "process": {
+     "read_mb_per_sec": 4.667760703216365,
+     "read_ops_per_sec": 1125.4758999547037,
+     "write_mb_per_sec": 0.0,
+     "write_ops_per_sec": 0.0
+    },
+    "sample_freshness": {
+     "age_ms": 447,
+     "last_sample_ms": 1791699409250,
+     "stale": false,
+     "state": "running",
+     "tick_ms": 1000
+    },
+    "sample_generation": 13,
+    "security": {
+     "admin_actions_since_start": 0,
+     "auth_failures_since_start": 0,
+     "forbidden_since_start": 0,
+     "last_admin_action": null
+    },
+    "storage_state": "Healthy",
+    "throughput": {
+     "active_connections": 1,
+     "active_queries": 1,
+     "active_sessions": 0,
+     "active_transactions": 0,
+     "http_requests_per_sec": 124.8327142555393,
+     "sql_queries_per_sec": 124.8327142555393,
+     "write_commits_per_sec": 0.0
+    },
+    "timestamp_unix_ms": 1791699409697,
+    "wal": {
+     "bytes": 4953029,
+     "segment_count": 2,
+     "state": "Running"
+    }
+   }
+  },
+  "/v1/admin/status": {
+   "status": 200,
+   "body": {
+    "background": {
+     "backup_running": false,
+     "check_running": false,
+     "last_check": null,
+     "maintenance_running": false
+    },
+    "backups": {
+     "configured": true,
+     "failed_total": 0,
+     "last": null,
+     "ok_total": 0,
+     "running": false
+    },
+    "compaction": {
+     "auto_trigger_enabled": true,
+     "blocked": false,
+     "consecutive_failures": 0,
+     "cycles_completed": 0,
+     "duration_max_ms": 0.0,
+     "failures_total": 0,
+     "input_bytes_total": 0,
+     "last_cycle_ms": null,
+     "last_failure": null,
+     "live_sstable_count": 2,
+     "output_bytes_total": 0,
+     "state": "idle",
+     "tombstones_dropped_total": 0,
+     "trigger_count": 4
+    },
+    "disk": {
+     "data_dir_bytes": 13014070,
+     "manifest_bytes": 148,
+     "sstable_bytes": 8060777,
+     "volume_free_bytes": 26735091712,
+     "wal_bytes": 4953085
+    },
+    "instance": {
+     "id": "9b23764a-48cd-43f5-ab73-eb38421393c7",
+     "name": "recon",
+     "uptime_secs": 12.4875625,
+     "version": "0.1.0"
+    },
+    "queries": {
+     "active_http_requests": 1,
+     "authorization_denials": 0,
+     "bind_errors": 0,
+     "cancellations": 0,
+     "errors": 21,
+     "latency_ms": {
+      "max": 66.2229,
+      "p50": 1.1624,
+      "p95": 1.3311,
+      "p99": 1.5673
+     },
+     "parse_errors": 0,
+     "requests": 1103,
+     "rows_affected": 1,
+     "rows_returned": 1081,
+     "success": 1082,
+     "timeouts": 0
+    },
+    "reads": {
+     "blocks_read": 13477,
+     "bloom_negatives": 3778,
+     "hits": 55760,
+     "misses": 4,
+     "requests": 7733
+    },
+    "recovery": {
+     "duration_ms": 62.8308,
+     "manifest_edits_replayed": 4,
+     "wal_records_applied": 28,
+     "wal_records_visited": 113
+    },
+    "resources": {
+     "cpu_seconds": 1.46875,
+     "handles": 114,
+     "rss_bytes": 15302656,
+     "threads": 19
+    },
+    "sessions": {
+     "active_transactions": 0
+    },
+    "storage": {
+     "capacity_pressure_events": 0,
+     "checkpoint_seq": 175,
+     "manifest_bytes": 148,
+     "manifest_records": 4,
+     "memtable_active_bytes": 1377658,
+     "memtable_active_entries": 5601,
+     "memtable_immutable_bytes": 0,
+     "memtable_immutable_count": 0,
+     "oldest_live_snapshot_seq": null,
+     "sstable_count": 2,
+     "state": "Healthy",
+     "storage_pressure_events": 0
+    },
+    "wal": {
+     "avg_batch_bytes": 56.0,
+     "avg_batch_processing_ms": 58.0247,
+     "avg_batch_records": 1.0,
+     "completed_err": 0,
+     "completed_ok": 1,
+     "coordinator_alive": true,
+     "durable_through": 205,
+     "highest_sequence": 205,
+     "max_batch_records": 1,
+     "pending_waiters": 0,
+     "poisoned": false,
+     "pool_state": "Running",
+     "queue_capacity": 4096,
+     "queue_depth": 0,
+     "queued_bytes": 0,
+     "rejected_backpressure": 0,
+     "segment_rotations": 0,
+     "submitted": 1,
+     "sync_attempts": 1,
+     "sync_failures": null,
+     "writes_timed_out": 0
+    }
+   }
+  },
+  "/v1/compaction/status": {
+   "status": 200,
+   "body": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 2,
+    "cycles_completed": 0,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   }
+  },
+  "/v1/instance": {
+   "status": 200,
+   "body": {
+    "instance_id": "9b23764a-48cd-43f5-ab73-eb38421393c7",
+    "name": "recon"
+   }
+  }
+ },
+ "endpoint_diff_after_queries": [
+  [
+   "//v1/admin/status/body/disk/data_dir_bytes",
+   "13014014",
+   "13014070"
+  ],
+  [
+   "//v1/admin/status/body/disk/wal_bytes",
+   "4953029",
+   "4953085"
+  ],
+  [
+   "//v1/admin/status/body/instance/uptime_secs",
+   "0.4475442",
+   "12.4875625"
+  ],
+  [
+   "//v1/admin/status/body/queries/errors",
+   "0",
+   "21"
+  ],
+  [
+   "//v1/admin/status/body/queries/latency_ms",
+   "None",
+   "{'max': 66.2229, 'p50': 1.1624, 'p95': 1.3311, 'p99': 1.5673}"
+  ],
+  [
+   "//v1/admin/status/body/queries/requests",
+   "0",
+   "1103"
+  ],
+  [
+   "//v1/admin/status/body/queries/rows_affected",
+   "0",
+   "1"
+  ],
+  [
+   "//v1/admin/status/body/queries/rows_returned",
+   "0",
+   "1081"
+  ],
+  [
+   "//v1/admin/status/body/queries/success",
+   "0",
+   "1082"
+  ],
+  [
+   "//v1/admin/status/body/reads/blocks_read",
+   "4",
+   "13477"
+  ],
+  [
+   "//v1/admin/status/body/reads/bloom_negatives",
+   "0",
+   "3778"
+  ],
+  [
+   "//v1/admin/status/body/reads/hits",
+   "2",
+   "55760"
+  ],
+  [
+   "//v1/admin/status/body/reads/misses",
+   "0",
+   "4"
+  ],
+  [
+   "//v1/admin/status/body/reads/requests",
+   "2",
+   "7733"
+  ],
+  [
+   "//v1/admin/status/body/resources/cpu_seconds",
+   "0.109375",
+   "1.46875"
+  ],
+  [
+   "//v1/admin/status/body/resources/handles",
+   "112",
+   "114"
+  ],
+  [
+   "//v1/admin/status/body/resources/rss_bytes",
+   "13258752",
+   "15302656"
+  ],
+  [
+   "//v1/admin/status/body/storage/memtable_active_bytes",
+   "1377600",
+   "1377658"
+  ],
+  [
+   "//v1/admin/status/body/storage/memtable_active_entries",
+   "5600",
+   "5601"
+  ],
+  [
+   "//v1/admin/status/body/wal/avg_batch_bytes",
+   "0.0",
+   "56.0"
+  ],
+  [
+   "//v1/admin/status/body/wal/avg_batch_processing_ms",
+   "0.0",
+   "58.0247"
+  ],
+  [
+   "//v1/admin/status/body/wal/avg_batch_records",
+   "0.0",
+   "1.0"
+  ],
+  [
+   "//v1/admin/status/body/wal/completed_ok",
+   "0",
+   "1"
+  ],
+  [
+   "//v1/admin/status/body/wal/durable_through",
+   "204",
+   "205"
+  ],
+  [
+   "//v1/admin/status/body/wal/highest_sequence",
+   "204",
+   "205"
+  ],
+  [
+   "//v1/admin/status/body/wal/max_batch_records",
+   "0",
+   "1"
+  ],
+  [
+   "//v1/admin/status/body/wal/submitted",
+   "0",
+   "1"
+  ],
+  [
+   "//v1/admin/status/body/wal/sync_attempts",
+   "0",
+   "1"
+  ],
+  [
+   "//v1/metrics/system/body/cpu/peak_percent",
+   "None",
+   "1.9430574365042406"
+  ],
+  [
+   "//v1/metrics/system/body/cpu/process_percent",
+   "None",
+   "1.3545216390575012"
+  ],
+  [
+   "//v1/metrics/system/body/disk/sizes_age_ms",
+   "1",
+   "2007"
+  ],
+  [
+   "//v1/metrics/system/body/disk/volume_free_bytes",
+   "26735095808",
+   "26735091712"
+  ],
+  [
+   "//v1/metrics/system/body/disk/volume_used_percent",
+   "79.00748270883727",
+   "79.00748592503487"
+  ],
+  [
+   "//v1/metrics/system/body/errors/http_server_errors_since_start",
+   "0",
+   "19"
+  ],
+  [
+   "//v1/metrics/system/body/errors/sql_errors_since_start",
+   "0",
+   "19"
+  ],
+  [
+   "//v1/metrics/system/body/instance/uptime_seconds",
+   "0.4235773",
+   "12.4644056"
+  ],
+  [
+   "//v1/metrics/system/body/latency/query_p50_ms",
+   "None",
+   "1.1689"
+  ],
+  [
+   "//v1/metrics/system/body/latency/query_p95_ms",
+   "None",
+   "1.3290000000000002"
+  ],
+  [
+   "//v1/metrics/system/body/latency/query_p99_ms",
+   "None",
+   "1.5411"
+  ],
+  [
+   "//v1/metrics/system/body/latency_of_response_ms",
+   "0.0399",
+   "0.0209"
+  ]
+ ],
+ "stop": [
+  "graceful",
+  0
+ ],
+ "changed_files": [
+  "WAL_CLEAN_STOP",
+  "wal/wal-00000000000000000003.log"
+ ],
+ "damaged_sstable_unmodified": true,
+ "server_err": "rubixdb: SSTABLE DAMAGED: sstables/00000000000000000002.sst failed verification after 5724 of 17200 records; the rows stored in the damaged block cannot be read. Run `rubixdb check`, then restore a verified backup into a new instance.\n"
+}

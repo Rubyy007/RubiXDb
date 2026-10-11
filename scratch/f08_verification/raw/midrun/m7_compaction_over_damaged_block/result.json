@@ -1,0 +1,334 @@
+{
+ "scenario": "m7_compaction_over_damaged_block",
+ "mutation": "data block 478 of SSTable 1 bit flipped on a 3-table directory (ids 8603..8620)",
+ "opened": true,
+ "compaction_before": {
+  "auto_trigger_enabled": true,
+  "trigger_count": 4,
+  "live_sstable_count": 3,
+  "cycles_completed": 0,
+  "state": "idle",
+  "failures_total": 0,
+  "consecutive_failures": 0,
+  "blocked": false,
+  "last_failure": null
+ },
+ "compaction_samples": [
+  {
+   "t": 5,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "failing",
+    "failures_total": 2,
+    "consecutive_failures": 2,
+    "blocked": false,
+    "last_failure": {
+     "at_unix_ms": 1791706389002,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 10,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 15,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 20,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 25,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 30,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 35,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 40,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 45,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 50,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 55,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  },
+  {
+   "t": 60,
+   "status": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 4,
+    "cycles_completed": 0,
+    "state": "blocked",
+    "failures_total": 3,
+    "consecutive_failures": 3,
+    "blocked": true,
+    "last_failure": {
+     "at_unix_ms": 1791706394051,
+     "kind": "corruption",
+     "message": "corruption: block: checksum mismatch"
+    }
+   },
+   "sstables_on_disk": 4
+  }
+ ],
+ "metrics_compaction": {
+  "blocked": true,
+  "consecutive_failures": 3,
+  "cycles_since_start": 0,
+  "failures_total": 3,
+  "last_duration_ms": null,
+  "last_failure": {
+   "at_unix_ms": 1791706394051,
+   "kind": "corruption",
+   "message": "corruption: block: checksum mismatch"
+  },
+  "live_sstable_count": 4,
+  "running": false,
+  "state": "blocked"
+ },
+ "admin_compaction": {
+  "auto_trigger_enabled": true,
+  "blocked": true,
+  "consecutive_failures": 3,
+  "cycles_completed": 0,
+  "duration_max_ms": 0.0,
+  "failures_total": 3,
+  "input_bytes_total": 0,
+  "last_cycle_ms": null,
+  "last_failure": {
+   "at_unix_ms": 1791706394051,
+   "kind": "corruption",
+   "message": "corruption: block: checksum mismatch"
+  },
+  "live_sstable_count": 4,
+  "output_bytes_total": 0,
+  "state": "blocked",
+  "tombstones_dropped_total": 0,
+  "trigger_count": 4
+ },
+ "readyz": [
+  200,
+  {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "damaged"
+  }
+ ],
+ "status": {
+  "storage_state": "Healthy",
+  "storage_pressure_events": 0,
+  "sstable_count": 4,
+  "checkpoint_seq": 349,
+  "manifest_record_count": 8,
+  "manifest_size_bytes": 296,
+  "live_sstable_count": 4,
+  "capacity_pressure_events": 0,
+  "uptime_secs": 64.909778,
+  "sstable_integrity": {
+   "state": "damaged",
+   "tables_total": 3,
+   "tables_verified": 3,
+   "bytes_verified": 10074328,
+   "damaged": [
+    {
+     "id": 1,
+     "path": "sstables/00000000000000000001.sst",
+     "records_before_failure": 8612,
+     "records_total": 17210
+    }
+   ]
+  }
+ },
+ "damaged_ids_after": {
+  "error": 18
+ },
+ "stop": [
+  "graceful",
+  0
+ ],
+ "server_err": "rubixdb: SSTABLE DAMAGED: sstables/00000000000000000001.sst failed verification after 8612 of 17210 records; the rows stored in the damaged block cannot be read. Run `rubixdb check`, then restore a verified backup into a new instance.\ncompaction: failed (attempt 1 of 3), will retry: corruption: block: checksum mismatch\ncompaction: failed (attempt 2 of 3), will retry: corruption: block: checksum mismatch\ncompaction: blocked after 3 consecutive permanent failures (corruption: block: checksum mismatch); restore the damaged table and restart\n",
+ "server_err_lines_compaction": [
+  "compaction: failed (attempt 1 of 3), will retry: corruption: block: checksum mismatch",
+  "compaction: failed (attempt 2 of 3), will retry: corruption: block: checksum mismatch",
+  "compaction: blocked after 3 consecutive permanent failures (corruption: block: checksum mismatch); restore the damaged table and restart"
+ ],
+ "sstables_after": [
+  "00000000000000000001.sst",
+  "00000000000000000002.sst",
+  "00000000000000000003.sst",
+  "00000000000000000004.sst"
+ ]
+}
