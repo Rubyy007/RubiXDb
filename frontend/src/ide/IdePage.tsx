@@ -86,8 +86,10 @@ export function IdePage() {
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("history");
-  const [rightOpen, setRightOpen] = useState(() => window.innerWidth > 1100);
-  const [leftOpen, setLeftOpen] = useState(() => window.innerWidth > 800);
+  // The app's own sidebar already takes 240px, so the IDE's rails open by default only when there is room
+  // for them beside a usable cell area; both stay one click (or Ctrl+B / Ctrl+J) away.
+  const [rightOpen, setRightOpen] = useState(() => window.innerWidth >= 1200);
+  const [leftOpen, setLeftOpen] = useState(() => window.innerWidth >= 1500);
   const [palette, setPalette] = useState<null | "commands" | "sheets">(null);
   const [help, setHelp] = useState(false);
   const [flashMsg, setFlashMsg] = useState("");
@@ -97,6 +99,15 @@ export function IdePage() {
   const pendingFocus = useRef<string | null>(null);
   const dragTab = useRef<string | null>(null);
   const flashTimer = useRef<number | undefined>(undefined);
+
+  // Shrinking the window to phone width closes the left rail (it would otherwise cover the cells).
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth < 800) setLeftOpen(false);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   // ---- runner ------------------------------------------------------------------------------------
   const runnerRef = useRef<Runner | null>(null);
