@@ -3,6 +3,7 @@ import { Icon } from "../components/Icon";
 import { SqlEditor } from "../components/console/SqlEditor";
 import { OverflowMenu } from "../components/console/OverflowMenu";
 import { renderMarkdown } from "./markdown";
+import { cellPosition, hasSql } from "./sqlSplit";
 import { applyCompletion, completionContext, filterItems, resolveBase, type CompletionContext } from "./completion";
 import { editorId, useIde } from "./ideContext";
 import { formatAge, formatMs } from "./format";
@@ -75,7 +76,10 @@ function jumpTarget(detail: string | undefined): { line: number; col: number } |
 
 function ErrorPane({ cellId, error, ms }: { cellId: string; error: RunError; ms?: number }) {
   const ide = useIde();
-  const target = jumpTarget(error.detail);
+  const rel = jumpTarget(error.detail);
+  // The server reports the position inside the one statement it received; map it back to the cell.
+  const target = rel ? (error.statement ? cellPosition(error.statement, rel.line, rel.col) : rel) : null;
+  const st = error.statement;
   return (
     <div className="ide-error" role="alert" data-code={error.code}>
       <div className="ide-error-head">
@@ -83,6 +87,12 @@ function ErrorPane({ cellId, error, ms }: { cellId: string; error: RunError; ms?
         <strong>{error.message}</strong>
         {error.code === "CANCELLED" && <span className="ide-stamp">cancelled</span>}
       </div>
+      {st && st.count > 1 && (
+        <div className="ide-error-detail">
+          Statement {st.index + 1} of {st.count} failed
+          {st.index + 1 < st.count ? `; the ${st.count - st.index - 1} after it did not run` : ""}.
+        </div>
+      )}
       {error.detail && <div className="ide-error-detail">{error.detail}</div>}
       <div className="ide-error-meta text-mono">
         {error.http !== undefined ? `HTTP ${error.http}` : "no HTTP response"}
@@ -113,7 +123,7 @@ function SqlCell({ cell, txnId }: { cell: IdeCell; txnId: string | null }) {
   const seq = useRef(0);
 
   const needsSession = txnId !== null && !session;
-  const canRun = cell.text.trim() !== "" && !active && !needsSession;
+  const canRun = hasSql(cell.text) && !active && !needsSession;
   const runTitle = needsSession ? "Begin the transaction first" : "Run cell (Ctrl+Enter)";
 
   const { catalog, fetchColumns } = ide;
@@ -305,7 +315,8 @@ function SqlCell({ cell, txnId }: { cell: IdeCell; txnId: string | null }) {
       )}
       {status === "running" && (
         <div className="ide-notice" role="status">
-          <span className="ide-spinner" aria-hidden="true" /> Request in flight · {formatMs(elapsed)} · no response yet
+          <span className="ide-spinner" aria-hidden="true" /> Request in flight
+          {run?.statementCount && run.statementCount > 1 ? ` · statement ${(run.current ?? 0) + 1} of ${run.statementCount}` : ""} · {formatMs(elapsed)} · no response yet
         </div>
       )}
       {blockedBy && (
@@ -396,7 +407,7 @@ function TxnView({ txn }: { txn: TxnBlock }) {
   const notice = ide.runs.notices[txn.id];
   const otherOpen = Object.keys(ide.runs.sessions).some((k) => k !== txn.id);
   const busy = !!session?.busyCell;
-  const hasSql = txn.cells.some((c) => c.text.trim() !== "");
+  const anySql = txn.cells.some((c) => hasSql(c.text));
   return (
     <section className="ide-txn" data-open={!!session} aria-label="Transaction">
       <header className="ide-txn-head">
@@ -416,7 +427,7 @@ function TxnView({ txn }: { txn: TxnBlock }) {
         <button type="button" className="btn btn-secondary" disabled={!!session || otherOpen} title={otherOpen ? "Another transaction is open in this tab" : "Start the transaction (BEGIN)"} onClick={() => ide.beginTxn(txn.id)}>
           Begin
         </button>
-        <button type="button" className="btn btn-secondary" disabled={!session || busy || !hasSql} onClick={() => ide.runSteps(txn.id)} title="Run the cells below in order, stopping at the first failure">
+        <button type="button" className="btn btn-secondary" disabled={!session || busy || !anySql} onClick={() => ide.runSteps(txn.id)} title="Run the cells below in order, stopping at the first failure">
           Run steps
         </button>
         <button type="button" className="btn btn-primary" disabled={!session || busy} onClick={() => ide.finishTxn(txn.id, "COMMIT")}>

@@ -47,6 +47,7 @@ import {
 } from "./model";
 import type { PaletteAction } from "./palette";
 import { RightPanel } from "./RightPanel";
+import { hasSql, splitStatements } from "./sqlSplit";
 import { Runner, implicitSessionKey, toRunError, type HistoryEntry } from "./runner";
 import "../styles/console.css";
 import "../styles/ide.css";
@@ -246,7 +247,7 @@ export function IdePage() {
   const topKey = implicitSessionKey(sheet.id);
 
   async function runTop(items: { cellId: string; sheetId: string; sql: string }[]) {
-    const todo = items.filter((i) => i.sql.trim() !== "");
+    const todo = items.filter((i) => hasSql(i.sql));
     if (todo.length === 0) return;
     if (state.autocommit) {
       for (const it of todo) void runner.runAutocommit(it);
@@ -262,7 +263,7 @@ export function IdePage() {
     if (!f || f.cell.kind !== "sql") return;
     const item = { cellId, sheetId: sheet.id, sql: f.cell.text };
     if (f.txnId) {
-      if (item.sql.trim() === "") return;
+      if (!hasSql(item.sql)) return;
       void runner.runInSession({ ...item, sessionKey: f.txnId }).then((r) => {
         if (r.outcome === "no-session") flash("Begin the transaction before running its cells.");
       });
@@ -276,7 +277,7 @@ export function IdePage() {
 
   function runAll() {
     const items = topCells();
-    if (items.every((i) => i.sql.trim() === "")) {
+    if (items.every((i) => !hasSql(i.sql))) {
       flash("No SQL to run outside transaction containers.");
       return;
     }
@@ -310,8 +311,10 @@ export function IdePage() {
     const c = clientRef.current;
     if (!f || f.cell.kind !== "sql" || !c) return;
     const text = f.cell.text;
-    const body = text.trim().replace(/;\s*$/, "");
-    if (body === "") return;
+    const stmts = splitStatements(text);
+    if (stmts.length === 0) return;
+    // EXPLAIN takes one statement; for a script it explains the last one.
+    const body = stmts[stmts.length - 1].text;
     const stmt = /^explain\b/i.test(body) ? body : `EXPLAIN ${body}`;
     setPlans((p) => ({ ...p, [cellId]: { sql: text, status: "loading" } }));
     c.sql({ sql: stmt })

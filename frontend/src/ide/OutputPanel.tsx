@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { SqlColumnMeta } from "../api/types";
 import { ResultsGrid } from "../components/console/ResultsGrid";
 import { toCsv } from "../utils/csv";
+import { queryTitle } from "../utils/sessionActivity";
 import { BarChart } from "./BarChart";
 import { formatMs } from "./format";
 import { chartOf, guessTable, profileRows, scalarOf, toInserts, toJson } from "./exports";
@@ -43,7 +44,13 @@ export function OutputPanel({ cell, run }: { cell: IdeCell; run: CellRun }) {
   const [showProfile, setShowProfile] = useState(false);
   const [note, setNote] = useState("");
 
-  const result = run.response?.result;
+  // A cell with several statements keeps one outcome per statement; show the chosen one (the last by default).
+  const parts = run.parts ?? [];
+  const [sel, setSel] = useState<number | null>(null);
+  const idx = sel !== null && sel < parts.length ? sel : parts.length - 1;
+  const part = idx >= 0 ? parts[idx] : undefined;
+  const ms = part ? part.ms : run.ms;
+  const result = part?.response?.result ?? run.response?.result;
   const rows = result && result.kind === "rows" ? result : null;
   const plan = ide.plans[cell.id];
 
@@ -64,7 +71,7 @@ export function OutputPanel({ cell, run }: { cell: IdeCell; run: CellRun }) {
       : result.kind === "write"
         ? `${result.statement} · ${result.rows_affected} affected`
         : result.kind;
-  const label = `Results (${summary}${run.ms !== undefined ? ` · ${formatMs(run.ms)}` : ""})`;
+  const label = `Results (${summary}${ms !== undefined ? ` · ${formatMs(ms)}` : ""})`;
   const tabs: { id: Tab; label: string }[] = [
     { id: "results", label },
     { id: "details", label: "Query details" },
@@ -89,6 +96,25 @@ export function OutputPanel({ cell, run }: { cell: IdeCell; run: CellRun }) {
 
   return (
     <div className="ide-out">
+      {parts.length > 1 && (
+        <div className="ide-stmts" role="group" aria-label="Statements in this cell">
+          {parts.map((pt, i) => (
+            <button
+              key={pt.index}
+              type="button"
+              className="ide-stmt"
+              aria-pressed={i === idx}
+              data-status={pt.status}
+              title={pt.text}
+              onClick={() => setSel(i)}
+            >
+              <span className="ide-stmt-n">{pt.index + 1}</span>
+              <span className="ide-stmt-sql text-mono">{queryTitle(pt.text, 36)}</span>
+              <span className="ide-stmt-ms text-mono">{formatMs(pt.ms)}</span>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="ide-out-tabs" role="tablist" aria-label={`Cell ${ide.flat.find((f) => f.cell.id === cell.id)?.num ?? ""} output`}>
         {tabs.map((t) => (
           <button
@@ -106,7 +132,7 @@ export function OutputPanel({ cell, run }: { cell: IdeCell; run: CellRun }) {
 
       {tab === "results" && (
         <div className="ide-out-body">
-          <ResultBody result={result} ms={run.ms} page={page} pageSize={pageSize} setPage={setPage} setPageSize={(n) => { setPageSize(n); setPage(0); }} />
+          <ResultBody result={result} ms={ms} page={page} pageSize={pageSize} setPage={setPage} setPageSize={(n) => { setPageSize(n); setPage(0); }} />
           {rows && (
             <>
               <div className="ide-out-actions">
@@ -154,9 +180,19 @@ export function OutputPanel({ cell, run }: { cell: IdeCell; run: CellRun }) {
               </>
             )}
             <dt>Round-trip time</dt>
-            <dd>{run.ms !== undefined ? `${formatMs(run.ms)} (measured in this browser)` : "—"}</dd>
+            <dd>{ms !== undefined ? `${formatMs(ms)} (measured in this browser)` : "—"}</dd>
             <dt>Statement class</dt>
             <dd>{result.kind === "write" ? result.statement : result.kind}</dd>
+            {parts.length > 1 && (
+              <>
+                <dt>Statements</dt>
+                <dd>
+                  Showing {idx + 1} of {run.statementCount ?? parts.length}. They ran in order, one request each.
+                </dd>
+                <dt>Whole cell</dt>
+                <dd>{run.ms !== undefined ? formatMs(run.ms) : "—"} browser round trips combined</dd>
+              </>
+            )}
             <dt>Session</dt>
             <dd className="text-mono">{run.sessionId ?? "none (autocommit)"}</dd>
             <dt>Snapshot</dt>
@@ -198,7 +234,7 @@ export function OutputPanel({ cell, run }: { cell: IdeCell; run: CellRun }) {
             <dt>Error detail</dt>
             <dd>None. The statement succeeded.</dd>
             <dt>Timing</dt>
-            <dd>Browser round trip {run.ms !== undefined ? formatMs(run.ms) : "—"}. The API reports no server-side breakdown.</dd>
+            <dd>Browser round trip {ms !== undefined ? formatMs(ms) : "—"}. The API reports no server-side breakdown.</dd>
             <dt>Started</dt>
             <dd>{run.startedAt ? new Date(run.startedAt).toLocaleTimeString() : "—"}</dd>
           </dl>

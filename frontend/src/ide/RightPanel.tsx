@@ -1,11 +1,36 @@
 import { useMemo, useState } from "react";
 import { useAuthzQuery, useIndexesQuery, useObservedQueriesQuery, useObservedSessionsQuery, useTableDescriptionQuery } from "../api/queries";
 import { Icon, type IconName } from "../components/Icon";
-import { queryTitle } from "../utils/sessionActivity";
 import { formatAge, formatMs } from "./format";
 import { guessTable } from "./exports";
 import { useIde, type RightTab } from "./ideContext";
 import { PlanTree } from "./PlanTree";
+
+/** Time of day, with the date when it is not today, so an entry is never ambiguous. */
+function stamp(ms: number): string {
+  const d = new Date(ms);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  return sameDay ? d.toLocaleTimeString() : d.toLocaleString();
+}
+
+/** A statement exactly as it was sent: whitespace and line breaks kept, long text folded behind a toggle. */
+function SqlBlock({ sql }: { sql: string }) {
+  const [open, setOpen] = useState(false);
+  const long = sql.split("\n").length > 3 || sql.length > 200;
+  return (
+    <div className="ide-sqlblock">
+      <pre className="text-mono" data-open={open || !long} aria-label="Statement text">
+        {sql}
+      </pre>
+      {long && (
+        <button type="button" className="ide-link ide-small" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+          {open ? "Show less" : "Show full statement"}
+        </button>
+      )}
+    </div>
+  );
+}
 
 const TABS: { id: RightTab; label: string; icon: IconName }[] = [
   { id: "sessions", label: "Sessions", icon: "link" },
@@ -170,12 +195,13 @@ function RunningTab() {
       {rows.map((r) => (
         <div key={r.cellId} className="ide-card" data-testid="running-row">
           <div className="ide-card-row">
-            <span className="ide-badge is-open">{label(r.cellId, r.sheetId)}</span>
+            <span className="ide-badge is-open">
+              {label(r.cellId, r.sheetId)}
+              {r.count > 1 ? ` · statement ${r.index + 1}/${r.count}` : ""}
+            </span>
             <span className="ide-spinner" aria-hidden="true" />
           </div>
-          <div className="text-mono ide-preview" title={r.sql}>
-            {queryTitle(r.sql, 60)}
-          </div>
+          <SqlBlock sql={r.sql} />
           <div className="ide-card-row">
             <span className="text-mono ide-small">elapsed {formatMs(Math.max(0, ide.now - r.startedAt))}</span>
             <button type="button" className="btn btn-danger" onClick={() => ide.cancel(r.cellId)} aria-label={`Cancel ${label(r.cellId, r.sheetId)}`}>
@@ -236,21 +262,30 @@ function HistoryTab() {
       <h3 className="ide-panel-h">This browser session ({local.length})</h3>
       {local.length === 0 && <p className="text-muted">No query history yet.</p>}
       <ul className="ide-histlist">
-        {local.map((h, i) => {
+        {local.map((h) => {
           const n = cellNum(h.cellId, h.sheetId);
+          const where = n ? `cell #${n}` : h.cellId.startsWith("c-") ? "other worksheet" : "transaction";
           return (
-            <li key={`${h.at}-${i}`} className="ide-card" data-testid="history-row">
+            <li key={h.seq} className="ide-card" data-testid="history-row">
               <div className="ide-card-row">
-                <span className="text-mono ide-small">{new Date(h.at).toLocaleTimeString()}</span>
-                <span className="ide-small">{n ? `cell #${n}` : h.cellId.startsWith("c-") ? "other worksheet" : "transaction"}</span>
+                <span className="text-mono ide-small" title={new Date(h.at).toLocaleString()}>
+                  {stamp(h.at)}
+                </span>
+                <span className="ide-small">
+                  {where}
+                  {h.count > 1 ? ` · statement ${h.index}/${h.count}` : ""}
+                </span>
                 <span className={`ide-badge ${h.ok ? "is-ok" : "is-bad"}`}>{h.ok ? "success" : (h.code ?? "failed")}</span>
               </div>
-              <button type="button" className="ide-preview text-mono ide-loadsql" title="Load into the focused cell" onClick={() => ide.loadHistorySql(h.sql)}>
-                {queryTitle(h.sql, 60)}
-              </button>
-              <div className="text-mono ide-small">
-                {formatMs(h.ms)}
-                {h.rows !== null ? ` · ${h.rows.toLocaleString()} row${h.rows === 1 ? "" : "s"}` : ""}
+              <SqlBlock sql={h.sql} />
+              <div className="ide-card-row">
+                <span className="text-mono ide-small">
+                  {formatMs(h.ms)}
+                  {h.rows !== null ? ` · ${h.rows.toLocaleString()} row${h.rows === 1 ? "" : "s"}` : ""}
+                </span>
+                <button type="button" className="ide-link ide-small" onClick={() => ide.loadHistorySql(h.sql)}>
+                  Load into cell
+                </button>
               </div>
             </li>
           );

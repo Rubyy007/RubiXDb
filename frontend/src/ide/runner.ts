@@ -1,5 +1,6 @@
 import type { SqlRequestBody, SqlResponseBody } from "../api/types";
 import { ApiRequestError } from "../api/types";
+import { splitStatements, type SqlStatement } from "./sqlSplit";
 
 /** Runs the IDE's cells against `POST /v1/sql`.
  *
@@ -20,6 +21,22 @@ export interface RunError {
   detail?: string;
   /** HTTP status when the API answered; absent for a client-side failure. */
   http?: number;
+  /** Which statement of a multi-statement cell failed (set by the runner). */
+  statement?: { index: number; count: number; text: string; startLine: number; startCol: number };
+}
+
+/** The outcome of one statement of a cell. A cell with several `;`-separated statements runs them in
+ * order, one request each, and stops at the first failure. */
+export interface StmtRun {
+  index: number;
+  text: string;
+  startLine: number;
+  startCol: number;
+  status: "success" | "error" | "cancelled";
+  response?: SqlResponseBody;
+  error?: RunError;
+  /** Browser-measured round trip of this statement. */
+  ms: number;
 }
 
 export interface CellRun {
@@ -35,6 +52,12 @@ export interface CellRun {
   blockedBy?: { sessionId: string; cellId: string };
   /** The session a cell ran in, for the details tab. */
   sessionId?: string | null;
+  /** One entry per statement that has finished so far. */
+  parts?: StmtRun[];
+  /** Number of statements in the cell text when it was run. */
+  statementCount?: number;
+  /** Index of the statement being executed while status is running. */
+  current?: number;
 }
 
 export interface SessionInfo {
@@ -47,12 +70,21 @@ export interface SessionInfo {
 export interface InFlight {
   cellId: string;
   sheetId: string;
+  /** The statement being executed right now (exactly as sent), not the whole cell. */
   sql: string;
   startedAt: number;
   sessionKey: string | null;
+  /** Position of that statement in the cell (0-based) and how many the cell has. */
+  index: number;
+  count: number;
 }
 
 export interface HistoryEntry {
+  /** Increasing sequence number, unique within this tab. */
+  seq: number;
+  /** Position of the statement in its cell (1-based) and how many the cell had. */
+  index: number;
+  count: number;
   at: number;
   sheetId: string;
   cellId: string;
@@ -113,6 +145,7 @@ export class Runner {
   private readonly controllers = new Map<string, AbortController>();
   private readonly queue: Job[] = [];
   private activeAuto = 0;
+  private seq = 0;
   private readonly send: Send;
   private readonly max: number;
   private readonly now: () => number;
@@ -165,7 +198,7 @@ export class Runner {
   // ---- autocommit ----------------------------------------------------------------------------
 
   runAutocommit(req: { cellId: string; sheetId: string; sql: string }): Promise<CellRun | null> {
-    if (req.sql.trim() === "" || this.isActive(req.cellId)) return Promise.resolve(null);
+    if (splitStatements(req.sql).length === 0 || this.isActive(req.cellId)) return Promise.resolve(null);
     return new Promise((resolve) => {
       this.queue.push({ ...req, resolve });
       this.setRun(req.cellId, { status: "queued", sql: req.sql });
@@ -229,11 +262,11 @@ export class Runner {
     const t0 = this.perf();
     try {
       const res = await this.send(sessionId ? { sql, session_id: sessionId } : { sql }, controller.signal);
-      this.history(sheetId, key, sql, true, null, this.perf() - t0, null);
+      this.history(sheetId, key, sql, true, null, this.perf() - t0, null, 1, 1);
       return res;
     } catch (err) {
       const e = toRunError(err);
-      this.history(sheetId, key, sql, false, e.code, this.perf() - t0, null);
+      this.history(sheetId, key, sql, false, e.code, this.perf() - t0, null, 1, 1);
       if (e.code === "SESSION_NOT_FOUND") this.setSession(key, null);
       this.setNotice(key, `${e.code}: ${e.message}${e.detail ? ` (${e.detail})` : ""}`);
       return null;
@@ -248,7 +281,7 @@ export class Runner {
   }): Promise<{ outcome: "done" | "blocked" | "no-session" | "ignored"; run?: CellRun }> {
     const s = this.st.sessions[req.sessionKey];
     if (!s) return { outcome: "no-session" };
-    if (req.sql.trim() === "" || this.isActive(req.cellId)) return { outcome: "ignored" };
+    if (splitStatements(req.sql).length === 0 || this.isActive(req.cellId)) return { outcome: "ignored" };
     if (s.busyCell && s.busyCell !== req.cellId) {
       const prev = this.st.runs[req.cellId];
       this.setRun(req.cellId, {
@@ -272,7 +305,7 @@ export class Runner {
     sessionKey: string,
   ): Promise<void> {
     for (const it of items) {
-      if (it.sql.trim() === "") continue;
+      if (splitStatements(it.sql).length === 0) continue;
       const r = await this.runInSession({ ...it, sessionKey });
       if (r.outcome !== "done" || r.run?.status !== "success") return;
     }
@@ -285,64 +318,113 @@ export class Runner {
     this.controllers.set(job.cellId, controller);
     const session = sessionKey ? this.st.sessions[sessionKey] : undefined;
     const sessionId = session ? session.sessionId : null;
+    const statements = splitStatements(job.sql);
     const startedAt = this.now();
     const t0 = this.perf();
-    this.set({
-      inFlight: [...this.st.inFlight, { cellId: job.cellId, sheetId: job.sheetId, sql: job.sql, startedAt, sessionKey }],
-    });
-    this.setRun(job.cellId, { status: "running", sql: job.sql, startedAt, sessionId });
-    let run: CellRun;
-    try {
-      const req: SqlRequestBody = sessionId ? { sql: job.sql, session_id: sessionId } : { sql: job.sql };
-      const response = await this.send(req, controller.signal);
-      const ms = this.perf() - t0;
-      run = { status: "success", sql: job.sql, response, startedAt, ms, sessionId: response.session_id ?? sessionId };
-      const r = response.result;
-      const rows = r.kind === "rows" ? r.row_count : r.kind === "write" ? r.rows_affected : null;
-      this.history(job.sheetId, job.cellId, job.sql, true, null, ms, rows);
-      this.afterSuccess(job, sessionKey, response);
-    } catch (err) {
-      const ms = this.perf() - t0;
-      const error = toRunError(err);
-      const cancelled = controller.signal.aborted;
-      run = {
-        status: cancelled ? "cancelled" : "error",
-        sql: job.sql,
-        error: cancelled ? { code: "CANCELLED", message: "the request was cancelled" } : error,
-        startedAt,
-        ms,
-        sessionId,
-      };
-      this.history(job.sheetId, job.cellId, job.sql, false, run.error?.code ?? null, ms, null);
-      if (sessionKey && error.code === "SESSION_NOT_FOUND") {
-        this.setSession(sessionKey, null);
-        this.setNotice(sessionKey, "The server no longer knows this session (it expired or ended).");
+    const parts: StmtRun[] = [];
+    // A script such as BEGIN; ...; COMMIT; carries the session from one statement to the next.
+    let sid: string | null = sessionId;
+    let failure: RunError | undefined;
+    let cancelled = false;
+
+    for (let i = 0; i < statements.length; i++) {
+      if (controller.signal.aborted) {
+        cancelled = true;
+        break;
       }
-    } finally {
-      this.controllers.delete(job.cellId);
+      const stmt = statements[i];
+      this.markCurrent(job, sessionKey, stmt, i, statements.length, startedAt, sessionId, parts);
+      const t1 = this.perf();
+      try {
+        const req: SqlRequestBody = sid ? { sql: stmt.text, session_id: sid } : { sql: stmt.text };
+        const response = await this.send(req, controller.signal);
+        const ms = this.perf() - t1;
+        sid = response.session_id;
+        parts.push({ index: i, text: stmt.text, startLine: stmt.startLine, startCol: stmt.startCol, status: "success", response, ms });
+        const r = response.result;
+        const rows = r.kind === "rows" ? r.row_count : r.kind === "write" ? r.rows_affected : null;
+        this.history(job.sheetId, job.cellId, stmt.text, true, null, ms, rows, i + 1, statements.length);
+      } catch (err) {
+        const ms = this.perf() - t1;
+        const aborted = controller.signal.aborted;
+        const base = aborted ? { code: "CANCELLED", message: "the request was cancelled" } : toRunError(err);
+        const error: RunError = {
+          ...base,
+          statement: { index: i, count: statements.length, text: stmt.text, startLine: stmt.startLine, startCol: stmt.startCol },
+        };
+        parts.push({ index: i, text: stmt.text, startLine: stmt.startLine, startCol: stmt.startCol, status: aborted ? "cancelled" : "error", error, ms });
+        this.history(job.sheetId, job.cellId, stmt.text, false, error.code, ms, null, i + 1, statements.length);
+        if (aborted) cancelled = true;
+        else failure = error;
+        if (sessionKey && error.code === "SESSION_NOT_FOUND") {
+          this.setSession(sessionKey, null);
+          this.setNotice(sessionKey, "The server no longer knows this session (it expired or ended).");
+          sid = null;
+        }
+        break;
+      }
     }
+    this.controllers.delete(job.cellId);
+
+    const last = parts[parts.length - 1];
+    const run: CellRun = {
+      status: cancelled ? "cancelled" : failure ? "error" : "success",
+      sql: job.sql,
+      response: !cancelled && !failure ? last?.response : undefined,
+      error: cancelled || failure ? last?.error : undefined,
+      startedAt,
+      ms: this.perf() - t0,
+      sessionId: sid ?? sessionId,
+      parts,
+      statementCount: statements.length,
+    };
+    this.afterRun(job, sessionKey, sid);
     this.releaseCell(job.cellId, sessionKey);
     this.setRun(job.cellId, run);
     return run;
   }
 
-  private afterSuccess(job: Job, sessionKey: string | null, response: SqlResponseBody): void {
+  private markCurrent(
+    job: Job,
+    sessionKey: string | null,
+    stmt: SqlStatement,
+    index: number,
+    count: number,
+    startedAt: number,
+    sessionId: string | null,
+    parts: StmtRun[],
+  ): void {
+    const entry: InFlight = { cellId: job.cellId, sheetId: job.sheetId, sql: stmt.text, startedAt, sessionKey, index, count };
+    this.set({ inFlight: [...this.st.inFlight.filter((f) => f.cellId !== job.cellId), entry] });
+    this.setRun(job.cellId, {
+      status: "running",
+      sql: job.sql,
+      startedAt,
+      sessionId,
+      parts: parts.slice(),
+      statementCount: count,
+      current: index,
+    });
+  }
+
+  /** What the session looks like once a cell's statements are done. */
+  private afterRun(job: Job, sessionKey: string | null, sid: string | null): void {
     if (sessionKey) {
-      // A COMMIT / ROLLBACK typed into a cell ends the session on the server.
-      if (response.session_id === null && this.st.sessions[sessionKey]) {
+      // A COMMIT or ROLLBACK in the cell text ended the session on the server.
+      if (sid === null && this.st.sessions[sessionKey]) {
         this.setSession(sessionKey, null);
-        this.setNotice(sessionKey, `Session ended by ${response.result.kind}.`);
+        this.setNotice(sessionKey, "The cell's COMMIT or ROLLBACK ended the session.");
       }
       return;
     }
-    if (response.session_id) {
-      // A BEGIN typed into an autocommit cell opened a session. Adopt it when this tab has none.
+    if (sid) {
+      // A BEGIN in an autocommit cell opened a session. Adopt it when this tab has none.
       const key = implicitSessionKey(job.sheetId);
       if (Object.keys(this.st.sessions).length === 0) {
-        this.setSession(key, { sessionId: response.session_id, startedAt: this.now(), busyCell: null });
+        this.setSession(key, { sessionId: sid, startedAt: this.now(), busyCell: null });
         this.setNotice(key, "A transaction opened by a cell is now this worksheet's open transaction.");
       } else {
-        this.setNotice(key, `That statement opened session ${response.session_id}, which this tab cannot manage; it expires on the server's idle timeout.`);
+        this.setNotice(key, `That statement opened session ${sid}, which this tab cannot manage; it expires on the server's idle timeout.`);
       }
     }
   }
@@ -369,8 +451,18 @@ export class Runner {
     this.set(patch);
   }
 
-  private history(sheetId: string, cellId: string, sql: string, ok: boolean, code: string | null, ms: number, rows: number | null): void {
-    this.onHistory?.({ at: this.now(), sheetId, cellId, sql, ok, code, ms, rows });
+  private history(
+    sheetId: string,
+    cellId: string,
+    sql: string,
+    ok: boolean,
+    code: string | null,
+    ms: number,
+    rows: number | null,
+    index: number,
+    count: number,
+  ): void {
+    this.onHistory?.({ seq: ++this.seq, index, count, at: this.now(), sheetId, cellId, sql, ok, code, ms, rows });
   }
 
   // ---- cancel / reset ------------------------------------------------------------------------

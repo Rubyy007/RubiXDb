@@ -172,7 +172,13 @@ describe("runner: autocommit", () => {
     calls[0].fail(new ApiRequestError(400, { error: { code: "PARSE_ERROR", message: "the SQL text could not be parsed", detail: "expected FROM" } }));
     const run = await p;
     expect(run?.status).toBe("error");
-    expect(run?.error).toEqual({ code: "PARSE_ERROR", message: "the SQL text could not be parsed", detail: "expected FROM", http: 400 });
+    expect(run?.error).toEqual({
+      code: "PARSE_ERROR",
+      message: "the SQL text could not be parsed",
+      detail: "expected FROM",
+      http: 400,
+      statement: { index: 0, count: 1, text: "SELEC", startLine: 1, startCol: 1 },
+    });
   });
 
   it("cancel aborts a running request and drops a queued one", async () => {
