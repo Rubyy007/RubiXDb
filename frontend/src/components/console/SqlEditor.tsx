@@ -21,12 +21,33 @@ interface SqlEditorProps {
   onHeightChange: (h: number) => void;
   /** Rendered at the left of the footer (the autocommit / transaction pill). */
   footerLeft: ReactNode;
+  /** DOM id of the textarea (default "sql-editor"). The SQL IDE renders many editors, so each needs its own. */
+  id?: string;
+  /** Accessible name of the textarea (default "SQL"). */
+  ariaLabel?: string;
+  readOnly?: boolean;
+  /** Runs before the built-in keys; return true to mark the event handled. */
+  onKeyExtra?: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
+  /** Called with the caret offset whenever it may have moved. */
+  onCursor?: (offset: number, value: string) => void;
 }
 
 /** Plain <textarea> (the real, accessible input, labelled "SQL") on top of a
  * highlight layer. The layer draws tokens as React text nodes -- never HTML.
  * No editor dependency. */
-export function SqlEditor({ value, onChange, onRun, height, onHeightChange, footerLeft }: SqlEditorProps) {
+export function SqlEditor({
+  value,
+  onChange,
+  onRun,
+  height,
+  onHeightChange,
+  footerLeft,
+  id = "sql-editor",
+  ariaLabel = "SQL",
+  readOnly = false,
+  onKeyExtra,
+  onCursor,
+}: SqlEditorProps) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const hlRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
@@ -41,7 +62,8 @@ export function SqlEditor({ value, onChange, onRun, height, onHeightChange, foot
     const ta = taRef.current;
     if (!ta) return;
     setCaret(caretPosition(ta.value, ta.selectionStart));
-  }, []);
+    onCursor?.(ta.selectionStart, ta.value);
+  }, [onCursor]);
 
   const syncScroll = useCallback(() => {
     const ta = taRef.current;
@@ -65,6 +87,7 @@ export function SqlEditor({ value, onChange, onRun, height, onHeightChange, foot
   }, [value, syncCaret]);
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (onKeyExtra?.(e)) return;
     const mod = e.ctrlKey || e.metaKey;
     if (mod && e.key === "Enter") {
       e.preventDefault();
@@ -123,11 +146,12 @@ export function SqlEditor({ value, onChange, onRun, height, onHeightChange, foot
               {"\n"}
             </code>
           </pre>
-          <label htmlFor="sql-editor" className="visually-hidden">
-            SQL
+          <label htmlFor={id} className="visually-hidden">
+            {ariaLabel}
           </label>
           <textarea
-            id="sql-editor"
+            id={id}
+            readOnly={readOnly}
             ref={taRef}
             className="sqled-input"
             value={value}
@@ -139,6 +163,7 @@ export function SqlEditor({ value, onChange, onRun, height, onHeightChange, foot
             onChange={(e) => {
               onChange(e.target.value);
               setCaret(caretPosition(e.target.value, e.target.selectionStart));
+              onCursor?.(e.target.selectionStart, e.target.value);
             }}
             onKeyDown={onKeyDown}
             onKeyUp={syncCaret}

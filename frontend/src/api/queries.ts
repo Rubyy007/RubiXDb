@@ -315,3 +315,57 @@ export function usePurgeOrphansMutation() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin"] }),
   });
 }
+
+// -----------------------------------------------------------------
+// SQL IDE -- read-only endpoints behind the right-hand context panel
+// and the instance chip. Polling is opt-in (`enabled`) so a closed
+// panel makes no requests.
+// -----------------------------------------------------------------
+
+export function useInstanceQuery() {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["ide", "instance"],
+    queryFn: () => client!.instance(),
+    enabled: client !== null,
+    staleTime: 60_000,
+  });
+}
+
+export function useObservedQueriesQuery(enabled: boolean) {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["ide", "observed-queries"],
+    queryFn: () => client!.observedQueries(200),
+    enabled: client !== null && enabled,
+    refetchInterval: enabled ? 5_000 : false,
+  });
+}
+
+export function useObservedSessionsQuery(enabled: boolean) {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["ide", "observed-sessions"],
+    queryFn: () => client!.observedSessions(),
+    enabled: client !== null && enabled,
+    refetchInterval: enabled ? 3_000 : false,
+  });
+}
+
+export function useTableDescriptionQuery(name: string | null) {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["sql", "table", name],
+    queryFn: () => client!.describeTable(name as string),
+    enabled: client !== null && name !== null,
+  });
+}
+
+export function useAuthzQuery(enabled: boolean) {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: ["sql", "authz"],
+    queryFn: () => client!.authz(),
+    enabled: client !== null && enabled,
+  });
+}

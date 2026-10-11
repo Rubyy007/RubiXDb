@@ -1,6 +1,7 @@
 import type {
   AdminStatusBody,
   ApiErrorBody,
+  AuthzBody,
   BackupCreated,
   BackupEntry,
   BackupVerified,
@@ -11,13 +12,16 @@ import type {
   DatabaseInfo,
   ExistsResponse,
   GetResponse,
+  InstanceBody,
   IndexInfo,
   MetadataBody,
   MetricsBody,
   RangeResponse,
+  QueriesBody,
   ReadyBody,
   SchemaInfo,
   SeqResponse,
+  SessionsBody,
   SnapshotBody,
   SqlRequestBody,
   SqlResponseBody,
@@ -226,6 +230,27 @@ export class ApiClient {
       `/v1/catalog/indexes/${indexId}`,
       { schema_name: schemaName, table_name: tableName, index_name: indexName },
     );
+  }
+
+  // ---- SQL IDE read-only endpoints ----
+
+  /** Unauthenticated identity probe; the IDE shows `name:port` in its instance chip. */
+  instance() {
+    return this.request<InstanceBody>("GET", "/v1/instance");
+  }
+
+  /** Recent statements as the server saw them (class, state, timing, counts; never SQL text). */
+  observedQueries(limit = 200) {
+    return this.request<QueriesBody>("GET", `/v1/observability/queries?limit=${limit}`);
+  }
+
+  /** Open SQL sessions (transactions) held by the server. */
+  observedSessions() {
+    return this.request<SessionsBody>("GET", "/v1/observability/sessions");
+  }
+
+  authz() {
+    return this.request<AuthzBody>("GET", "/v1/catalog/authz");
   }
 
   // ---- operator endpoints (admin role) ----

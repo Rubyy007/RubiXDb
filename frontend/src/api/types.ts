@@ -427,3 +427,62 @@ export interface PurgeResult {
   deleted: number;
   remaining: number;
 }
+
+// ---------------------------------------------------------------------
+// SQL IDE (`/v1/instance`, `/v1/observability/{queries,sessions}`,
+// `/v1/catalog/authz`). Mirrors `api/src/routes/{instance,observability,
+// catalog}.rs`. None of these carry SQL text or credentials.
+// ---------------------------------------------------------------------
+
+export interface InstanceBody {
+  instance_id: string | null;
+  name: string | null;
+}
+
+export interface ObservedQuery {
+  query_id: number;
+  statement_class: string;
+  state: string;
+  start_unix_ms: number;
+  duration_ms: number;
+  rows_affected: number | null;
+  rows_returned: number | null;
+  timeout_state: string;
+  cancellation_state: string;
+  error_class: string | null;
+}
+
+export interface QueriesBody {
+  queries: ObservedQuery[];
+  returned: number;
+  active: number;
+  untracked_active: number;
+  max_records: number;
+}
+
+export interface ObservedSession {
+  session_id: string;
+  state: string;
+  age_seconds: number;
+  transaction_state: string;
+  operation_class: string;
+  idle_seconds: number;
+  idle_timeout_remaining_seconds: number | null;
+  lifetime_remaining_seconds: number;
+  timeout_state: string;
+  cancellation_state: string;
+}
+
+export interface SessionsBody {
+  sessions: ObservedSession[];
+  returned: number;
+  total: number;
+  truncated: boolean;
+  max_records: number;
+}
+
+export interface AuthzBody {
+  principal: string;
+  role: Role;
+  explicit_grants: { object_kind: string; object_id: number; privilege: string }[];
+}

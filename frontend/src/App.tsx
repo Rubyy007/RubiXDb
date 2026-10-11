@@ -11,6 +11,7 @@ import { HealthPage } from "./pages/HealthPage";
 import { OperationsPage } from "./pages/OperationsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { SqlConsolePage } from "./pages/SqlConsolePage";
+import { IdePage } from "./ide/IdePage";
 
 function RequireSession({ children }: { children: ReactElement }) {
   const { session, bootstrapping } = useSession();
@@ -33,7 +34,9 @@ export function App() {
         }
       >
         <Route path="/" element={<DashboardPage />} />
-        <Route path="/sql" element={<SqlConsolePage />} />
+        <Route path="/sql" element={<IdePage />} />
+        {/* The previous single-statement console, kept reachable but no longer in the navigation. */}
+        <Route path="/sql-classic" element={<SqlConsolePage />} />
         <Route path="/explorer" element={<ExplorerPage />} />
         <Route path="/snapshots" element={<SnapshotsPage />} />
         <Route path="/compaction" element={<CompactionPage />} />

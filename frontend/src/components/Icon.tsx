@@ -24,6 +24,16 @@ const PATHS = {
   stop: "M6 6h12v12H6z",
   more: "M5 12h.01M12 12h.01M19 12h.01",
   close: "M6 6l12 12M18 6L6 18",
+  clock: "M12 7v5l3 2 M12 3a9 9 0 100 18 9 9 0 000-18z",
+  table: "M3 5h18v14H3z M3 10h18M9 5v14",
+  plan: "M5 5h6v4H5z M13 15h6v4h-6z M8 9v8h5",
+  link: "M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1 M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1",
+  reset: "M4 12a8 8 0 103 6.2 M4 19v-5h5",
+  runAll: "M3 5l8 7-8 7z M12 5l8 7-8 7z",
+  runAbove: "M6 10l7 5-7 5z M17 15V4 M13 8l4-4 4 4",
+  moon: "M20 14.5A8 8 0 019.5 4a8 8 0 1010.5 10.5z",
+  panelRight: "M4 5h16v14H4z M15 5v14",
+  panelLeft: "M4 5h16v14H4z M9 5v14",
 } as const;
 
 export type IconName = keyof typeof PATHS;
