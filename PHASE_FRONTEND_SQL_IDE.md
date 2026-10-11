@@ -24,7 +24,7 @@ New API client calls: `instance()`, `observedQueries()`, `observedSessions()`, `
 
 ## Verified
 
-- `npx tsc --noEmit`, `npx eslint src` (0 errors; 3 warnings that were already present), `npx vitest run`: 147 tests pass (69 before this work).
+- `npx tsc --noEmit`, `npx eslint src` (0 errors; 3 warnings that were already present), `npx vitest run`: 148 tests pass (69 before this work).
 - `npm run build` succeeds.
 
 ## End-to-end results (real `rubixdb gui` release binary, Chromium, real CSP, disposable data folders)

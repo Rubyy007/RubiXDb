@@ -173,6 +173,19 @@ describe("IdePage: several statements in one cell", () => {
     expect(sqlMock).toHaveBeenCalledTimes(2);
   });
 
+  it("labels a statement by its SQL, not by a comment line above it", async () => {
+    sqlMock.mockResolvedValueOnce(ok(1));
+    sqlMock.mockResolvedValueOnce(ok(2));
+    renderPage();
+    fireEvent.change(screen.getByLabelText("Cell 1 SQL"), { target: { value: "SELECT 1; -- next\nSELECT 2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run cell 1" }));
+    const strip = await screen.findByRole("group", { name: "Statements in this cell" });
+    const second = within(strip).getAllByRole("button")[1];
+    expect(second).toHaveTextContent("SELECT 2");
+    expect(second).not.toHaveTextContent("-- next");
+    expect(second).toHaveAttribute("title", "-- next\nSELECT 2");
+  });
+
   it("a trailing semicolon is a single statement and is not sent", async () => {
     sqlMock.mockResolvedValueOnce(ok(1));
     renderPage();

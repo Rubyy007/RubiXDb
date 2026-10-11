@@ -13,6 +13,12 @@ import type { CellRun } from "./runner";
 
 type Tab = "results" | "details" | "plan" | "logs";
 
+/** Chip label for a statement: its first line that is not a comment (the full text stays in the tooltip). */
+function stmtLabel(text: string, max: number): string {
+  const line = text.split(/\r?\n/).find((l) => l.trim() !== "" && !l.trim().startsWith("--"));
+  return queryTitle(line ?? text, max);
+}
+
 async function copyText(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
@@ -109,7 +115,7 @@ export function OutputPanel({ cell, run }: { cell: IdeCell; run: CellRun }) {
               onClick={() => setSel(i)}
             >
               <span className="ide-stmt-n">{pt.index + 1}</span>
-              <span className="ide-stmt-sql text-mono">{queryTitle(pt.text, 36)}</span>
+              <span className="ide-stmt-sql text-mono">{stmtLabel(pt.text, 36)}</span>
               <span className="ide-stmt-ms text-mono">{formatMs(pt.ms)}</span>
             </button>
           ))}
