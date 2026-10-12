@@ -37,6 +37,17 @@ pub struct SqlLimits {
     pub max_list_elements: usize,
     /// Most rows one `INSERT ... VALUES (...), (...), ...` may supply.
     pub max_values_rows: usize,
+    /// SQL-mission-1: deepest nesting of subqueries (a subquery inside a
+    /// subquery inside ...) one statement may bind. Binding and execution
+    /// both recurse once per level, so this bounds both the binder's and the
+    /// executor's native stack depth independently of `max_expression_depth`
+    /// (which a level of nesting consumes only 2 of).
+    pub max_subquery_depth: usize,
+    /// SQL-mission-1: most subquery expressions (scalar / `EXISTS` /
+    /// `IN (SELECT ...)`) one statement may contain in total. Each is bound
+    /// and planned separately, so this bounds bind/plan work for a
+    /// statement that is small in bytes but wide in subqueries.
+    pub max_subqueries_per_statement: usize,
 }
 
 impl Default for SqlLimits {
@@ -50,6 +61,8 @@ impl Default for SqlLimits {
             max_columns: 1_600, // D27: "Max columns/table"
             max_list_elements: 10_000,
             max_values_rows: 10_000,
+            max_subquery_depth: 32,
+            max_subqueries_per_statement: 256,
         }
     }
 }

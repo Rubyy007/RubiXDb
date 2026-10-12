@@ -1,0 +1,85 @@
+[
+  {
+    "id": "A-M1 NOT IN trap: non-member + NULL in set -> FALSE instead of UNKNOWN",
+    "why": "the classic NOT IN / NULL three-valued-logic bug",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::differential::in_not_in_exists_and_scalar_match_the_reference_model_on_random_data",
+      "subquery_tests::exec::in_subquery_truth_table",
+      "subquery_tests::exec::not_in_subquery_truth_table_never_true_when_the_set_contains_null",
+      "subquery_tests::exec::not_in_with_a_null_in_the_subquery_returns_no_rows_the_classic_trap"
+    ],
+    "summary": "test result: FAILED. 60 passed; 4 failed; 0 ignored; 0 measured; 357 filtered out; finished in 1.87s"
+  },
+  {
+    "id": "A-M2 empty set + NULL lhs -> UNKNOWN instead of FALSE",
+    "why": "NULL IN (empty) must be FALSE, NULL NOT IN (empty) TRUE",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::differential::in_not_in_exists_and_scalar_match_the_reference_model_on_random_data",
+      "subquery_tests::exec::in_subquery_truth_table",
+      "subquery_tests::exec::not_in_subquery_truth_table_never_true_when_the_set_contains_null"
+    ],
+    "summary": "test result: FAILED. 61 passed; 3 failed; 0 ignored; 0 measured; 357 filtered out; finished in 2.09s"
+  },
+  {
+    "id": "A-M3 scalar subquery silently takes the first of many rows",
+    "why": "cardinality violation must be a runtime error",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::exec::a_failing_subquery_in_dml_where_changes_nothing",
+      "subquery_tests::exec::scalar_subquery_over_multiple_rows_is_a_runtime_error_not_a_bind_error"
+    ],
+    "summary": "test result: FAILED. 62 passed; 2 failed; 0 ignored; 0 measured; 357 filtered out; finished in 8.69s"
+  },
+  {
+    "id": "A-M4 uncorrelated result cache disabled",
+    "why": "uncorrelated subquery must run once per statement",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::exec::an_uncorrelated_subquery_runs_once_per_statement"
+    ],
+    "summary": "test result: FAILED. 63 passed; 1 failed; 0 ignored; 0 measured; 357 filtered out; finished in 5.20s"
+  },
+  {
+    "id": "A-M5 table-ref ids restart per scope (collision with outer query)",
+    "why": "inner and outer rows would collide in RowContext",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::binder::table_reference_ids_are_unique_across_a_statement_including_its_subqueries"
+    ],
+    "summary": "test result: FAILED. 63 passed; 1 failed; 0 ignored; 0 measured; 357 filtered out; finished in 5.13s"
+  },
+  {
+    "id": "A-M6 IN-set row bound removed",
+    "why": "materialization must fail closed",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::exec::in_subquery_exceeding_max_materialized_rows_fails_closed_never_truncates"
+    ],
+    "summary": "test result: FAILED. 63 passed; 1 failed; 0 ignored; 0 measured; 357 filtered out; finished in 5.20s"
+  },
+  {
+    "id": "A-M7 NOT EXISTS polarity inverted",
+    "why": "EXISTS/NOT EXISTS",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::differential::in_not_in_exists_and_scalar_match_the_reference_model_on_random_data",
+      "subquery_tests::exec::delete_where_not_in_subquery_and_not_exists",
+      "subquery_tests::exec::exists_and_not_exists_in_where",
+      "subquery_tests::exec::exists_is_never_null_and_a_null_only_row_still_exists",
+      "subquery_tests::exec::exists_over_an_empty_table_is_false",
+      "subquery_tests::exec::scalar_and_exists_do_not_materialize_so_the_row_limit_does_not_apply"
+    ],
+    "summary": "test result: FAILED. 58 passed; 6 failed; 0 ignored; 0 measured; 357 filtered out; finished in 1.96s"
+  },
+  {
+    "id": "A-M8 IN-set byte bound removed",
+    "why": "byte-level fail-closed bound",
+    "compiled": true,
+    "failed_tests": [
+      "subquery_tests::exec::in_subquery_exceeding_max_materialized_bytes_fails_closed"
+    ],
+    "summary": "test result: FAILED. 63 passed; 1 failed; 0 ignored; 0 measured; 357 filtered out; finished in 4.66s"
+  }
+]

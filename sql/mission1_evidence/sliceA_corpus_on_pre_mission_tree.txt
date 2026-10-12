@@ -1,0 +1,57 @@
+   Compiling rubixdb v0.1.0 (C:\Users\Ruby\AppData\Local\Temp\claude\E--RubiXDb\1335cf18-f0ea-4e1e-af6a-4b2b0a834873\scratchpad\baseline_tree)
+   Compiling rubixdb-sql v0.1.0 (C:\Users\Ruby\AppData\Local\Temp\claude\E--RubiXDb\1335cf18-f0ea-4e1e-af6a-4b2b0a834873\scratchpad\baseline_tree\sql)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.16s
+     Running unittests src\lib.rs (E:/RubiXDb/target\debug\deps\rubixdb_sql-6e3978e39f6379a9.exe)
+
+running 1 test
+test mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows ... FAILED
+
+failures:
+
+---- mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows stdout ----
+
+thread 'mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows' (7552) panicked at sql\src\mission1_corpus_tests.rs:143:5:
+17 corpus statement(s) failed:
+[A] SELECT (SELECT MAX(amount) FROM orders)
+    error: unsupported: expression kind: subquery expression
+[A] SELECT (SELECT amount FROM orders WHERE id = 999)
+    error: unsupported: expression kind: subquery expression
+[A] SELECT (SELECT MAX(amount) FROM orders) + 1
+    error: unsupported: expression kind: subquery expression
+[A] SELECT id FROM t WHERE id = (SELECT MIN(t_id) FROM orders)
+    error: unsupported: expression kind: subquery expression
+[A] SELECT id FROM t WHERE id > (SELECT MIN(id) FROM t) ORDER BY id
+    error: unsupported: expression kind: subquery expression
+[A] SELECT active, COUNT(*) FROM t GROUP BY active HAVING COUNT(*) > (SELECT COUNT(*) FROM orders WHERE amount IS NULL)
+    error: unsupported: expression kind: subquery expression
+[A] SELECT id FROM t WHERE id IN (SELECT t_id FROM orders) ORDER BY id
+    error: unsupported: expression kind: IN (subquery)
+[A] SELECT id FROM t WHERE id NOT IN (SELECT t_id FROM orders)
+    error: unsupported: expression kind: IN (subquery)
+[A] SELECT id FROM t WHERE id NOT IN (SELECT t_id FROM orders WHERE t_id IS NOT NULL) ORDER BY id
+    error: unsupported: expression kind: IN (subquery)
+[A] SELECT 9 IN (SELECT t_id FROM orders)
+    error: unsupported: expression kind: IN (subquery)
+[A] SELECT 9 NOT IN (SELECT t_id FROM orders)
+    error: unsupported: expression kind: IN (subquery)
+[A] SELECT NULL NOT IN (SELECT id FROM t WHERE id > 100)
+    error: unsupported: expression kind: IN (subquery)
+[A] SELECT 1 IN (SELECT t_id FROM orders)
+    error: unsupported: expression kind: IN (subquery)
+[A] SELECT id FROM t WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 90) ORDER BY id
+    error: unsupported: expression kind: EXISTS
+[A] SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 90)
+    error: unsupported: expression kind: EXISTS
+[A] SELECT EXISTS (SELECT t_id FROM orders WHERE id = 14)
+    error: unsupported: expression kind: EXISTS
+[A] SELECT id FROM t WHERE id IN (SELECT t_id FROM orders WHERE amount > (SELECT MIN(amount) FROM orders WHERE t_id IN (SELECT id FROM t WHERE active))) ORDER BY id
+    error: unsupported: expression kind: IN (subquery)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 357 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p rubixdb-sql --lib`

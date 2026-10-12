@@ -25,6 +25,7 @@ pub fn validate_plan(plan: &Plan, catalog: &CatalogService) -> Result<()> {
         Plan::Query {
             physical,
             max_parameter,
+            ..
         } => {
             validate_physical(physical, catalog)?;
             let mut seen_params = BTreeSet::new();
@@ -49,6 +50,21 @@ pub fn validate_plan(plan: &Plan, catalog: &CatalogService) -> Result<()> {
         Plan::Insert(_) | Plan::Ddl(_) | Plan::Begin | Plan::Commit | Plan::Rollback => Ok(()),
         Plan::Explain(inner) => validate_plan(inner, catalog),
     }
+}
+
+/// Validates one subquery's physical plan (SQL-mission-1): the same
+/// structural checks `validate_plan` applies to a top-level query -- every
+/// accessed table still resolves, every chosen index belongs to its table,
+/// no parameter index exceeds what the subquery's own bound query declared.
+pub fn validate_subplan(
+    plan: &PhysicalPlan,
+    max_parameter: u32,
+    catalog: &CatalogService,
+) -> Result<()> {
+    validate_physical(plan, catalog)?;
+    let mut seen_params = BTreeSet::new();
+    collect_parameters_physical(plan, &mut seen_params);
+    check_parameter_bound(&seen_params, max_parameter)
 }
 
 fn access_predicate(access: &PhysicalAccess) -> Option<&BoundExpr> {
@@ -76,6 +92,10 @@ fn check_parameter_bound(seen: &BTreeSet<u32>, max_parameter: u32) -> Result<()>
 fn validate_physical(plan: &PhysicalPlan, catalog: &CatalogService) -> Result<()> {
     match plan {
         PhysicalPlan::EmptyRelation => Ok(()),
+        // A derived table's / CTE's body was validated where it was planned
+        // (`validate_subplan`); only its place in the tree is checked here.
+        PhysicalPlan::Derived { plan, .. } => validate_physical(plan, catalog),
+        PhysicalPlan::CteNode { cte, .. } => validate_physical(&cte.plan, catalog),
         PhysicalPlan::Access(access) => validate_access(access, catalog),
         PhysicalPlan::Join { left, right, .. } => {
             validate_physical(left, catalog)?;
@@ -121,6 +141,8 @@ fn validate_access(access: &PhysicalAccess, catalog: &CatalogService) -> Result<
 fn collect_parameters_physical(plan: &PhysicalPlan, out: &mut BTreeSet<u32>) {
     match plan {
         PhysicalPlan::EmptyRelation => {}
+        PhysicalPlan::Derived { plan, .. } => collect_parameters_physical(plan, out),
+        PhysicalPlan::CteNode { cte, .. } => collect_parameters_physical(&cte.plan, out),
         PhysicalPlan::Access(access) => collect_parameters_access(access, out),
         PhysicalPlan::Join {
             left, right, on, ..
@@ -288,5 +310,13 @@ fn collect_parameters_expr(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
             }
         }
         BoundExprKind::AggregateRef(_) => {}
+        // A subquery's own plan is validated where it is planned
+        // (`validate_subplan`); at this level only its `IN` operand is part
+        // of the enclosing statement's parameter space check.
+        BoundExprKind::Subquery(sq) => {
+            if let Some(operand) = &sq.operand {
+                collect_parameters_expr(operand, out);
+            }
+        }
     }
 }

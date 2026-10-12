@@ -30,7 +30,7 @@ mod reader;
 pub(crate) mod test_support;
 mod writer;
 
-pub use bloom::BloomFilter;
+pub use bloom::{max_record_count_for_bloom_cap, BloomFilter};
 pub use reader::{SsTable, SsTableRangeCursor};
 pub use writer::{write_from_memtable, write_from_sorted_records, SsTableWriterConfig};
 

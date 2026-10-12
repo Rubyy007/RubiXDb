@@ -1,0 +1,60 @@
+{
+ "400000000": {
+  "value": 400000000,
+  "opened": false,
+  "exit": 1,
+  "seconds": 1.75,
+  "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_CORRUPT: corruption: sstable <root>\\recon\\data\\sstables\\00000000000000000001.sst: footer: record_count 400000000 exceeds 214748364, the largest count whose bloom filter fits the 268435456 byte reader limit; refusing to open: a table the Manifest lists as live is damaged and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.\n",
+  "inventory_files": 9,
+  "directory_unchanged": true,
+  "changed": [],
+  "sstables_dir": [
+   "00000000000000000001.sst",
+   "00000000000000000002.sst",
+   "00000000000000000003.sst"
+  ]
+ },
+ "bound+1": {
+  "value": 214748365,
+  "opened": false,
+  "exit": 1,
+  "seconds": 1.06,
+  "stderr": "rubixdb gui: failed to start: engine open refused: SSTABLE_CORRUPT: corruption: sstable <root>\\recon\\data\\sstables\\00000000000000000001.sst: footer: record_count 214748365 exceeds 214748364, the largest count whose bloom filter fits the 268435456 byte reader limit; refusing to open: a table the Manifest lists as live is damaged and the engine would not serve a complete database. Run `rubixdb check` and restore a verified backup into a new instance. The directory has not been modified.\n",
+  "inventory_files": 9,
+  "directory_unchanged": true,
+  "changed": [],
+  "sstables_dir": [
+   "00000000000000000001.sst",
+   "00000000000000000002.sst",
+   "00000000000000000003.sst"
+  ]
+ },
+ "bound": {
+  "value": 214748364,
+  "opened": true,
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ },
+ "b4_17211": {
+  "value": 17211,
+  "opened": true,
+  "readyz": {
+   "ready": true,
+   "storage_state": "Healthy",
+   "index_recovery": "complete",
+   "sstable_verification": "complete"
+  },
+  "stop": [
+   "graceful",
+   0
+  ]
+ }
+}

@@ -1,0 +1,14 @@
+{
+ "scenario": "CM5_wal_torn_tail",
+ "mutation": "last WAL frame CRC bit flipped",
+ "check_exit": 1,
+ "check_stdout_tail": "l\\recon\\data\nWARNING  WAL_TORN_TAIL              wal                a torn tail was found in the newest segment; recovery truncates it (expected after a crash)\nINFO     WAL_TAIL_WOULD_BE_QUARANTINED wal                a start would copy the 44621 byte(s) at offset 1115574 of WAL segment 3 (last good sequence 203) to wal-quarantine/ and then truncate them; this check did not modify the directory (its logical pass runs on a private copy)\nINFO     WAL_TAIL_START_WOULD_REFUSE wal                a start would refuse with WAL_TAIL_DAMAGED: the last clean shutdown recorded sequence 204 and the log reaches 203; this check did not modify the directory\nresult: 0 error(s), 1 warning(s), check complete\n",
+ "stderr": "",
+ "diff": {
+  "added": [],
+  "removed": [],
+  "content_changed": [],
+  "mtime_only": []
+ },
+ "modified": false
+}

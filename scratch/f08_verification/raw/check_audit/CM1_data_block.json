@@ -1,0 +1,14 @@
+{
+ "scenario": "CM1_data_block",
+ "mutation": "data block bit flip",
+ "check_exit": 2,
+ "check_stdout_tail": "INSPECTION  offline check of <dir>\\recon\\data\nphysical errors found; the logical pass is skipped (opening a damaged directory could run recovery over it)\nERROR    SSTABLE_CORRUPT            sstable[1]         data block failed verification: corruption: block: checksum mismatch\nresult: 1 error(s), 0 warning(s), check complete\n",
+ "stderr": "",
+ "diff": {
+  "added": [],
+  "removed": [],
+  "content_changed": [],
+  "mtime_only": []
+ },
+ "modified": false
+}

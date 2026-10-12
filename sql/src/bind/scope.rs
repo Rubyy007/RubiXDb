@@ -4,8 +4,13 @@
 //! directly and checks `crate::auth::is_authorized` before returning,
 //! never separately, never via a second metadata structure.
 
-use rubixdb::catalog::schema::{ColumnRow, ObjectKind, Privilege, TableRow};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use rubixdb::catalog::schema::{ColumnRow, ObjectKind, Privilege, TableRow, TableState};
 use rubixdb::catalog::CatalogService;
+use rubixdb::relational::value as rv;
+use rubixdb::relational::RelationalType;
 
 use crate::ast;
 use crate::auth::AuthContext;
@@ -231,19 +236,66 @@ impl ScopeEntry {
     }
 }
 
+/// A CTE visible by name (SQL-mission-1 Slice C): its relation id and the
+/// columns it exposes (names after any column-name list, types from the body).
+#[derive(Debug, Clone)]
+pub struct CteBinding {
+    pub name: String,
+    pub id: u32,
+    pub columns: Vec<ColumnRow>,
+}
+
+/// What a bare `FROM name` means when the CTE lists in scope are consulted.
+#[derive(Debug, Clone)]
+pub enum CteLookup {
+    /// `name` is a CTE visible here.
+    Found(CteBinding),
+    /// `name` is the CTE currently being defined (its own body).
+    SelfReference,
+    /// `name` is a CTE defined later in the same `WITH` list.
+    ForwardReference,
+    /// Not a CTE name at all: resolve it against the catalog.
+    NotACte,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
+    /// CTEs defined by this query's own `WITH` list, in definition order
+    /// (only the ones already bound while the list is being bound).
+    pub ctes: Vec<CteBinding>,
+    /// Names of the CTEs of this query's `WITH` list that are not defined
+    /// yet (used to tell a forward reference from an unknown table).
+    pub pending_cte_names: Vec<String>,
+    /// The CTE whose body is being bound (its name is not visible there).
+    pub defining_cte: Option<String>,
     pub entries: Vec<ScopeEntry>,
+    /// Source of `ScopeEntry::table_ref_id`. A standalone scope owns a
+    /// private counter (ids 0, 1, ... in push order -- exactly the previous
+    /// numbering); a scope created through `BindEnv::new_scope` shares the
+    /// statement-wide counter, so ids are unique across a statement's
+    /// subqueries (SQL-mission-1).
+    ref_counter: Rc<Cell<u32>>,
 }
 
 impl Scope {
+    pub fn with_counter(ref_counter: Rc<Cell<u32>>) -> Scope {
+        Scope {
+            ctes: Vec::new(),
+            pending_cte_names: Vec::new(),
+            defining_cte: None,
+            entries: Vec::new(),
+            ref_counter,
+        }
+    }
+
     pub fn push(
         &mut self,
         resolved: ResolvedTable,
         alias: Option<&ast::Ident>,
         null_extended: bool,
     ) -> u32 {
-        let table_ref_id = self.entries.len() as u32;
+        let table_ref_id = self.ref_counter.get();
+        self.ref_counter.set(table_ref_id + 1);
         let effective_name = alias
             .map(|a| a.value.clone())
             .unwrap_or_else(|| resolved.table.name.clone());
@@ -278,38 +330,62 @@ impl Scope {
     }
 
     pub fn resolve_column(&self, col_ref: &ast::ColumnRef) -> Result<(&ScopeEntry, &ColumnRow)> {
+        match self.lookup_column(col_ref)? {
+            Some(found) => Ok(found),
+            None => Err(match col_ref.parts.len() {
+                1 => SqlError::UnknownObject {
+                    kind: "column",
+                    detail: col_ref.parts[0].value.clone(),
+                },
+                _ => SqlError::UnknownObject {
+                    kind: "table reference",
+                    detail: col_ref.parts[0].value.clone(),
+                },
+            }),
+        }
+    }
+
+    /// Resolves a column reference against *this* scope level only.
+    ///
+    /// `Ok(None)` means "this level does not define the name" -- an unqualified
+    /// name no FROM item has, or a qualifier no FROM item is called -- which
+    /// is the one case where a subquery's binder may go on to ask the next
+    /// enclosing level (SQL-mission-1 correlation: the innermost binding wins).
+    /// Anything else is a definitive answer for this level and must not fall
+    /// through to an outer one: an ambiguous unqualified name, or a qualifier
+    /// that names a FROM item here which lacks the column. Letting those
+    /// slide outward would let an inner typo silently bind to an outer column.
+    pub fn lookup_column(
+        &self,
+        col_ref: &ast::ColumnRef,
+    ) -> Result<Option<(&ScopeEntry, &ColumnRow)>> {
         match col_ref.parts.len() {
             1 => {
                 let name = &col_ref.parts[0].value;
                 let mut matches = Vec::new();
                 for entry in &self.entries {
-                    if let Some(c) = entry.resolved.columns.iter().find(|c| &c.name == name) {
+                    if let Some(c) = find_in_entry(entry, name)? {
                         matches.push((entry, c));
                     }
                 }
                 match matches.len() {
-                    0 => Err(SqlError::UnknownObject {
-                        kind: "column",
-                        detail: name.clone(),
-                    }),
-                    1 => Ok(matches[0]),
+                    0 => Ok(None),
+                    1 => Ok(Some(matches[0])),
                     _ => Err(SqlError::AmbiguousColumn { detail: name.clone() }),
                 }
             }
             2 => {
                 let qualifier = &col_ref.parts[0].value;
                 let name = &col_ref.parts[1].value;
+                if !self.entries.iter().any(|e| &e.effective_name == qualifier) {
+                    return Ok(None);
+                }
                 let entry = self.find_by_qualifier(qualifier)?;
-                let column = entry
-                    .resolved
-                    .columns
-                    .iter()
-                    .find(|c| &c.name == name)
-                    .ok_or_else(|| SqlError::UnknownObject {
-                        kind: "column",
-                        detail: format!("{qualifier}.{name}"),
-                    })?;
-                Ok((entry, column))
+                let column = find_in_entry(entry, name)?.ok_or_else(|| SqlError::UnknownObject {
+                    kind: "column",
+                    detail: format!("{qualifier}.{name}"),
+                })?;
+                Ok(Some((entry, column)))
             }
             n => Err(SqlError::InvalidIdentifier {
                 detail: format!(
@@ -317,5 +393,219 @@ impl Scope {
                 ),
             }),
         }
+    }
+}
+
+/// The enclosing queries of the query being bound, innermost first
+/// (SQL-mission-1 correlation). A subquery's column reference resolves
+/// against its own `Scope` first; only when that level does not define the
+/// name does the search move to `scope` here (the immediately enclosing
+/// query), then to `parent`, and so on up to the statement's outermost
+/// query. It is a linked chain of borrows -- each link lives on the binder's
+/// stack for exactly as long as the nested query is being bound -- so
+/// nothing is cloned and no flat "outer" slot can lose a level.
+#[derive(Clone, Copy)]
+pub struct OuterScopes<'a> {
+    pub scope: &'a Scope,
+    pub parent: Option<&'a OuterScopes<'a>>,
+    /// `Some` marks a **boundary**: the relation bound *beneath* this link
+    /// (a non-`LATERAL` derived table, or a CTE body) cannot read the columns
+    /// of this scope or of anything above it. Such a name still resolves for
+    /// the purpose of a clear error, never as a value; CTE *names* stay
+    /// visible through a boundary.
+    pub boundary: Option<Boundary<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Boundary<'a> {
+    pub kind: BoundaryKind,
+    pub name: &'a str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryKind {
+    Derived,
+    Cte,
+}
+
+impl Boundary<'_> {
+    fn refusal(&self, column: &str) -> SqlError {
+        match self.kind {
+            BoundaryKind::Derived => SqlError::InvalidIdentifier {
+                detail: format!(
+                    "derived table '{}' cannot reference outer column '{column}' without LATERAL",
+                    self.name
+                ),
+            },
+            BoundaryKind::Cte => SqlError::InvalidIdentifier {
+                detail: format!(
+                    "CTE '{}' cannot reference outer column '{column}'",
+                    self.name
+                ),
+            },
+        }
+    }
+}
+
+impl<'a> OuterScopes<'a> {
+    /// Number of enclosing queries in the chain.
+    pub fn len(&self) -> usize {
+        1 + self.parent.map_or(0, |p| p.len())
+    }
+
+    /// Always `false`: a chain has at least the enclosing query.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Resolves `col_ref` against the enclosing levels, innermost first.
+    /// Returns the level index (0 = the immediately enclosing query) with the
+    /// entry and column found there, or `None` if no level defines the name.
+    pub fn lookup(
+        &self,
+        col_ref: &ast::ColumnRef,
+    ) -> Result<Option<(usize, &'a ScopeEntry, &'a ColumnRow)>> {
+        let mut level = 0usize;
+        let mut link = Some(self);
+        let mut blocked: Option<Boundary<'a>> = None;
+        while let Some(l) = link {
+            if blocked.is_none() {
+                blocked = l.boundary;
+            }
+            if let Some((entry, column)) = l.scope.lookup_column(col_ref)? {
+                return match blocked {
+                    None => Ok(Some((level, entry, column))),
+                    Some(b) => Err(b.refusal(&display_column(col_ref))),
+                };
+            }
+            level += 1;
+            link = l.parent;
+        }
+        Ok(None)
+    }
+
+    /// Classifies a bare relation name against every CTE list in scope: this
+    /// query's own (passed as `scope`), then each enclosing query's, nearest
+    /// first. A CTE found anywhere wins over the catalog; self- and
+    /// forward-references are reported only when no CTE of that name is
+    /// visible (so `WITH t AS (SELECT * FROM t)` over a real table `t` reads
+    /// the table, exactly as the SQL standard's scoping rules say, while an
+    /// unknown self-reference gets a precise message).
+    pub fn lookup_cte(scope: &Scope, outer: Option<&OuterScopes<'_>>, name: &str) -> CteLookup {
+        let mut scopes: Vec<&Scope> = vec![scope];
+        let mut link = outer;
+        while let Some(l) = link {
+            scopes.push(l.scope);
+            link = l.parent;
+        }
+        for s in &scopes {
+            if let Some(c) = s.ctes.iter().find(|c| c.name == name) {
+                return CteLookup::Found(c.clone());
+            }
+        }
+        if scopes.iter().any(|s| s.defining_cte.as_deref() == Some(name)) {
+            return CteLookup::SelfReference;
+        }
+        if scopes.iter().any(|s| s.pending_cte_names.iter().any(|n| n == name)) {
+            return CteLookup::ForwardReference;
+        }
+        CteLookup::NotACte
+    }
+}
+
+fn display_column(col_ref: &ast::ColumnRef) -> String {
+    col_ref
+        .parts
+        .iter()
+        .map(|p| p.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The column of `entry` called `name`. A derived table or CTE can expose two
+/// columns with the same name (`SELECT a, a FROM t`); referring to such a name
+/// is ambiguous. (A catalog table never has duplicate names, so this changes
+/// nothing for one.)
+fn find_in_entry<'e>(entry: &'e ScopeEntry, name: &str) -> Result<Option<&'e ColumnRow>> {
+    let mut found = entry.resolved.columns.iter().filter(|c| c.name == name);
+    let first = found.next();
+    if first.is_some() && found.next().is_some() {
+        return Err(SqlError::AmbiguousColumn {
+            detail: format!("{}.{name}", entry.effective_name),
+        });
+    }
+    Ok(first)
+}
+
+/// The type tag (and `DECIMAL` parameters) a relation column of type `ty`
+/// carries -- the inverse of `bind::ddl::relational_type_of`.
+fn tag_and_params(ty: RelationalType) -> (u8, Option<Vec<u8>>) {
+    match ty {
+        RelationalType::Boolean => (rv::TYPE_TAG_BOOLEAN, None),
+        RelationalType::Integer => (rv::TYPE_TAG_INTEGER, None),
+        RelationalType::Bigint => (rv::TYPE_TAG_BIGINT, None),
+        RelationalType::Real => (rv::TYPE_TAG_REAL, None),
+        RelationalType::Double => (rv::TYPE_TAG_DOUBLE, None),
+        // The precision byte is never read back (`relational_type_of` takes
+        // only the scale); 38 is the widest `DECIMAL` the engine encodes.
+        RelationalType::Decimal { scale } => (rv::TYPE_TAG_DECIMAL, Some(vec![38, scale])),
+        RelationalType::Text => (rv::TYPE_TAG_TEXT, None),
+        RelationalType::Blob => (rv::TYPE_TAG_BLOB, None),
+        RelationalType::Date => (rv::TYPE_TAG_DATE, None),
+        RelationalType::Time => (rv::TYPE_TAG_TIME, None),
+        RelationalType::Timestamp => (rv::TYPE_TAG_TIMESTAMP, None),
+    }
+}
+
+/// The columns a derived table or CTE exposes, built from its body's output
+/// (SQL-mission-1 Slice C). `names` are the output names (already replaced by
+/// a column-name list if one was written); a column whose type cannot be
+/// determined (a bare `NULL`) is refused rather than guessed.
+pub fn relation_columns(
+    relation: &str,
+    columns: &[(String, Option<RelationalType>, bool)],
+) -> Result<Vec<ColumnRow>> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (name, ty, nullable))| {
+            let ty = ty.ok_or_else(|| SqlError::TypeMismatch {
+                detail: format!(
+                    "column '{name}' of '{relation}' has no determinable type (a bare NULL); \
+                     select a typed expression instead"
+                ),
+            })?;
+            let (data_type, type_params) = tag_and_params(ty);
+            Ok(ColumnRow {
+                table_id: crate::bound::SYNTHETIC_TABLE_ID,
+                ordinal: ordinal as u16,
+                name: name.clone(),
+                data_type,
+                nullable: *nullable,
+                default_value: None,
+                added_in_schema_version: 0,
+                type_params,
+            })
+        })
+        .collect()
+}
+
+/// A `ResolvedTable` for a relation that is not in the catalog (a derived
+/// table or a CTE reference): no primary key, a sentinel table id.
+pub fn synthetic_resolved(name: &str, columns: Vec<ColumnRow>) -> ResolvedTable {
+    ResolvedTable {
+        database_id: 0,
+        schema_id: 0,
+        table_id: crate::bound::SYNTHETIC_TABLE_ID,
+        table: TableRow {
+            table_id: crate::bound::SYNTHETIC_TABLE_ID,
+            schema_id: 0,
+            name: name.to_string(),
+            pk_ordinals: Vec::new(),
+            schema_version: 0,
+            state: TableState::Active,
+            created_at: 0,
+        },
+        columns,
     }
 }

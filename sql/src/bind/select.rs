@@ -42,8 +42,12 @@ use rubixdb::relational::RelationalType;
 
 use crate::ast;
 use crate::auth::AuthContext;
+use crate::bind::env::BindEnv;
 use crate::bind::expr::ExprBinder;
-use crate::bind::scope::{self, BindContext, Scope, ScopeEntry};
+use crate::bind::scope::{
+    self, BindContext, Boundary, BoundaryKind, CteBinding, CteLookup, OuterScopes, Scope,
+    ScopeEntry,
+};
 use crate::bound::*;
 use crate::error::{Result, SqlError};
 use crate::limits::SqlLimits;
@@ -57,58 +61,65 @@ pub fn bind_select(
     limits: &SqlLimits,
     stmt: &ast::Select,
 ) -> Result<BoundSelect> {
-    let mut scope = Scope::default();
+    let env = BindEnv::new(catalog, ctx, auth, metrics);
+    bind_select_in(&env, limits, stmt, None)
+}
+
+/// Binds one `SELECT` -- the statement itself or (SQL-mission-1) a subquery
+/// nested in one -- inside a statement-wide `BindEnv`. `outer` is the chain
+/// of enclosing queries (`None` for the statement's outermost query): a
+/// column this query's own `FROM` does not define is resolved against it,
+/// innermost enclosing query first.
+pub fn bind_select_in(
+    env: &BindEnv<'_>,
+    limits: &SqlLimits,
+    stmt: &ast::Select,
+    outer: Option<&OuterScopes<'_>>,
+) -> Result<BoundSelect> {
+    let mut scope = env.new_scope();
     let mut from = Vec::new();
     let mut max_parameter = 0u32;
 
+    let ctes = bind_with_list(env, limits, &stmt.ctes, &mut scope, outer, &mut max_parameter)?;
+
     if let Some(from_clause) = &stmt.from {
-        let resolved = scope::resolve_table(
-            catalog,
-            ctx,
-            auth,
-            metrics,
-            &from_clause.first.name,
-            Privilege::Select,
+        let (table, relation) = bind_from_item(
+            env,
+            limits,
+            &mut scope,
+            outer,
+            &from_clause.first,
+            false,
+            &mut max_parameter,
         )?;
-        check_alias_not_duplicate(
-            &scope,
-            from_clause.first.alias.as_ref(),
-            &resolved.table.name,
-        )?;
-        scope.push(resolved, from_clause.first.alias.as_ref(), false);
         from.push(BoundFromItem {
-            table: scope
-                .entries
-                .last()
-                .expect("just pushed")
-                .to_bound_table_ref(),
+            table,
             join: None,
+            relation,
         });
 
         for join in &from_clause.joins {
-            let resolved = scope::resolve_table(
-                catalog,
-                ctx,
-                auth,
-                metrics,
-                &join.table.name,
-                Privilege::Select,
-            )?;
-            check_alias_not_duplicate(&scope, join.table.alias.as_ref(), &resolved.table.name)?;
             let null_extended = matches!(join.kind, ast::JoinKind::Left);
-            scope.push(resolved, join.table.alias.as_ref(), null_extended);
+            let (table, relation) = bind_from_item(
+                env,
+                limits,
+                &mut scope,
+                outer,
+                &join.table,
+                null_extended,
+                &mut max_parameter,
+            )?;
 
-            let mut eb = ExprBinder::new(Some(&scope), limits);
+            let mut eb = ExprBinder::new(Some(&scope), limits)
+                .with_capture_env(env)
+                .with_outer(outer);
             let on = eb.bind(&join.on, Some(RelationalType::Boolean))?;
             max_parameter = max_parameter.max(eb.max_parameter);
 
             from.push(BoundFromItem {
-                table: scope
-                    .entries
-                    .last()
-                    .expect("just pushed")
-                    .to_bound_table_ref(),
+                table,
                 join: Some((join.kind, on)),
+                relation,
             });
         }
     }
@@ -120,7 +131,9 @@ pub fn bind_select(
         .selection
         .as_ref()
         .map(|e| -> Result<BoundExpr> {
-            let mut eb = ExprBinder::new(Some(&scope), limits);
+            let mut eb = ExprBinder::new(Some(&scope), limits)
+                .with_env(env)
+                .with_outer(outer);
             let bound = eb.bind(e, Some(RelationalType::Boolean))?;
             max_parameter = max_parameter.max(eb.max_parameter);
             Ok(bound)
@@ -133,21 +146,38 @@ pub fn bind_select(
         .group_by
         .iter()
         .map(|e| -> Result<BoundExpr> {
-            let mut eb = ExprBinder::new(Some(&scope), limits);
+            let mut eb = ExprBinder::new(Some(&scope), limits)
+                .with_capture_env(env)
+                .with_outer(outer);
             let bound = eb.bind(e, None)?;
             max_parameter = max_parameter.max(eb.max_parameter);
             Ok(bound)
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let projection = bind_projection(&scope, limits, &stmt.projection, &mut max_parameter)?;
+    let projection = bind_projection(
+        env,
+        &scope,
+        outer,
+        limits,
+        &stmt.projection,
+        &mut max_parameter,
+    )?;
+    // The table references this query's own FROM defines: a column of any
+    // other table is an outer-query column, constant within one evaluation
+    // of this query (SQL-mission-1).
+    let own_refs: std::collections::BTreeSet<u32> =
+        scope.entries.iter().map(|e| e.table_ref_id).collect();
 
     // HAVING — aggregate calls allowed (item 20).
     let having = stmt
         .having
         .as_ref()
         .map(|e| -> Result<BoundExpr> {
-            let mut eb = ExprBinder::new(Some(&scope), limits).with_aggregate(true);
+            let mut eb = ExprBinder::new(Some(&scope), limits)
+                .with_aggregate(true)
+                .with_env(env)
+                .with_outer(outer);
             let bound = eb.bind(e, Some(RelationalType::Boolean))?;
             max_parameter = max_parameter.max(eb.max_parameter);
             Ok(bound)
@@ -166,10 +196,10 @@ pub fn bind_select(
         // item 17: every projection/HAVING expression must be either
         // group-compatible or fully inside an aggregate call.
         for item in &projection {
-            validate_group_compat(&item.expr, &group_by)?;
+            validate_group_compat(&item.expr, &group_by, &own_refs)?;
         }
         if let Some(h) = &having {
-            validate_group_compat(h, &group_by)?;
+            validate_group_compat(h, &group_by, &own_refs)?;
         }
     }
 
@@ -180,11 +210,14 @@ pub fn bind_select(
         .order_by
         .iter()
         .map(|item| -> Result<BoundOrderByItem> {
-            let mut eb = ExprBinder::new(Some(&scope), limits).with_aggregate(is_aggregated);
+            let mut eb = ExprBinder::new(Some(&scope), limits)
+                .with_aggregate(is_aggregated)
+                .with_env(env)
+                .with_outer(outer);
             let bound = eb.bind(&item.expr, None)?;
             max_parameter = max_parameter.max(eb.max_parameter);
             if is_aggregated {
-                validate_group_compat(&bound, &group_by)?;
+                validate_group_compat(&bound, &group_by, &own_refs)?;
             }
             // D5 default: NULLS LAST ascending / NULLS FIRST descending.
             let nulls = match item.nulls_first {
@@ -252,6 +285,7 @@ pub fn bind_select(
     max_parameter = max_parameter.max(int_binder.max_parameter);
 
     Ok(BoundSelect {
+        ctes,
         distinct: stmt.distinct,
         from,
         projection,
@@ -264,6 +298,229 @@ pub fn bind_select(
         offset,
         max_parameter,
     })
+}
+
+/// Binds a `WITH` list into `scope` (SQL-mission-1 Slice C) and returns the
+/// bound definitions. Each body is bound across a **boundary**: it sees the
+/// CTEs defined before it (and those of enclosing queries) but no column of
+/// any enclosing query, and not its own name or any later one (a forward or
+/// self reference is an error unless a catalog table of that name exists).
+/// Used by `SELECT`, `UPDATE`, `DELETE` and `INSERT` alike.
+pub fn bind_with_list(
+    env: &BindEnv<'_>,
+    limits: &SqlLimits,
+    ctes: &[ast::Cte],
+    scope: &mut Scope,
+    outer: Option<&OuterScopes<'_>>,
+    max_parameter: &mut u32,
+) -> Result<Vec<BoundCte>> {
+    if ctes.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (i, cte) in ctes.iter().enumerate() {
+        if ctes[..i].iter().any(|c| c.name.value == cte.name.value) {
+            return Err(SqlError::InvalidIdentifier {
+                detail: format!("CTE name '{}' is defined more than once in one WITH list", cte.name.value),
+            });
+        }
+    }
+    scope.pending_cte_names = ctes.iter().map(|c| c.name.value.clone()).collect();
+    let mut out = Vec::with_capacity(ctes.len());
+    for cte in ctes {
+        let name = cte.name.value.clone();
+        scope.defining_cte = Some(name.clone());
+        env.enter(limits)?;
+        let link = OuterScopes {
+            scope: &*scope,
+            parent: outer,
+            boundary: Some(Boundary {
+                kind: BoundaryKind::Cte,
+                name: &name,
+            }),
+        };
+        let body = bind_select_in(env, limits, &cte.query, Some(&link));
+        env.leave();
+        let body = body?;
+        scope.defining_cte = None;
+        *max_parameter = (*max_parameter).max(body.max_parameter);
+
+        let described = format!("CTE '{name}'");
+        let (names, typed) = relation_output(&described, &body, &cte.columns)?;
+        let columns = scope::relation_columns(&described, &typed)?;
+        let id = env.alloc_relation_id();
+        if let Some(pos) = scope.pending_cte_names.iter().position(|n| n == &name) {
+            scope.pending_cte_names.remove(pos);
+        }
+        scope.ctes.push(CteBinding { name: name.clone(), id, columns });
+        out.push(BoundCte {
+            id,
+            name,
+            columns: names,
+            query: body,
+        });
+    }
+    scope.pending_cte_names.clear();
+    Ok(out)
+}
+
+/// A relation's output columns (names, types, nullability) from its body's
+/// projection, with an optional `AS alias(a, b, ...)` column-name list that
+/// must name exactly as many columns as the body produces.
+/// `(name, type, nullable)` of one column of a derived table or CTE.
+type RelationColumn = (String, Option<RelationalType>, bool);
+
+fn relation_output(
+    described: &str,
+    body: &BoundSelect,
+    column_names: &[ast::Ident],
+) -> Result<(Vec<String>, Vec<RelationColumn>)> {
+    if !column_names.is_empty() && column_names.len() != body.projection.len() {
+        return Err(SqlError::InvalidIdentifier {
+            detail: format!(
+                "{described} produces {} column(s) but {} column name(s) were given",
+                body.projection.len(),
+                column_names.len()
+            ),
+        });
+    }
+    let names: Vec<String> = if column_names.is_empty() {
+        body.projection.iter().map(|i| i.output_name.clone()).collect()
+    } else {
+        column_names.iter().map(|i| i.value.clone()).collect()
+    };
+    let typed = names
+        .iter()
+        .zip(&body.projection)
+        .map(|(n, item)| (n.clone(), item.expr.ty, item.expr.nullable))
+        .collect();
+    Ok((names, typed))
+}
+
+/// Binds one `FROM` / `JOIN` item: a catalog table, a CTE reference or a
+/// derived table (SQL-mission-1 Slice C), pushing its columns into `scope`.
+fn bind_from_item(
+    env: &BindEnv<'_>,
+    limits: &SqlLimits,
+    scope: &mut Scope,
+    outer: Option<&OuterScopes<'_>>,
+    tref: &ast::TableRef,
+    null_extended: bool,
+    max_parameter: &mut u32,
+) -> Result<(BoundTableRef, BoundRelation)> {
+    let (catalog, ctx, auth, metrics) = (env.catalog, env.ctx, env.auth, env.metrics);
+
+    if let Some(body_ast) = &tref.derived {
+        let alias = tref.alias.as_ref().ok_or_else(|| SqlError::InvalidIdentifier {
+            detail: "every derived table must have an alias, e.g. `(SELECT ...) AS name`".to_string(),
+        })?;
+        check_alias_not_duplicate(scope, Some(alias), &alias.value)?;
+        let id = env.alloc_relation_id();
+        env.enter(limits)?;
+        if tref.lateral {
+            env.push_frame();
+        }
+        let link = OuterScopes {
+            scope: &*scope,
+            parent: outer,
+            // An ordinary derived table cannot read the query it sits in or
+            // anything above it; a LATERAL one can read the items before it.
+            boundary: (!tref.lateral).then_some(Boundary {
+                kind: BoundaryKind::Derived,
+                name: &alias.value,
+            }),
+        };
+        let bound = bind_select_in(env, limits, body_ast, Some(&link));
+        let captures = if tref.lateral { env.pop_frame() } else { Vec::new() };
+        env.leave();
+        let query = bound?;
+        *max_parameter = (*max_parameter).max(query.max_parameter);
+
+        let described = format!("derived table '{}'", alias.value);
+        let (_, typed) = relation_output(&described, &query, &tref.column_aliases)?;
+        let columns = scope::relation_columns(&described, &typed)?;
+        scope.push(scope::synthetic_resolved(&alias.value, columns), Some(alias), null_extended);
+        let table = scope.entries.last().expect("just pushed").to_bound_table_ref();
+        let outer_refs = captures.iter().filter(|c| c.correlating).map(|c| c.column).collect();
+        return Ok((
+            table,
+            BoundRelation::Derived(Box::new(BoundDerived {
+                id,
+                query,
+                lateral: tref.lateral,
+                outer_refs,
+                plan: None,
+            })),
+        ));
+    }
+
+    if tref.name.0.len() == 1 {
+        let name = &tref.name.0[0].value;
+        let cte = match OuterScopes::lookup_cte(scope, outer, name) {
+            CteLookup::Found(binding) => Some(binding),
+            CteLookup::NotACte => None,
+            CteLookup::SelfReference | CteLookup::ForwardReference => {
+                // Not visible as a CTE here -- but a catalog table of that
+                // name is (SQL scoping): only when there is none is it an
+                // error, and then a precise one.
+                let forward = matches!(
+                    OuterScopes::lookup_cte(scope, outer, name),
+                    CteLookup::ForwardReference
+                );
+                match scope::resolve_table(catalog, ctx, auth, metrics, &tref.name, Privilege::Select) {
+                    Err(SqlError::UnknownObject { kind: "table", .. }) => {
+                        return Err(SqlError::InvalidIdentifier {
+                            detail: if forward {
+                                format!("CTE '{name}' is referenced before it is defined; a CTE can only use CTEs defined earlier in the same WITH list")
+                            } else {
+                                format!("CTE '{name}' refers to itself; use WITH RECURSIVE")
+                            },
+                        });
+                    }
+                    Err(other) => return Err(other),
+                    Ok(_) => None,
+                }
+            }
+        };
+        if let Some(binding) = cte {
+            let effective = tref.alias.as_ref().map(|a| a.value.as_str()).unwrap_or(name);
+            let described = format!("CTE '{name}'");
+            if !tref.column_aliases.is_empty() && tref.column_aliases.len() != binding.columns.len() {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: format!(
+                        "{described} produces {} column(s) but {} column name(s) were given",
+                        binding.columns.len(),
+                        tref.column_aliases.len()
+                    ),
+                });
+            }
+            check_alias_not_duplicate(scope, tref.alias.as_ref(), name)?;
+            let mut columns = binding.columns.clone();
+            for (col, alias) in columns.iter_mut().zip(&tref.column_aliases) {
+                col.name = alias.value.clone();
+            }
+            scope.push(scope::synthetic_resolved(effective, columns), tref.alias.as_ref(), null_extended);
+            let table = scope.entries.last().expect("just pushed").to_bound_table_ref();
+            return Ok((
+                table,
+                BoundRelation::Cte(BoundCteRef {
+                    cte_id: binding.id,
+                    name: name.clone(),
+                    plan: None,
+                }),
+            ));
+        }
+    }
+
+    if !tref.column_aliases.is_empty() {
+        return Err(SqlError::Unsupported {
+            detail: "a column-name list on a base-table alias".to_string(),
+        });
+    }
+    let resolved = scope::resolve_table(catalog, ctx, auth, metrics, &tref.name, Privilege::Select)?;
+    check_alias_not_duplicate(scope, tref.alias.as_ref(), &resolved.table.name)?;
+    scope.push(resolved, tref.alias.as_ref(), null_extended);
+    let table = scope.entries.last().expect("just pushed").to_bound_table_ref();
+    Ok((table, BoundRelation::Table))
 }
 
 fn check_alias_not_duplicate(
@@ -281,7 +538,9 @@ fn check_alias_not_duplicate(
 }
 
 fn bind_projection(
+    env: &BindEnv<'_>,
     scope: &Scope,
+    outer: Option<&OuterScopes<'_>>,
     limits: &SqlLimits,
     items: &[ast::SelectItem],
     max_parameter: &mut u32,
@@ -300,7 +559,10 @@ fn bind_projection(
                 // binding an aggregate call is never by itself illegal,
                 // matching plain SQL ("SELECT COUNT(*) FROM t" needs no
                 // GROUP BY).
-                let mut eb = ExprBinder::new(Some(scope), limits).with_aggregate(true);
+                let mut eb = ExprBinder::new(Some(scope), limits)
+                    .with_aggregate(true)
+                    .with_env(env)
+                    .with_outer(outer);
                 let bound = eb.bind(&item_expr.expr, None)?;
                 *max_parameter = (*max_parameter).max(eb.max_parameter);
                 let output_name = item_expr
@@ -434,6 +696,9 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
         BoundExprKind::Function { args, .. } => args.iter().any(contains_aggregate),
+        // The subquery's own aggregates belong to the subquery; only its
+        // `IN` operand is an expression of *this* query.
+        BoundExprKind::Subquery(sq) => sq.operand.as_ref().is_some_and(contains_aggregate),
     }
 }
 
@@ -443,7 +708,11 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
 /// `group_by`'s own bound expressions. A bare column reference
 /// satisfying neither is rejected — never silently resolved against an
 /// arbitrary row of its group (item 17's own core correctness rule).
-fn validate_group_compat(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()> {
+fn validate_group_compat(
+    expr: &BoundExpr,
+    group_by: &[BoundExpr],
+    own_refs: &std::collections::BTreeSet<u32>,
+) -> Result<()> {
     if group_by.iter().any(|g| g == expr) {
         return Ok(());
     }
@@ -454,34 +723,37 @@ fn validate_group_compat(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
         // already rejected earlier, at aggregate-binding time).
         BoundExprKind::Aggregate(_) | BoundExprKind::AggregateRef(_) => Ok(()),
         BoundExprKind::Literal(_) | BoundExprKind::Parameter { .. } => Ok(()),
+        // A column of an enclosing query is a constant for one evaluation of
+        // this (sub)query, so it needs no grouping.
+        BoundExprKind::Column(c) if !own_refs.contains(&c.table_ref.0) => Ok(()),
         BoundExprKind::Column(_) => Err(SqlError::TypeMismatch {
             detail:
                 "column must appear in the GROUP BY clause or be used inside an aggregate function"
                     .to_string(),
         }),
-        BoundExprKind::UnaryOp { expr, .. } => validate_group_compat(expr, group_by),
+        BoundExprKind::UnaryOp { expr, .. } => validate_group_compat(expr, group_by, own_refs),
         BoundExprKind::BinaryOp { left, right, .. } => {
-            validate_group_compat(left, group_by)?;
-            validate_group_compat(right, group_by)
+            validate_group_compat(left, group_by, own_refs)?;
+            validate_group_compat(right, group_by, own_refs)
         }
-        BoundExprKind::IsNull { expr, .. } => validate_group_compat(expr, group_by),
+        BoundExprKind::IsNull { expr, .. } => validate_group_compat(expr, group_by, own_refs),
         BoundExprKind::Between {
             expr, low, high, ..
         } => {
-            validate_group_compat(expr, group_by)?;
-            validate_group_compat(low, group_by)?;
-            validate_group_compat(high, group_by)
+            validate_group_compat(expr, group_by, own_refs)?;
+            validate_group_compat(low, group_by, own_refs)?;
+            validate_group_compat(high, group_by, own_refs)
         }
         BoundExprKind::InList { expr, list, .. } => {
-            validate_group_compat(expr, group_by)?;
+            validate_group_compat(expr, group_by, own_refs)?;
             for item in list {
-                validate_group_compat(item, group_by)?;
+                validate_group_compat(item, group_by, own_refs)?;
             }
             Ok(())
         }
         BoundExprKind::Like { expr, pattern, .. } => {
-            validate_group_compat(expr, group_by)?;
-            validate_group_compat(pattern, group_by)
+            validate_group_compat(expr, group_by, own_refs)?;
+            validate_group_compat(pattern, group_by, own_refs)
         }
         BoundExprKind::Case {
             operand,
@@ -489,20 +761,42 @@ fn validate_group_compat(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             else_result,
         } => {
             if let Some(o) = operand {
-                validate_group_compat(o, group_by)?;
+                validate_group_compat(o, group_by, own_refs)?;
             }
             for (w, t) in branches {
-                validate_group_compat(w, group_by)?;
-                validate_group_compat(t, group_by)?;
+                validate_group_compat(w, group_by, own_refs)?;
+                validate_group_compat(t, group_by, own_refs)?;
             }
             if let Some(e) = else_result {
-                validate_group_compat(e, group_by)?;
+                validate_group_compat(e, group_by, own_refs)?;
             }
             Ok(())
         }
         BoundExprKind::Function { args, .. } => {
             for a in args {
-                validate_group_compat(a, group_by)?;
+                validate_group_compat(a, group_by, own_refs)?;
+            }
+            Ok(())
+        }
+        // An uncorrelated subquery is a constant per statement. A correlated
+        // one is evaluated once per group, so every column of *this* query
+        // it reads must be a grouping column (a column of a still-outer
+        // query is constant and needs nothing). Its `IN` operand is an
+        // expression of this query.
+        BoundExprKind::Subquery(sq) => {
+            if let Some(operand) = &sq.operand {
+                validate_group_compat(operand, group_by, own_refs)?;
+            }
+            for c in &sq.outer_refs {
+                if own_refs.contains(&c.table_ref.0)
+                    && !group_by
+                        .iter()
+                        .any(|g| matches!(&g.kind, BoundExprKind::Column(gc) if gc == c))
+                {
+                    return Err(SqlError::TypeMismatch {
+                        detail: "a column read by a correlated subquery must appear in the GROUP BY clause or be used inside an aggregate function".to_string(),
+                    });
+                }
             }
             Ok(())
         }
@@ -601,6 +895,13 @@ fn extract_aggregates(expr: BoundExpr, out: &mut Vec<BoundAggregateExpr>) -> Bou
                 .map(|a| extract_aggregates(a, out))
                 .collect(),
         },
+        BoundExprKind::Subquery(mut sq) => {
+            // The subquery's own tree was fully bound (aggregates already
+            // extracted) in its own `bind_select_in`; only the `IN` operand
+            // belongs to this query's aggregate namespace.
+            sq.operand = sq.operand.take().map(|e| extract_aggregates(e, out));
+            BoundExprKind::Subquery(sq)
+        }
     };
     BoundExpr { kind, ty, nullable }
 }

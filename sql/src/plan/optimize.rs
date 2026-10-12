@@ -160,7 +160,10 @@ fn pushdown_predicates(
             limit,
             offset,
         }),
-        leaf @ (LogicalPlan::EmptyRelation | LogicalPlan::Scan { .. }) => Ok(leaf),
+        leaf @ (LogicalPlan::EmptyRelation
+        | LogicalPlan::Scan { .. }
+        | LogicalPlan::Derived { .. }
+        | LogicalPlan::Cte { .. }) => Ok(leaf),
     }
 }
 
@@ -214,7 +217,9 @@ fn collect_required_columns(plan: &LogicalPlan, acc: &mut HashMap<u32, BTreeSet<
         }
     };
     match plan {
-        LogicalPlan::EmptyRelation => {}
+        // A derived table / CTE reference is opaque to column pruning: its
+        // body was planned and pruned on its own.
+        LogicalPlan::EmptyRelation | LogicalPlan::Derived { .. } | LogicalPlan::Cte { .. } => {}
         LogicalPlan::Scan {
             table, predicate, ..
         } => {
@@ -334,7 +339,9 @@ fn annotate_required_columns(
             limit,
             offset,
         },
-        leaf @ LogicalPlan::EmptyRelation => leaf,
+        leaf @ (LogicalPlan::EmptyRelation
+        | LogicalPlan::Derived { .. }
+        | LogicalPlan::Cte { .. }) => leaf,
     }
 }
 
@@ -403,7 +410,10 @@ fn mark_pushable_limits(plan: LogicalPlan, metrics: &PlannerMetrics) -> LogicalP
             input: Box::new(mark_pushable_limits(*input, metrics)),
             items,
         },
-        leaf @ (LogicalPlan::EmptyRelation | LogicalPlan::Scan { .. }) => leaf,
+        leaf @ (LogicalPlan::EmptyRelation
+        | LogicalPlan::Scan { .. }
+        | LogicalPlan::Derived { .. }
+        | LogicalPlan::Cte { .. }) => leaf,
     }
 }
 

@@ -7,6 +7,7 @@
 //! never by "approximate reasoning."
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use rubixdb::catalog::CatalogService;
 
@@ -30,10 +31,39 @@ pub enum JoinAlgorithm {
     IndexNestedLoop,
 }
 
+/// A CTE's definition, planned once (SQL-mission-1 Slice C) and shared by
+/// every reference to it (`Arc`): the executor materializes `plan`'s rows the
+/// first time any reference is read and serves all references from them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CtePlan {
+    pub id: u32,
+    pub name: String,
+    pub plan: PhysicalPlan,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalPlan {
     EmptyRelation,
     Access(PhysicalAccess),
+    /// A derived table: runs `plan` and exposes its output rows as the
+    /// relation `table_ref`.
+    Derived {
+        table_ref: u32,
+        id: u32,
+        alias: String,
+        plan: Box<PhysicalPlan>,
+        /// `LATERAL` and reading an earlier `FROM` item: re-run for every
+        /// row of the items before it (`outer_row_input`).
+        correlated: bool,
+        /// The right side of a join is read once per left row; such a
+        /// (non-correlated) derived table is materialized once and re-read.
+        rescanned: bool,
+    },
+    /// A reference to a materialized-once CTE, exposed as `table_ref`.
+    CteNode {
+        table_ref: u32,
+        cte: Arc<CtePlan>,
+    },
     Join {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
@@ -95,6 +125,23 @@ pub fn build_physical_plan(
 ) -> Result<PhysicalPlan> {
     match plan {
         LogicalPlan::EmptyRelation => Ok(PhysicalPlan::EmptyRelation),
+        LogicalPlan::Derived {
+            table,
+            id,
+            plan,
+            correlated,
+        } => Ok(PhysicalPlan::Derived {
+            table_ref: table.id.0,
+            id: *id,
+            alias: table.effective_name.clone(),
+            plan: plan.clone(),
+            correlated: *correlated,
+            rescanned: false,
+        }),
+        LogicalPlan::Cte { table, cte } => Ok(PhysicalPlan::CteNode {
+            table_ref: table.id.0,
+            cte: Arc::clone(cte),
+        }),
         LogicalPlan::Scan {
             table, predicate, ..
         } => {
@@ -124,7 +171,7 @@ pub fn build_physical_plan(
             // expressions naturally reveal whether this happened (a key
             // referencing a `left`-side `TableRefId` is what makes this
             // Index Nested Loop, not a separate mechanism).
-            let right_phys = match right.as_ref() {
+            let mut right_phys = match right.as_ref() {
                 LogicalPlan::Scan {
                     table, predicate, ..
                 } => {
@@ -149,6 +196,10 @@ pub fn build_physical_plan(
                 }
                 other => build_physical_plan(other, catalog, metrics)?,
             };
+
+            if let PhysicalPlan::Derived { rescanned, .. } = &mut right_phys {
+                *rescanned = true;
+            }
 
             let algorithm = if is_correlated_to(&right_phys, &left_refs) {
                 metrics.record_index_nested_loop_join();
@@ -282,7 +333,9 @@ fn collect_table_refs(plan: &LogicalPlan) -> BTreeSet<u32> {
     fn walk(plan: &LogicalPlan, out: &mut BTreeSet<u32>) {
         match plan {
             LogicalPlan::EmptyRelation => {}
-            LogicalPlan::Scan { table, .. } => {
+            LogicalPlan::Scan { table, .. }
+            | LogicalPlan::Derived { table, .. }
+            | LogicalPlan::Cte { table, .. } => {
                 out.insert(table.id.0);
             }
             LogicalPlan::Join { left, right, .. } => {

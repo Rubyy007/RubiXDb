@@ -101,6 +101,46 @@ pub enum BoundExprKind {
     Aggregate(BoundAggregateExpr),
     /// A reference to the output of an Aggregate plan operator (0-based index into aggregates).
     AggregateRef(usize),
+    /// SQL-mission-1: a scalar / `EXISTS` / `IN (SELECT ...)` subquery — one
+    /// node for all three, so the planner and executor have a single
+    /// nested-plan mechanism rather than one per syntax form.
+    Subquery(Box<BoundSubqueryExpr>),
+}
+
+/// What a subquery expression asks of its inner query's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryKind {
+    /// `(SELECT x ...)`: zero rows -> `NULL`, one row -> its value, more than
+    /// one row -> a runtime error (SQL standard; not a parse-time error).
+    Scalar,
+    /// `[NOT] EXISTS (SELECT ...)`: never `NULL`.
+    Exists { negated: bool },
+    /// `operand [NOT] IN (SELECT x ...)`: SQL three-valued logic.
+    In { negated: bool },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSubqueryExpr {
+    /// Statement-unique id (binder-allocated). Executor-side caches of an
+    /// uncorrelated subquery's result are keyed by it.
+    pub id: u32,
+    pub kind: SubqueryKind,
+    /// The left-hand expression of `IN`; `None` for `Scalar`/`Exists`.
+    pub operand: Option<BoundExpr>,
+    pub query: BoundSelect,
+    /// Outer-query columns this subquery (at any nesting depth) reads. Empty
+    /// means uncorrelated: its result is the same for every outer row.
+    pub outer_refs: Vec<ColumnRef>,
+    /// `alias.column` labels for the outer row this subquery is evaluated
+    /// for: every `outer_refs` column plus the primary-key columns of the
+    /// outer tables they belong to. Used only to say *which* outer row
+    /// triggered a runtime error (a scalar subquery returning several rows);
+    /// never part of evaluation.
+    pub outer_labels: Vec<(String, ColumnRef)>,
+    /// The physical plan of `query`, filled in by the planner
+    /// (`crate::plan`) -- `None` between bind and plan. The executor refuses
+    /// a subquery whose plan is `None`.
+    pub plan: Option<crate::plan::physical::PhysicalPlan>,
 }
 
 pub type BoundAggregateArg = crate::aggregate::AggregateArg<Box<BoundExpr>>;
@@ -121,12 +161,65 @@ pub struct BoundSelectItem {
     pub output_name: String,
 }
 
+/// The `table_id` every derived-table / CTE-reference relation carries in
+/// its `BoundTableRef` and in the `ColumnRef`s that read it. It is never a
+/// catalog id: nothing that looks a table up by id is ever handed such a
+/// relation (`LogicalPlan::Derived` / `Cte` are not `Scan`s).
+pub const SYNTHETIC_TABLE_ID: u32 = u32::MAX;
+
+/// Where a `FROM` item's rows come from (SQL-mission-1 Slice C).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundRelation {
+    /// A catalog table -- the only kind before Slice C.
+    Table,
+    /// `(SELECT ...) AS alias`, optionally `LATERAL`.
+    Derived(Box<BoundDerived>),
+    /// A reference to a CTE of an enclosing (or this) query's `WITH` list.
+    Cte(BoundCteRef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundDerived {
+    /// Statement-unique relation id (`BindEnv::alloc_relation_id`).
+    pub id: u32,
+    pub query: BoundSelect,
+    /// `LATERAL`: the body reads the `FROM` items before it, so it is
+    /// re-run for every row of them (and listed in `outer_refs`).
+    pub lateral: bool,
+    /// For a `LATERAL` body: the columns it reads from outside itself.
+    /// Empty for an ordinary derived table, which can read none.
+    pub outer_refs: Vec<ColumnRef>,
+    /// The body's physical plan, attached by the planner.
+    pub plan: Option<crate::plan::physical::PhysicalPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundCteRef {
+    pub cte_id: u32,
+    pub name: String,
+    /// The shared, once-planned definition (filled in by the planner).
+    pub plan: Option<std::sync::Arc<crate::plan::physical::CtePlan>>,
+}
+
+/// One `WITH name [(cols)] AS (...)` definition, owned by the query (or
+/// `UPDATE`/`DELETE`) that wrote the `WITH`. References point to it by id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundCte {
+    pub id: u32,
+    pub name: String,
+    /// Output column names after any column-name list.
+    pub columns: Vec<String>,
+    pub query: BoundSelect,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundFromItem {
     pub table: BoundTableRef,
     /// `None` for the first (base) item; `Some((kind, on_condition))`
     /// for every joined item.
     pub join: Option<(JoinKind, BoundExpr)>,
+    /// Where this item's rows come from (`Table` for a catalog table).
+    pub relation: BoundRelation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +240,8 @@ pub struct BoundOrderByItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSelect {
+    /// The `WITH` list this query wrote (SQL-mission-1 Slice C).
+    pub ctes: Vec<BoundCte>,
     pub distinct: bool,
     pub from: Vec<BoundFromItem>,
     pub projection: Vec<BoundSelectItem>,
@@ -192,6 +287,7 @@ pub struct BoundAssignment {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundUpdate {
+    pub ctes: Vec<BoundCte>,
     pub table: BoundTableRef,
     pub assignments: Vec<BoundAssignment>,
     pub selection: Option<BoundExpr>,
@@ -200,6 +296,7 @@ pub struct BoundUpdate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundDelete {
+    pub ctes: Vec<BoundCte>,
     pub table: BoundTableRef,
     pub selection: Option<BoundExpr>,
     pub max_parameter: u32,

@@ -6,10 +6,12 @@
 
 pub mod ddl;
 pub mod dml;
+pub mod env;
 pub mod expr;
 pub mod scope;
 pub mod select;
 
+pub use env::BindEnv;
 pub use scope::BindContext;
 
 use rubixdb::catalog::CatalogService;

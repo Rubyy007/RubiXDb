@@ -1,0 +1,20 @@
+[
+  {
+    "id": "feature_off",
+    "why": "Slice-B-complete tree: the converter refuses a derived table / LATERAL and every WITH list as Unsupported, exactly as before Slice C. Every Slice C test still compiles, so each failure is the feature's absence.",
+    "edits": [
+      {"file": "sql/src/convert.rs",
+       "old": "    if with.recursive {",
+       "new": "    if true || with.recursive {"},
+      {"file": "sql/src/convert.rs",
+       "old": "            if sample.is_some() {",
+       "new": "            if true || sample.is_some() {"}
+    ],
+    "commands": [
+      ["cargo", "test", "-p", "rubixdb-sql", "--lib", "--", "relation_tests", "mission1_corpus",
+       "correlated_tests::parser", "correlated_tests::binder", "parse_tests"],
+      ["cargo", "test", "-p", "rubixdb-api", "--test", "api_sql_integration", "--",
+       "derived_tables_through_the_real_api", "non_recursive_ctes_through_the_real_api"]
+    ]
+  }
+]

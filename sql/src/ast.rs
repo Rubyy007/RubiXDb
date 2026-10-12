@@ -173,6 +173,29 @@ pub enum Expr {
         func: crate::aggregate::AggregateFunc,
         arg: crate::aggregate::AggregateArg<Box<Expr>>,
     },
+    /// SQL-mission-1: a parenthesized scalar subquery, `(SELECT ...)`.
+    ScalarSubquery(Box<QueryExpr>),
+    /// SQL-mission-1: `[NOT] EXISTS (SELECT ...)`.
+    Exists {
+        subquery: Box<QueryExpr>,
+        negated: bool,
+    },
+    /// SQL-mission-1: `expr [NOT] IN (SELECT ...)`.
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<QueryExpr>,
+        negated: bool,
+    },
+}
+
+/// SQL-mission-1: a query used as a value or a relation (a subquery, a CTE
+/// body, a derived table, a set-operation branch) — the one nested-query
+/// shape every one of those forms shares. Extended by later slices of the
+/// mission with set operations; a top-level statement keeps using
+/// `Statement::Select` for the plain case.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryExpr {
+    Select(Box<Select>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,10 +213,30 @@ pub enum SelectItem {
     QualifiedWildcard(ObjectName),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
+    /// A base table's (or CTE's) name. For a derived table this is the
+    /// alias (or empty when none was written) -- callers must check
+    /// `derived` first.
     pub name: ObjectName,
     pub alias: Option<Ident>,
+    /// SQL-mission-1 Slice C: `(SELECT ...) AS alias`. `Some` makes this a
+    /// derived table whose body is this query.
+    pub derived: Option<Box<Select>>,
+    /// `LATERAL (SELECT ...)`: the body may read the FROM items before it.
+    pub lateral: bool,
+    /// `AS alias(a, b, ...)`: the relation's column names, replacing the
+    /// body's output names. Empty when none were written.
+    pub column_aliases: Vec<Ident>,
+}
+
+/// One `WITH name [(columns)] AS (SELECT ...)` definition (non-recursive;
+/// `WITH RECURSIVE` is refused at conversion).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: Ident,
+    pub columns: Vec<Ident>,
+    pub query: Box<Select>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +270,8 @@ pub struct OrderByItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// SQL-mission-1 Slice C: the `WITH` list of this query (empty if none).
+    pub ctes: Vec<Cte>,
     pub distinct: bool,
     pub projection: Vec<SelectItem>,
     pub from: Option<FromClause>,
@@ -240,6 +285,8 @@ pub struct Select {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insert {
+    /// A `WITH` list written before the statement (SQL-mission-1 Slice C).
+    pub ctes: Vec<Cte>,
     pub table: ObjectName,
     /// `None` = every column, in catalog ordinal order (`INSERT INTO t
     /// VALUES (...)`); `Some` = the explicit `(col, ...)` list.
@@ -255,6 +302,8 @@ pub struct Assignment {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
+    /// A `WITH` list written before the statement (SQL-mission-1 Slice C).
+    pub ctes: Vec<Cte>,
     pub table: ObjectName,
     pub assignments: Vec<Assignment>,
     pub selection: Option<Expr>,
@@ -262,6 +311,8 @@ pub struct Update {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delete {
+    /// A `WITH` list written before the statement (SQL-mission-1 Slice C).
+    pub ctes: Vec<Cte>,
     pub table: ObjectName,
     pub selection: Option<Expr>,
 }

@@ -1,0 +1,14 @@
+{
+ "scenario": "CM6_large_wal_tail",
+ "mutation": "clean stopped directory whose un-flushed WAL tail is far above the 4 MiB memtable bound",
+ "check_exit": 0,
+ "check_stdout_tail": "INSPECTION  offline check of <dir>\\recon\\data\nINFO     NON_RELATIONAL_KEYS        keyspace           22218 entries outside the catalog/relational namespaces (raw key-value API data)\nresult: 0 error(s), 0 warning(s), check complete\n",
+ "stderr": "",
+ "diff": {
+  "added": [],
+  "removed": [],
+  "content_changed": [],
+  "mtime_only": []
+ },
+ "modified": false
+}

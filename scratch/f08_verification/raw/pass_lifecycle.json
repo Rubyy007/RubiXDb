@@ -1,0 +1,102 @@
+{
+ "fixture_sstable_bytes": 3481397709,
+ "full_pass_256": {
+  "rate": 256,
+  "transitions": [
+   [
+    0.02,
+    "running"
+   ],
+   [
+    21.39,
+    "complete"
+   ]
+  ],
+  "threads_before_pass": 19,
+  "threads_peak": 19,
+  "handles_peak": 114,
+  "status_anomalies": [],
+  "final": {
+   "t": 21.38,
+   "state": "complete",
+   "tv": 3,
+   "tt": 3,
+   "bv": 3481188624,
+   "readyz": "complete",
+   "ready": true,
+   "threads": 18,
+   "handles": 113
+  },
+  "threads_after_pass": 18,
+  "handles_after_pass": 113,
+  "stop": [
+   "graceful",
+   0
+  ]
+ },
+ "cancel_midpass_4": {
+  "rate": 4,
+  "transitions": [
+   [
+    0.01,
+    "running"
+   ]
+  ],
+  "threads_before_pass": 19,
+  "threads_peak": 19,
+  "handles_peak": 115,
+  "status_anomalies": [],
+  "final": {
+   "t": 15.15,
+   "state": "running",
+   "tv": 0,
+   "tt": 3,
+   "bv": 63545328,
+   "readyz": "running",
+   "ready": true,
+   "threads": 19,
+   "handles": 115
+  },
+  "stop": [
+   "graceful",
+   0
+  ],
+  "stop_seconds": 0.38,
+  "process_alive_after_stop": false,
+  "rubixdb_processes_left": []
+ },
+ "restart_after_cancel": {
+  "rate": 256,
+  "transitions": [
+   [
+    0.02,
+    "running"
+   ],
+   [
+    13.38,
+    "complete"
+   ]
+  ],
+  "threads_before_pass": 19,
+  "threads_peak": 19,
+  "handles_peak": 113,
+  "status_anomalies": [],
+  "final": {
+   "t": 13.37,
+   "state": "complete",
+   "tv": 3,
+   "tt": 3,
+   "bv": 3481188624,
+   "readyz": "complete",
+   "ready": true,
+   "threads": 18,
+   "handles": 111
+  },
+  "threads_after_pass": 18,
+  "handles_after_pass": 111,
+  "stop": [
+   "graceful",
+   0
+  ]
+ }
+}

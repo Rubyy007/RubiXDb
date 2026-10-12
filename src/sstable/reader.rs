@@ -13,8 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::error::{EngineError, Result};
-use crate::sstable::bloom::BloomFilter;
-use crate::sstable::format::{self, DecodedRecord, Footer, IndexEntry, FOOTER_SIZE, OP_PUT};
+use crate::sstable::bloom::{self, BloomFilter};
+use crate::sstable::format::{
+    self, DecodedRecord, Footer, IndexEntry, DEFAULT_BLOOM_BITS_PER_KEY, FOOTER_SIZE, OP_PUT,
+};
 use crate::sstable::RecordValue;
 
 fn corrupt(detail: impl Into<String>) -> EngineError {
@@ -123,6 +125,19 @@ impl SsTable {
             return Err(corrupt(
                 "footer: index block does not end exactly at the footer",
             ));
+        }
+
+        // F-08 / GAP-B: the footer `record_count` is not otherwise validated at open, yet compaction sums it into the
+        // output bloom size. Refuse, in constant time and before the bloom block is read or allocated, a count whose
+        // bloom the reader itself would refuse (`bloom::max_record_count_for_bloom_cap`, derived from the reader cap).
+        // The format is not changed; an honest table never exceeds it (its own bloom would not decode).
+        let max_record_count = bloom::max_record_count_for_bloom_cap(DEFAULT_BLOOM_BITS_PER_KEY);
+        if footer.record_count > max_record_count {
+            return Err(corrupt(format!(
+                "footer: record_count {} exceeds {max_record_count}, the largest count whose bloom filter fits the {} byte reader limit",
+                footer.record_count,
+                bloom::MAX_BLOOM_BIT_ARRAY_BYTES
+            )));
         }
 
         let bloom_len_usize: usize = footer

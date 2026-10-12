@@ -46,8 +46,24 @@ pub fn build_operator<'a>(
     ec: &ExecCtx<'a>,
 ) -> Result<Box<dyn Operator<'a> + 'a>> {
     match plan {
-        PhysicalPlan::EmptyRelation => Ok(Box::new(EmptyRelationOp { done: false })),
+        PhysicalPlan::EmptyRelation => Ok(Box::new(EmptyRelationOp {
+            done: false,
+            // SQL-mission-1 Slice B: a `FROM`-less subquery (`SELECT t.id + 1`)
+            // reads its enclosing query's row, so its single row carries it.
+            ctx: outer.clone(),
+        })),
         PhysicalPlan::Access(access) => Ok(Box::new(AccessOp::build(access, outer, ec)?)),
+        PhysicalPlan::Derived {
+            table_ref,
+            id,
+            plan,
+            correlated,
+            rescanned,
+            ..
+        } => super::relation::open_derived(*table_ref, *id, plan, *correlated, *rescanned, outer, ec),
+        PhysicalPlan::CteNode { table_ref, cte } => {
+            super::relation::open_cte(*table_ref, cte, outer, ec)
+        }
         PhysicalPlan::Join {
             left,
             right,
@@ -83,6 +99,7 @@ pub fn build_operator<'a>(
             build_operator(input, outer, ec)?,
             group_by.clone(),
             aggregates.clone(),
+            outer.clone(),
         ))),
         PhysicalPlan::Sort { input, items } => Ok(Box::new(SortOp::build(
             build_operator(input, outer, ec)?,
@@ -109,6 +126,7 @@ pub fn build_operator<'a>(
 
 struct EmptyRelationOp {
     done: bool,
+    ctx: RowContext,
 }
 
 impl<'a> Operator<'a> for EmptyRelationOp {
@@ -118,7 +136,7 @@ impl<'a> Operator<'a> for EmptyRelationOp {
         }
         self.done = true;
         Ok(Some(Tuple {
-            ctx: RowContext::new(),
+            ctx: self.ctx.clone(),
             projected: Vec::new(),
         }))
     }
@@ -294,6 +312,12 @@ struct AggregateOp<'a> {
     group_by: Vec<BoundExpr>,
     aggregates: Vec<BoundAggregateExpr>,
     output: Option<std::vec::IntoIter<Tuple>>,
+    /// The enclosing query's row (SQL-mission-1 Slice B). A group built from
+    /// input rows already carries it (every row below was produced with it);
+    /// the one group that has *no* input row -- a global aggregate over zero
+    /// rows -- would otherwise lose it, and a correlated `SELECT MAX(x) + t.y
+    /// FROM u WHERE u.k = t.k` could not read `t.y`.
+    outer: RowContext,
 }
 
 impl<'a> AggregateOp<'a> {
@@ -301,12 +325,14 @@ impl<'a> AggregateOp<'a> {
         input: Box<dyn Operator<'a> + 'a>,
         group_by: Vec<BoundExpr>,
         aggregates: Vec<BoundAggregateExpr>,
+        outer: RowContext,
     ) -> Self {
         AggregateOp {
             input,
             group_by,
             aggregates,
             output: None,
+            outer,
         }
     }
 
@@ -401,7 +427,7 @@ impl<'a> AggregateOp<'a> {
         // qualifying input rows (every aggregate's own documented
         // empty-input contract — `COUNT` is `0`, the rest are `NULL`).
         if self.group_by.is_empty() && groups.is_empty() {
-            groups.push((RowContext::new(), self.initial_states()?));
+            groups.push((self.outer.clone(), self.initial_states()?));
         }
 
         ec.metrics.record_aggregate_rows_processed(rows_processed);
@@ -768,6 +794,9 @@ fn right_side_table_refs(plan: &PhysicalPlan) -> Vec<u32> {
         match plan {
             PhysicalPlan::EmptyRelation => {}
             PhysicalPlan::Access(access) => out.push(access_table_ref(access)),
+            PhysicalPlan::Derived { table_ref, .. } | PhysicalPlan::CteNode { table_ref, .. } => {
+                out.push(*table_ref)
+            }
             PhysicalPlan::Join { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);

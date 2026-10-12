@@ -1,0 +1,16 @@
+{
+ "present_40001_60000": {
+  "n": 6667,
+  "wrong_or_missing": 0
+ },
+ "absent": {
+  "n": 2499,
+  "unexpected": 0
+ },
+ "count": "84000",
+ "expected_count": 84000,
+ "stop": [
+  "graceful",
+  0
+ ]
+}

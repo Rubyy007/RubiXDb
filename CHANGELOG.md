@@ -2829,3 +2829,41 @@ Every protected path; the F-07 refusal path, quarantine, `check` path and cleanu
 - `PHASE_ITEM_F08_VERIFICATION.md` and `scratch/f08_verification/` (scripts, raw evidence).
 ### Not changed
 Every source file, test and protected path; ADR-SST-01 behaviour.
+
+## 2026-10-11 -- SSTable footer `record_count` is bounded at open (under [Unreleased])
+### Fixed
+- **A table whose footer `record_count` is above 214,748,364 is refused at open with a corruption error, before its bloom filter is read.** The value is the largest count whose bloom filter fits the reader's 256 MiB limit at the format's 10 bits per key. Before, such a table (for example one with a valid footer checksum and `record_count` 400,000,000) opened, and the next compaction sized the new table's bloom from it, wrote tables the reader refuses, and the next start was refused. The refusal is constant-time (one integer comparison), reads no data block, and the start-up preflight reports it as `SSTABLE_CORRUPT` with the directory untouched. No format change.
+### Not fixed
+- Compaction still sums the input tables' counts when sizing the output bloom: inputs whose counts add up to more than 214,748,364 still produce a table the reader refuses. A count below the bound that disagrees with the stored records is still not detected at start.
+
+## 2026-10-11 -- Compaction no longer commits an output whose bloom filter the reader would refuse (under [Unreleased])
+### Fixed
+- **A compaction whose input tables' record counts add up to more than 214,748,364 no longer writes, commits and then fails to open an oversized output.** The output bloom filter is now sized from the inputs' summed counts capped at the largest count whose bloom the reader accepts (a saturating sum, so it cannot wrap), and an output whose real record count still exceeds that bound is removed before anything is committed to the Manifest and reported as a permanent-candidate failure (the worker blocks after its existing budget). Before, such a compaction committed an unreadable table about every 5-7 seconds (about 285 MB each), never blocked, and the next start was refused. Every record is still written and every key still inserted in the bloom; the footer record count and the format are unchanged.
+### Not fixed
+- A database with more than 214,748,364 compaction survivors cannot be compacted into one table (compaction blocks safely). A record count below the bound that disagrees with the stored records is still not detected at start.
+
+## 2026-10-11 -- SQL: scalar, IN and EXISTS subqueries (under [Unreleased])
+### Added
+- **Scalar subqueries, `[NOT] EXISTS (SELECT ...)` and `expr [NOT] IN (SELECT ...)`** in the SELECT list, `WHERE`, `HAVING` and `ORDER BY` of a `SELECT`, and in the `WHERE` of `UPDATE` and `DELETE`. A scalar subquery over zero rows is `NULL`, over one row is its value, and over more than one row fails at run time with `EXECUTION_ERROR` (a subquery with more than one column is a bind error). `IN`/`NOT IN` follow SQL three-valued logic (`x NOT IN (1, 2, NULL)` is never true). An uncorrelated subquery runs once per statement; a subquery used where it cannot run (`JOIN ... ON`, `GROUP BY`, `LIMIT`/`OFFSET`, `INSERT ... VALUES`, `UPDATE ... SET`, column `DEFAULT`) is rejected as unsupported. `EXPLAIN` shows the nested plan without running it.
+- New limits: nesting depth 32 and 256 subqueries per statement (parse/bind, `RESOURCE_LIMIT`), and 256 MiB / 1,000,000 rows for a materialized `IN` set (execution, `RESOURCE_LIMIT`, never truncated).
+### Not added
+- Correlated subqueries (an outer column inside a subquery is still an unknown column), derived tables, CTEs and set operations.
+
+## 2026-10-11 -- SQL: correlated subqueries (under [Unreleased])
+### Added
+- **Correlated subqueries**: a scalar, `[NOT] EXISTS` or `[NOT] IN (SELECT ...)` subquery may reference columns of any enclosing query (up to the 32-level nesting limit). A name resolves against the subquery's own `FROM` first, then each enclosing query innermost-first; a name found nowhere is an unknown column. The inner query is re-run for every enclosing row (no caching, no decorrelation). A scalar subquery that returns more than one row for an enclosing row is a runtime `EXECUTION_ERROR` that names that row.
+- **`UPDATE ... SET col = (SELECT ...)`**, including correlated subqueries, evaluated against the table as it was before the statement (a refused or failed statement writes nothing). Correlated subqueries in `UPDATE`/`DELETE ... WHERE` see the pre-statement table as well.
+- New execution limits: `max_correlated_reexecutions` (1,000,000 per statement) and `max_subquery_outer_rows` (100,000 per subquery), both `RESOURCE_LIMIT`; new counter `correlated_subquery_reexecs` (`ExecMetrics`); `EXPLAIN` marks a correlated subquery `correlated outer_row_input=true` and an uncorrelated one `uncorrelated (executed once)`.
+### Changed
+- An aggregate whose arguments reference only an enclosing query's columns is rejected as unsupported (it belongs to the enclosing query), instead of being evaluated over the inner rows.
+### Not added
+- Correlation inside derived tables, CTEs, set operations (later slices); index-driven or decorrelated execution of correlated subqueries.
+
+## 2026-10-11 -- SQL: derived tables, LATERAL and non-recursive CTEs (under [Unreleased])
+### Added
+- **Derived tables**: `SELECT ... FROM (SELECT ...) AS d`, with an optional column-name list `AS d(a, b)` (exactly as many names as columns), nesting, joins, and GROUP BY / HAVING / ORDER BY / LIMIT / DISTINCT inside. A derived table must have an alias. Its columns are the inner SELECT list's output names. An ordinary derived table cannot read columns of the query around it or of the FROM items beside it: `derived table 'd' cannot reference outer column 'c' without LATERAL`.
+- **`[LEFT] JOIN LATERAL (SELECT ...) alias ON cond`**: the body may read the FROM items before it; it runs once per row of them.
+- **Non-recursive CTEs**: `WITH name [(columns)] AS (SELECT ...), ... <statement>` before `SELECT`, `UPDATE`, `DELETE` (and, with no effect, `INSERT`). A CTE shadows a base table of the same name (only for an unqualified name), may use earlier CTEs of its list, may be read any number of times -- its rows are computed once per statement -- and is scoped to the query that wrote it (a `WITH` inside a subquery or derived table does not leak). A CTE that refers to itself is rejected (`CTE 'x' refers to itself; use WITH RECURSIVE`) unless a table of that name exists; one that uses a later CTE is rejected.
+- New limits (`RESOURCE_LIMIT`): `max_cte_definitions` (64), `max_cte_references` (256), `max_derived_table_depth` (32); a materialized CTE / join-side derived table is bounded by `max_materialized_rows` and `max_materialized_bytes`. New counter `cte_materializations_total`. `EXPLAIN` shows a twice-read CTE once, marked materialized.
+### Changed
+- `WITH` and derived tables were rejected as unsupported before; they now work. Still unsupported: `WITH RECURSIVE`, set operations (`UNION` etc.) inside a derived table or CTE, `FROM t, LATERAL (...)` and `CROSS JOIN LATERAL`.

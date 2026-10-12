@@ -13,8 +13,13 @@ mod access_op;
 pub mod cost;
 pub mod expr_eval;
 pub mod operators;
+mod relation;
+mod subquery;
 pub mod write;
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -274,6 +279,56 @@ pub struct ExecLimits {
     /// per item 30's own "choose a defensible bound and document it"
     /// instruction, since no existing limit already covers this shape.
     pub max_aggregate_state_bytes: usize,
+    /// SQL-mission-1: the hard cap on the estimated bytes one subquery's
+    /// materialized result (an `IN (SELECT ...)` value set; later, a CTE's or
+    /// set operation's row buffer) may occupy. `max_materialized_rows` bounds
+    /// the *count*; this bounds the *size*, because a few rows of large
+    /// `TEXT`/`BLOB` values can exhaust memory long before the row cap. Same
+    /// default and rationale as `max_aggregate_state_bytes` (a structurally
+    /// similar "state held for the life of one statement" resource).
+    pub max_materialized_bytes: usize,
+    /// SQL-mission-1 Slice B: the most times *all* correlated subqueries of
+    /// one statement together may be re-executed (once per enclosing-query
+    /// row that drives them). A correlated subquery runs its inner query once
+    /// per outer row, so without this bound a large outer table turns one
+    /// statement into an unbounded amount of work. Exceeding it is
+    /// `RESOURCE_LIMIT`, never a silent truncation.
+    ///
+    /// Default 1,000,000: the same figure as `max_materialized_rows` and
+    /// `max_group_count` -- the codebase's existing "one statement may touch
+    /// about a million of these" budget -- so a correlated query over a
+    /// million-row outer table is still permitted while one over a hundred
+    /// million is refused up front rather than left to run into the
+    /// deadline.
+    pub max_correlated_reexecutions: u64,
+    /// SQL-mission-1 Slice B: the most times *one* correlated subquery may be
+    /// evaluated in a statement, i.e. the number of enclosing-query rows
+    /// allowed to drive it. A secondary guard under
+    /// `max_correlated_reexecutions`: it stops a single subquery from
+    /// consuming the whole budget (and, for a subquery nested in another
+    /// correlated subquery, counts every evaluation across all the outer
+    /// evaluations).
+    ///
+    /// Default 100,000: one tenth of the statement-wide budget, so a
+    /// statement with several correlated subqueries over a table of up to
+    /// 100,000 rows runs, while one runaway subquery cannot starve the rest.
+    pub max_subquery_outer_rows: u64,
+    /// SQL-mission-1 Slice C: the most `WITH` definitions (CTEs) one
+    /// statement may contain, counted over the whole statement including
+    /// CTEs defined inside subqueries and derived tables. Checked when
+    /// execution starts, before any work. Default 64: far more than a
+    /// hand-written query uses, small enough that the per-definition
+    /// bookkeeping (one materialized row set each) stays bounded.
+    pub max_cte_definitions: u32,
+    /// The most CTE *references* (`FROM name` occurrences, across all CTEs)
+    /// one statement may contain. Default 256: four references to each of the
+    /// default 64 definitions.
+    pub max_cte_references: u32,
+    /// The deepest nesting of derived tables (`FROM (SELECT ... FROM (SELECT
+    /// ...))`) one statement may execute. Default 32, the same as the
+    /// subquery nesting limit (`SqlLimits::max_subquery_depth`), which the
+    /// binder also applies to derived tables.
+    pub max_derived_table_depth: u32,
 }
 
 impl Default for ExecLimits {
@@ -287,6 +342,12 @@ impl Default for ExecLimits {
             max_dml_target_rows: 10_000,
             max_group_count: 1_000_000,
             max_aggregate_state_bytes: 256 * 1024 * 1024,
+            max_materialized_bytes: 256 * 1024 * 1024,
+            max_correlated_reexecutions: 1_000_000,
+            max_subquery_outer_rows: 100_000,
+            max_cte_definitions: 64,
+            max_cte_references: 256,
+            max_derived_table_depth: 32,
         }
     }
 }
@@ -356,6 +417,21 @@ pub struct ExecMetrics {
     /// aggregation-specific check (`max_group_count`/`max_aggregate_
     /// state_bytes`) actually raised.
     aggregate_resource_limit_hits: AtomicU64,
+    /// SQL-mission-1: inner-query executions started for a subquery
+    /// expression. An uncorrelated subquery contributes at most 1 per
+    /// statement; a correlated one 1 per evaluation (per outer row).
+    subquery_executions: AtomicU64,
+    /// SQL-mission-1: evaluations of an uncorrelated subquery answered from
+    /// the per-statement result cache instead of re-running the inner query.
+    subquery_cache_hits: AtomicU64,
+    /// SQL-mission-1 Slice B: evaluations of a *correlated* subquery, i.e.
+    /// times its inner query was re-run for an enclosing-query row. (Each
+    /// one is also counted in `subquery_executions`.)
+    correlated_subquery_reexecs: AtomicU64,
+    /// SQL-mission-1 Slice C: CTEs whose rows were materialized (once each
+    /// per execution, however many references read them; a CTE nobody
+    /// reads is never materialized).
+    cte_materializations_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -390,6 +466,10 @@ pub struct ExecMetricsSnapshot {
     pub groups_emitted: u64,
     pub aggregate_rows_processed: u64,
     pub aggregate_resource_limit_hits: u64,
+    pub subquery_executions: u64,
+    pub subquery_cache_hits: u64,
+    pub correlated_subquery_reexecs: u64,
+    pub cte_materializations_total: u64,
 }
 
 impl ExecMetrics {
@@ -454,6 +534,21 @@ impl ExecMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_subquery_execution(&self) {
+        self.subquery_executions.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_subquery_cache_hit(&self) {
+        self.subquery_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_cte_materialization(&self) {
+        self.cte_materializations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_correlated_subquery_reexec(&self) {
+        self.correlated_subquery_reexecs
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> ExecMetricsSnapshot {
         ExecMetricsSnapshot {
             queries_executed: self.queries_executed.load(Ordering::Relaxed),
@@ -481,6 +576,12 @@ impl ExecMetrics {
             aggregate_resource_limit_hits: self
                 .aggregate_resource_limit_hits
                 .load(Ordering::Relaxed),
+            subquery_executions: self.subquery_executions.load(Ordering::Relaxed),
+            subquery_cache_hits: self.subquery_cache_hits.load(Ordering::Relaxed),
+            correlated_subquery_reexecs: self
+                .correlated_subquery_reexecs
+                .load(Ordering::Relaxed),
+            cte_materializations_total: self.cte_materializations_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -490,6 +591,20 @@ impl ExecMetrics {
 // nothing else. No raw SQL text, no credentials, no filesystem path, no
 // mutable global state.
 // =======================================================================
+
+/// Correlated-subquery evaluations already spent against
+/// `max_correlated_reexecutions` / `max_subquery_outer_rows`. An `UPDATE`
+/// evaluates its `WHERE` and then its `SET` expressions in separate execution
+/// contexts; carrying this from one to the next keeps the limits per
+/// *statement*, not per phase.
+#[derive(Debug, Clone, Default)]
+pub struct CorrelatedUsage {
+    total: u64,
+    by_subquery: HashMap<u32, u64>,
+}
+
+/// The stored rows of one materialized relation, shared by its readers.
+type RelationRows = Rc<Vec<Vec<Option<RelationalValue>>>>;
 
 pub struct ExecCtx<'a> {
     /// Item 35: every read goes through this transaction's own pinned
@@ -511,6 +626,25 @@ pub struct ExecCtx<'a> {
     pub metrics: &'a ExecMetrics,
     pub cancellation: &'a CancellationToken,
     deadline_at: Option<Instant>,
+    /// SQL-mission-1: results of *uncorrelated* subqueries already evaluated
+    /// in this execution, keyed by the binder-allocated subquery id. An
+    /// uncorrelated subquery's result cannot depend on the outer row, and
+    /// every read in one execution goes through one pinned snapshot, so
+    /// evaluating it once per statement is exact, not an approximation.
+    /// Execution is single-threaded (`ExecCtx` is borrowed `&`, never
+    /// shared across threads), so `RefCell` suffices.
+    subquery_cache: RefCell<HashMap<u32, Rc<subquery::CachedSubquery>>>,
+    /// SQL-mission-1 Slice B: correlated-subquery evaluations so far in this
+    /// execution -- in total, and per subquery id -- checked against
+    /// `ExecLimits::{max_correlated_reexecutions, max_subquery_outer_rows}`
+    /// *before* each re-execution starts.
+    correlated_total: Cell<u64>,
+    correlated_by_subquery: RefCell<HashMap<u32, u64>>,
+    /// SQL-mission-1 Slice C: rows of the relations materialized in this
+    /// execution (every CTE; a derived table the join re-reads), keyed by
+    /// relation id. Such a relation cannot read an enclosing row, so its rows
+    /// are the same whenever and however often it is read in one statement.
+    relation_cache: RefCell<HashMap<u32, RelationRows>>,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -533,7 +667,26 @@ impl<'a> ExecCtx<'a> {
             metrics,
             cancellation,
             deadline_at,
+            subquery_cache: RefCell::new(HashMap::new()),
+            correlated_total: Cell::new(0),
+            correlated_by_subquery: RefCell::new(HashMap::new()),
+            relation_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// What this context has spent against the correlated-subquery limits.
+    pub fn correlated_usage(&self) -> CorrelatedUsage {
+        CorrelatedUsage {
+            total: self.correlated_total.get(),
+            by_subquery: self.correlated_by_subquery.borrow().clone(),
+        }
+    }
+
+    /// Continues counting from `usage` (see `CorrelatedUsage`).
+    pub fn with_correlated_usage(self, usage: CorrelatedUsage) -> Self {
+        self.correlated_total.set(usage.total);
+        *self.correlated_by_subquery.borrow_mut() = usage.by_subquery;
+        self
     }
 
     /// Item 40/41/71: called at every operator's own natural iteration
@@ -653,6 +806,7 @@ fn execute_inner(
         }
     };
 
+    check_relation_limits(plan, limits)?;
     let ctx = ExecCtx::new(
         txn,
         table_store,
@@ -687,6 +841,41 @@ fn execute_inner(
     }
     metrics.record_rows_returned(rows.len() as u64);
     Ok(QueryResult { schema, rows })
+}
+
+/// Refuses, before any work, a statement whose CTE definitions, CTE
+/// references or derived-table nesting exceed the configured bounds
+/// (SQL-mission-1 Slice C). `RESOURCE_LIMIT`, never a truncation.
+pub(crate) fn check_relation_limits(plan: &Plan, limits: &ExecLimits) -> Result<()> {
+    let stats = crate::plan::relstats::plan_stats(plan);
+    // Counts every definition in the statement, including ones nothing reads.
+    let defined = crate::plan::relstats::defined_ctes(plan).max(stats.cte_definitions.len() as u32);
+    if u64::from(defined) > u64::from(limits.max_cte_definitions) {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "statement defines {defined} CTEs; max_cte_definitions is {}",
+                limits.max_cte_definitions
+            ),
+        });
+    }
+    if stats.cte_references.len() as u64 > u64::from(limits.max_cte_references) {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "statement references CTEs {} times; max_cte_references is {}",
+                stats.cte_references.len(),
+                limits.max_cte_references
+            ),
+        });
+    }
+    if stats.max_derived_depth as u64 > u64::from(limits.max_derived_table_depth) {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "derived tables are nested {} deep; max_derived_table_depth is {}",
+                stats.max_derived_depth, limits.max_derived_table_depth
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn plan_kind(plan: &Plan) -> &'static str {

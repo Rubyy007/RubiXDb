@@ -44,7 +44,7 @@ impl<'a> DepthGuard<'a> {
 pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Statement> {
     let dg = DepthGuard { limits };
     match stmt {
-        sp::Statement::Query(q) => Ok(Statement::Select(Box::new(convert_query(q, &dg, 0)?))),
+        sp::Statement::Query(q) => convert_query_statement(q, &dg),
         sp::Statement::Insert(insert) => Ok(Statement::Insert(convert_insert(insert, &dg)?)),
         sp::Statement::Update(update) => Ok(Statement::Update(convert_update(update, &dg)?)),
         sp::Statement::Delete(delete) => Ok(Statement::Delete(convert_delete(delete, &dg)?)),
@@ -227,11 +227,88 @@ fn statement_kind_name(stmt: &sp::Statement) -> &'static str {
 // SELECT
 // ---------------------------------------------------------------------
 
+/// `sp::Statement::Query`: a plain `SELECT` (possibly with a `WITH`), or --
+/// when sqlparser reads `WITH ... DELETE|UPDATE|INSERT` as a query whose body
+/// is the DML statement -- that statement with its `WITH` list attached.
+fn convert_query_statement(q: &sp::Query, dg: &DepthGuard) -> Result<Statement> {
+    let dml = match q.body.as_ref() {
+        sp::SetExpr::Delete(s) | sp::SetExpr::Update(s) | sp::SetExpr::Insert(s) => Some(s),
+        _ => None,
+    };
+    let Some(inner) = dml else {
+        return Ok(Statement::Select(Box::new(convert_query(q, dg, 0)?)));
+    };
+    if q.order_by.is_some()
+        || q.limit_clause.is_some()
+        || q.fetch.is_some()
+        || !q.locks.is_empty()
+        || q.for_clause.is_some()
+    {
+        return Err(unsupported("ORDER BY/LIMIT/FETCH/FOR on a data-modification statement"));
+    }
+    let ctes = convert_with(q.with.as_ref(), dg, 0)?;
+    match inner {
+        sp::Statement::Delete(d) => {
+            let mut d = convert_delete(d, dg)?;
+            d.ctes = ctes;
+            Ok(Statement::Delete(d))
+        }
+        sp::Statement::Update(u) => {
+            let mut u = convert_update(u, dg)?;
+            u.ctes = ctes;
+            Ok(Statement::Update(u))
+        }
+        sp::Statement::Insert(i) => {
+            let mut i = convert_insert(i, dg)?;
+            i.ctes = ctes;
+            Ok(Statement::Insert(i))
+        }
+        _ => Err(unsupported("statement kind not in the approved grammar subset")),
+    }
+}
+
+/// A `WITH` list (SQL-mission-1 Slice C). Only non-recursive definitions
+/// with a plain name, an optional plain column-name list and a `SELECT` body
+/// are accepted; everything else is refused, never dropped.
+fn convert_with(with: Option<&sp::With>, dg: &DepthGuard, depth: usize) -> Result<Vec<Cte>> {
+    let Some(with) = with else {
+        return Ok(Vec::new());
+    };
+    if with.recursive {
+        return Err(unsupported("WITH RECURSIVE"));
+    }
+    with.cte_tables
+        .iter()
+        .map(|cte| {
+            if cte.materialized.is_some() {
+                return Err(unsupported("WITH ... AS [NOT] MATERIALIZED"));
+            }
+            if cte.from.is_some() {
+                return Err(unsupported("WITH ... FROM"));
+            }
+            let columns = cte
+                .alias
+                .columns
+                .iter()
+                .map(|c| {
+                    if c.data_type.is_some() {
+                        return Err(unsupported("typed column in a CTE column list"));
+                    }
+                    convert_ident(&c.name, dg.limits)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Cte {
+                name: convert_ident(&cte.alias.name, dg.limits)?,
+                columns,
+                query: Box::new(convert_query(&cte.query, dg, depth + 1)?),
+            })
+        })
+        .collect()
+}
+
 fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select> {
     dg.check(depth)?;
-    if q.with.is_some() {
-        return Err(unsupported("WITH (common table expressions)"));
-    }
+    let ctes = convert_with(q.with.as_ref(), dg, depth)?;
     if q.fetch.is_some() || !q.locks.is_empty() || q.for_clause.is_some() {
         return Err(unsupported("FETCH/FOR UPDATE/FOR XML|JSON clauses"));
     }
@@ -353,6 +430,7 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
     };
 
     Ok(Select {
+        ctes,
         distinct,
         projection,
         from,
@@ -363,6 +441,14 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
         limit,
         offset,
     })
+}
+
+/// SQL-mission-1: a nested query (scalar / `EXISTS` / `IN` subquery) — the
+/// same `convert_query` a top-level statement uses, so a subquery accepts
+/// exactly the grammar a plain `SELECT` does and rejects exactly the same
+/// constructs.
+fn convert_subquery(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<QueryExpr> {
+    Ok(QueryExpr::Select(Box::new(convert_query(q, dg, depth)?)))
 }
 
 fn convert_select_item(item: &sp::SelectItem, dg: &DepthGuard, depth: usize) -> Result<SelectItem> {
@@ -417,7 +503,7 @@ fn convert_table_with_joins(
     depth: usize,
 ) -> Result<FromClause> {
     dg.check(depth)?;
-    let first = convert_table_factor(&t.relation, dg.limits)?;
+    let first = convert_table_factor(&t.relation, dg, depth + 1)?;
     let joins = t
         .joins
         .iter()
@@ -426,7 +512,9 @@ fn convert_table_with_joins(
     Ok(FromClause { first, joins })
 }
 
-fn convert_table_factor(tf: &sp::TableFactor, limits: &SqlLimits) -> Result<TableRef> {
+fn convert_table_factor(tf: &sp::TableFactor, dg: &DepthGuard, depth: usize) -> Result<TableRef> {
+    dg.check(depth)?;
+    let limits = dg.limits;
     match tf {
         sp::TableFactor::Table {
             name,
@@ -451,15 +539,46 @@ fn convert_table_factor(tf: &sp::TableFactor, limits: &SqlLimits) -> Result<Tabl
                     "table reference with function args/hints/version/partitions/ordinality",
                 ));
             }
+            let (alias, column_aliases) = match alias {
+                Some(a) => {
+                    let (name, columns) = convert_table_alias(a, limits)?;
+                    (Some(name), columns)
+                }
+                None => (None, Vec::new()),
+            };
             Ok(TableRef {
                 name: convert_object_name(name, limits)?,
-                alias: alias
-                    .as_ref()
-                    .map(|a| convert_table_alias(a, limits))
-                    .transpose()?,
+                alias,
+                derived: None,
+                lateral: false,
+                column_aliases,
             })
         }
-        sp::TableFactor::Derived { .. } => Err(unsupported("derived table (subquery in FROM)")),
+        sp::TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            sample,
+        } => {
+            if sample.is_some() {
+                return Err(unsupported("TABLESAMPLE on a derived table"));
+            }
+            let body = convert_query(subquery, dg, depth + 1)?;
+            let (alias, column_aliases) = match alias {
+                Some(a) => {
+                    let (name, columns) = convert_table_alias(a, limits)?;
+                    (Some(name), columns)
+                }
+                None => (None, Vec::new()),
+            };
+            Ok(TableRef {
+                name: ObjectName(alias.iter().cloned().collect()),
+                alias,
+                derived: Some(Box::new(body)),
+                lateral: *lateral,
+                column_aliases,
+            })
+        }
         other => Err(unsupported(format!("FROM item kind: {other:?}")).into_kind_only()),
     }
 }
@@ -488,11 +607,21 @@ impl IntoKindOnly for SqlError {
     }
 }
 
-fn convert_table_alias(alias: &sp::TableAlias, limits: &SqlLimits) -> Result<Ident> {
-    if !alias.columns.is_empty() {
-        return Err(unsupported("table alias with an explicit column list"));
-    }
-    convert_ident(&alias.name, limits)
+fn convert_table_alias(
+    alias: &sp::TableAlias,
+    limits: &SqlLimits,
+) -> Result<(Ident, Vec<Ident>)> {
+    let columns = alias
+        .columns
+        .iter()
+        .map(|c| {
+            if c.data_type.is_some() {
+                return Err(unsupported("typed column in a table alias column list"));
+            }
+            convert_ident(&c.name, limits)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((convert_ident(&alias.name, limits)?, columns))
 }
 
 fn convert_join(j: &sp::Join, dg: &DepthGuard, depth: usize) -> Result<Join> {
@@ -500,7 +629,7 @@ fn convert_join(j: &sp::Join, dg: &DepthGuard, depth: usize) -> Result<Join> {
     if j.global {
         return Err(unsupported("GLOBAL JOIN"));
     }
-    let table = convert_table_factor(&j.relation, dg.limits)?;
+    let table = convert_table_factor(&j.relation, dg, depth + 1)?;
     let (kind, constraint) = match &j.join_operator {
         sp::JoinOperator::Join(c) | sp::JoinOperator::Inner(c) => (JoinKind::Inner, c),
         sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinKind::Left, c),
@@ -639,6 +768,7 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Insert {
+        ctes: Vec::new(),
         table,
         columns,
         rows,
@@ -649,7 +779,10 @@ fn convert_update(update: &sp::Update, dg: &DepthGuard) -> Result<Update> {
     if update.from.is_some() || update.returning.is_some() {
         return Err(unsupported("UPDATE ... FROM / RETURNING"));
     }
-    let table = convert_table_factor(&update.table.relation, dg.limits)?;
+    let table = convert_table_factor(&update.table.relation, dg, 1)?;
+    if table.derived.is_some() {
+        return Err(unsupported("UPDATE of a derived table"));
+    }
     if !update.table.joins.is_empty() {
         return Err(unsupported("UPDATE with a joined target"));
     }
@@ -664,6 +797,7 @@ fn convert_update(update: &sp::Update, dg: &DepthGuard) -> Result<Update> {
         .map(|e| convert_expr(e, dg, 1))
         .transpose()?;
     Ok(Update {
+        ctes: Vec::new(),
         table: table.name,
         assignments,
         selection,
@@ -705,13 +839,17 @@ fn convert_delete(delete: &sp::Delete, dg: &DepthGuard) -> Result<Delete> {
             "DELETE with more than one target or a joined target",
         ));
     }
-    let table = convert_table_factor(&from[0].relation, dg.limits)?;
+    let table = convert_table_factor(&from[0].relation, dg, 1)?;
+    if table.derived.is_some() {
+        return Err(unsupported("DELETE from a derived table"));
+    }
     let selection = delete
         .selection
         .as_ref()
         .map(|e| convert_expr(e, dg, 1))
         .transpose()?;
     Ok(Delete {
+        ctes: Vec::new(),
         table: table.name,
         selection,
     })
@@ -861,6 +999,24 @@ fn convert_expr(e: &sp::Expr, dg: &DepthGuard, depth: usize) -> Result<Expr> {
         }
         sp::Expr::TypedString(ts) => convert_typed_string(ts),
         sp::Expr::Function(f) => convert_function(f, dg, depth),
+        sp::Expr::Subquery(q) => Ok(Expr::ScalarSubquery(Box::new(convert_subquery(
+            q,
+            dg,
+            depth + 1,
+        )?))),
+        sp::Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+            subquery: Box::new(convert_subquery(subquery, dg, depth + 1)?),
+            negated: *negated,
+        }),
+        sp::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(Expr::InSubquery {
+            expr: Box::new(convert_expr(expr, dg, depth + 1)?),
+            subquery: Box::new(convert_subquery(subquery, dg, depth + 1)?),
+            negated: *negated,
+        }),
         other => Err(unsupported(format!(
             "expression kind: {}",
             expr_kind_name(other)
@@ -870,9 +1026,6 @@ fn convert_expr(e: &sp::Expr, dg: &DepthGuard, depth: usize) -> Result<Expr> {
 
 fn expr_kind_name(e: &sp::Expr) -> &'static str {
     match e {
-        sp::Expr::Subquery(_) => "subquery expression",
-        sp::Expr::Exists { .. } => "EXISTS",
-        sp::Expr::InSubquery { .. } => "IN (subquery)",
         sp::Expr::Cast { .. } => "CAST",
         sp::Expr::Interval(_) => "INTERVAL",
         _ => "not in the approved grammar subset",

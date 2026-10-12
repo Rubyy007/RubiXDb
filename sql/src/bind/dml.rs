@@ -10,8 +10,9 @@ use rubixdb::catalog::CatalogService;
 use crate::ast;
 use crate::auth::AuthContext;
 use crate::bind::ddl::relational_type_of;
+use crate::bind::env::BindEnv;
 use crate::bind::expr::ExprBinder;
-use crate::bind::scope::{self, BindContext, Scope};
+use crate::bind::scope::{self, BindContext};
 use crate::bound::*;
 use crate::error::{Result, SqlError};
 use crate::limits::SqlLimits;
@@ -27,6 +28,15 @@ pub fn bind_insert(
 ) -> Result<BoundInsert> {
     let resolved =
         scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Insert)?;
+    if !stmt.ctes.is_empty() {
+        // An INSERT's VALUES cannot contain a subquery, so a CTE written
+        // before it can never be referenced. It is still bound (so a bad or
+        // forbidden definition is an error) and then dropped, unexecuted.
+        let env = BindEnv::new(catalog, ctx, auth, metrics);
+        let mut scope = env.new_scope();
+        let mut unused = 0u32;
+        crate::bind::select::bind_with_list(&env, limits, &stmt.ctes, &mut scope, None, &mut unused)?;
+    }
     let column_count = resolved.columns.len();
 
     let target_ordinals: Vec<u16> = match &stmt.columns {
@@ -162,14 +172,23 @@ pub fn bind_update(
     limits: &SqlLimits,
     stmt: &ast::Update,
 ) -> Result<BoundUpdate> {
+    let env = BindEnv::new(catalog, ctx, auth, metrics);
     let resolved =
         scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Update)?;
     let pk_ordinals: HashSet<u16> = resolved.table.pk_ordinals.iter().copied().collect();
-    let mut scope = Scope::default();
+    let mut scope = env.new_scope();
+    let mut max_parameter = 0u32;
+    let ctes = crate::bind::select::bind_with_list(
+        &env,
+        limits,
+        &stmt.ctes,
+        &mut scope,
+        None,
+        &mut max_parameter,
+    )?;
     scope.push(resolved, None, false);
     let table_columns = scope.entries[0].resolved.columns.clone();
 
-    let mut max_parameter = 0u32;
     let mut seen = HashSet::new();
     let assignments = stmt
         .assignments
@@ -194,7 +213,10 @@ pub fn bind_update(
                 });
             }
             let ty = relational_type_of(column)?;
-            let mut eb = ExprBinder::new(Some(&scope), limits);
+            // A `SET` expression may contain a subquery (SQL-mission-1 Slice
+            // B); it is evaluated against the row's pre-update values and the
+            // pre-statement table state (`exec::write::execute_update`).
+            let mut eb = ExprBinder::new(Some(&scope), limits).with_env(&env);
             let bound = eb.bind(&a.value, Some(ty))?;
             max_parameter = max_parameter.max(eb.max_parameter);
             if matches!(bound.kind, BoundExprKind::Literal(None)) && !column.nullable {
@@ -218,7 +240,7 @@ pub fn bind_update(
         .selection
         .as_ref()
         .map(|e| -> Result<BoundExpr> {
-            let mut eb = ExprBinder::new(Some(&scope), limits);
+            let mut eb = ExprBinder::new(Some(&scope), limits).with_env(&env);
             let bound = eb.bind(e, Some(rubixdb::relational::RelationalType::Boolean))?;
             max_parameter = max_parameter.max(eb.max_parameter);
             Ok(bound)
@@ -226,6 +248,7 @@ pub fn bind_update(
         .transpose()?;
 
     Ok(BoundUpdate {
+        ctes,
         table: scope.entries[0].to_bound_table_ref(),
         assignments,
         selection,
@@ -241,17 +264,26 @@ pub fn bind_delete(
     limits: &SqlLimits,
     stmt: &ast::Delete,
 ) -> Result<BoundDelete> {
+    let env = BindEnv::new(catalog, ctx, auth, metrics);
     let resolved =
         scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Delete)?;
-    let mut scope = Scope::default();
+    let mut scope = env.new_scope();
+    let mut max_parameter = 0u32;
+    let ctes = crate::bind::select::bind_with_list(
+        &env,
+        limits,
+        &stmt.ctes,
+        &mut scope,
+        None,
+        &mut max_parameter,
+    )?;
     scope.push(resolved, None, false);
 
-    let mut max_parameter = 0u32;
     let selection = stmt
         .selection
         .as_ref()
         .map(|e| -> Result<BoundExpr> {
-            let mut eb = ExprBinder::new(Some(&scope), limits);
+            let mut eb = ExprBinder::new(Some(&scope), limits).with_env(&env);
             let bound = eb.bind(e, Some(rubixdb::relational::RelationalType::Boolean))?;
             max_parameter = max_parameter.max(eb.max_parameter);
             Ok(bound)
@@ -259,6 +291,7 @@ pub fn bind_delete(
         .transpose()?;
 
     Ok(BoundDelete {
+        ctes,
         table: scope.entries[0].to_bound_table_ref(),
         selection,
         max_parameter,

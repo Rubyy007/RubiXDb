@@ -1,0 +1,16 @@
+{
+ "scenario": "CM4_manifest_torn_tail",
+ "mutation": "3 stray bytes appended to MANIFEST (torn trailing frame)",
+ "check_exit": 1,
+ "check_stdout_tail": "INSPECTION  offline check of <dir>\\recon\\data\nWARNING  MANIFEST_TORN_TAIL         MANIFEST           a torn tail was found; recovery truncates it (expected after a crash)\nresult: 0 error(s), 1 warning(s), check complete\n",
+ "stderr": "",
+ "diff": {
+  "added": [],
+  "removed": [],
+  "content_changed": [
+   "MANIFEST"
+  ],
+  "mtime_only": []
+ },
+ "modified": true
+}

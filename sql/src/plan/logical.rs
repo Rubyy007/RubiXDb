@@ -6,9 +6,13 @@
 //! (`BoundTableRef`) or an already-typed `BoundExpr`.
 
 use crate::ast::JoinKind;
+use std::sync::Arc;
+
 use crate::bound::{
-    BoundAggregateExpr, BoundExpr, BoundOrderByItem, BoundSelect, BoundSelectItem, BoundTableRef,
+    BoundAggregateExpr, BoundExpr, BoundOrderByItem, BoundRelation, BoundSelect, BoundSelectItem,
+    BoundTableRef,
 };
+use crate::plan::physical::{CtePlan, PhysicalPlan};
 use crate::error::{Result, SqlError};
 use crate::plan::limits::PlannerLimits;
 
@@ -32,6 +36,21 @@ pub enum LogicalPlan {
         /// "not yet pruned, assume every column is needed" (the safe
         /// default `build_logical_plan` itself uses).
         required_columns: Option<Vec<u16>>,
+    },
+    /// A derived table, `(SELECT ...) AS alias` (SQL-mission-1 Slice C): a
+    /// leaf whose rows are the already-planned body's output, exposed as the
+    /// relation `table`. No predicate is pushed into it.
+    Derived {
+        table: BoundTableRef,
+        id: u32,
+        plan: Box<PhysicalPlan>,
+        /// `LATERAL` and actually reading an earlier `FROM` item.
+        correlated: bool,
+    },
+    /// A reference to a CTE: a leaf reading the CTE's materialized rows.
+    Cte {
+        table: BoundTableRef,
+        cte: Arc<CtePlan>,
     },
     Join {
         left: Box<LogicalPlan>,
@@ -97,11 +116,7 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
 
     let mut plan = match select.from.first() {
         None => LogicalPlan::EmptyRelation,
-        Some(first) => LogicalPlan::Scan {
-            table: first.table.clone(),
-            predicate: None,
-            required_columns: None,
-        },
+        Some(first) => relation_leaf(first)?,
     };
 
     for item in select.from.iter().skip(1) {
@@ -111,11 +126,7 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
             .expect("crate::bind always sets `join: Some(..)` on every non-first BoundFromItem");
         plan = LogicalPlan::Join {
             left: Box::new(plan),
-            right: Box::new(LogicalPlan::Scan {
-                table: item.table.clone(),
-                predicate: None,
-                required_columns: None,
-            }),
+            right: Box::new(relation_leaf(item)?),
             kind,
             on,
         };
@@ -182,12 +193,41 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
     Ok(plan)
 }
 
+/// The leaf node for one `FROM` item: a `Scan` of a catalog table, or a
+/// derived table / CTE reference carrying its already-planned body.
+fn relation_leaf(item: &crate::bound::BoundFromItem) -> Result<LogicalPlan> {
+    Ok(match &item.relation {
+        BoundRelation::Table => LogicalPlan::Scan {
+            table: item.table.clone(),
+            predicate: None,
+            required_columns: None,
+        },
+        BoundRelation::Derived(d) => LogicalPlan::Derived {
+            table: item.table.clone(),
+            id: d.id,
+            plan: Box::new(d.plan.clone().ok_or_else(|| SqlError::PlanValidation {
+                detail: "a derived table reached logical planning without a physical plan".to_string(),
+            })?),
+            correlated: d.lateral && !d.outer_refs.is_empty(),
+        },
+        BoundRelation::Cte(r) => LogicalPlan::Cte {
+            table: item.table.clone(),
+            cte: r.plan.clone().ok_or_else(|| SqlError::PlanValidation {
+                detail: "a CTE reference reached logical planning without a planned definition".to_string(),
+            })?,
+        },
+    })
+}
+
 /// Total node count — used by `crate::plan::optimize`/`physical` to
 /// enforce `PlannerLimits::max_plan_nodes` (item 26) without needing a
 /// separate visitor per pass.
 pub fn node_count(plan: &LogicalPlan) -> usize {
     match plan {
-        LogicalPlan::EmptyRelation | LogicalPlan::Scan { .. } => 1,
+        LogicalPlan::EmptyRelation
+        | LogicalPlan::Scan { .. }
+        | LogicalPlan::Derived { .. }
+        | LogicalPlan::Cte { .. } => 1,
         LogicalPlan::Join { left, right, .. } => 1 + node_count(left) + node_count(right),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }

@@ -1,0 +1,386 @@
+[
+  {
+    "id": "M01_outer_level_beats_inner",
+    "why": "scope resolution reversed: a name the subquery defines itself is re-bound to an enclosing query's column (innermost no longer wins)",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 7,
+    "failed_tests": [
+      "correlated_tests::binder::a_qualifier_that_names_an_inner_item_never_falls_through_to_an_outer_column",
+      "correlated_tests::binder::an_ambiguity_inside_the_inner_query_is_not_escaped_by_an_outer_match",
+      "correlated_tests::binder::an_unqualified_name_defined_by_the_subquery_itself_is_not_an_outer_reference",
+      "correlated_tests::nested::a_correlated_subquery_may_contain_an_uncorrelated_one_which_still_runs_once",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "subquery_tests::exec::subquery_in_a_join_query_is_pushed_to_the_right_scan",
+      "subquery_tests::exec::subquery_parameter_is_bound_at_execution"
+    ]
+  },
+  {
+    "id": "M02_not_in_null_is_false",
+    "why": "NOT IN null trap broken: a non-member with a NULL in the inner set is FALSE instead of UNKNOWN",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 5,
+    "failed_tests": [
+      "correlated_tests::in_subquery::correlated_in_and_not_in_match_the_reference_model_on_random_data",
+      "correlated_tests::in_subquery::correlated_in_and_not_in_match_the_three_valued_reference_on_the_standard_data",
+      "correlated_tests::in_subquery::correlated_not_in_with_a_null_in_the_inner_set_never_returns_true",
+      "correlated_tests::in_subquery::the_in_value_is_null_exactly_when_the_result_is_unknown",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M03_outer_row_context_cleared",
+    "why": "the correlated inner plan is built with an empty outer row context instead of the current outer row",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 50,
+    "failed_tests": [
+      "correlated_tests::diff::a_correlated_scalar_compared_in_where_matches_the_reference_model",
+      "correlated_tests::diff::correlated_scalar_aggregates_match_the_reference_model_on_random_data",
+      "correlated_tests::diff_exists::correlated_exists_and_not_exists_match_the_reference_model_on_random_data",
+      "correlated_tests::dml::a_runtime_error_in_set_changes_nothing_and_names_the_row",
+      "correlated_tests::dml::a_self_correlated_delete_removes_every_member_of_a_duplicate_group",
+      "correlated_tests::dml::a_self_correlated_update_sees_the_pre_statement_table_not_its_own_partial_changes",
+      "correlated_tests::dml::delete_where_correlated_exists_not_exists_and_in_remove_exactly_the_matching_rows",
+      "correlated_tests::dml::set_may_mix_a_subquery_with_a_plain_expression_over_the_old_row",
+      "correlated_tests::dml::set_subqueries_see_the_table_as_it_was_before_the_statement",
+      "correlated_tests::dml::set_with_a_correlated_scalar_subquery_matches_the_reference",
+      "correlated_tests::dml::the_correlated_budget_is_one_per_statement_across_where_and_set",
+      "correlated_tests::dml::the_correlated_column_may_be_updated_by_the_same_statement",
+      "correlated_tests::dml::update_where_a_correlated_exists_changes_exactly_the_matching_rows",
+      "correlated_tests::exists::an_aggregate_without_group_by_inside_exists_always_yields_a_row",
+      "correlated_tests::exists::correlated_exists_and_not_exists_match_a_btreemap_join_and_partition_the_outer_rows",
+      "correlated_tests::exists::exists_combines_with_other_predicates_and_with_a_second_correlated_subquery",
+      "correlated_tests::exists::exists_is_never_unknown_when_the_inner_where_involves_null",
+      "correlated_tests::exists::exists_is_usable_as_a_value_in_the_select_list_and_in_case",
+      "correlated_tests::exists::exists_over_an_inner_join_with_the_correlation_in_the_join_condition",
+      "correlated_tests::exists::exists_stops_at_the_first_inner_row",
+      "correlated_tests::in_subquery::a_null_outer_value_is_unknown_unless_the_inner_set_is_empty",
+      "correlated_tests::in_subquery::an_expression_over_outer_columns_is_a_valid_in_operand",
+      "correlated_tests::in_subquery::correlated_in_and_not_in_match_the_reference_model_on_random_data",
+      "correlated_tests::in_subquery::correlated_in_and_not_in_match_the_three_valued_reference_on_the_standard_data",
+      "correlated_tests::in_subquery::correlated_not_in_with_a_null_in_the_inner_set_never_returns_true",
+      "correlated_tests::in_subquery::each_outer_row_re_runs_the_inner_query_and_the_set_is_bounded_per_evaluation",
+      "correlated_tests::in_subquery::the_in_value_is_null_exactly_when_the_result_is_unknown",
+      "correlated_tests::nested::a_correlated_subquery_may_contain_an_uncorrelated_one_which_still_runs_once",
+      "correlated_tests::nested::a_name_present_at_two_enclosing_levels_binds_to_the_nearer_one_at_run_time",
+      "correlated_tests::nested::a_runtime_error_in_the_innermost_level_names_the_enclosing_row_it_was_running_for",
+      "correlated_tests::nested::an_uncorrelated_subquery_may_contain_a_correlated_one",
+      "correlated_tests::nested::nested_correlated_queries_match_the_reference_model_on_random_data",
+      "correlated_tests::nested::nested_correlation_in_update_and_delete_matches_the_reference",
+      "correlated_tests::nested::the_innermost_binding_wins_when_an_alias_is_reused_at_the_third_level",
+      "correlated_tests::nested::three_levels_at_full_scale_match_the_reference",
+      "correlated_tests::nested::three_levels_exists_where_the_innermost_reads_both_enclosing_levels",
+      "correlated_tests::nested::three_levels_in_where_the_inner_set_depends_on_two_enclosing_rows",
+      "correlated_tests::nested::three_levels_scalar_counts_match_the_nested_loop_reference",
+      "correlated_tests::scalar::a_correlated_count_is_zero_not_null_when_nothing_matches",
+      "correlated_tests::scalar::a_correlated_max_matches_a_btreemap_join_for_every_outer_row",
+      "correlated_tests::scalar::a_correlated_scalar_returns_null_for_zero_rows_the_value_for_one_and_errors_for_many",
+      "correlated_tests::scalar::a_correlated_scalar_works_in_where_order_by_and_having",
+      "correlated_tests::scalar::a_from_less_subquery_reads_the_outer_row",
+      "correlated_tests::scalar::a_text_value_in_the_error_message_cannot_inject_terminal_escapes",
+      "correlated_tests::scalar::an_aggregate_over_zero_inner_rows_still_reads_the_outer_row",
+      "correlated_tests::scalar::an_outer_column_that_is_not_in_the_outer_select_list_is_still_available",
+      "correlated_tests::scalar::the_error_names_the_primary_key_even_when_correlating_on_another_column",
+      "correlated_tests::scalar::the_inner_aggregate_ranges_over_the_inner_rows_only_not_the_outer_table",
+      "correlated_tests::scalar::the_many_rows_error_names_the_outer_row_that_caused_it",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M04_reexec_metric_never_incremented",
+    "why": "correlated_subquery_reexecs is never recorded",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 8,
+    "failed_tests": [
+      "correlated_tests::exists::each_outer_row_costs_one_re_execution",
+      "correlated_tests::in_subquery::each_outer_row_re_runs_the_inner_query_and_the_set_is_bounded_per_evaluation",
+      "correlated_tests::nested::a_correlated_subquery_may_contain_an_uncorrelated_one_which_still_runs_once",
+      "correlated_tests::nested::an_uncorrelated_subquery_may_contain_a_correlated_one",
+      "correlated_tests::nested::the_budget_counts_every_level_exactly",
+      "correlated_tests::scalar::the_inner_query_is_re_run_once_per_outer_row_and_never_cached",
+      "exec::subquery::tests::a_refused_evaluation_is_not_counted_as_run",
+      "exec::subquery::tests::each_admitted_evaluation_is_counted_and_numbered_from_one"
+    ]
+  },
+  {
+    "id": "M05_total_counter_never_advances",
+    "why": "the statement-wide re-execution counter is never advanced, so max_correlated_reexecutions can never fire",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 8,
+    "failed_tests": [
+      "correlated_tests::dml::a_correlated_delete_respects_the_reexecution_limit_and_deletes_nothing_when_refused",
+      "correlated_tests::dml::the_correlated_budget_is_one_per_statement_across_where_and_set",
+      "correlated_tests::exists::the_correlated_exists_respects_max_correlated_reexecutions",
+      "correlated_tests::in_subquery::each_outer_row_re_runs_the_inner_query_and_the_set_is_bounded_per_evaluation",
+      "correlated_tests::nested::the_budget_counts_every_level_exactly",
+      "correlated_tests::scalar::max_correlated_reexecutions_is_enforced_and_exact",
+      "correlated_tests::scalar::the_per_subquery_limit_counts_each_subquery_separately",
+      "exec::subquery::tests::a_refused_evaluation_is_not_counted_as_run"
+    ]
+  },
+  {
+    "id": "M06_deadline_only_inside_inner_plan",
+    "why": "no deadline/cancellation check between outer rows; only the inner plan's own operators check",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 2,
+    "failed_tests": [
+      "exec::subquery::tests::a_cancelled_statement_is_detected_before_the_evaluation_is_counted",
+      "exec::subquery::tests::an_expired_deadline_is_detected_before_the_evaluation_is_counted"
+    ]
+  },
+  {
+    "id": "M07_authorization_skipped_for_nested_queries",
+    "why": "a nested (correlated) query is bound with an admin principal, so only the outermost FROM is authorization-checked",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 3,
+    "failed_tests": [
+      "correlated_tests::binder::a_forbidden_table_inside_a_correlated_subquery_fails_at_bind_like_a_missing_one",
+      "correlated_tests::binder::authorization_is_checked_for_every_level_of_a_nested_correlated_chain",
+      "correlated_tests::binder::the_outer_table_being_forbidden_is_the_same_error_with_or_without_a_subquery"
+    ]
+  },
+  {
+    "id": "M08_capture_not_propagated_to_intermediate_levels",
+    "why": "an outer column read two levels down is recorded only on the innermost subquery, so the middle subquery looks uncorrelated",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 1,
+    "failed_tests": [
+      "correlated_tests::binder::a_reference_two_levels_out_makes_every_query_in_between_correlated"
+    ]
+  },
+  {
+    "id": "M09_from_less_subquery_drops_outer_row",
+    "why": "EmptyRelationOp discards the outer row",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 3,
+    "failed_tests": [
+      "correlated_tests::nested::a_name_present_at_two_enclosing_levels_binds_to_the_nearer_one_at_run_time",
+      "correlated_tests::scalar::a_from_less_subquery_reads_the_outer_row",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M10_empty_aggregate_group_drops_outer_row",
+    "why": "the one group an aggregate emits over zero input rows carries no outer row",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 2,
+    "failed_tests": [
+      "correlated_tests::scalar::an_aggregate_over_zero_inner_rows_still_reads_the_outer_row",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M11_primary_key_not_recorded_for_error_labels",
+    "why": "the outer table's primary key is no longer recorded, so a runtime error cannot name the outer row by key",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 2,
+    "failed_tests": [
+      "correlated_tests::binder::the_outer_row_is_labelled_by_its_primary_key_even_if_it_correlates_on_another_column",
+      "correlated_tests::scalar::the_error_names_the_primary_key_even_when_correlating_on_another_column"
+    ]
+  },
+  {
+    "id": "M12_set_evaluated_row_at_a_time",
+    "why": "UPDATE ... SET (subquery) writes each row before the next row's subquery runs (no pre-statement snapshot)",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 3,
+    "failed_tests": [
+      "correlated_tests::dml::rows_buffered_for_a_set_with_a_subquery_are_bounded_by_max_materialized_bytes",
+      "correlated_tests::dml::set_subqueries_see_the_table_as_it_was_before_the_statement",
+      "correlated_tests::dml::the_correlated_budget_is_one_per_statement_across_where_and_set"
+    ]
+  },
+  {
+    "id": "M13_per_subquery_limit_not_enforced",
+    "why": "max_subquery_outer_rows is never checked",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 2,
+    "failed_tests": [
+      "correlated_tests::nested::the_budget_counts_every_level_exactly",
+      "correlated_tests::scalar::max_subquery_outer_rows_is_enforced_and_exact"
+    ]
+  },
+  {
+    "id": "M14_total_limit_not_enforced",
+    "why": "max_correlated_reexecutions is never checked",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 8,
+    "failed_tests": [
+      "correlated_tests::dml::a_correlated_delete_respects_the_reexecution_limit_and_deletes_nothing_when_refused",
+      "correlated_tests::dml::the_correlated_budget_is_one_per_statement_across_where_and_set",
+      "correlated_tests::exists::the_correlated_exists_respects_max_correlated_reexecutions",
+      "correlated_tests::in_subquery::each_outer_row_re_runs_the_inner_query_and_the_set_is_bounded_per_evaluation",
+      "correlated_tests::nested::the_budget_counts_every_level_exactly",
+      "correlated_tests::scalar::max_correlated_reexecutions_is_enforced_and_exact",
+      "correlated_tests::scalar::the_per_subquery_limit_counts_each_subquery_separately",
+      "exec::subquery::tests::a_refused_evaluation_is_not_counted_as_run"
+    ]
+  },
+  {
+    "id": "M15_budget_not_shared_between_where_and_set",
+    "why": "the SET phase starts its correlated-subquery budget from zero instead of continuing the WHERE phase's",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 1,
+    "failed_tests": [
+      "correlated_tests::dml::the_correlated_budget_is_one_per_statement_across_where_and_set"
+    ]
+  },
+  {
+    "id": "M16_outer_columns_treated_as_ungrouped",
+    "why": "an outer-query column beside an aggregate in a subquery's projection is rejected as ungrouped",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 3,
+    "failed_tests": [
+      "correlated_tests::binder::an_outer_column_beside_an_aggregate_in_the_inner_projection_is_a_constant",
+      "correlated_tests::scalar::an_aggregate_over_zero_inner_rows_still_reads_the_outer_row",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M17_outer_only_aggregate_not_refused",
+    "why": "an aggregate over only outer columns is silently evaluated over the inner rows",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 1,
+    "failed_tests": [
+      "correlated_tests::binder::an_aggregate_over_only_outer_columns_is_refused_not_silently_mis_scoped"
+    ]
+  },
+  {
+    "id": "M18_join_condition_captures_dropped",
+    "why": "an outer column used in an inner JOIN ... ON is not recorded as a correlation",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 1,
+    "failed_tests": [
+      "correlated_tests::binder::an_outer_reference_in_an_inner_join_condition_binds"
+    ]
+  },
+  {
+    "id": "M19_inner_ambiguity_falls_through_to_outer",
+    "why": "an ambiguous name inside the subquery is silently re-resolved against an enclosing query",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 1,
+    "failed_tests": [
+      "correlated_tests::binder::an_ambiguity_inside_the_inner_query_is_not_escaped_by_an_outer_match"
+    ]
+  },
+  {
+    "id": "M20_correlated_result_hoisted_and_cached",
+    "why": "a correlated subquery is treated as uncorrelated (evaluated once and cached) -- the hoisting the slice forbids",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 58,
+    "failed_tests": [
+      "correlated_tests::diff::a_correlated_scalar_compared_in_where_matches_the_reference_model",
+      "correlated_tests::diff::correlated_scalar_aggregates_match_the_reference_model_on_random_data",
+      "correlated_tests::diff_exists::correlated_exists_and_not_exists_match_the_reference_model_on_random_data",
+      "correlated_tests::dml::a_correlated_delete_respects_the_reexecution_limit_and_deletes_nothing_when_refused",
+      "correlated_tests::dml::a_runtime_error_in_set_changes_nothing_and_names_the_row",
+      "correlated_tests::dml::a_self_correlated_delete_removes_every_member_of_a_duplicate_group",
+      "correlated_tests::dml::a_self_correlated_update_sees_the_pre_statement_table_not_its_own_partial_changes",
+      "correlated_tests::dml::delete_where_correlated_exists_not_exists_and_in_remove_exactly_the_matching_rows",
+      "correlated_tests::dml::set_may_mix_a_subquery_with_a_plain_expression_over_the_old_row",
+      "correlated_tests::dml::set_subqueries_see_the_table_as_it_was_before_the_statement",
+      "correlated_tests::dml::set_with_a_correlated_scalar_subquery_matches_the_reference",
+      "correlated_tests::dml::the_correlated_budget_is_one_per_statement_across_where_and_set",
+      "correlated_tests::dml::the_correlated_column_may_be_updated_by_the_same_statement",
+      "correlated_tests::dml::update_where_a_correlated_exists_changes_exactly_the_matching_rows",
+      "correlated_tests::exists::an_aggregate_without_group_by_inside_exists_always_yields_a_row",
+      "correlated_tests::exists::correlated_exists_and_not_exists_match_a_btreemap_join_and_partition_the_outer_rows",
+      "correlated_tests::exists::each_outer_row_costs_one_re_execution",
+      "correlated_tests::exists::exists_combines_with_other_predicates_and_with_a_second_correlated_subquery",
+      "correlated_tests::exists::exists_is_never_unknown_when_the_inner_where_involves_null",
+      "correlated_tests::exists::exists_is_usable_as_a_value_in_the_select_list_and_in_case",
+      "correlated_tests::exists::exists_over_an_inner_join_with_the_correlation_in_the_join_condition",
+      "correlated_tests::exists::exists_stops_at_the_first_inner_row",
+      "correlated_tests::exists::the_correlated_exists_respects_max_correlated_reexecutions",
+      "correlated_tests::in_subquery::a_null_outer_value_is_unknown_unless_the_inner_set_is_empty",
+      "correlated_tests::in_subquery::an_expression_over_outer_columns_is_a_valid_in_operand",
+      "correlated_tests::in_subquery::correlated_in_and_not_in_match_the_reference_model_on_random_data",
+      "correlated_tests::in_subquery::correlated_in_and_not_in_match_the_three_valued_reference_on_the_standard_data",
+      "correlated_tests::in_subquery::correlated_not_in_with_a_null_in_the_inner_set_never_returns_true",
+      "correlated_tests::in_subquery::each_outer_row_re_runs_the_inner_query_and_the_set_is_bounded_per_evaluation",
+      "correlated_tests::in_subquery::the_in_value_is_null_exactly_when_the_result_is_unknown",
+      "correlated_tests::nested::a_correlated_subquery_may_contain_an_uncorrelated_one_which_still_runs_once",
+      "correlated_tests::nested::a_name_present_at_two_enclosing_levels_binds_to_the_nearer_one_at_run_time",
+      "correlated_tests::nested::a_runtime_error_in_the_innermost_level_names_the_enclosing_row_it_was_running_for",
+      "correlated_tests::nested::an_uncorrelated_subquery_may_contain_a_correlated_one",
+      "correlated_tests::nested::nested_correlated_queries_match_the_reference_model_on_random_data",
+      "correlated_tests::nested::nested_correlation_in_update_and_delete_matches_the_reference",
+      "correlated_tests::nested::the_budget_counts_every_level_exactly",
+      "correlated_tests::nested::the_innermost_binding_wins_when_an_alias_is_reused_at_the_third_level",
+      "correlated_tests::nested::three_levels_at_full_scale_match_the_reference",
+      "correlated_tests::nested::three_levels_exists_where_the_innermost_reads_both_enclosing_levels",
+      "correlated_tests::nested::three_levels_in_where_the_inner_set_depends_on_two_enclosing_rows",
+      "correlated_tests::nested::three_levels_scalar_counts_match_the_nested_loop_reference",
+      "correlated_tests::scalar::a_correlated_count_is_zero_not_null_when_nothing_matches",
+      "correlated_tests::scalar::a_correlated_max_matches_a_btreemap_join_for_every_outer_row",
+      "correlated_tests::scalar::a_correlated_scalar_returns_null_for_zero_rows_the_value_for_one_and_errors_for_many",
+      "correlated_tests::scalar::a_correlated_scalar_works_in_where_order_by_and_having",
+      "correlated_tests::scalar::a_from_less_subquery_reads_the_outer_row",
+      "correlated_tests::scalar::a_text_value_in_the_error_message_cannot_inject_terminal_escapes",
+      "correlated_tests::scalar::an_aggregate_over_zero_inner_rows_still_reads_the_outer_row",
+      "correlated_tests::scalar::an_outer_column_that_is_not_in_the_outer_select_list_is_still_available",
+      "correlated_tests::scalar::max_correlated_reexecutions_is_enforced_and_exact",
+      "correlated_tests::scalar::max_subquery_outer_rows_is_enforced_and_exact",
+      "correlated_tests::scalar::the_error_names_the_primary_key_even_when_correlating_on_another_column",
+      "correlated_tests::scalar::the_inner_aggregate_ranges_over_the_inner_rows_only_not_the_outer_table",
+      "correlated_tests::scalar::the_inner_query_is_re_run_once_per_outer_row_and_never_cached",
+      "correlated_tests::scalar::the_many_rows_error_names_the_outer_row_that_caused_it",
+      "correlated_tests::scalar::the_per_subquery_limit_counts_each_subquery_separately",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M21_error_does_not_name_the_outer_row_values",
+    "why": "the multi-row error names the columns but not their values",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 5,
+    "failed_tests": [
+      "correlated_tests::dml::a_runtime_error_in_set_changes_nothing_and_names_the_row",
+      "correlated_tests::nested::a_runtime_error_in_the_innermost_level_names_the_enclosing_row_it_was_running_for",
+      "correlated_tests::scalar::a_text_value_in_the_error_message_cannot_inject_terminal_escapes",
+      "correlated_tests::scalar::the_error_names_the_primary_key_even_when_correlating_on_another_column",
+      "correlated_tests::scalar::the_many_rows_error_names_the_outer_row_that_caused_it"
+    ]
+  },
+  {
+    "id": "M22_text_in_error_not_escaped",
+    "why": "a text value in the error message is printed raw, so control characters reach the terminal",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 2,
+    "failed_tests": [
+      "correlated_tests::scalar::a_text_value_in_the_error_message_cannot_inject_terminal_escapes",
+      "correlated_tests::scalar::the_error_names_the_primary_key_even_when_correlating_on_another_column"
+    ]
+  },
+  {
+    "id": "M23_explain_hides_the_correlation",
+    "why": "EXPLAIN prints a correlated subquery without saying it is correlated",
+    "compiled": true,
+    "tests_run": 109,
+    "failed_count": 1,
+    "failed_tests": [
+      "correlated_tests::dml::explain_shows_the_correlation_for_where_and_set"
+    ]
+  }
+]

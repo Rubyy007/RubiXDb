@@ -1,0 +1,195 @@
+{
+ "record_count_set_to": 214748364,
+ "sstables_before": {
+  "00000000000000000001.sst": 4030612,
+  "00000000000000000002.sst": 4030165,
+  "00000000000000000003.sst": 4030165
+ },
+ "manifest_sha_before": "d4b095d38951b592",
+ "compaction_status_at_start": {
+  "auto_trigger_enabled": true,
+  "trigger_count": 4,
+  "live_sstable_count": 3,
+  "cycles_completed": 0,
+  "state": "idle",
+  "failures_total": 0,
+  "consecutive_failures": 0,
+  "blocked": false,
+  "last_failure": null
+ },
+ "timeline": [
+  {
+   "t": 5,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     6.0
+    ]
+   }
+  },
+  {
+   "t": 10,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     11.1
+    ]
+   }
+  },
+  {
+   "t": 15,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     16.1
+    ]
+   }
+  },
+  {
+   "t": 20,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     21.1
+    ]
+   }
+  },
+  {
+   "t": 25,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     26.1
+    ]
+   }
+  },
+  {
+   "t": 30,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     31.1
+    ]
+   }
+  },
+  {
+   "t": 35,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     36.1
+    ]
+   }
+  },
+  {
+   "t": 40,
+   "compaction": {
+    "auto_trigger_enabled": true,
+    "trigger_count": 4,
+    "live_sstable_count": 1,
+    "cycles_completed": 1,
+    "state": "idle",
+    "failures_total": 0,
+    "consecutive_failures": 0,
+    "blocked": false,
+    "last_failure": null
+   },
+   "files": {
+    "00000000000000000005.sst": [
+     284470233,
+     41.2
+    ]
+   }
+  }
+ ],
+ "stop": [
+  "graceful",
+  0
+ ],
+ "stderr_lines": [
+  "rubixdb gui: warning: no built frontend found (none embedded in this executable, and RUBIXDB_FRONTEND_DIST / paths relative to the executable had none) -- serving the API only. Run `npm run build` in frontend/ to enable the console."
+ ],
+ "sstables_after": {
+  "00000000000000000005.sst": 284470233
+ },
+ "manifest_sha_after": "aaf77bb2887fdd18",
+ "check_exit": 0,
+ "check_stdout": "INSPECTION  offline check of <root>\\recon\\data\nresult: 0 error(s), 0 warning(s), check complete\n"
+}

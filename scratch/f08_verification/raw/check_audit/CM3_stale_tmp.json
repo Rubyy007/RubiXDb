@@ -1,0 +1,16 @@
+{
+ "scenario": "CM3_stale_tmp",
+ "mutation": "stale .sst.tmp",
+ "check_exit": 0,
+ "check_stdout_tail": "INSPECTION  offline check of <dir>\\recon\\data\nINFO     UNEXPECTED_FILE            sstable 00000000000000000010.sst.tmp interrupted build output; removed at startup\nresult: 0 error(s), 0 warning(s), check complete\n",
+ "stderr": "",
+ "diff": {
+  "added": [],
+  "removed": [
+   "sstables/00000000000000000010.sst.tmp"
+  ],
+  "content_changed": [],
+  "mtime_only": []
+ },
+ "modified": true
+}

@@ -127,6 +127,18 @@ fn collect_table_refs(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
             }
         }
         BoundExprKind::AggregateRef(_) => {}
+        // A subquery reads the *enclosing* query's tables only through its
+        // outer references (and its `IN` operand); its own tables are its
+        // own. This is what keeps predicate pushdown from moving a
+        // correlated conjunct somewhere its outer columns are not bound.
+        BoundExprKind::Subquery(sq) => {
+            if let Some(operand) = &sq.operand {
+                collect_table_refs(operand, out);
+            }
+            for c in &sq.outer_refs {
+                out.insert(c.table_ref.0);
+            }
+        }
     }
 }
 
@@ -200,6 +212,137 @@ fn collect_ordinals(expr: &BoundExpr, table_ref: u32, out: &mut BTreeSet<u16>) {
             }
         }
         BoundExprKind::AggregateRef(_) => {}
+        BoundExprKind::Subquery(sq) => {
+            if let Some(operand) = &sq.operand {
+                collect_ordinals(operand, table_ref, out);
+            }
+            for c in &sq.outer_refs {
+                if c.table_ref.0 == table_ref {
+                    out.insert(c.ordinal);
+                }
+            }
+        }
+    }
+}
+
+/// Visits every subquery expression directly contained in `expr` (not
+/// those nested inside another subquery's own query -- the visitor decides
+/// how to treat those), including through the `IN` operand of a subquery.
+/// The visitor gets mutable access so the planner can attach each
+/// subquery's physical plan in place.
+pub fn for_each_subquery_mut<F>(expr: &mut BoundExpr, f: &mut F) -> crate::error::Result<()>
+where
+    F: FnMut(&mut crate::bound::BoundSubqueryExpr) -> crate::error::Result<()>,
+{
+    match &mut expr.kind {
+        BoundExprKind::Literal(_)
+        | BoundExprKind::Parameter { .. }
+        | BoundExprKind::Column(_)
+        | BoundExprKind::AggregateRef(_) => Ok(()),
+        BoundExprKind::UnaryOp { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+            for_each_subquery_mut(expr, f)
+        }
+        BoundExprKind::BinaryOp { left, right, .. } => {
+            for_each_subquery_mut(left, f)?;
+            for_each_subquery_mut(right, f)
+        }
+        BoundExprKind::Between {
+            expr, low, high, ..
+        } => {
+            for_each_subquery_mut(expr, f)?;
+            for_each_subquery_mut(low, f)?;
+            for_each_subquery_mut(high, f)
+        }
+        BoundExprKind::InList { expr, list, .. } => {
+            for_each_subquery_mut(expr, f)?;
+            for item in list {
+                for_each_subquery_mut(item, f)?;
+            }
+            Ok(())
+        }
+        BoundExprKind::Like { expr, pattern, .. } => {
+            for_each_subquery_mut(expr, f)?;
+            for_each_subquery_mut(pattern, f)
+        }
+        BoundExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                for_each_subquery_mut(operand, f)?;
+            }
+            for (when, then) in branches {
+                for_each_subquery_mut(when, f)?;
+                for_each_subquery_mut(then, f)?;
+            }
+            if let Some(else_result) = else_result {
+                for_each_subquery_mut(else_result, f)?;
+            }
+            Ok(())
+        }
+        BoundExprKind::Function { args, .. } => {
+            for arg in args {
+                for_each_subquery_mut(arg, f)?;
+            }
+            Ok(())
+        }
+        BoundExprKind::Aggregate(agg) => {
+            if let crate::aggregate::AggregateArg::Expr(e) = &mut agg.arg {
+                for_each_subquery_mut(e, f)?;
+            }
+            Ok(())
+        }
+        BoundExprKind::Subquery(sq) => {
+            if let Some(operand) = &mut sq.operand {
+                for_each_subquery_mut(operand, f)?;
+            }
+            f(sq)
+        }
+    }
+}
+
+/// `true` iff `expr` contains a subquery expression anywhere in its own tree
+/// (a subquery nested inside another subquery's query does not count -- that
+/// one is reached through the outer subquery node itself).
+pub fn contains_subquery(expr: &BoundExpr) -> bool {
+    match &expr.kind {
+        BoundExprKind::Subquery(_) => true,
+        BoundExprKind::Literal(_)
+        | BoundExprKind::Parameter { .. }
+        | BoundExprKind::Column(_)
+        | BoundExprKind::AggregateRef(_) => false,
+        BoundExprKind::UnaryOp { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+            contains_subquery(expr)
+        }
+        BoundExprKind::BinaryOp { left, right, .. } => {
+            contains_subquery(left) || contains_subquery(right)
+        }
+        BoundExprKind::Between {
+            expr, low, high, ..
+        } => contains_subquery(expr) || contains_subquery(low) || contains_subquery(high),
+        BoundExprKind::InList { expr, list, .. } => {
+            contains_subquery(expr) || list.iter().any(contains_subquery)
+        }
+        BoundExprKind::Like { expr, pattern, .. } => {
+            contains_subquery(expr) || contains_subquery(pattern)
+        }
+        BoundExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(contains_subquery)
+                || branches
+                    .iter()
+                    .any(|(w, t)| contains_subquery(w) || contains_subquery(t))
+                || else_result.as_deref().is_some_and(contains_subquery)
+        }
+        BoundExprKind::Function { args, .. } => args.iter().any(contains_subquery),
+        BoundExprKind::Aggregate(agg) => match &agg.arg {
+            crate::aggregate::AggregateArg::Expr(e) => contains_subquery(e),
+            crate::aggregate::AggregateArg::Wildcard => false,
+        },
     }
 }
 

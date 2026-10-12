@@ -1,0 +1,51 @@
+[
+  {
+    "id": "M01_outer_level_beats_inner",
+    "why": "scope resolution reversed: a name the subquery defines itself is re-bound to an enclosing query's column (innermost no longer wins)",
+    "compiled": true,
+    "tests_run": 116,
+    "failed_count": 7,
+    "failed_tests": [
+      "correlated_tests::binder::a_qualifier_that_names_an_inner_item_never_falls_through_to_an_outer_column",
+      "correlated_tests::binder::an_ambiguity_inside_the_inner_query_is_not_escaped_by_an_outer_match",
+      "correlated_tests::binder::an_unqualified_name_defined_by_the_subquery_itself_is_not_an_outer_reference",
+      "correlated_tests::nested::a_correlated_subquery_may_contain_an_uncorrelated_one_which_still_runs_once",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "subquery_tests::exec::subquery_in_a_join_query_is_pushed_to_the_right_scan",
+      "subquery_tests::exec::subquery_parameter_is_bound_at_execution"
+    ]
+  },
+  {
+    "id": "M09_from_less_subquery_drops_outer_row",
+    "why": "EmptyRelationOp discards the outer row",
+    "compiled": true,
+    "tests_run": 116,
+    "failed_count": 3,
+    "failed_tests": [
+      "correlated_tests::nested::a_name_present_at_two_enclosing_levels_binds_to_the_nearer_one_at_run_time",
+      "correlated_tests::scalar::a_from_less_subquery_reads_the_outer_row",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M10_empty_aggregate_group_drops_outer_row",
+    "why": "the one group an aggregate emits over zero input rows carries no outer row",
+    "compiled": true,
+    "tests_run": 116,
+    "failed_count": 2,
+    "failed_tests": [
+      "correlated_tests::scalar::an_aggregate_over_zero_inner_rows_still_reads_the_outer_row",
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M19_inner_ambiguity_falls_through_to_outer",
+    "why": "an ambiguous name inside the subquery is silently re-resolved against an enclosing query",
+    "compiled": true,
+    "tests_run": 116,
+    "failed_count": 1,
+    "failed_tests": [
+      "correlated_tests::binder::an_ambiguity_inside_the_inner_query_is_not_escaped_by_an_outer_match"
+    ]
+  }
+]

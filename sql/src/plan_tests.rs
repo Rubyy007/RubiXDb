@@ -55,6 +55,8 @@ fn only_access(plan: &PhysicalPlan) -> &PhysicalAccess {
         | PhysicalPlan::Limit { input, .. } => only_access(input),
         PhysicalPlan::Join { .. }
         | PhysicalPlan::EmptyRelation
+        | PhysicalPlan::Derived { .. }
+        | PhysicalPlan::CteNode { .. }
         | PhysicalPlan::Aggregate { .. } => {
             panic!("expected a single Access node, found {plan:?}")
         }
@@ -578,7 +580,9 @@ fn required_columns_of_scan(plan: &crate::plan::LogicalPlan) -> Vec<u16> {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => required_columns_of_scan(input),
         LogicalPlan::Join { left, .. } => required_columns_of_scan(left),
-        LogicalPlan::EmptyRelation => Vec::new(),
+        LogicalPlan::EmptyRelation | LogicalPlan::Derived { .. } | LogicalPlan::Cte { .. } => {
+            Vec::new()
+        }
     }
 }
 

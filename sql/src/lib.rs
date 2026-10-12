@@ -89,3 +89,19 @@ mod materialization_tests;
 
 #[cfg(test)]
 mod inc18_compare_bench;
+
+// SQL-mission-1 (subqueries, CTEs, set operations).
+#[cfg(test)]
+mod mission1_support;
+
+#[cfg(test)]
+mod subquery_tests;
+
+#[cfg(test)]
+mod mission1_corpus_tests;
+
+#[cfg(test)]
+mod correlated_tests;
+
+#[cfg(test)]
+mod relation_tests;

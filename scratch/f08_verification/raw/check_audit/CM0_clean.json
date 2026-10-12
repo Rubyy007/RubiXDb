@@ -1,0 +1,14 @@
+{
+ "scenario": "CM0_clean",
+ "mutation": "none (clean stopped directory)",
+ "check_exit": 0,
+ "check_stdout_tail": "INSPECTION  offline check of <dir>\\recon\\data\nresult: 0 error(s), 0 warning(s), check complete\n",
+ "stderr": "",
+ "diff": {
+  "added": [],
+  "removed": [],
+  "content_changed": [],
+  "mtime_only": []
+ },
+ "modified": false
+}

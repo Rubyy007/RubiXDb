@@ -10,7 +10,7 @@
 use std::fmt::Write as _;
 
 use crate::ast::{BinaryOp, JoinKind, UnaryOp};
-use crate::bound::{BoundExpr, BoundExprKind};
+use crate::bound::{BoundExpr, BoundExprKind, BoundSubqueryExpr, SubqueryKind};
 use crate::plan::access::{IndexAccessMode, PhysicalAccess};
 use crate::plan::physical::{JoinAlgorithm, PhysicalPlan};
 use crate::plan::Plan;
@@ -33,6 +33,7 @@ fn write_plan(plan: &Plan, depth: usize, out: &mut String) {
         Plan::Query {
             physical,
             max_parameter,
+            ..
         } => {
             let _ = writeln!(out, "Query (max_parameter={max_parameter})");
             write_physical(physical, depth + 1, out);
@@ -59,11 +60,14 @@ fn write_plan(plan: &Plan, depth: usize, out: &mut String) {
             );
             indent(out, depth + 1);
             write_access(access, out);
+            write_subplans(access_exprs(access), depth + 2, out);
+            write_subplans(assignments.iter().map(|a| &a.value), depth + 1, out);
         }
         Plan::Delete { table, access, .. } => {
             let _ = writeln!(out, "Delete table_id={}", table.table_id);
             indent(out, depth + 1);
             write_access(access, out);
+            write_subplans(access_exprs(access), depth + 2, out);
         }
         Plan::Ddl(_) => {
             let _ = writeln!(out, "Ddl");
@@ -90,7 +94,49 @@ fn write_physical(plan: &PhysicalPlan, depth: usize, out: &mut String) {
         PhysicalPlan::EmptyRelation => {
             let _ = writeln!(out, "EmptyRelation");
         }
-        PhysicalPlan::Access(access) => write_access(access, out),
+        PhysicalPlan::Derived {
+            table_ref,
+            id,
+            alias,
+            plan,
+            correlated,
+            rescanned,
+        } => {
+            let how = if *correlated {
+                "outer_row_input=true (LATERAL: re-run for each row of the preceding FROM items)"
+            } else if *rescanned {
+                "outer_row_input=false (materialized once, re-read for each left row)"
+            } else {
+                "outer_row_input=false"
+            };
+            let _ = writeln!(
+                out,
+                "Derived #{} alias={alias} as t{table_ref} {how}",
+                id
+            );
+            write_physical(plan, depth + 1, out);
+        }
+        PhysicalPlan::CteNode { table_ref, cte } => {
+            let marker = format!("cte#{} defined here", cte.id);
+            if out.contains(&marker) {
+                let _ = writeln!(
+                    out,
+                    "CteNode name={} as t{table_ref} cte#{} (reads the rows materialized above)",
+                    cte.name, cte.id
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "CteNode name={} as t{table_ref} {marker} (materialized once per statement)",
+                    cte.name
+                );
+                write_physical(&cte.plan, depth + 1, out);
+            }
+        }
+        PhysicalPlan::Access(access) => {
+            write_access(access, out);
+            write_subplans(access_exprs(access), depth + 1, out);
+        }
         PhysicalPlan::Join {
             left,
             right,
@@ -107,16 +153,19 @@ fn write_physical(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 JoinAlgorithm::IndexNestedLoop => "IndexNestedLoop",
             };
             let _ = writeln!(out, "{kind} Join ({algo}) on {}", fmt_expr(on));
+            write_subplans([on], depth + 1, out);
             write_physical(left, depth + 1, out);
             write_physical(right, depth + 1, out);
         }
         PhysicalPlan::Filter { input, predicate } => {
             let _ = writeln!(out, "Filter {}", fmt_expr(predicate));
+            write_subplans([predicate], depth + 1, out);
             write_physical(input, depth + 1, out);
         }
         PhysicalPlan::Projection { input, items } => {
             let names: Vec<&str> = items.iter().map(|i| i.output_name.as_str()).collect();
             let _ = writeln!(out, "Projection [{}]", names.join(", "));
+            write_subplans(items.iter().map(|i| &i.expr), depth + 1, out);
             write_physical(input, depth + 1, out);
         }
         PhysicalPlan::Distinct { input } => {
@@ -159,6 +208,7 @@ fn write_physical(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 })
                 .collect();
             let _ = writeln!(out, "Sort [{}]", parts.join(", "));
+            write_subplans(items.iter().map(|i| &i.expr), depth + 1, out);
             write_physical(input, depth + 1, out);
         }
         PhysicalPlan::Limit {
@@ -365,5 +415,164 @@ fn fmt_expr(expr: &BoundExpr) -> String {
             format!("{}({})", agg.func.name(), arg)
         }
         BoundExprKind::AggregateRef(idx) => format!("agg[{idx}]"),
+        BoundExprKind::Subquery(sq) => match sq.kind {
+            SubqueryKind::Scalar => format!("subquery#{}", sq.id),
+            SubqueryKind::Exists { negated } => {
+                format!("{}EXISTS(subquery#{})", if negated { "NOT " } else { "" }, sq.id)
+            }
+            SubqueryKind::In { negated } => format!(
+                "({} {}IN subquery#{})",
+                sq.operand
+                    .as_ref()
+                    .map(fmt_expr)
+                    .unwrap_or_else(|| "?".to_string()),
+                if negated { "NOT " } else { "" },
+                sq.id
+            ),
+        },
     }
+}
+
+/// Every subquery expression directly contained in `expr` (not those nested
+/// inside another subquery's own query -- those are rendered when that
+/// subquery's plan is).
+pub(super) fn collect_subqueries<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundSubqueryExpr>) {
+    match &expr.kind {
+        BoundExprKind::Literal(_)
+        | BoundExprKind::Parameter { .. }
+        | BoundExprKind::Column(_)
+        | BoundExprKind::AggregateRef(_) => {}
+        BoundExprKind::UnaryOp { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+            collect_subqueries(expr, out)
+        }
+        BoundExprKind::BinaryOp { left, right, .. } => {
+            collect_subqueries(left, out);
+            collect_subqueries(right, out);
+        }
+        BoundExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_subqueries(expr, out);
+            collect_subqueries(low, out);
+            collect_subqueries(high, out);
+        }
+        BoundExprKind::InList { expr, list, .. } => {
+            collect_subqueries(expr, out);
+            list.iter().for_each(|e| collect_subqueries(e, out));
+        }
+        BoundExprKind::Like { expr, pattern, .. } => {
+            collect_subqueries(expr, out);
+            collect_subqueries(pattern, out);
+        }
+        BoundExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_subqueries(o, out);
+            }
+            for (w, t) in branches {
+                collect_subqueries(w, out);
+                collect_subqueries(t, out);
+            }
+            if let Some(e) = else_result {
+                collect_subqueries(e, out);
+            }
+        }
+        BoundExprKind::Function { args, .. } => args.iter().for_each(|e| collect_subqueries(e, out)),
+        BoundExprKind::Aggregate(agg) => {
+            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+                collect_subqueries(e, out);
+            }
+        }
+        BoundExprKind::Subquery(sq) => {
+            if let Some(o) = &sq.operand {
+                collect_subqueries(o, out);
+            }
+            out.push(sq);
+        }
+    }
+}
+
+/// Renders the plan of every subquery contained in `exprs`, one level below
+/// the node that evaluates them.
+fn write_subplans<'a>(
+    exprs: impl IntoIterator<Item = &'a BoundExpr>,
+    depth: usize,
+    out: &mut String,
+) {
+    let mut subs = Vec::new();
+    for e in exprs {
+        collect_subqueries(e, &mut subs);
+    }
+    for sq in subs {
+        indent(out, depth);
+        if sq.outer_refs.is_empty() {
+            let _ = writeln!(out, "Subquery #{} uncorrelated (executed once)", sq.id);
+        } else {
+            // The plan below reads these outer columns for every row of the
+            // enclosing query; EXPLAIN shows that and runs none of it.
+            let refs: Vec<String> = sq
+                .outer_refs
+                .iter()
+                .map(|c| format!("col(t{}.{})", c.table_ref.0, c.ordinal))
+                .collect();
+            let _ = writeln!(
+                out,
+                "Subquery #{} correlated outer_row_input=true (re-executed per outer row; outer columns: {})",
+                sq.id,
+                refs.join(", ")
+            );
+        }
+        match &sq.plan {
+            Some(plan) => write_physical(plan, depth + 1, out),
+            None => {
+                indent(out, depth + 1);
+                let _ = writeln!(out, "(unplanned)");
+            }
+        }
+    }
+}
+
+pub(super) fn access_exprs(access: &PhysicalAccess) -> Vec<&BoundExpr> {
+    let mut v: Vec<&BoundExpr> = Vec::new();
+    match access {
+        PhysicalAccess::PkLookup {
+            key_values,
+            residual,
+            ..
+        } => {
+            v.extend(key_values.iter());
+            v.extend(residual.iter());
+        }
+        PhysicalAccess::IndexScan { mode, residual, .. } => {
+            match mode {
+                IndexAccessMode::Equality { prefix } => v.extend(prefix.iter()),
+                IndexAccessMode::Range { start, end } => {
+                    for b in [start, end] {
+                        if let std::ops::Bound::Included(x) | std::ops::Bound::Excluded(x) = b {
+                            v.extend(x.iter());
+                        }
+                    }
+                }
+            }
+            v.extend(residual.iter());
+        }
+        PhysicalAccess::SeqScan { predicate, .. } => v.extend(predicate.iter()),
+        PhysicalAccess::PkRangeScan {
+            start,
+            end,
+            residual,
+            ..
+        } => {
+            for b in [start, end] {
+                if let std::ops::Bound::Included(x) | std::ops::Bound::Excluded(x) = b {
+                    v.extend(x.iter());
+                }
+            }
+            v.extend(residual.iter());
+        }
+    }
+    v
 }

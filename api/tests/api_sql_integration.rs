@@ -1005,3 +1005,889 @@ async fn unsupported_grammar_is_a_stable_error_not_silently_accepted() {
     state.engine.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -----------------------------------------------------------------
+// SQL-mission-1, Slice A: scalar / IN / EXISTS subqueries through the
+// real HTTP stack (real engine, real router, real SQL pipeline).
+// -----------------------------------------------------------------
+
+/// `people(id INTEGER PK, name TEXT)` = (1 ann) (2 bob) (3 cy);
+/// `visits(id INTEGER PK, person INTEGER, minutes INTEGER)` =
+/// (1, 1, 30) (2, 1, 45) (3, 2, NULL) (4, NULL, 10).
+async fn seed_people_visits(router: &Router) {
+    exec_sql(
+        router,
+        ADMIN_KEY,
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    exec_sql(
+        router,
+        ADMIN_KEY,
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, person INTEGER, minutes INTEGER)",
+    )
+    .await;
+    for sql in [
+        "INSERT INTO people (id, name) VALUES (1, 'ann')",
+        "INSERT INTO people (id, name) VALUES (2, 'bob')",
+        "INSERT INTO people (id, name) VALUES (3, 'cy')",
+        "INSERT INTO visits (id, person, minutes) VALUES (1, 1, 30)",
+        "INSERT INTO visits (id, person, minutes) VALUES (2, 1, 45)",
+        "INSERT INTO visits (id, person, minutes) VALUES (3, 2, NULL)",
+        "INSERT INTO visits (id, person, minutes) VALUES (4, NULL, 10)",
+    ] {
+        exec_sql(router, ADMIN_KEY, sql).await;
+    }
+}
+
+fn int_cells(body: &Value) -> Vec<i64> {
+    body["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[0]["value"].as_i64().expect("an integer cell"))
+        .collect()
+}
+
+#[tokio::test]
+async fn scalar_in_and_exists_subqueries_through_the_real_api() {
+    let dir = temp_dir("subq_basic");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    // Scalar subquery in the select list.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT (SELECT MAX(minutes) FROM visits)",
+    )
+    .await;
+    assert_eq!(r["result"]["kind"], "rows");
+    assert_eq!(r["result"]["rows"][0][0]["type"], "integer");
+    assert_eq!(r["result"]["rows"][0][0]["value"], 45);
+
+    // Zero-row scalar subquery is NULL.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT (SELECT minutes FROM visits WHERE id = 999)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows"][0][0]["type"], "null");
+
+    // IN (subquery) filters; the NULL person never matches.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE id IN (SELECT person FROM visits) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+
+    // NOT IN over a set containing NULL returns no rows (three-valued logic).
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE id NOT IN (SELECT person FROM visits)",
+    )
+    .await;
+    assert_eq!(r["result"]["row_count"], 0);
+
+    // ...and with the NULL filtered out it returns the rows with no visit.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE id NOT IN (SELECT person FROM visits WHERE person IS NOT NULL)",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![3]);
+
+    // EXISTS / NOT EXISTS.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE EXISTS (SELECT 1 FROM visits WHERE minutes > 40) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE NOT EXISTS (SELECT 1 FROM visits WHERE minutes > 40)",
+    )
+    .await;
+    assert_eq!(r["result"]["row_count"], 0);
+
+    // The result schema reports the scalar subquery's name and nullability.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT (SELECT MAX(minutes) FROM visits) AS m",
+    )
+    .await;
+    assert_eq!(r["result"]["columns"][0]["name"], "m");
+    assert_eq!(r["result"]["columns"][0]["nullable"], true);
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn multi_row_scalar_subquery_is_a_runtime_execution_error_over_http() {
+    let dir = temp_dir("subq_multirow");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT (SELECT minutes FROM visits)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "EXECUTION_ERROR");
+
+    // A subquery returning two columns is a *bind* error instead.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT (SELECT id, minutes FROM visits WHERE id = 1)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "BIND_ERROR");
+
+    // A type mismatch across the subquery boundary is a bind error.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT id FROM people WHERE id IN (SELECT name FROM people)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "BIND_ERROR");
+
+    // A clause that cannot run a subquery fails closed as UNSUPPORTED.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT id FROM people LIMIT (SELECT 1)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "UNSUPPORTED");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn subqueries_in_update_and_delete_where_through_the_real_api() {
+    let dir = temp_dir("subq_dml");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "UPDATE people SET name = 'visited' WHERE id IN (SELECT person FROM visits WHERE minutes > 40)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 1);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE name = 'visited'",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1]);
+
+    // The subquery is uncorrelated (`person = 3` matches nothing), so
+    // NOT EXISTS is true for every person and all three are deleted.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM visits WHERE person = 3)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 3);
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn subquery_inside_an_explicit_transaction_sees_its_own_uncommitted_writes() {
+    let dir = temp_dir("subq_txn");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    let begin = exec_sql(&router, ADMIN_KEY, "BEGIN").await;
+    let session_id = begin["session_id"].as_str().unwrap().to_string();
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "INSERT INTO visits (id, person, minutes) VALUES (9, 3, 500)", "session_id": session_id }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+
+    let (status, inside) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT id FROM people WHERE id IN (SELECT person FROM visits WHERE minutes > 100)", "session_id": session_id }),
+    )
+    .await;
+    assert!(status.is_success(), "{inside}");
+    assert_eq!(int_cells(&inside), vec![3], "the session sees its own insert");
+
+    // Another client, outside the session, does not.
+    let outside = exec_sql(
+        &router,
+        READER_KEY,
+        "SELECT id FROM people WHERE id IN (SELECT person FROM visits WHERE minutes > 100)",
+    )
+    .await;
+    assert_eq!(outside["result"]["row_count"], 0);
+
+    let (status, _) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "ROLLBACK", "session_id": session_id }),
+    )
+    .await;
+    assert!(status.is_success());
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn explain_shows_the_nested_subquery_plan_and_does_not_execute_it() {
+    let dir = temp_dir("subq_explain");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN SELECT id FROM people WHERE id IN (SELECT person FROM visits)",
+    )
+    .await;
+    let text = r["result"]["plan_text"].as_str().unwrap();
+    assert!(text.contains("Subquery #0"), "{text}");
+    assert!(text.contains("IN subquery#0"), "{text}");
+
+    // EXPLAIN of a statement that would fail at runtime still succeeds.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN SELECT (SELECT minutes FROM visits)",
+    )
+    .await;
+    assert_eq!(r["result"]["kind"], "explain");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -----------------------------------------------------------------
+// SQL-mission-1, Slice B: correlated subqueries through the real HTTP
+// stack. Sub-slice B2: correlated scalar subquery.
+// -----------------------------------------------------------------
+
+fn cell_values(body: &Value, column: usize) -> Vec<Value> {
+    body["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r[column]["value"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn correlated_scalar_subquery_through_the_real_api() {
+    let dir = temp_dir("corr_scalar");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    // The inner query is re-run for each person: ann has visits (max 45),
+    // bob's only visit has NULL minutes, cy has none.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id, (SELECT MAX(minutes) FROM visits WHERE visits.person = people.id) AS m \
+         FROM people ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3]);
+    assert_eq!(
+        cell_values(&r, 1),
+        vec![json!(45), Value::Null, Value::Null],
+        "{r}"
+    );
+    assert_eq!(r["result"]["columns"][1]["name"], "m");
+
+    // COUNT over zero inner rows is 0, never NULL.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT (SELECT COUNT(*) FROM visits WHERE visits.person = people.id) FROM people ORDER BY id",
+    )
+    .await;
+    // BIGINT travels as a JSON string.
+    assert_eq!(cell_values(&r, 0), vec![json!("2"), json!("1"), json!("0")], "{r}");
+
+    // A correlated scalar subquery in WHERE.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE (SELECT COUNT(*) FROM visits WHERE visits.person = people.id) >= 1 ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+
+    // More than one inner row for an outer row is a RUNTIME error that names
+    // the outer row (ann, id 1, has two visits).
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT (SELECT minutes FROM visits WHERE visits.person = people.id) FROM people" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "EXECUTION_ERROR");
+    assert!(
+        body.to_string().contains("people.id = 1"),
+        "the error names the outer row: {body}"
+    );
+
+    // An unknown name at every level is reported like any unknown object
+    // (the API maps UnknownObject to NOT_FOUND, authorization included).
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT (SELECT 1 FROM visits WHERE visits.nope = people.id) FROM people" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Sub-slice B3: correlated EXISTS / NOT EXISTS.
+#[tokio::test]
+async fn correlated_exists_and_not_exists_through_the_real_api() {
+    let dir = temp_dir("corr_exists");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    // ann (1) and bob (2) have visits; cy (3) has none.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE EXISTS (SELECT 1 FROM visits WHERE visits.person = people.id) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE NOT EXISTS (SELECT 1 FROM visits WHERE visits.person = people.id) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![3]);
+
+    // A NULL in the inner WHERE (bob's visit has NULL minutes) does not make
+    // EXISTS unknown: bob simply does not qualify, and NOT EXISTS keeps him.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE NOT EXISTS (SELECT 1 FROM visits WHERE visits.person = people.id AND visits.minutes > 40) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![2, 3]);
+
+    // EXISTS as a selected boolean value.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id, EXISTS (SELECT 1 FROM visits WHERE visits.person = people.id) AS has_visit FROM people ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        cell_values(&r, 1),
+        vec![json!(true), json!(true), json!(false)],
+        "{r}"
+    );
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn correlated_reads_work_for_a_reader_and_an_unknown_inner_table_is_not_found_over_http() {
+    // A missing inner table is NOT_FOUND at bind time. (Per-table grants are
+    // not expressible through the API keys used here; the forbidden-table
+    // case, indistinguishable from this one, is covered with real grants in
+    // `correlated_tests::binder`.)
+    let dir = temp_dir("corr_authz");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    let (status_missing, body_missing) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT id FROM people WHERE EXISTS (SELECT 1 FROM no_such WHERE no_such.p = people.id)" }),
+    )
+    .await;
+    assert_eq!(status_missing, StatusCode::NOT_FOUND, "{body_missing}");
+
+    // The READER key may read, but is not an admin: a write is refused, and a
+    // correlated read still works for it.
+    let r = exec_sql(
+        &router,
+        READER_KEY,
+        "SELECT id FROM people WHERE EXISTS (SELECT 1 FROM visits WHERE visits.person = people.id) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Sub-slice B4: correlated IN / NOT IN and the NULL trap.
+#[tokio::test]
+async fn correlated_in_and_not_in_with_null_handling_through_the_real_api() {
+    let dir = temp_dir("corr_in");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    // For person p the inner set is the `person` of every visit with a larger
+    // id: p=1 -> {1, 2, NULL}, p=2 -> {2, NULL}, p=3 -> {NULL}.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE id IN (SELECT person FROM visits WHERE visits.id > people.id) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+
+    // NOT IN over a set containing NULL is never TRUE: nobody is returned,
+    // not even cy (3), who is simply absent from the set.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE id NOT IN (SELECT person FROM visits WHERE visits.id > people.id)",
+    )
+    .await;
+    assert_eq!(r["result"]["row_count"], 0, "{r}");
+
+    // With the NULLs removed from the inner set, cy comes back.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM people WHERE id NOT IN (SELECT person FROM visits WHERE visits.id > people.id AND visits.person IS NOT NULL)",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![3]);
+
+    // The UNKNOWN is visible as a SQL NULL when selected.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id, id IN (SELECT person FROM visits WHERE visits.id > people.id) FROM people ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        cell_values(&r, 1),
+        vec![json!(true), json!(true), Value::Null],
+        "{r}"
+    );
+
+    // A type mismatch across the subquery boundary is a bind error.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT id FROM people WHERE name IN (SELECT person FROM visits WHERE visits.id > people.id)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "BIND_ERROR");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Sub-slice B5: UPDATE / DELETE with a correlated subquery, and EXPLAIN.
+#[tokio::test]
+async fn correlated_subqueries_in_update_and_delete_through_the_real_api() {
+    let dir = temp_dir("corr_dml");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    // SET with a correlated scalar subquery: each person's name becomes the
+    // number of their visits, as text via a lookup of the max minutes (ann 45,
+    // bob NULL, cy NULL) -- the subquery sees each row's ORIGINAL id.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "UPDATE people SET name = (SELECT CASE WHEN COUNT(*) = 0 THEN 'none' ELSE 'some' END FROM visits WHERE visits.person = people.id)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 3);
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT name FROM people ORDER BY id").await;
+    assert_eq!(
+        cell_values(&r, 0),
+        vec![json!("some"), json!("some"), json!("none")],
+        "{r}"
+    );
+
+    // DELETE ... WHERE NOT EXISTS (correlated): cy (3) has no visit.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "DELETE FROM people WHERE NOT EXISTS (SELECT 1 FROM visits WHERE visits.person = people.id)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 1);
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT id FROM people ORDER BY id").await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+
+    // A self-correlated DELETE sees the table as it was before the statement:
+    // people 1 and 2 now both carry the name 'some', so BOTH are deleted.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "DELETE FROM people WHERE EXISTS (SELECT 1 FROM people p2 WHERE p2.name = people.name AND p2.id <> people.id)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 2);
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT id FROM people").await;
+    assert_eq!(r["result"]["row_count"], 0);
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn explain_of_a_correlated_subquery_shows_the_correlation_and_executes_nothing_over_http() {
+    let dir = temp_dir("corr_explain");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    // Executed, this would fail (ann has two visits -> two inner rows).
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN SELECT (SELECT minutes FROM visits WHERE visits.person = people.id) FROM people",
+    )
+    .await;
+    let text = r["result"]["plan_text"].as_str().expect("a plan text");
+    assert!(text.contains("correlated outer_row_input=true"), "{text}");
+    assert!(!text.contains("uncorrelated"), "{text}");
+
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN SELECT id FROM people WHERE id IN (SELECT person FROM visits)",
+    )
+    .await;
+    let text = r["result"]["plan_text"].as_str().expect("a plan text");
+    assert!(text.contains("uncorrelated (executed once)"), "{text}");
+
+    // EXPLAIN of a correlated DELETE changes nothing.
+    exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN DELETE FROM people WHERE EXISTS (SELECT 1 FROM visits WHERE visits.person = people.id)",
+    )
+    .await;
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT COUNT(*) FROM people").await;
+    assert_eq!(cell_values(&r, 0), vec![json!("3")]);
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Sub-slice B6: nested correlation, three levels.
+#[tokio::test]
+async fn three_level_correlated_subqueries_through_the_real_api() {
+    let dir = temp_dir("corr_nested");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+    exec_sql(
+        &router,
+        ADMIN_KEY,
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, visit_id INTEGER, len INTEGER)",
+    )
+    .await;
+    for sql in [
+        "INSERT INTO notes (id, visit_id, len) VALUES (1, 1, 5)",
+        "INSERT INTO notes (id, visit_id, len) VALUES (2, 2, 1)",
+        "INSERT INTO notes (id, visit_id, len) VALUES (3, 3, 2)",
+    ] {
+        exec_sql(&router, ADMIN_KEY, sql).await;
+    }
+
+    // The innermost query reads the middle level (v.id) AND the outermost
+    // (people.id). Person 1: visit 1 has a note of length 5 > 1. Person 2:
+    // visit 3's note has length 2, not > 2. Person 3 has no visits.
+    let deep = "EXISTS (SELECT 1 FROM visits v WHERE v.person = people.id AND \
+                EXISTS (SELECT 1 FROM notes n WHERE n.visit_id = v.id AND n.len > people.id))";
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        &format!("SELECT id FROM people WHERE {deep} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        &format!("SELECT id FROM people WHERE NOT {deep} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![2, 3]);
+
+    // Three-level scalar.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id, (SELECT COUNT(*) FROM visits v WHERE v.person = people.id AND \
+         (SELECT COUNT(*) FROM notes n WHERE n.visit_id = v.id) >= 1) FROM people ORDER BY id",
+    )
+    .await;
+    assert_eq!(cell_values(&r, 1), vec![json!("2"), json!("1"), json!("0")], "{r}");
+
+    // A nested correlated DELETE.
+    let r = exec_sql(&router, ADMIN_KEY, &format!("DELETE FROM people WHERE {deep}")).await;
+    assert_eq!(r["result"]["rows_affected"], 1);
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT id FROM people ORDER BY id").await;
+    assert_eq!(int_cells(&r), vec![2, 3]);
+
+    // The re-execution limits are not reachable with this little data over
+    // the default limits (they are exercised in the engine tests); the
+    // nesting-depth limit is: 33 nested levels fail closed as RESOURCE_LIMIT.
+    let mut sql = String::from("SELECT 1");
+    for _ in 0..33 {
+        sql = format!("SELECT ({sql})");
+    }
+    let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": sql })).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "RESOURCE_LIMIT");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -----------------------------------------------------------------
+// SQL-mission-1, Slice C: derived tables, LATERAL and non-recursive CTEs
+// through the real HTTP stack.
+// -----------------------------------------------------------------
+
+const PER_PERSON: &str =
+    "(SELECT person AS p, COUNT(*) AS n FROM visits WHERE person IS NOT NULL GROUP BY person)";
+
+#[tokio::test]
+async fn derived_tables_through_the_real_api() {
+    let dir = temp_dir("rel_derived");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        &format!("SELECT d.p, d.n FROM {PER_PERSON} AS d ORDER BY d.p"),
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+    assert_eq!(cell_values(&r, 1), vec![json!("2"), json!("1")], "{r}");
+    // The result names are the derived table's, not the underlying table's.
+    assert_eq!(r["result"]["columns"][0]["name"], "p");
+    assert_eq!(r["result"]["columns"][1]["name"], "n");
+
+    // LEFT JOIN keeps people without visits.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        &format!("SELECT people.id, d.n FROM people LEFT JOIN {PER_PERSON} AS d ON d.p = people.id ORDER BY people.id"),
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3]);
+    assert_eq!(cell_values(&r, 1), vec![json!("2"), json!("1"), Value::Null], "{r}");
+
+    // A column list renames.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT a FROM (SELECT id, name FROM people) AS d(a, b) ORDER BY a",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3]);
+
+    // LATERAL: the most recent visit per person.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT people.id, l.v FROM people LEFT JOIN LATERAL \
+         (SELECT visits.id AS v FROM visits WHERE visits.person = people.id ORDER BY visits.id DESC LIMIT 1) AS l ON true \
+         ORDER BY people.id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3]);
+    assert_eq!(cell_values(&r, 1), vec![json!(2), json!(3), Value::Null], "{r}");
+
+    // Errors.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT 1 FROM (SELECT id FROM people)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "BIND_ERROR");
+    assert!(body.to_string().contains("alias"), "{body}");
+
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT 1 FROM people JOIN (SELECT id FROM visits WHERE visits.person = people.id) AS d ON true" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "BIND_ERROR");
+    assert!(
+        body.to_string().contains("derived table 'd' cannot reference outer column 'people.id' without LATERAL"),
+        "{body}"
+    );
+
+    // Nesting past the limit fails closed.
+    let mut sql = String::from("SELECT id AS c0 FROM people");
+    for i in 1..=33 {
+        sql = format!("SELECT c{} AS c{i} FROM ({sql}) AS d{i}", i - 1);
+    }
+    let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": sql })).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "RESOURCE_LIMIT");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn non_recursive_ctes_through_the_real_api() {
+    let dir = temp_dir("rel_cte");
+    let (state, router) = build_app(&dir);
+    seed_people_visits(&router).await;
+
+    // Single reference.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH busy AS (SELECT person AS p FROM visits WHERE minutes > 20) \
+         SELECT id FROM people WHERE id IN (SELECT p FROM busy) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1]);
+
+    // Chained, and referenced twice (a self-join: person 1 has two visits with
+    // minutes, so 2 x 2 = 4 matching pairs).
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH a AS (SELECT person AS p, minutes AS m FROM visits WHERE person IS NOT NULL), \
+              b AS (SELECT p FROM a WHERE m IS NOT NULL) \
+         SELECT x.p FROM b AS x JOIN b AS y ON x.p = y.p ORDER BY x.p",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 1, 1, 1]);
+
+    // A CTE shadows the base table of the same name for the statement.
+    let r = exec_sql(&router, ADMIN_KEY, "WITH visits AS (SELECT 42 AS answer) SELECT answer FROM visits").await;
+    assert_eq!(int_cells(&r), vec![42]);
+
+    // WITH before DELETE.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH quiet AS (SELECT id FROM people WHERE id NOT IN (SELECT person FROM visits WHERE person IS NOT NULL)) \
+         DELETE FROM people WHERE id IN (SELECT id FROM quiet)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 1);
+
+    // EXPLAIN shows a twice-read CTE once, flagged as materialized once.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN WITH x AS (SELECT person AS p FROM visits) SELECT 1 FROM x AS a JOIN x AS b ON a.p = b.p",
+    )
+    .await;
+    let text = r["result"]["plan_text"].as_str().expect("plan text");
+    assert_eq!(text.matches("defined here").count(), 1, "{text}");
+    assert!(text.contains("materialized once per statement"), "{text}");
+
+    // Errors.
+    for (sql, needle) in [
+        ("WITH x AS (SELECT * FROM x) SELECT * FROM x", "CTE 'x' refers to itself; use WITH RECURSIVE"),
+        (
+            "WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS v) SELECT * FROM a",
+            "referenced before it is defined",
+        ),
+        (
+            "WITH x(a, b) AS (SELECT 1 AS v) SELECT * FROM x",
+            "column name",
+        ),
+    ] {
+        let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": sql })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}: {body}");
+        assert_eq!(body["error"]["code"], "BIND_ERROR", "{sql}");
+        assert!(body.to_string().contains(needle), "{sql}: {body}");
+    }
+    // WITH RECURSIVE belongs to a later slice: typed, not a crash.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT * FROM r" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "UNSUPPORTED");
+    // A CTE inside a subquery does not leak; a dead CTE with a bad body is an error.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT (WITH x AS (SELECT 5 AS v) SELECT v FROM x), (SELECT v FROM x)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "WITH x AS (SELECT id FROM no_such_table) SELECT 1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // The definition limit (64) is enforced over HTTP: 64 pass, 65 do not.
+    let chain = |n: usize| {
+        let mut sql = String::from("WITH c0 AS (SELECT 1 AS v)");
+        for i in 1..n {
+            sql.push_str(&format!(", c{i} AS (SELECT v FROM c{})", i - 1));
+        }
+        sql.push_str(&format!(" SELECT v FROM c{}", n - 1));
+        sql
+    };
+    let r = exec_sql(&router, ADMIN_KEY, &chain(64)).await;
+    assert_eq!(int_cells(&r), vec![1]);
+    let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": chain(65) })).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "RESOURCE_LIMIT");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

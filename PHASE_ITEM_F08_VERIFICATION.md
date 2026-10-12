@@ -149,3 +149,218 @@ NOT TESTED: power loss; a real disk error or full disk during the pass; a databa
 ## 11. What was and was not done
 
 Done: inspection, baseline, re-run of the full open-time, mid-run, combined, error-contract and environment matrices on HEAD, a 3.24 GiB throttle and resource measurement (warm and cold), spec comparison, erratum. Not done and why: no code fix, because every defect-shaped finding is either outside the ADR (policy / contract) or in a protected file, which the Fix Policy and the protected-path rule forbid fixing without a decision or authorisation. ADR-STARTUP-01 and F-11 were not touched. No production-readiness claim is made.
+
+---
+
+## 12. ADDENDUM (second pass, 2026-10-11, tree `35bc86e`; sections 1-11 above are unchanged history)
+
+**Premise check.** The second-pass prompt said the first pass left provisional GAP-B (`metadata_findings`) and GAP-E (SQL `CORRUPTION`) changes in the tree. **They do not exist**: HEAD `35bc86e` is docs-only, `git status --short` is empty, `git diff a95e2f4 -- src api cli sql` is empty, and `metadata_findings` / `metadata_mismatch` occur nowhere in the source. The first pass recommended fixing them as a *next step* and never implemented them; no such instruction was received. Therefore there is no provisional change set to verify, label, ratify or revert, GAP-B and GAP-E remain decision requests (12.5), and nothing was built on them.
+
+**12.1 Reuse of first-pass evidence.** Source is byte-identical to `a95e2f4`, so the first-pass runs of F08-01, -02, -05, -06, -07 (sections 2, 4, 5, 6) and F08-03 (section 3, 3.24 GiB fixture, binary SHA-256 `f655de73...bd05d`) stand; the fixture and generator are re-used, not rebuilt. Added below: F08-02/-03 details, F08-04, section-7 audit.
+
+**12.2 F08-02 additions** (`raw/pass_lifecycle.json`, 3.24 GiB fixture, real binary). Transitions `running -> complete` (rate 256: 21.4 s on a cooler cache, 13.4 s after restart); no torn status in 3 runs of about 30 samples each (no non-monotonic counter, `tables_verified <= tables_total`, `/readyz.sstable_verification == /v1/status state`, `ready:true` in every sample); final `bytes_verified` 3,481,188,624 against 3,481,397,709 bytes of table files (0.006 % under: accounted by average block size, bloom/index/footer excluded). Threads 19 during the pass, 18 after it; handles 113-115 during, 111-113 after. Cancel: a graceful stop 15 s into a 4 MiB/s pass took 0.38 s, exit 0, no `rubixdb` process left; the restart starts a fresh pass (state `running` from 0). Invalid values and 0: section 2 AC-7. **PASS.**
+
+**12.3 F08-03 additions.** Partial first/last intervals bias the whole-pass rate by at most 3.5 %: steady-state (t >= 2 s, excluding the last sample) 64.0 / 255.8 / 939.0 MiB/s warm and 165.1 cold, against whole-pass 63.8 / 247.2 / 924.8 / 160.8. Thread count and handles in 12.2. Foreground **write** latency during the pass: **NOT TESTED** (only point reads were probed). Disk pressure beyond the process' read bytes: not sampled. Everything else in section 3 stands. Default unchanged; no throttle policy added.
+
+**12.4 F08-04 — footer `record_count`.** Code: `src/sstable/format.rs:423` parses it, `src/sstable/reader.rs:173` exposes it; `src/ops/check.rs:952` and `src/ops/sstable_integrity.rs:157,486` read it; `src/lsm/mod.rs:2940` sums it into the compaction output's `entry_count_hint`.
+
+| Entry point | Validates it? | Observed with `record_count` 17210 -> 17211, footer CRC valid (`b4`) |
+|---|---|---|
+| startup preflight | no | opens |
+| engine open / normal reads | no | correct data, 1,082 of 1,082 lookups |
+| background pass | no (counts records, never compares) | `complete`, no finding |
+| `rubixdb check` | yes | `ERROR SSTABLE_CORRUPT 17210 records readable, footer says 17211`, exit 2 |
+
+Both an inconsistency (two detectors disagree) **and** a detection gap (the running instance reports clean).
+
+**New finding, demonstrated: the field is not inert.** Its one non-diagnostic consumer is compaction's bloom sizing, uncapped in the writer (`BloomFilter::new_for_key_count`), while the reader rejects any bloom above 268,435,456 bytes (`format.rs:352`). Isolated fixture (`scripts/recordcount_consumer.py`; 3-table template; SSTable 1 `record_count` set to 400,000,000 with a valid footer CRC; a 4th flush triggers compaction): the instance opened `ready:true` with `sstable_verification:"complete"`; within 70 s compaction wrote **six 516,099,278-byte tables** (3.1 GB) whose bloom (500,064,500 bytes) the reader refuses (`capacity exceeded: requested 500064500, max 268435456`); `compaction: failed, will retry` repeated while `cycles_completed` stayed 0; the inputs 1-4 were left as Manifest orphans; and the **next start was refused** (`SSTABLE_CORRUPT ... capacity exceeded`; `rubixdb check`: `ERROR` on sstable 5-10, `ORPHAN` on 1-4). The recovery path is a verified backup into a new instance; the inputs remain on disk but no repair is authorised.
+
+Reachability: random corruption cannot trigger it (the footer CRC), so it needs a writer bug or a deliberate rewrite. **By arithmetic only (NOT TESTED at honest scale):** an honest database whose summed `record_count` reaches about 214.7 million (268,435,456 x 8 / 10 bits per key; 10 bits per key is what the observed 500,064,500 implies) would hit the same cliff on its next full-merge compaction. The fix location is `src/sstable/` / `src/lsm/` (protected) or an O(1) footer sanity bound in the preflight (policy; "do not add record_count startup validation" is binding in this mission). **No code changed.**
+
+**12.5 Decision requests** (the maintainer ratifies or rejects; this mission implements none).
+
+| | Current behaviour (exact) | Distinction wanted | Options and trade-off |
+|---|---|---|---|
+| GAP-B `record_count` | table in 12.4: pass `complete`, `check` exit 2 | one agreed meaning | (1) report a mismatch as a non-`damaged` finding (no startup cost, hazard remains); (2) an O(1) bound in the preflight, `record_count x min_record_bytes <= data region` (no scan, closes the compaction hazard, changes what starts); (3) downgrade `check` to a warning (hazard remains); (4) cap the bloom in the writer (protected engine, needs an ADR). 12.4 shows the field is load-bearing. |
+| GAP-E SQL code | SQL: 500 `STORAGE_ERROR`, `a storage error occurred`, no detail; KV, `/exists`, range: 500 `CORRUPTION`, detail `block: checksum mismatch` (`raw/error_contract`). No test pins SQL = `STORAGE_ERROR` for corruption; only the KV mapping is asserted (`api/src/error.rs:421`, `api/tests/sstable_integrity_reporting.rs:377`) | a SQL client can tell a damaged block from other storage failures | (1) map `RelationalError::Engine(Corruption)` to `CORRUPTION` in `sql/src/error.rs` and `api/src/error.rs` (public contract, a new SQL code, no protected path); (2) leave and document; clients use `/readyz`. |
+
+**12.6 Section 7 — `rubixdb check --data-dir` safety boundary** (`raw/check_audit/*.json`, `scripts/check_mutation_audit.py`). `check` was run **directly** on stopped disposable directories (not on copies), with a full before/after inventory by SHA-256, size and mtime.
+
+| ID | Directory condition | Exit | Directory modified? |
+|---|---|---|---|
+| CM0 | clean | 0 | no |
+| CM1 | data-block flip (physical errors, logical pass skipped) | 2 | no |
+| CM2 | valid foreign table, never recorded | 1 | **YES: `MANIFEST` changed (the table was adopted)** |
+| CM3 | stale `*.sst.tmp` | 0 | **YES: the file was deleted and no finding was printed** |
+| CM4 | 3 stray bytes after the last Manifest frame | 1 | **YES: `MANIFEST` changed (tail truncated)** |
+| CM5 | torn WAL tail (F-07 fix) | 1 | no |
+| CM6 | 23 MB un-flushed WAL tail, far above the 4 MiB memtable bound | 0 | no (no recovery flush occurred) |
+
+`rubixdb check --data-dir` is therefore **not** read-only in general: it adopts an unknown table, removes stale temp files and truncates a torn Manifest tail in the directory it inspects (3 of 7 conditions; a recovery flush did not occur in CM6). This turns the 2026-10-10 code-reading residual into a tested result. The WAL clean-stop attestation was never consumed by `check`. Not fixed: the candidate remedy (widen the copy-on-recovery rule of `open_engine_for_inspection`, `PHASE_ITEM_F07_CHECKPATH_ADR.md`) is not authorised. **OPEN.**
+
+**12.7 Classification after the second pass**
+
+| Item | Status |
+|---|---|
+| F08-01, F08-02, F08-05 (trace), F08-06, F08-07 | PASS (as the first pass; for damage while running, detection is NOT REQUIRED by the ADR limit and the evidence survives restart) |
+| F08-03 | PASS for throttle accuracy and read-latency measurement; default acceptability OPEN (GAP-A); write latency NOT TESTED |
+| F08-04 | OPEN (GAP-B decision; a newly demonstrated compaction and restart hazard) |
+| F08-05 mapping | OPEN (GAP-E decision) |
+| F08-08 | PASS (additive erratum); the stale comment `src/sstable/mod.rs:6-16` is OPEN (protected path) |
+| Section 7 | FAIL for "check is read-only" (3 of 7 conditions mutate); remedy OPEN |
+
+**Regression.** No code changed since `a95e2f4`, so the first-pass results are the current ones: fmt 0, clippy `-D warnings` 0, focused 18 + 4 + 10 + 5 + 2, debug workspace 1,470 passed / 2 failed (`repo_hygiene` x2), release 1,471 passed / 3 failed (`repo_hygiene` x2 and M1.3 at 26,543 ops/s in-suite; 91,315 / 89,651 / 107,883 alone). Nothing was re-run because nothing relevant changed; this is stated, not presented as a new pass. Not committed (instruction: no commit unless asked).
+
+---
+
+## 13. GAP-B: O(1) bound on the footer `record_count` (2026-10-11, base `35bc86e`; sections 1-12 above are unchanged history)
+
+**Authorisation.** The maintainer's mission prompt "GAP-B — O(1) SSTable `record_count` Preflight Bound" (2026-10-11), sections 0 and 3: option (2) of 12.5, with protected-path edits limited to `src/sstable/bloom.rs` (the helper) and `src/sstable/reader.rs` (the call site). No other protected file was touched (`git diff --stat -- src/wal src/manifest src/compaction src/error.rs src/lsm` is empty). No separate ADR file was written; this section is the record.
+
+**13.1 Derivation (from the code, not copied).** Writer sizing, `BloomFilter::new_for_key_count`: `num_bits = max(1, saturating(expected_keys * bits_per_key))`, bytes `= ceil(num_bits / 8)`; the product is `u64`, the bytes are cast to `usize`. Reader cap, `format::decode_bloom_block`: `checked_len(ceil(num_bits / 8), 256 * 1024 * 1024)`: it applies to the **bit array only** (not the 8-byte `num_bits`, the 1-byte hash count or the 4-byte checksum) and refuses with `EngineError::CapacityExceeded`, strictly above 268,435,456. `ceil(n / 8) <= C` holds exactly when `n <= 8 * C`, so the largest safe count is `floor(8 * C / bits_per_key)`. At the pinned 10 bits per key (spec 2.5, `DEFAULT_BLOOM_BITS_PER_KEY`): `floor(2,147,483,648 / 10) = 214,748,364`. Proof of tightness: 214,748,364 x 10 = 2,147,483,640 bits = 268,435,455 bytes (fits); 214,748,365 x 10 = 2,147,483,650 bits = 268,435,457 bytes (refused by the reader). `8 * C = 2^31` fits `u64`; `bits_per_key == 0` sizes a 1-bit filter, so every count is safe; the largest `bits_per_key` yields 0.
+
+**13.2 Change.**
+
+| File | Change | Class |
+|---|---|---|
+| `src/sstable/bloom.rs` | `MAX_BLOOM_BIT_ARRAY_BYTES` (mirrors the reader literal), `bloom_num_bits` (the single sizing formula, now used by `new_for_key_count`), `max_record_count_for_bloom_cap(bits_per_key)`; 4 unit tests | **protected, authorised** |
+| `src/sstable/reader.rs` | `SsTable::open`: after the footer and offset checks, before the bloom block is read or allocated, `record_count > bound` returns the existing `EngineError::Corruption` with a detail naming `record_count`, the value, the bound and the 268435456-byte reader limit | **protected, authorised** |
+| `src/ops/sstable_integrity_tests.rs` | one new test, existing assertions untouched | product layer, test |
+| `tests/sstable_record_count_bound.rs` | new integration test file (6 tests, counting allocator) | test |
+
+The preflight (`src/ops/sstable_integrity.rs`) was **not edited**: it already calls `SsTable::open` and maps its error to `SSTABLE_CORRUPT` carrying the engine text, so the new refusal arrives through the existing path with the directory untouched. Not changed: `FOOTER`/`bloom`/`index` byte formats, the public `SsTable` API, WAL, Manifest, checkpoint, purge, startup order, `rubixdb check`, `/readyz`, `/v1/status`, the 64 MiB/s default. Footer CRC, index, bloom and structural checks still run exactly as before; the new check is an extra, earlier comparison of one integer. `bits_per_key` for the bound is the format-pinned 10; a library caller that wrote a table with fewer bits per key and more than 214,748,364 records would now be refused (no product path does that; the product uses the default).
+
+**13.3 Tests.**
+
+| Command | Result |
+|---|---|
+| `cargo test -p rubixdb --test sstable_record_count_bound` | 6 passed |
+| `cargo test -p rubixdb --lib sstable` (baseline 88 passed, 1 ignored) | 93 passed, 1 ignored |
+| `cargo test -p rubixdb --lib sstable_integrity` (baseline 18, 1 ignored) | 19 passed, 1 ignored |
+| `cargo test -p rubixdb --lib compaction` (baseline 47, 1 ignored) | 47 passed, 1 ignored |
+| `cargo test -p rubixdb-api --test sstable_integrity_reporting` | 4 passed |
+| `cargo test -p rubixdb-cli --test f07_tail_damage_integration` | 16 passed |
+| `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 / exit 0 |
+| `cargo test --workspace --no-fail-fast` (debug) | 1,480 passed, **3 failed**, 32 ignored |
+
+Workspace failures: `repo_hygiene` x2 (baseline, a tracked credentials file) and **`observability_integration::two_real_instances_keep_every_surface_apart_and_a_restarted_one_starts_fresh`**, a failure not in earlier baselines: it asserted that two instances report different start times and both reported `1791713053286` (two servers started in the same millisecond; the test then leaked its two servers, which were stopped by hand). It is unrelated to SSTables (observability start-time bookkeeping; this change only adds a comparison in `SsTable::open`). It passed 6 of 6 on immediate re-runs (`logs/gapb/`). The first failure is kept as the evidence; it is **intermittent**, not "clean". The release workspace suite was **not run** (not requested; the debug workspace was).
+
+Non-vacuity: against the unfixed `HEAD` source the new integration file fails 5 of 6 (the control that a normal table opens passes) and the new preflight test fails (`unwrap_err` on an `Ok`). Mutants of the fix, all killed (6 of 6, `logs/gapb/gapb_mutants.log`): `>` to `>=` (the bound is refused), `>` to `> max+1` (the next integer is accepted), helper divisor `+1`, helper cap x4, sizing loses `max(1)`, and the check moved after the bloom block is decoded.
+
+**13.4 `400,000,000` is rejected before any unsafe allocation or encoding.**
+
+* Allocator proof (`tests/sstable_record_count_bound.rs`): with a counting global allocator, `SsTable::open` of the honest 500-record table makes a largest single allocation under 1 MiB (control); the same table with `record_count = 400,000,000` and a **valid** footer CRC returns `EngineError::Corruption` (detail names `record_count`, `400000000`, `214748364`), with a largest single allocation under 1 MiB, against the 500,000,000 bytes a bloom for that count would be; the file is byte-identical afterwards.
+* Order proof: with the bloom block also damaged, the refusal is the `record_count` one (the bloom was never read or decoded); with every data-block byte wrecked, `open` still succeeds for an honest count (it reads no data block) and refuses the inflated count identically.
+* Real binary (`rubixdb_gapb.exe`, release, SHA-256 `35c87fea...a59`, `raw/gapb_real_binary.json`, 3-table disposable copy, SHA-256 inventory of 9 files before and after): `400,000,000` and `214,748,365` -> exit 1 in 1.1-1.8 s, `SSTABLE_CORRUPT ... footer: record_count 400000000 exceeds 214748364, the largest count whose bloom filter fits the 268435456 byte reader limit; refusing to open ...`, `directory_unchanged: true`, no new file, no compaction, no 3 GB of output. `214,748,364` and the `b4` value `17211` still open (a mismatch below the bound is not detected, by design of this mission).
+
+**13.5 O(1).** The check compares one already-decoded `u64` footer field with one `const fn` result (a division by a constant); it runs after the 72-byte footer read the open already performed, before the bloom read, with no allocation, no loop, no data-block read, no thread. Startup cost therefore does not depend on data size (the preflight reads each table's footer, bloom and index exactly as before).
+
+**13.6 Remaining limitation, demonstrated: the bound is per table; compaction sums.** `lsm/mod.rs:2940` sums the inputs' counts into the output's bloom size. With `record_count` set to the **bound itself** (214,748,364, accepted) on one of four small tables, compaction on the fixed binary still wrote nine 284,534,733-byte tables whose bloom (268,499,955 bytes, 64,499 over the cap) the reader refuses (`capacity exceeded: requested 268499955, max 268435456`), `cycles_completed` stayed 0, and the next start was refused (`raw/recordcount_consumer_214748364.json`). So the O(1) bound closes the `400,000,000` shape (any single count above 214,748,364) but **not** the summed shape: a database whose inputs' counts add up to more than 214,748,364 at compaction time (honest or not) still produces a table the reader refuses. This is the case 12.4 derived by arithmetic; it is now also reproduced. The remedy is a clamp of the hint at its one call site (`src/lsm/mod.rs`, `entry_count_hint.min(max_record_count_for_bloom_cap(bits_per_key))`, same helper) or a writer cap; both are outside this mission's authorised files.
+
+**13.7 Still open.** Full `record_count` mismatch detection (a count below the bound that disagrees with the stored records: opens, serves, `check` exit 2); the pass does not report it. GAP-A (default rate), GAP-C (CRC-consistent semantic damage), GAP-D (online check all-clear), GAP-E (SQL code), GAP-F (stale comment `src/sstable/mod.rs:6-16`, protected) and the `rubixdb check --data-dir` mutation finding are untouched. F-08 is not complete; no production-readiness claim.
+
+---
+
+## 14. GAP-B follow-up: the summed compaction hint (2026-10-11, base `35bc86e` + the section-13 changes; sections 1-13 above are unchanged history)
+
+**Status: the fix is designed, validated in a scratch copy, and NOT applied to the repository.** The shared helper `max_record_count_for_bloom_cap` is unreachable from `src/lsm`: `mod bloom;` is private in `src/sstable/mod.rs` (only `BloomFilter` is re-exported). Using the helper, as the mission requires ("so the sizing rule is not duplicated"), needs a one-line `pub use` in `src/sstable/mod.rs`, which the mission excludes ("no change to `src/sstable/`"; "if the smallest correct change requires touching `src/compaction/` or `src/sstable/` beyond reading, stop and report"). So the mission stopped at that rule. `git diff HEAD -- src/lsm src/compaction src/sstable/mod.rs` is empty. The complete patch, its tests and the evidence are in `scratch/f08_verification/proposed_summed_hint/`.
+
+**14.1 What `entry_count_hint` controls (proved from the code, before choosing a remedy).** The hint has one consumer in the writer, `write_from_sorted_records`: `BloomFilter::new_for_key_count(entry_count_hint.max(1), bits_per_key)` (`src/sstable/writer.rs:150`). It does not control record inclusion (`for item in records` writes every record), the persisted `record_count` (`total_records`, counted in that loop and written to the footer), or key insertion (`bloom.insert(&key)` runs for every record, unconditionally). Capacity cannot make construction fail or omit a key: `bit_positions` takes `% num_bits` with `num_bits >= 1`, `bits.len() == ceil(num_bits / 8)`, and insert and query use the same positions, so every inserted key has all its bits set whatever the size; a smaller filter only collides more. The reader uses the bloom in exactly two places, `get_versioned` (`reader.rs:233`) and `contains` (`reader.rs:302`), both of which answer "absent" only when a bit is clear, which cannot happen for an inserted key; `range_scan_raw` never consults it and there is no separate block-scan fallback. So an undersized bloom changes the false-positive rate, never a read result. In addition, the chosen remedy never undersizes below the output's need (14.4). The hint feeds nothing else (`grep entry_count_hint`: `lsm/mod.rs:2940,2963`, `sstable/writer.rs:80,90,113,132,150`, tests).
+
+**14.2 Section 2.1: the "nine tables" are not a leak; they are nine committed outputs** (fresh fixture, `scripts/nine_tables.py`, `raw/nine_tables_214748364.json`, binary of the previous mission, table 1 `record_count` = 214,748,364, 24,000 rows to force a fourth flush, sampled every 5 s for 60 s).
+
+| Observation | Value |
+|---|---|
+| attempts | one compaction per attempt, about every 5-7 s; `failures_total` 1 (first sample) -> 8 (last), `consecutive_failures` the same, `cycles_completed` 0 |
+| per attempt | one complete output of 284,534,733 bytes was written, renamed (so `TmpFileGuard` was disarmed, no `.sst.tmp` leaked) **and committed to the Manifest (`AddSstable`, then `RemoveSstable` for each input)**; only then did `SsTable::open(output)` fail with `capacity exceeded: requested 268499955, max 268435456`, before the in-memory splice |
+| files over time | 6, 6, 7, 8, 8, 9, 10, 10, 11, 12, 12, 13 (inputs 1-4 plus up to nine outputs) |
+| in-memory view | `live_sstable_count` stayed 4 (stale), so every retry compacted the same inputs again |
+| classification | `last_failure.kind: "other"`: `CapacityExceeded` falls in "any other error", i.e. **transient**; `blocked: false` throughout; stderr: `compaction: failed, will retry on the next trigger` repeated, no table named |
+| end state | `rubixdb check`: `ERROR SSTABLE_CORRUPT` on sstable 5-13, `WARNING SSTABLE_ORPHAN` on 1-4, exit 2; the next start refused |
+
+So the failure mode is **commit before verify** (the output is opened only after the Manifest commit) combined with a **transient** classification: an unreadable output is committed again every ~5 s, about 285 MB each, with no block and no cap, until something else stops it (disk full). It is not the ADR-COMPACTION-LEAK-01 shape (that guard covers `.sst.tmp`). The clamp removes this trigger; the general ordering and the transient classification are **not** changed by it (open finding, 14.7).
+
+**14.3 Section 2.2: the observability failure is pre-existing and intermittent.** `observability_integration::two_real_instances_keep_every_surface_apart_and_a_restarted_one_starts_fresh` asserts the two instances report different start times. Both spawn at once (`spawn_owner` twice back to back) and the assertion fails when both report the same millisecond.
+
+| Tree | Build | Runs | Failures | Signature |
+|---|---|---|---|---|
+| baseline: `git archive` of `35bc86e` (identical code to `a95e2f4` for every non-doc file), separate target dir | debug | 40 sequential | **1** (run 35) | `observability_integration.rs:403`, `left: Number(1791714347198)`, `right: Number(1791714347198)` |
+| current tree (section-13 changes) | debug | 40 sequential, plus 6 earlier re-runs | 0 of 46; plus 1 of 1 in the section-13 workspace run | the same line and kind (`1791713053286` on both sides) |
+
+Both failures leave two leaked servers with identical creation timestamps, as seen. The rates (1/40 baseline; 1/47 on the current tree counting the workspace run) are not distinguishable. The section-13 change does not touch code the test exercises: the test's instances are fresh and have no SSTable, so `SsTable::open` never runs, and nothing it adds concerns timestamps. **Classification: pre-existing intermittent** (reproduced on unmodified code with the same signature). It is not caused by section 13. Caveat: the baseline and current runs used separate build directories on the same machine, not simultaneous runs.
+
+**14.4 Remedy: A (clamp) plus a pre-commit output guard.** A alone closes the demonstrated trigger but not the following: with the per-table open bound of section 13, an output whose real survivor count exceeds 214,748,364 has a footer count that `SsTable::open` refuses, and it is only opened after the Manifest commit, so the same commit-before-verify failure occurs with the cause moved from the hint to the real count. Remedy B (refuse whenever the *sum* exceeds the cap) is safe but blocks compaction for a database whose inputs carry many overwritten versions (the sum counts versions and tombstones that the merge drops). Chosen, in `compact_once_impl` only:
+
+1. `entry_count_hint = saturating_sum(inputs' record_count).min(cap)` where `cap = max_record_count_for_bloom_cap(max(bloom_bits_per_key, 10))` (never above what `open` accepts). The sum saturates (a wrapped sum could become a small hint); the clamp is documented in code as intentional. With the guard below, an output that gets this far holds at most `cap` records, so a bloom sized for `cap` keys is **not** undersized for it: the false-positive rate is the design rate or better.
+2. After the output is written and before the Manifest commit: if its real `record_count > cap`, remove the output file (nothing references it) and return `EngineError::Unsupported` (an existing permanent-candidate class, so the worker blocks after its 3-attempt budget instead of retrying forever). No new variant, no format change.
+
+**14.5 Validation in the scratch copy (`E:\rubixdb_f08b\nv_fix`, current tree + patch; not the repository).**
+
+| Check | Result |
+|---|---|
+| unit tests of the pure functions (cap, saturating sum, boundary, `u64::MAX`) | 4 passed |
+| `tests/compaction_summed_hint.rs` (real engine, background worker): normal compaction (bloom framing `13 + ceil(total x 10 / 8)` unchanged); summed hint exactly at the cap; cap + 1; survivors above a scaled cap (`bloom_bits_per_key` 3,000,000 -> cap 715, 1,428 survivors): refused before the commit, worker `blocked`, `cycles_completed` 0, no output file left, **Manifest bytes unchanged**, all keys still readable | 4 passed (61 s; the three big cases write 256 MiB blooms) |
+| non-vacuity | against the unfixed call site the cap + 1 case FAILS (the at-cap case and the normal case pass: controls) |
+| mutants, 6 of 6 killed | clamp removed (integration + 2 unit); clamp applied per input before the sum (integration + 2 unit); wrapping sum (unit); guard `<=` -> `<` (unit); guard never refuses (integration + unit); guard call removed from the compaction path (integration) |
+| real binary, scratch build, SHA-256 `fe1ac6db...564db`, same fixture as 14.2 | `cycles_completed` 1, `failures_total` 0, `blocked` false, 1 live table, 1 file in `sstables/`, `rubixdb check` exit 0 with 0 errors and 0 warnings (the previous build: nine unreadable tables) |
+| scratch regression | `--lib compaction` 47 passed + 1 ignored; `--lib lsm` 127 + 1; `--lib sstable` 93 + 1; `sstable_record_count_bound` 6; `sstable_integrity_reporting` 4; scratch `cargo fmt --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0 (after moving the helpers above the doc comment, which clippy required) |
+
+The scratch workspace test run and the release workspace run were not done. The guard's wiring is tested end to end only at the scaled cap; at the real cap (214.7 million survivors) it is **NOT TESTED**.
+
+**14.6 Authorisation needed to apply it** (the maintainer; the smallest set): (1) the one-line re-export `pub use bloom::{max_record_count_for_bloom_cap, BloomFilter};` in `src/sstable/mod.rs`; (2) the `src/lsm/mod.rs` edit (about 45 lines including three tiny pure functions and their unit tests). Reproducible with `scripts/patch_lsm_scratch.py <repo>` followed by `cargo fmt`, which is byte-identical to the validated scratch copy (verified); the new test file `tests/compaction_summed_hint.rs` goes beside it.
+
+**14.7 Findings this follow-up adds, not fixed.** (a) Commit-before-verify in `compact_once_impl`: the output is opened after `AddSstable`/`RemoveSstable` are committed; any other open failure of the output (not only this one) commits an unreadable table and, being classified transient, repeats it without a block. (b) `EngineError::CapacityExceeded` is classified transient by `CompactionFailureKind::classify`. Both are engine behaviour outside this mission. (c) Format limit made visible: with a single full-merge output and a 256 MiB bloom cap, a database whose compaction survivors exceed 214,748,364 records can no longer be compacted (with the guard it blocks safely; read amplification grows, as ADR-COMPACTION-LEAK-01 already accepts). Remaining from sections 12-13: counts below the bound that disagree with the stored records are undetected at start; GAP-A, C, D, E, F and the `rubixdb check --data-dir` mutation are untouched.
+
+---
+
+## 15. GAP-B summed hint: the validated fix APPLIED (2026-10-11; base `35bc86e` + the section-13 changes; sections 1-14 above are unchanged history)
+
+**Authorisation.** The maintainer's mission "RubixDB GAP-B — Apply the Validated Aggregate Compaction Fix" (2026-10-11): (1) the re-export in `src/sstable/mod.rs`, (2) the clamp and the pre-commit guard in `src/lsm/mod.rs`, (3) `tests/compaction_summed_hint.rs`, (4) the records. `src/sstable/reader.rs` was not touched in this mission (its diff is the section-13 change only). Nothing was committed or pushed.
+
+**15.1 Independent review before applying.** The scratch patch was re-read line by line, not trusted. Confirmed from the code: the aggregate is `fold(0, saturating_add)` and only then `.min(cap)` (a wrapped sum cannot become a small hint; the unit tests include `u64::MAX + 2`); the guard (`lsm/mod.rs:2992`) sits after `write_from_sorted_records` returns and **before** the first `Manifest` write (`AddSstable`, line 3016), so a refused output is never committed; `EngineError::Unsupported` is classified permanent-candidate by `CompactionFailureKind::classify` (`is_permanent()` true), so the worker blocks after its existing budget; the writer still inserts every key and counts every record whatever the hint is, so the persisted `record_count` and the bloom's contents are unchanged. **One deviation from the scratch patch, found in review:** the guard removes a file that already has its published `.sst` name; the writer makes its rename durable with `fsync_dir`, so the removal now does the same (`let _ = wal::fsync_dir(sstables_dir);`, best effort, three lines), otherwise an OS crash in that window could bring an unreadable table back as an unrecorded one. On Windows that helper is a no-op; the Unix effect is **NOT TESTED**. The result is otherwise byte-identical to the validated scratch copy (diffed).
+
+**15.2 Changed files.**
+
+| File | Change | Class |
+|---|---|---|
+| `src/sstable/mod.rs` | `pub use bloom::{max_record_count_for_bloom_cap, BloomFilter};` (one line) | **protected, authorised** |
+| `src/lsm/mod.rs` | three pure functions (`compaction_record_cap`, `capped_bloom_hint`, `compaction_output_fits`), the capped hint at the former `entry_count_hint` line, the pre-commit guard, 4 unit tests | **engine, authorised** |
+| `tests/compaction_summed_hint.rs` | new, 4 integration tests | test |
+| `PROGRESS.md`, `OPEN_ITEMS.md`, `CHANGELOG.md`, this document, `scratch/f08_verification/` | records and evidence | docs |
+
+Earlier uncommitted section-13 changes (`bloom.rs`, `reader.rs`, `sstable_integrity_tests.rs`, `tests/sstable_record_count_bound.rs`) were preserved. Not changed: `reader.rs` in this mission, the SSTable format, the reader's cap, WAL, Manifest, checkpoint, purge, the failure classification, the worker.
+
+**15.3 Verification (repository, exit codes 0 unless stated).**
+
+| Command | Result |
+|---|---|
+| `cargo test -p rubixdb --lib summed_hint` | 4 passed |
+| `cargo test -p rubixdb --test compaction_summed_hint` | 4 passed (61 s) |
+| `cargo test -p rubixdb --test sstable_record_count_bound` | 6 passed |
+| `cargo test -p rubixdb --lib sstable` | 93 passed, 1 ignored |
+| `cargo test -p rubixdb --lib sstable_integrity` | 19 passed, 1 ignored |
+| `cargo test -p rubixdb --lib compaction` | 47 passed, 1 ignored |
+| `cargo test -p rubixdb --lib lsm` | 127 passed, 1 ignored |
+| `cargo test -p rubixdb-api --test sstable_integrity_reporting` | 4 passed |
+| `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 / exit 0 |
+
+Non-vacuity and mutants are those of section 14.5 (unfixed call site fails the cap + 1 case; 6 of 6 mutants killed); they ran on the scratch copy and were not re-run on the repository, whose code differs by the three fsync lines only. The scratch real-binary result is superseded by the repository build below. **Not run:** the debug and release workspace suites (not required by this mission); `f07_tail_damage_integration` (untouched code path).
+
+**15.4 The nine-table scenario on a build of the repository** (release, SHA-256 `242671371aae...6004d`, built into `E:\rubixdb_f08b\apply_target` because `target\release\rubixdb.exe` was in use by another running console; disposable 3-table copy, table 1 `record_count` = 214,748,364, 24,000 rows to force the fourth flush, `scripts/nine_tables_port.py`, `scripts/verify_output.py`). The disposable instance was pinned to port 3302 because a separate `rubixdb gui` (not started by this session) holds port 302 on this machine; it was not touched (my first attempt reached it with requests that returned 401 and wrote nothing).
+
+| Check | Before (previous build) | After (this build) |
+|---|---|---|
+| compaction | 9 outputs committed in 60 s, `failures_total` 8, `cycles_completed` 0, `blocked` false | `cycles_completed` 1, `failures_total` 0, `blocked` false, 40 s of samples unchanged |
+| files in `sstables/` | 13 (4 inputs + 9 unreadable outputs) | 1 (284,470,233 bytes) |
+| stderr | `compaction: failed, will retry ...` repeated | none |
+| output footer | - | `record_count` 68,810 (the real count, not the hint), `bloom_length` **268,435,468 = 13 + 268,435,455**, exactly the clamped bound |
+| `rubixdb check` (stopped) | exit 2, 9 errors | exit 0, 0 errors, 0 warnings |
+| restart | refused | ready in 0.6 s |
+| reads | - | `COUNT(*)` 84,000 (= 60,000 + 24,000); 28,001 sampled present keys all correct (0 wrong); 2,499 absent keys all return no rows |
+| `check` after the restart | - | exit 0, 0 errors, 0 warnings |
+
+(A first run of my verification script reported 2,000 "unexpected" rows among its absent keys; that was a wrong expectation in the script, ids 50000-51999 exist in the 60,000-row fixture. The script was corrected and rerun: `raw/apply_verify_output.json` is the first run, `raw/apply_verify_output2.json` the corrected one.) The zero false negatives over 28,001 present keys against a bloom sized for the cap is the behavioural evidence that the clamped bloom is correct; the argument that it must be is in 14.1.
+
+**15.5 The real-cap guard is NOT TESTED.** The guard (an output with more than 214,748,364 real records is refused before the commit) has been exercised only through the scaled test in `tests/compaction_summed_hint.rs` (`bloom_bits_per_key` 3,000,000, cap 715, 1,428 survivors): same code path, a different cap. That is **not** equivalent to the production bound and is not presented as such. A test at 214.7 million survivors was not run.
+
+**15.6 Remaining.** Counts below the per-table bound that disagree with the stored records are still not detected at start or by the verification pass (`rubixdb check` reports them). A database whose compaction survivors exceed 214,748,364 records now blocks compaction safely (permanent-candidate failure, nothing committed) instead of committing an unreadable table; read amplification then grows. The ordering "output opened after the Manifest commit" and the transient classification of `CapacityExceeded` are unchanged and remain open for any other cause of an unreadable output. The `fsync_dir` line is untested on Unix. Untouched: GAP-A, C, D, E, F, the `rubixdb check --data-dir` mutation finding, the intermittent observability test. F-08 is not complete; no production-readiness claim.

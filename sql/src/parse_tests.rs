@@ -271,13 +271,26 @@ fn unsupported_grammar_is_a_typed_error_not_a_panic() {
     // All`/non-empty-`modifiers` rejections), so this test still proves
     // "unsupported grammar is a typed error, never a panic" without
     // asserting something this increment made false.
+    //
+    // SQL-mission-1 Slice A (2026-10-11) removed exactly one case from this
+    // list, `"SELECT (SELECT 1)"`: scalar subqueries are now a supported
+    // feature (see `subquery_tests::parser` for the replacement assertions
+    // that the syntax parses to `Expr::ScalarSubquery`). No other case was
+    // touched, and the remaining cases still prove "unsupported grammar is a
+    // typed error, never a panic". The `WITH` and `UNION` cases below are
+    // expected to leave this list the same way in Slices C/D/E, each
+    // documented in `sql/MISSION1_FEATURE_MATRIX.md`.
+    //
+    // SQL-mission-1 Slice C (2026-10-11) removed exactly one more case,
+    // `"WITH x AS (SELECT 1) SELECT * FROM x"`: non-recursive CTEs are now a
+    // supported feature (`relation_tests::parser` and `::cte*` hold the
+    // replacement assertions; `WITH RECURSIVE` is still Unsupported and is
+    // asserted there). The `UNION` case below leaves in Slice E.
     let cases = [
         "SELECT id FROM t GROUP BY ALL",
         "SELECT id FROM t GROUP BY ROLLUP(id)",
         "SELECT * FROM t, orders",
-        "WITH x AS (SELECT 1) SELECT * FROM x",
         "SELECT id FROM t UNION SELECT id FROM orders",
-        "SELECT (SELECT 1)",
         "SELECT id FROM t RIGHT JOIN orders o ON t.id = o.id",
         "SELECT id FROM t FULL JOIN orders o ON t.id = o.id",
     ];

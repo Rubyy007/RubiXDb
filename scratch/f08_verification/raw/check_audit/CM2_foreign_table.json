@@ -1,0 +1,16 @@
+{
+ "scenario": "CM2_foreign_table",
+ "mutation": "valid foreign table id 9 added, never recorded",
+ "check_exit": 1,
+ "check_stdout_tail": "INSPECTION  offline check of <dir>\\recon\\data\nWARNING  SSTABLE_ORPHAN             sstable[9]         file is not listed live by the manifest (leftover of an interrupted flush/compaction)\nresult: 0 error(s), 1 warning(s), check complete\n",
+ "stderr": "",
+ "diff": {
+  "added": [],
+  "removed": [],
+  "content_changed": [
+   "MANIFEST"
+  ],
+  "mtime_only": []
+ },
+ "modified": true
+}

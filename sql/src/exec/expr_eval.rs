@@ -55,7 +55,7 @@ fn tri_or(a: Tri, b: Tri) -> Tri {
     }
 }
 
-fn tri_not(a: Tri) -> Tri {
+pub(super) fn tri_not(a: Tri) -> Tri {
     match a {
         Tri::True => Tri::False,
         Tri::False => Tri::True,
@@ -196,10 +196,11 @@ pub fn eval(expr: &BoundExpr, ctx: &RowContext, ec: &ExecCtx) -> Result<Option<R
             detail: "an aggregate expression reached execution unresolved (internal binder invariant violation: expected AggregateRef after bind-time extraction)".to_string(),
         }),
         BoundExprKind::AggregateRef(idx) => Ok(ctx.get_aggregate(*idx).cloned()),
+        BoundExprKind::Subquery(sq) => super::subquery::eval_subquery(sq, ctx, ec),
     }
 }
 
-fn tri_to_bool(t: Tri) -> Option<RelationalValue> {
+pub(super) fn tri_to_bool(t: Tri) -> Option<RelationalValue> {
     match t {
         Tri::Unknown => None,
         Tri::True => Some(RelationalValue::Boolean(true)),
@@ -258,7 +259,7 @@ fn eval_binary(
 
 /// `a = b` per SQL equality (`NULL = NULL` is `Unknown`, never `True`)
 /// — the same rule `CASE`'s operand form, `IN`, and `=` all share.
-fn values_eq(a: &Option<RelationalValue>, b: &Option<RelationalValue>) -> Tri {
+pub(super) fn values_eq(a: &Option<RelationalValue>, b: &Option<RelationalValue>) -> Tri {
     compare(a, b, BinaryOp::Eq).unwrap_or(Tri::Unknown)
 }
 

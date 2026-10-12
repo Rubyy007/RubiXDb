@@ -1,0 +1,53 @@
+[
+  {
+    "id": "feature_off",
+    "why": "Slice-A-complete tree: a subquery cannot see an enclosing query's columns; the FROM-less and empty-aggregate operators drop the outer row; UPDATE ... SET (subquery) is refused. Every Slice B test still compiles and runs.",
+    "edits": [
+      {
+        "file": "sql/src/bind/expr.rs",
+        "old": "Some(chain) => chain.lookup(col_ref)?,",
+        "new": "Some(chain) => chain.lookup(col_ref)?.filter(|_| false),"
+      },
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "            ctx: outer.clone(),\n        })),",
+        "new": "            ctx: RowContext::new(),\n        })),"
+      },
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "groups.push((self.outer.clone(), self.initial_states()?));",
+        "new": "groups.push((RowContext::new(), self.initial_states()?));"
+      },
+      {
+        "file": "sql/src/bind/dml.rs",
+        "old": "let mut eb = ExprBinder::new(Some(&scope), limits).with_env(&env);\n            let bound = eb.bind(&a.value, Some(ty))?;",
+        "new": "let mut eb = ExprBinder::new(Some(&scope), limits);\n            let bound = eb.bind(&a.value, Some(ty))?;"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "correlated_tests",
+        "exec::subquery",
+        "mission1_corpus"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "--",
+        "correlated",
+        "explain_of_a_correlated",
+        "three_level"
+      ]
+    ]
+  }
+]

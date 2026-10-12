@@ -1,0 +1,46 @@
+[
+  {
+    "id": "M01_outer_level_beats_inner",
+    "why": "scope resolution reversed: a name the subquery defines itself is re-bound to an enclosing query's column (innermost no longer wins)",
+    "edits": [
+      {
+        "file": "sql/src/bind/expr.rs",
+        "old": "Some(scope) => scope.lookup_column(col_ref)?,",
+        "new": "Some(scope) => if self.outer.is_some_and(|c| c.lookup(col_ref).ok().flatten().is_some()) { None } else { scope.lookup_column(col_ref)? },"
+      }
+    ]
+  },
+  {
+    "id": "M09_from_less_subquery_drops_outer_row",
+    "why": "EmptyRelationOp discards the outer row",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "            ctx: outer.clone(),\n        })),",
+        "new": "            ctx: RowContext::new(),\n        })),"
+      }
+    ]
+  },
+  {
+    "id": "M10_empty_aggregate_group_drops_outer_row",
+    "why": "the one group an aggregate emits over zero input rows carries no outer row",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "groups.push((self.outer.clone(), self.initial_states()?));",
+        "new": "groups.push((RowContext::new(), self.initial_states()?));"
+      }
+    ]
+  },
+  {
+    "id": "M19_inner_ambiguity_falls_through_to_outer",
+    "why": "an ambiguous name inside the subquery is silently re-resolved against an enclosing query",
+    "edits": [
+      {
+        "file": "sql/src/bind/scope.rs",
+        "old": "_ => Err(SqlError::AmbiguousColumn { detail: name.clone() }),",
+        "new": "_ => Ok(None),"
+      }
+    ]
+  }
+]

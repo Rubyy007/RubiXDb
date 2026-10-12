@@ -20,7 +20,9 @@ use crate::bound::{BoundAssignment, BoundColumnDef, BoundInsert, BoundStatement}
 use crate::error::{Result, SqlError};
 use crate::exec::expr_eval::eval;
 use crate::exec::operators::build_operator;
-use crate::exec::{CancellationToken, ExecCtx, ExecLimits, ExecMetrics, RowContext};
+use crate::exec::{
+    CancellationToken, CorrelatedUsage, ExecCtx, ExecLimits, ExecMetrics, RowContext,
+};
 use crate::plan::access::PhysicalAccess;
 use crate::plan::physical::PhysicalPlan;
 use crate::plan::Plan;
@@ -196,6 +198,7 @@ fn execute_write_inner(
     metrics: &WriteMetrics,
     cancellation: &CancellationToken,
 ) -> Result<WriteResult> {
+    crate::exec::check_relation_limits(plan, limits)?;
     match plan {
         Plan::Insert(insert) => {
             metrics.record_insert_statement();
@@ -420,7 +423,7 @@ fn execute_update(
         SqlError::Storage("a target table no longer resolves in the catalog".to_string())
     })?;
     let table_ref = access_table_ref(access);
-    let target_pks = find_target_pks(
+    let (target_pks, usage) = find_target_pks(
         access,
         &table.pk_ordinals,
         txn,
@@ -432,6 +435,30 @@ fn execute_update(
     )?;
     let at = deadline_at(limits);
     let metrics = ExecMetrics::default();
+
+    // SQL-mission-1 Slice B: a `SET` expression containing a subquery reads
+    // table state, so it must see the table as it was BEFORE this statement
+    // changed any row -- not the half-updated state a row-at-a-time write
+    // loop would show it. Such statements evaluate every new row first and
+    // write afterwards.
+    if assignments
+        .iter()
+        .any(|a| crate::plan::expr_util::contains_subquery(&a.value))
+    {
+        return execute_update_with_subqueries(
+            table_id,
+            table_ref,
+            assignments,
+            &target_pks,
+            usage,
+            txn,
+            table_store,
+            index_builder,
+            params,
+            limits,
+            cancellation,
+        );
+    }
 
     let mut updated = 0u64;
     for pk in target_pks {
@@ -524,7 +551,7 @@ fn execute_delete(
     let table = catalog.get_table(table_id)?.ok_or_else(|| {
         SqlError::Storage("a target table no longer resolves in the catalog".to_string())
     })?;
-    let target_pks = find_target_pks(
+    let (target_pks, _usage) = find_target_pks(
         access,
         &table.pk_ordinals,
         txn,
@@ -577,7 +604,7 @@ fn find_target_pks(
     params: &[Option<RelationalValue>],
     limits: &ExecLimits,
     cancellation: &CancellationToken,
-) -> Result<Vec<Vec<RelationalValue>>> {
+) -> Result<(Vec<Vec<RelationalValue>>, CorrelatedUsage)> {
     let table_ref = access_table_ref(access);
     let metrics = ExecMetrics::default();
     let ec = ExecCtx::new(
@@ -620,7 +647,84 @@ fn find_target_pks(
             }
         }
     }
-    Ok(out)
+    Ok((out, ec.correlated_usage()))
+}
+
+/// `UPDATE` whose `SET` contains a subquery (SQL-mission-1 Slice B).
+///
+/// Phase 1 evaluates every matched row's new value against the unmodified
+/// table (one shared `ExecCtx`, so the subquery limits and the uncorrelated-
+/// result cache span the whole statement, and the `WHERE` phase's correlated
+/// usage carries over); phase 2 writes. Every `SET` expression -- and any
+/// correlated subquery inside it -- sees the matched row's ORIGINAL values,
+/// and no row's update can change what another row's subquery reads. The
+/// pending rows are bounded by `max_dml_target_rows` (already enforced when
+/// the targets were collected) and by `max_materialized_bytes`.
+#[allow(clippy::too_many_arguments)]
+fn execute_update_with_subqueries(
+    table_id: u32,
+    table_ref: u32,
+    assignments: &[BoundAssignment],
+    target_pks: &[Vec<RelationalValue>],
+    usage: CorrelatedUsage,
+    txn: &mut Transaction,
+    table_store: &TableStore,
+    index_builder: &IndexBuilder,
+    params: &[Option<RelationalValue>],
+    limits: &ExecLimits,
+    cancellation: &CancellationToken,
+) -> Result<u64> {
+    let at = deadline_at(limits);
+    let metrics = ExecMetrics::default();
+    let mut pending: Vec<Vec<Option<RelationalValue>>> = Vec::new();
+    let mut pending_bytes = 0usize;
+    let mut updated = 0u64;
+    {
+        let ec = ExecCtx::new(
+            txn,
+            table_store,
+            index_builder,
+            params,
+            limits,
+            &metrics,
+            cancellation,
+        )
+        .with_correlated_usage(usage);
+        for pk in target_pks {
+            check_point(cancellation, at)?;
+            let old_row = txn.get_row(table_id, pk)?.ok_or_else(|| {
+                SqlError::Storage(
+                    "a target row disappeared between being matched and being updated".to_string(),
+                )
+            })?;
+            let row_ctx = RowContext::single(table_ref, old_row.clone());
+            let mut new_row = old_row;
+            for assignment in assignments {
+                new_row[assignment.ordinal as usize] = eval(&assignment.value, &row_ctx, &ec)?;
+            }
+            updated += 1;
+            if row_ctx.row_for(table_ref) == Some(&new_row) {
+                continue;
+            }
+            pending_bytes = pending_bytes.saturating_add(
+                crate::aggregate::GroupingKey::from_values(&new_row).estimated_bytes(),
+            );
+            if pending_bytes > limits.max_materialized_bytes {
+                return Err(SqlError::ResourceLimit {
+                    detail: format!(
+                        "an UPDATE with a subquery in SET buffered more than max_materialized_bytes ({}) of new rows",
+                        limits.max_materialized_bytes
+                    ),
+                });
+            }
+            pending.push(new_row);
+        }
+    }
+    for new_row in pending {
+        check_point(cancellation, at)?;
+        txn.put_row(table_id, &new_row)?;
+    }
+    Ok(updated)
 }
 
 fn access_table_ref(access: &PhysicalAccess) -> u32 {

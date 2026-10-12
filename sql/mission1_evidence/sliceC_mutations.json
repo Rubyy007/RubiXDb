@@ -1,0 +1,292 @@
+[
+  {
+    "id": "M01_cte_re_executed_per_reference",
+    "why": "CTE rows are not stored after the first read, so every reference re-runs the definition (the materialization rule broken)",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 6,
+    "failed_tests": [
+      "relation_tests::cte::a_cte_joined_to_a_base_table_and_filtered_by_the_outer_query",
+      "relation_tests::cte::a_cte_read_from_a_correlated_subquery_is_materialized_once_not_per_outer_row",
+      "relation_tests::cte::a_cte_referenced_twice_is_materialized_once_and_both_references_see_the_same_rows",
+      "relation_tests::cte::a_nondeterministic_looking_body_gives_both_references_identical_rows",
+      "relation_tests::cte::multiple_ctes_in_one_with_are_independent_relations",
+      "relation_tests::materialization::a_right_side_derived_table_reads_its_source_once_not_once_per_left_row"
+    ]
+  },
+  {
+    "id": "M02_materialization_drops_the_first_row",
+    "why": "the materialized rows lose their first row",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 22,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "relation_tests::cte::a_cte_body_may_use_subqueries_and_where_clauses",
+      "relation_tests::cte::a_cte_inside_lateral_and_a_cte_read_by_a_lateral_body",
+      "relation_tests::cte::a_cte_larger_than_max_materialized_rows_fails_closed_without_truncating",
+      "relation_tests::cte::a_cte_named_like_a_base_table_wins_over_it",
+      "relation_tests::cte::a_cte_read_from_a_correlated_subquery_is_materialized_once_not_per_outer_row",
+      "relation_tests::cte::a_cte_referenced_twice_is_materialized_once_and_both_references_see_the_same_rows",
+      "relation_tests::cte::a_nondeterministic_looking_body_gives_both_references_identical_rows",
+      "relation_tests::cte::a_single_reference_cte_returns_the_body_rows_and_materializes_once",
+      "relation_tests::cte::chained_ctes_see_earlier_ones_and_each_materializes_once",
+      "relation_tests::cte::ctes_inside_a_subquery_and_inside_a_derived_table",
+      "relation_tests::cte::empty_and_all_null_ctes",
+      "relation_tests::cte::multiple_ctes_in_one_with_are_independent_relations",
+      "relation_tests::cte::with_before_delete_update_and_insert",
+      "relation_tests::cte_binder::an_inner_with_shadows_an_outer_cte_of_the_same_name_only_inside",
+      "relation_tests::cte_binder::inside_its_own_body_a_ctes_name_means_the_catalog_table_if_there_is_one",
+      "relation_tests::derived::a_derived_table_on_the_left_and_two_derived_tables_in_one_from",
+      "relation_tests::derived::a_derived_table_on_the_right_of_a_join_is_read_once_per_left_row_from_one_materialization",
+      "relation_tests::diff_relations::derived_tables_and_a_twice_read_cte_match_the_reference_on_random_data",
+      "relation_tests::lateral::a_lateral_body_that_reads_nothing_before_it_is_not_correlated",
+      "relation_tests::materialization::a_derived_table_and_a_cte_work_in_an_update_set_subquery",
+      "relation_tests::materialization::a_right_side_derived_table_reads_its_source_once_not_once_per_left_row"
+    ]
+  },
+  {
+    "id": "M03_materialization_drops_the_last_row",
+    "why": "the materialized rows lose their last row",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 18,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "relation_tests::cte::a_cte_body_may_use_subqueries_and_where_clauses",
+      "relation_tests::cte::a_cte_larger_than_max_materialized_rows_fails_closed_without_truncating",
+      "relation_tests::cte::a_cte_named_like_a_base_table_wins_over_it",
+      "relation_tests::cte::a_cte_referenced_twice_is_materialized_once_and_both_references_see_the_same_rows",
+      "relation_tests::cte::a_nondeterministic_looking_body_gives_both_references_identical_rows",
+      "relation_tests::cte::a_single_reference_cte_returns_the_body_rows_and_materializes_once",
+      "relation_tests::cte::chained_ctes_see_earlier_ones_and_each_materializes_once",
+      "relation_tests::cte::ctes_inside_a_subquery_and_inside_a_derived_table",
+      "relation_tests::cte::empty_and_all_null_ctes",
+      "relation_tests::cte::multiple_ctes_in_one_with_are_independent_relations",
+      "relation_tests::cte::with_before_delete_update_and_insert",
+      "relation_tests::cte_binder::an_inner_with_shadows_an_outer_cte_of_the_same_name_only_inside",
+      "relation_tests::cte_binder::inside_its_own_body_a_ctes_name_means_the_catalog_table_if_there_is_one",
+      "relation_tests::derived::a_derived_table_on_the_left_and_two_derived_tables_in_one_from",
+      "relation_tests::diff_relations::derived_tables_and_a_twice_read_cte_match_the_reference_on_random_data",
+      "relation_tests::lateral::a_lateral_body_that_reads_nothing_before_it_is_not_correlated",
+      "relation_tests::materialization::a_right_side_derived_table_reads_its_source_once_not_once_per_left_row"
+    ]
+  },
+  {
+    "id": "M04_catalog_checked_before_the_cte_list",
+    "why": "a name is looked up in the catalog first and only a miss consults the CTEs, so a CTE no longer shadows a base table",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 4,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "relation_tests::cte::a_cte_named_like_a_base_table_wins_over_it",
+      "relation_tests::cte_binder::a_cte_shadows_a_base_table_of_the_same_name_for_the_whole_statement",
+      "relation_tests::cte_binder::inside_its_own_body_a_ctes_name_means_the_catalog_table_if_there_is_one"
+    ]
+  },
+  {
+    "id": "M05_self_reference_falls_through_to_the_catalog",
+    "why": "a CTE's own name inside its body is no longer recognized as a self reference; it is looked up in the catalog (and fails there with a different error)",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::cte_binder::a_cte_referencing_itself_without_recursive_is_a_clear_bind_error"
+    ]
+  },
+  {
+    "id": "M06_forward_reference_not_recognized",
+    "why": "a CTE defined later in the same WITH list is no longer recognized as a forward reference",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::cte_binder::a_cte_may_use_earlier_ctes_but_never_later_ones"
+    ]
+  },
+  {
+    "id": "M07_derived_alias_silently_invented",
+    "why": "a derived table without an alias is given an invented one instead of being refused",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::binder::a_derived_table_requires_an_alias_and_none_is_invented"
+    ]
+  },
+  {
+    "id": "M08_column_name_list_ignored",
+    "why": "the relation exposes the body's own output names even when an AS alias(a, b) column list renames them",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 3,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "relation_tests::binder::a_column_name_list_renames_and_must_match_the_column_count_exactly",
+      "relation_tests::cte_binder::a_cte_column_name_list_renames_and_must_match_exactly"
+    ]
+  },
+  {
+    "id": "M09_non_lateral_derived_table_sees_outer_columns",
+    "why": "an ordinary derived table is bound without a boundary, so it can read the query it sits in",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 4,
+    "failed_tests": [
+      "relation_tests::binder::a_derived_table_cannot_read_a_preceding_from_item_without_lateral",
+      "relation_tests::binder::a_derived_table_cannot_read_the_enclosing_query_of_the_subquery_it_sits_in",
+      "relation_tests::binder::a_derived_table_nested_in_a_derived_table_cannot_read_the_one_around_it",
+      "relation_tests::lateral::a_non_lateral_derived_table_with_the_same_body_is_refused"
+    ]
+  },
+  {
+    "id": "M10_cte_list_bound_in_reverse_order",
+    "why": "the WITH list is bound back to front, so the visibility order of CTEs is reversed (later ones visible to earlier ones, earlier ones not to later ones)",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 4,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "relation_tests::cte::chained_ctes_see_earlier_ones_and_each_materializes_once",
+      "relation_tests::cte::cte_limits_are_enforced_before_any_work",
+      "relation_tests::cte_binder::a_cte_may_use_earlier_ctes_but_never_later_ones"
+    ]
+  },
+  {
+    "id": "M11_materialized_byte_bound_removed",
+    "why": "max_materialized_bytes is never checked while materializing a relation",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 2,
+    "failed_tests": [
+      "relation_tests::cte::a_cte_larger_than_max_materialized_rows_fails_closed_without_truncating",
+      "relation_tests::derived::a_rescanned_derived_table_is_bounded_by_max_materialized_rows"
+    ]
+  },
+  {
+    "id": "M12_materialized_row_bound_off_by_one",
+    "why": "the row bound admits one row too many",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::cte::a_cte_larger_than_max_materialized_rows_fails_closed_without_truncating"
+    ]
+  },
+  {
+    "id": "M13_materialization_metric_not_recorded",
+    "why": "cte_materializations_total is never incremented",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 8,
+    "failed_tests": [
+      "relation_tests::cte::a_cte_joined_to_a_base_table_and_filtered_by_the_outer_query",
+      "relation_tests::cte::a_cte_read_from_a_correlated_subquery_is_materialized_once_not_per_outer_row",
+      "relation_tests::cte::a_cte_referenced_twice_is_materialized_once_and_both_references_see_the_same_rows",
+      "relation_tests::cte::a_nondeterministic_looking_body_gives_both_references_identical_rows",
+      "relation_tests::cte::a_single_reference_cte_returns_the_body_rows_and_materializes_once",
+      "relation_tests::cte::chained_ctes_see_earlier_ones_and_each_materializes_once",
+      "relation_tests::cte::ctes_inside_a_subquery_and_inside_a_derived_table",
+      "relation_tests::cte::multiple_ctes_in_one_with_are_independent_relations"
+    ]
+  },
+  {
+    "id": "M14_cte_references_not_counted",
+    "why": "CTE references are not collected, so max_cte_references can never fire",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::cte::cte_limits_are_enforced_before_any_work"
+    ]
+  },
+  {
+    "id": "M15_unreferenced_ctes_not_counted",
+    "why": "only CTEs the plan reads count toward max_cte_definitions",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::cte::cte_limits_are_enforced_before_any_work"
+    ]
+  },
+  {
+    "id": "M16_derived_depth_not_incremented",
+    "why": "derived-table nesting depth is always 0",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::derived::max_derived_table_depth_is_enforced_exactly_before_any_work"
+    ]
+  },
+  {
+    "id": "M17_join_right_derived_table_not_materialized",
+    "why": "the right side of a join is not marked rescanned, so its derived table is re-run for every left row",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 3,
+    "failed_tests": [
+      "relation_tests::derived::a_rescanned_derived_table_is_bounded_by_max_materialized_rows",
+      "relation_tests::derived::explain_shows_a_derived_table_as_an_uncorrelated_subplan",
+      "relation_tests::materialization::a_right_side_derived_table_reads_its_source_once_not_once_per_left_row"
+    ]
+  },
+  {
+    "id": "M18_lateral_runs_outside_the_correlated_gate",
+    "why": "a LATERAL derived table is re-run without the deadline check or the re-execution counters",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::lateral::a_lateral_body_is_re_run_once_per_left_row_through_the_correlated_gate"
+    ]
+  },
+  {
+    "id": "M19_boundary_refusal_removed",
+    "why": "a name found beyond a derived-table / CTE boundary is returned as a value instead of being refused",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 6,
+    "failed_tests": [
+      "correlated_tests::parser::a_cte_inside_a_subquery_is_refused_so_it_cannot_reference_the_outer_query",
+      "relation_tests::binder::a_derived_table_cannot_read_a_preceding_from_item_without_lateral",
+      "relation_tests::binder::a_derived_table_cannot_read_the_enclosing_query_of_the_subquery_it_sits_in",
+      "relation_tests::binder::a_derived_table_nested_in_a_derived_table_cannot_read_the_one_around_it",
+      "relation_tests::cte_binder::a_cte_body_cannot_read_a_column_of_an_enclosing_query",
+      "relation_tests::lateral::a_non_lateral_derived_table_with_the_same_body_is_refused"
+    ]
+  },
+  {
+    "id": "M20_duplicate_output_names_not_ambiguous",
+    "why": "two columns with the same name in a derived table resolve silently to the first",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::binder::two_columns_with_the_same_name_make_a_reference_to_it_ambiguous"
+    ]
+  },
+  {
+    "id": "M21_column_count_not_checked",
+    "why": "an AS alias(a, b) / WITH x(a, b) list that does not match the body's column count is accepted",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 2,
+    "failed_tests": [
+      "relation_tests::binder::a_column_name_list_renames_and_must_match_the_column_count_exactly",
+      "relation_tests::cte_binder::a_cte_column_name_list_renames_and_must_match_exactly"
+    ]
+  },
+  {
+    "id": "M22_explain_prints_the_cte_body_every_time",
+    "why": "EXPLAIN prints a CTE's definition at every reference",
+    "compiled": true,
+    "tests_run": 140,
+    "failed_count": 1,
+    "failed_tests": [
+      "relation_tests::cte::explain_shows_a_referenced_twice_cte_once_with_the_materialized_flag"
+    ]
+  }
+]

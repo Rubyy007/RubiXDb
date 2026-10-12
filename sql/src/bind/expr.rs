@@ -6,8 +6,12 @@
 use rubixdb::relational::{RelationalType, RelationalValue};
 
 use crate::ast::{self, BinaryOp, Expr, Literal, UnaryOp};
-use crate::bind::scope::Scope;
-use crate::bound::{BoundAggregateExpr, BoundExpr, BoundExprKind, ColumnRef};
+use crate::bind::env::{BindEnv, Capture};
+use crate::bind::scope::{OuterScopes, Scope};
+use crate::bound::{
+    BoundAggregateExpr, BoundExpr, BoundExprKind, BoundSelect, BoundSubqueryExpr, ColumnRef,
+    SubqueryKind,
+};
 use crate::error::{Result, SqlError};
 use crate::functions::{self, ReturnType};
 use crate::limits::SqlLimits;
@@ -30,11 +34,54 @@ fn check_assignable(actual: Option<RelationalType>, expected: RelationalType) ->
     }
 }
 
+/// A bound nested query plus what it reads from enclosing queries.
+struct NestedQuery {
+    id: u32,
+    query: BoundSelect,
+    outer_refs: Vec<ColumnRef>,
+    outer_labels: Vec<(String, ColumnRef)>,
+}
+
+fn unknown_column(col_ref: &ast::ColumnRef) -> SqlError {
+    SqlError::UnknownObject {
+        kind: "column",
+        detail: col_ref
+            .parts
+            .iter()
+            .map(|p| p.value.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+    }
+}
+
 pub struct ExprBinder<'a> {
     pub scope: Option<&'a Scope>,
     pub limits: &'a SqlLimits,
     pub max_parameter: u32,
     pub allow_aggregate: bool,
+    /// SQL-mission-1: present only in the contexts where a subquery
+    /// expression is supported (a `SELECT`'s list / `WHERE` / `HAVING` /
+    /// `ORDER BY`, and the `WHERE` of `UPDATE`/`DELETE`). Absent everywhere
+    /// else (`INSERT ... VALUES`, `UPDATE ... SET`, `LIMIT`/`OFFSET`, `GROUP
+    /// BY`, `JOIN ... ON`, `DEFAULT`), where a subquery fails closed with
+    /// `SqlError::Unsupported` rather than reaching a stage that cannot run it.
+    pub env: Option<&'a BindEnv<'a>>,
+    /// SQL-mission-1 correlation: the queries enclosing the one this binder
+    /// belongs to, innermost first. A column that `scope` does not define is
+    /// looked up here before it is reported unknown. `None` for the
+    /// statement's outermost query.
+    pub outer: Option<&'a OuterScopes<'a>>,
+    /// Records outer-column captures without enabling subquery expressions:
+    /// the clauses of a nested query that may *read* an enclosing query's
+    /// columns but may not themselves contain a subquery (`JOIN ... ON`,
+    /// `GROUP BY`) are bound with this instead of `env`.
+    capture_env: Option<&'a BindEnv<'a>>,
+    /// Column references resolved in `scope` / in an enclosing query so far,
+    /// used to refuse an aggregate whose arguments name only outer columns
+    /// (that aggregate would belong to the enclosing query, which this
+    /// implementation does not evaluate there).
+    local_column_refs: usize,
+    outer_column_refs: usize,
 }
 
 impl<'a> ExprBinder<'a> {
@@ -44,7 +91,27 @@ impl<'a> ExprBinder<'a> {
             limits,
             max_parameter: 0,
             allow_aggregate: false,
+            env: None,
+            outer: None,
+            capture_env: None,
+            local_column_refs: 0,
+            outer_column_refs: 0,
         }
+    }
+
+    pub fn with_capture_env(mut self, env: &'a BindEnv<'a>) -> Self {
+        self.capture_env = Some(env);
+        self
+    }
+
+    pub fn with_outer(mut self, outer: Option<&'a OuterScopes<'a>>) -> Self {
+        self.outer = outer;
+        self
+    }
+
+    pub fn with_env(mut self, env: &'a BindEnv<'a>) -> Self {
+        self.env = Some(env);
+        self
     }
 
     pub fn with_aggregate(mut self, allow: bool) -> Self {
@@ -150,7 +217,157 @@ impl<'a> ExprBinder<'a> {
                 }
                 self.bind_aggregate(*func, arg, expected)
             }
+            Expr::ScalarSubquery(q) => self.bind_scalar_subquery(q),
+            Expr::Exists { subquery, negated } => self.bind_exists(subquery, *negated),
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => self.bind_in_subquery(expr, subquery, *negated),
         }
+    }
+
+    /// Binds a nested query in a fresh scope of the same statement
+    /// (SQL-mission-1). The nested query resolves a name against its own
+    /// `FROM` items first and then, innermost first, against every enclosing
+    /// query (`OuterScopes`); what it reads from enclosing queries is
+    /// returned as the subquery's `outer_refs` (empty = uncorrelated).
+    fn bind_nested_query(&mut self, q: &ast::QueryExpr) -> Result<NestedQuery> {
+        let env = self.env.ok_or_else(|| SqlError::Unsupported {
+            detail: "a subquery is not supported in this clause (supported: the SELECT list, WHERE, HAVING and ORDER BY of a SELECT, and the WHERE and SET of UPDATE/DELETE)".to_string(),
+        })?;
+        let id = env.alloc_subquery_id(self.limits)?;
+        env.enter(self.limits)?;
+        env.push_frame();
+        // This binder's own scope becomes the nearest enclosing level of the
+        // nested query; the chain behind it is whatever enclosed this binder.
+        let link = self.scope.map(|scope| OuterScopes {
+            scope,
+            parent: self.outer,
+            boundary: None,
+        });
+        let chain: Option<&OuterScopes<'_>> = link.as_ref().or(self.outer);
+        let bound = match q {
+            ast::QueryExpr::Select(select) => {
+                crate::bind::select::bind_select_in(env, self.limits, select, chain)
+            }
+        };
+        let captures = env.pop_frame();
+        env.leave();
+        let bound = bound?;
+        self.max_parameter = self.max_parameter.max(bound.max_parameter);
+        let outer_refs = captures
+            .iter()
+            .filter(|c| c.correlating)
+            .map(|c| c.column)
+            .collect();
+        let outer_labels = captures.into_iter().map(|c| (c.label, c.column)).collect();
+        Ok(NestedQuery {
+            id,
+            query: bound,
+            outer_refs,
+            outer_labels,
+        })
+    }
+
+    fn bind_scalar_subquery(&mut self, q: &ast::QueryExpr) -> Result<BoundExpr> {
+        let NestedQuery {
+            id,
+            query,
+            outer_refs,
+            outer_labels,
+        } = self.bind_nested_query(q)?;
+        if query.projection.len() != 1 {
+            return Err(type_mismatch(format!(
+                "a scalar subquery must return exactly one column, found {}",
+                query.projection.len()
+            )));
+        }
+        let ty = query.projection[0].expr.ty;
+        Ok(BoundExpr {
+            kind: BoundExprKind::Subquery(Box::new(BoundSubqueryExpr {
+                id,
+                kind: SubqueryKind::Scalar,
+                operand: None,
+                query,
+                outer_refs,
+                outer_labels,
+                plan: None,
+            })),
+            ty,
+            // Zero rows -> NULL, whatever the column's own nullability.
+            nullable: true,
+        })
+    }
+
+    fn bind_exists(&mut self, q: &ast::QueryExpr, negated: bool) -> Result<BoundExpr> {
+        let NestedQuery {
+            id,
+            query,
+            outer_refs,
+            outer_labels,
+        } = self.bind_nested_query(q)?;
+        Ok(BoundExpr {
+            kind: BoundExprKind::Subquery(Box::new(BoundSubqueryExpr {
+                id,
+                kind: SubqueryKind::Exists { negated },
+                operand: None,
+                query,
+                outer_refs,
+                outer_labels,
+                plan: None,
+            })),
+            ty: Some(RelationalType::Boolean),
+            // EXISTS is never UNKNOWN.
+            nullable: false,
+        })
+    }
+
+    fn bind_in_subquery(
+        &mut self,
+        lhs: &Expr,
+        q: &ast::QueryExpr,
+        negated: bool,
+    ) -> Result<BoundExpr> {
+        let NestedQuery {
+            id,
+            query,
+            outer_refs,
+            outer_labels,
+        } = self.bind_nested_query(q)?;
+        if query.projection.len() != 1 {
+            return Err(type_mismatch(format!(
+                "an IN subquery must return exactly one column, found {}",
+                query.projection.len()
+            )));
+        }
+        // The left-hand side conforms to the subquery column's type exactly
+        // as it would to the other operand of `=` (D21: no implicit
+        // coercion; a literal adopts the column's type, a rigid mismatch is
+        // a bind-time TypeMismatch).
+        let inner_ty = query.projection[0].expr.ty;
+        let operand = self.bind(lhs, inner_ty)?;
+        if let (Some(l), Some(r)) = (operand.ty, inner_ty) {
+            if l != r {
+                return Err(type_mismatch(format!(
+                    "IN subquery compares {l:?} with {r:?}"
+                )));
+            }
+        }
+        Ok(BoundExpr {
+            kind: BoundExprKind::Subquery(Box::new(BoundSubqueryExpr {
+                id,
+                kind: SubqueryKind::In { negated },
+                operand: Some(operand),
+                query,
+                outer_refs,
+                outer_labels,
+                plan: None,
+            })),
+            ty: Some(RelationalType::Boolean),
+            // Three-valued: a NULL operand or a NULL in the set yields UNKNOWN.
+            nullable: true,
+        })
     }
 
     fn bind_aggregate(
@@ -176,9 +393,23 @@ impl<'a> ExprBinder<'a> {
             }
             crate::aggregate::AggregateArg::Expr(inner) => {
                 let prev_allow = self.allow_aggregate;
+                let (local_before, outer_before) =
+                    (self.local_column_refs, self.outer_column_refs);
                 self.allow_aggregate = false;
                 let bound_inner = self.bind(inner, None);
                 self.allow_aggregate = prev_allow;
+                if bound_inner.is_ok()
+                    && self.outer_column_refs > outer_before
+                    && self.local_column_refs == local_before
+                {
+                    // SQL assigns such an aggregate to the *enclosing* query
+                    // (it aggregates over the outer rows). Evaluating it
+                    // there is not implemented; evaluating it over the inner
+                    // rows would silently compute something else, so refuse.
+                    return Err(SqlError::Unsupported {
+                        detail: "an aggregate whose arguments reference only columns of an enclosing query is not supported".to_string(),
+                    });
+                }
                 let bound_inner = match bound_inner {
                     Err(SqlError::TypeMismatch { detail })
                         if detail == "aggregate functions are not allowed in this context" =>
@@ -235,25 +466,86 @@ impl<'a> ExprBinder<'a> {
         col_ref: &ast::ColumnRef,
         expected: Option<RelationalType>,
     ) -> Result<BoundExpr> {
-        let scope = self.scope.ok_or_else(|| SqlError::UnknownObject {
-            kind: "column",
-            detail: col_ref
-                .parts
-                .iter()
-                .map(|p| p.value.as_str())
-                .collect::<Vec<_>>()
-                .join("."),
-        })?;
-        let (entry, column) = scope.resolve_column(col_ref)?;
+        // Innermost binding wins: this query's own FROM items are searched
+        // first, then each enclosing query in turn (SQL-mission-1). A name
+        // defined at an inner level is never re-resolved outward, and an
+        // ambiguity *within* one level is an error rather than a reason to
+        // look further out.
+        let local = match self.scope {
+            Some(scope) => scope.lookup_column(col_ref)?,
+            None => None,
+        };
+        let (entry, column, outer_level) = match local {
+            Some((entry, column)) => {
+                self.local_column_refs += 1;
+                (entry, column, None)
+            }
+            None => {
+                let found = match self.outer {
+                    Some(chain) => chain.lookup(col_ref)?,
+                    None => None,
+                };
+                match found {
+                    Some((level, entry, column)) => {
+                        self.outer_column_refs += 1;
+                        (entry, column, Some(level))
+                    }
+                    None => {
+                        // Unknown at every level: reported exactly as it
+                        // would be for a statement with no enclosing query.
+                        return Err(match self.scope {
+                            Some(scope) => scope
+                                .resolve_column(col_ref)
+                                .err()
+                                .unwrap_or_else(|| unknown_column(col_ref)),
+                            None => unknown_column(col_ref),
+                        });
+                    }
+                }
+            }
+        };
         let ty = crate::bind::ddl::relational_type_of(column)?;
         check_assignable(Some(ty), expected.unwrap_or(ty))?;
         let nullable = column.nullable || entry.null_extended;
+        let column_ref = ColumnRef {
+            table_ref: crate::bound::TableRefId(entry.table_ref_id),
+            table_id: entry.resolved.table_id,
+            ordinal: column.ordinal,
+        };
+        if let (Some(level), Some(env)) = (outer_level, self.env.or(self.capture_env)) {
+            // The nested query(ies) between here and the owning level now
+            // depend on this outer column. The primary key of the owning
+            // table is recorded too (never read, only named) so a runtime
+            // error can say which outer row it was evaluating.
+            let levels = level + 1;
+            let label = |name: &str| format!("{}.{}", entry.effective_name, name);
+            env.record_capture(
+                levels,
+                &Capture {
+                    column: column_ref,
+                    label: label(&column.name),
+                    correlating: true,
+                },
+            );
+            for &pk in &entry.resolved.table.pk_ordinals {
+                if let Some(pk_col) = entry.resolved.columns.iter().find(|c| c.ordinal == pk) {
+                    env.record_capture(
+                        levels,
+                        &Capture {
+                            column: ColumnRef {
+                                table_ref: column_ref.table_ref,
+                                table_id: column_ref.table_id,
+                                ordinal: pk,
+                            },
+                            label: label(&pk_col.name),
+                            correlating: false,
+                        },
+                    );
+                }
+            }
+        }
         Ok(BoundExpr {
-            kind: BoundExprKind::Column(ColumnRef {
-                table_ref: crate::bound::TableRefId(entry.table_ref_id),
-                table_id: entry.resolved.table_id,
-                ordinal: column.ordinal,
-            }),
+            kind: BoundExprKind::Column(column_ref),
             ty: Some(ty),
             nullable,
         })

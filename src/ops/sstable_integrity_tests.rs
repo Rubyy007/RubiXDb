@@ -1018,3 +1018,55 @@ fn sweep_existing_directories() {
     }
     fs::write(out, rows).unwrap();
 }
+
+/// F-08 / GAP-B: a footer `record_count` above the largest value whose bloom the reader accepts (214,748,364 at 10 bits per
+/// key) is refused by the preflight through the engine's own `SsTable::open`, in constant time, with the directory (and the
+/// attestation) untouched; the bound itself is not refused, and the engine refuses the same directory.
+#[test]
+fn an_inflated_record_count_is_refused_by_the_preflight_and_leaves_the_directory_untouched() {
+    const F_RECORD_COUNT: usize = 28;
+    fn set_count(p: &Path, count: u64) {
+        let mut b = fs::read(p).unwrap();
+        let f = b.len() - FOOTER;
+        b[f + F_RECORD_COUNT..f + F_RECORD_COUNT + 8].copy_from_slice(&count.to_le_bytes());
+        recompute_footer_crc(&mut b);
+        fs::write(p, b).unwrap();
+    }
+    let t = small();
+    for (count, refused) in [
+        (400_000_000u64, true),
+        (214_748_365, true),
+        (u64::MAX, true),
+        (214_748_364, false),
+    ] {
+        let d = fresh_copy(&t);
+        set_count(&ssts(&d)[0], count);
+        let before = digest(&d);
+        assert!(before.contains_key(ATTESTATION_FILE));
+        if refused {
+            let err = guard(&d, false).unwrap_err();
+            assert_eq!(err.code, codes::SSTABLE_CORRUPT, "{count}: {err}");
+            let text = err.to_string();
+            assert!(text.contains("record_count"), "{count}: {text}");
+            assert!(text.contains(".sst"), "{count}: {text}");
+            assert!(
+                text.ends_with("The directory has not been modified."),
+                "{count}: {text}"
+            );
+            assert_eq!(
+                digest(&d),
+                before,
+                "{count}: a refused start must not modify any file"
+            );
+            let engine_copy = fresh_copy(&d);
+            assert!(
+                LsmEngine::open(&engine_copy, wal_cfg(), pool_cfg(), LsmConfig::default()).is_err(),
+                "{count}: the engine must also refuse"
+            );
+        } else {
+            // The bound itself is not refused by this check (a mismatch with the stored records is a separate,
+            // undecided matter): the preflight passes.
+            guard(&d, false).expect("a count at the bound is not refused");
+        }
+    }
+}

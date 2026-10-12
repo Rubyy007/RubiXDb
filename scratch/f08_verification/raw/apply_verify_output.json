@@ -1,0 +1,62 @@
+{
+ "sst_files": [
+  [
+   "00000000000000000005.sst",
+   284470233
+  ]
+ ],
+ "footer": {
+  "records": 68810,
+  "bloom_len": 268435468,
+  "expected_bloom_len_at_cap": 268435468,
+  "blocks": 3823,
+  "min_seq": 1,
+  "max_seq": 349
+ },
+ "restart_ready_s": 0.599,
+ "readyz": {
+  "ready": true,
+  "storage_state": "Healthy",
+  "index_recovery": "complete",
+  "sstable_verification": "running"
+ },
+ "count": [
+  200,
+  [
+   [
+    {
+     "type": "bigint",
+     "value": "84000"
+    }
+   ]
+  ]
+ ],
+ "present_lookups": {
+  "n": 21334,
+  "wrong_or_missing": 0,
+  "seconds": 128
+ },
+ "absent_lookups": {
+  "n": 2500,
+  "unexpected_rows_or_errors": 2000
+ },
+ "compaction": {
+  "auto_trigger_enabled": true,
+  "trigger_count": 4,
+  "live_sstable_count": 1,
+  "cycles_completed": 0,
+  "state": "idle",
+  "failures_total": 0,
+  "consecutive_failures": 0,
+  "blocked": false,
+  "last_failure": null
+ },
+ "stop": [
+  "graceful",
+  0
+ ],
+ "check_after_restart": {
+  "exit": 0,
+  "tail": "result: 0 error(s), 0 warning(s), check complete"
+ }
+}
