@@ -196,6 +196,24 @@ pub fn eval(expr: &BoundExpr, ctx: &RowContext, ec: &ExecCtx) -> Result<Option<R
             detail: "an aggregate expression reached execution unresolved (internal binder invariant violation: expected AggregateRef after bind-time extraction)".to_string(),
         }),
         BoundExprKind::AggregateRef(idx) => Ok(ctx.get_aggregate(*idx).cloned()),
+        BoundExprKind::Window(_) => Err(SqlError::UnsupportedExecution {
+            detail: "a window function reached execution unresolved (internal binder invariant violation: expected WindowRef after bind-time extraction)".to_string(),
+        }),
+        BoundExprKind::WindowRef(slot) => Ok(ctx.get_window(*slot).cloned()),
+        BoundExprKind::GroupKeyRef(idx) => Ok(ctx.get_group_key(*idx).cloned()),
+        BoundExprKind::Grouping(indexes) => {
+            // GROUPING(e1, ..., en): bit (n-1-j) is 1 iff ei is left out of this
+            // row's grouping set (ISO/IEC 9075-2 6.9 <grouping operation>).
+            let mask = ctx.grouping_mask();
+            let n = indexes.len();
+            let mut value: i32 = 0;
+            for (j, &i) in indexes.iter().enumerate() {
+                if i < 64 && (mask >> i) & 1 == 1 {
+                    value |= 1 << (n - 1 - j);
+                }
+            }
+            Ok(Some(RelationalValue::Integer(value)))
+        }
         BoundExprKind::Subquery(sq) => super::subquery::eval_subquery(sq, ctx, ec),
     }
 }

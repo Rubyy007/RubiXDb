@@ -1,0 +1,13 @@
+[
+  {
+    "id": "M36_rows_current_row_takes_peers",
+    "why": "ROWS ... CURRENT ROW end includes the row's peers",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "                FrameUnits::Rows => p + 1,\n                FrameUnits::Range => self.peer_end[p],",
+        "new": "                FrameUnits::Rows => self.peer_end[p],\n                FrameUnits::Range => self.peer_end[p],"
+      }
+    ]
+  }
+]

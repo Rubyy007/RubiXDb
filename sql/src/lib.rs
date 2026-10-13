@@ -105,3 +105,21 @@ mod correlated_tests;
 
 #[cfg(test)]
 mod relation_tests;
+
+#[cfg(test)]
+mod setop_tests;
+
+#[cfg(test)]
+mod recursive_tests;
+
+#[cfg(test)]
+mod window_tests;
+
+#[cfg(test)]
+mod window_reference_model;
+
+#[cfg(test)]
+mod aggregation_tests;
+
+#[cfg(test)]
+mod mission2_corpus_tests;

@@ -1,0 +1,134 @@
+[
+  {
+    "id": "M08a_over_dropped_by_converter",
+    "why": "the Slice D bug reintroduced: the converter accepts OVER and drops it (SUM(x) OVER (...) runs as the plain aggregate)",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    if let Some(over) = &f.over {\n        return convert_window_function(f, &name, over, dg, depth);\n    }",
+        "new": "    if let Some(_over) = &f.over {\n    }"
+      }
+    ]
+  },
+  {
+    "id": "M08b_over_ignored_by_planner",
+    "why": "OVER accepted by parser and binder but the planner drops the Window nodes",
+    "edits": [
+      {
+        "file": "sql/src/plan/logical.rs",
+        "old": "for (spec, functions) in nodes {",
+        "new": "for (spec, functions) in nodes.into_iter().take(0) {"
+      }
+    ]
+  },
+  {
+    "id": "M08c_over_ignored_by_executor",
+    "why": "the Window operator is replaced by a pass-through",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "        } => Ok(Box::new(super::window::WindowOp::build(\n            build_operator(input, outer, ec)?,\n            spec,\n            functions,\n        ))),",
+        "new": "        } => {\n            let _ = (spec, functions);\n            build_operator(input, outer, ec)\n        }"
+      }
+    ]
+  },
+  {
+    "id": "M01_default_frame_is_rows",
+    "why": "default frame with ORDER BY is ROWS instead of RANGE (peers not included)",
+    "edits": [
+      {
+        "file": "sql/src/bind/window.rs",
+        "old": "            units: FrameUnits::Range,\n            start: BoundFrameBound::UnboundedPreceding,",
+        "new": "            units: FrameUnits::Rows,\n            start: BoundFrameBound::UnboundedPreceding,"
+      }
+    ]
+  },
+  {
+    "id": "M02_default_frame_without_order_is_current_row",
+    "why": "default frame without ORDER BY ends at CURRENT ROW",
+    "edits": [
+      {
+        "file": "sql/src/bind/window.rs",
+        "old": "            end: if order_by.is_empty() {\n                BoundFrameBound::UnboundedFollowing\n            } else {\n                BoundFrameBound::CurrentRow\n            },",
+        "new": "            end: BoundFrameBound::CurrentRow,"
+      }
+    ]
+  },
+  {
+    "id": "M03_rank_behaves_like_row_number",
+    "why": "RANK has no gaps after ties",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "out[part.rows[p]] = bigint(part.peer_start[p] + 1);",
+        "new": "out[part.rows[p]] = bigint(p + 1);"
+      }
+    ]
+  },
+  {
+    "id": "M04_dense_rank_behaves_like_rank",
+    "why": "DENSE_RANK has gaps",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "out[part.rows[p]] = bigint(dense);",
+        "new": "out[part.rows[p]] = bigint(part.peer_start[p] + 1);"
+      }
+    ]
+  },
+  {
+    "id": "M09_distinct_windows_merged",
+    "why": "two different windows are merged into one operator",
+    "edits": [
+      {
+        "file": "sql/src/plan/logical.rs",
+        "old": "match nodes.iter_mut().find(|(spec, _)| spec.same_window(&call.spec)) {",
+        "new": "match nodes.iter_mut().find(|_| true) {"
+      }
+    ]
+  },
+  {
+    "id": "M15_null_partition_keys_do_not_group",
+    "why": "each NULL partition key is its own partition",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "part_keys.push(SetKey(pk));",
+        "new": "let pk = if pk.iter().any(|v| v.is_none()) {\n                vec![Some(RelationalValue::Bigint(part_keys.len() as i64)), Some(RelationalValue::Boolean(false))]\n            } else {\n                pk\n            };\n            part_keys.push(SetKey(pk));"
+      }
+    ]
+  },
+  {
+    "id": "M18_window_allowed_in_where",
+    "why": "a window function binds in WHERE",
+    "edits": [
+      {
+        "file": "sql/src/bind/window.rs",
+        "old": "        if !self.allow_window {\n            return Err(err(\n                \"window functions are not allowed",
+        "new": "        if false && !self.allow_window {\n            return Err(err(\n                \"window functions are not allowed"
+      }
+    ]
+  },
+  {
+    "id": "M21_peer_groups_ignore_nulls",
+    "why": "NULL order keys are not peers of each other",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "|| !rows_not_distinct(&order_keys[rows[p - 1]], &order_keys[rows[p]]);",
+        "new": "|| true;"
+      }
+    ]
+  },
+  {
+    "id": "M22_window_order_nulls_always_last",
+    "why": "a descending window order puts NULLs last regardless (D5 ignored)",
+    "edits": [
+      {
+        "file": "sql/src/bind/window.rs",
+        "old": "                None if item.descending => NullsOrder::First,\n                None => NullsOrder::Last,\n            };\n            Ok(BoundOrderByItem {",
+        "new": "                None => NullsOrder::Last,\n            };\n            Ok(BoundOrderByItem {"
+      }
+    ]
+  }
+]

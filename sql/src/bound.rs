@@ -101,6 +101,22 @@ pub enum BoundExprKind {
     Aggregate(BoundAggregateExpr),
     /// A reference to the output of an Aggregate plan operator (0-based index into aggregates).
     AggregateRef(usize),
+    /// SQL-mission-2: a window function call before plan generation. The
+    /// binder extracts every call out of the SELECT list / `QUALIFY` /
+    /// `ORDER BY` into `BoundSelect::windows`, leaving a `WindowRef`.
+    Window(Box<BoundWindowCall>),
+    /// SQL-mission-2: the value a `Window` plan operator computed for the
+    /// current row (0-based index into `BoundSelect::windows`).
+    WindowRef(usize),
+    /// SQL-mission-2: the value of grouping expression `group_by[i]` for the
+    /// current output row of an aggregation that uses `GROUPING SETS` /
+    /// `ROLLUP` / `CUBE` -- `NULL` when the row's grouping set leaves it out.
+    GroupKeyRef(usize),
+    /// SQL-mission-2: `GROUPING(e1, ...)`: each element is the index of a
+    /// `group_by` expression; the value is the bit string (first argument in
+    /// the most significant position) of "this row's grouping set does not
+    /// include it".
+    Grouping(Vec<usize>),
     /// SQL-mission-1: a scalar / `EXISTS` / `IN (SELECT ...)` subquery — one
     /// node for all three, so the planner and executor have a single
     /// nested-plan mechanism rather than one per syntax form.
@@ -149,6 +165,528 @@ pub type BoundAggregateArg = crate::aggregate::AggregateArg<Box<BoundExpr>>;
 pub struct BoundAggregateExpr {
     pub func: crate::aggregate::AggregateFunc,
     pub arg: BoundAggregateArg,
+    /// SQL-mission-2: `AGG(DISTINCT x)` -- each distinct non-`NULL` value of
+    /// the argument is accumulated once per group.
+    pub distinct: bool,
+    /// SQL-mission-2: `AGG(x) FILTER (WHERE cond)` -- only rows for which the
+    /// condition is `TRUE` reach this aggregate's state.
+    pub filter: Option<Box<BoundExpr>>,
+}
+
+impl BoundAggregateExpr {
+    /// A plain aggregate: no `DISTINCT`, no `FILTER`.
+    pub fn plain(func: crate::aggregate::AggregateFunc, arg: BoundAggregateArg) -> Self {
+        BoundAggregateExpr {
+            func,
+            arg,
+            distinct: false,
+            filter: None,
+        }
+    }
+}
+
+// =======================================================================
+// SQL-mission-2: window functions
+// =======================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundFrameBound {
+    UnboundedPreceding,
+    /// `N PRECEDING`: a constant, non-negative offset (checked at execution
+    /// when it is a parameter).
+    Preceding(Box<BoundExpr>),
+    CurrentRow,
+    Following(Box<BoundExpr>),
+    UnboundedFollowing,
+}
+
+/// A window frame, always concrete: when the query wrote none the binder
+/// stores the default (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`
+/// with an `ORDER BY`, `... AND UNBOUNDED FOLLOWING` without).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundFrame {
+    pub units: crate::ast::FrameUnits,
+    pub start: BoundFrameBound,
+    pub end: BoundFrameBound,
+    /// The query wrote the frame (display only; two windows that differ only
+    /// in this flag are the same window).
+    pub explicit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundWindowSpec {
+    pub partition_by: Vec<BoundExpr>,
+    pub order_by: Vec<BoundOrderByItem>,
+    pub frame: BoundFrame,
+}
+
+impl BoundWindowSpec {
+    /// `true` iff both specs are provably the same window: the same
+    /// `PARTITION BY` expressions, the same `ORDER BY` items and the same
+    /// (resolved) frame. Only such windows may share one `Window` operator.
+    pub fn same_window(&self, other: &BoundWindowSpec) -> bool {
+        self.partition_by == other.partition_by
+            && self.order_by == other.order_by
+            && self.frame.units == other.frame.units
+            && self.frame.start == other.frame.start
+            && self.frame.end == other.frame.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundWindowFunc {
+    /// An aggregate evaluated over the window frame.
+    Aggregate {
+        func: crate::aggregate::AggregateFunc,
+        arg: BoundAggregateArg,
+        filter: Option<Box<BoundExpr>>,
+    },
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile(Box<BoundExpr>),
+    Lag {
+        expr: Box<BoundExpr>,
+        offset: Option<Box<BoundExpr>>,
+        default: Option<Box<BoundExpr>>,
+    },
+    Lead {
+        expr: Box<BoundExpr>,
+        offset: Option<Box<BoundExpr>>,
+        default: Option<Box<BoundExpr>>,
+    },
+    /// `FIRST_VALUE(expr)`: `expr` at the first row of the **frame** (`NULL` for
+    /// an empty frame).
+    FirstValue(Box<BoundExpr>),
+    /// `LAST_VALUE(expr)`: `expr` at the last row of the **frame**.
+    ///
+    /// **Not the partition's last row** unless the frame says so. With the
+    /// default frame -- `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, what
+    /// a window with an `ORDER BY` and no frame means -- the frame ends at the
+    /// current row's last *peer*, so `LAST_VALUE` is the current row's own value
+    /// (the value of the last of its ties when there are ties). To get the
+    /// partition's last value, write the frame:
+    /// `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`. (Without an
+    /// `ORDER BY` the default frame is the whole partition.) This is the
+    /// standard's behaviour, not a quirk of this engine; tests pin all three
+    /// cases (`window_tests::exec_2c::last_value_*`).
+    LastValue(Box<BoundExpr>),
+    /// `NTH_VALUE(expr, n)`: `expr` at the n-th row (1-based) of the **frame**;
+    /// `NULL` when the frame has fewer than `n` rows.
+    NthValue {
+        expr: Box<BoundExpr>,
+        n: Box<BoundExpr>,
+    },
+}
+
+impl BoundWindowFunc {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BoundWindowFunc::Aggregate { func, .. } => func.name(),
+            BoundWindowFunc::RowNumber => "row_number",
+            BoundWindowFunc::Rank => "rank",
+            BoundWindowFunc::DenseRank => "dense_rank",
+            BoundWindowFunc::PercentRank => "percent_rank",
+            BoundWindowFunc::CumeDist => "cume_dist",
+            BoundWindowFunc::Ntile(_) => "ntile",
+            BoundWindowFunc::Lag { .. } => "lag",
+            BoundWindowFunc::Lead { .. } => "lead",
+            BoundWindowFunc::FirstValue(_) => "first_value",
+            BoundWindowFunc::LastValue(_) => "last_value",
+            BoundWindowFunc::NthValue { .. } => "nth_value",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundWindowCall {
+    pub func: BoundWindowFunc,
+    pub spec: BoundWindowSpec,
+}
+
+impl BoundWindowCall {
+    /// Every expression the call evaluates per row: the function's arguments
+    /// and filter, the `PARTITION BY` and `ORDER BY` expressions, the frame
+    /// offsets.
+    pub fn exprs(&self) -> Vec<&BoundExpr> {
+        let mut out: Vec<&BoundExpr> = Vec::new();
+        match &self.func {
+            BoundWindowFunc::Aggregate { arg, filter, .. } => {
+                if let BoundAggregateArg::Expr(e) = arg {
+                    out.push(e);
+                }
+                if let Some(f) = filter {
+                    out.push(f);
+                }
+            }
+            BoundWindowFunc::RowNumber
+            | BoundWindowFunc::Rank
+            | BoundWindowFunc::DenseRank
+            | BoundWindowFunc::PercentRank
+            | BoundWindowFunc::CumeDist => {}
+            BoundWindowFunc::Ntile(n) => out.push(n),
+            BoundWindowFunc::Lag {
+                expr,
+                offset,
+                default,
+            }
+            | BoundWindowFunc::Lead {
+                expr,
+                offset,
+                default,
+            } => {
+                out.push(expr);
+                out.extend(offset.iter().map(|b| b.as_ref()));
+                out.extend(default.iter().map(|b| b.as_ref()));
+            }
+            BoundWindowFunc::FirstValue(e) | BoundWindowFunc::LastValue(e) => out.push(e),
+            BoundWindowFunc::NthValue { expr, n } => {
+                out.push(expr);
+                out.push(n);
+            }
+        }
+        out.extend(self.spec.partition_by.iter());
+        out.extend(self.spec.order_by.iter().map(|o| &o.expr));
+        for bound in [&self.spec.frame.start, &self.spec.frame.end] {
+            if let BoundFrameBound::Preceding(e) | BoundFrameBound::Following(e) = bound {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    /// Rebuilds the call with `f` applied to each of `exprs()`'s expressions.
+    pub fn map_exprs(self, f: &mut dyn FnMut(BoundExpr) -> BoundExpr) -> BoundWindowCall {
+        let mut m = |e: Box<BoundExpr>| Box::new(f(*e));
+        let func = match self.func {
+            BoundWindowFunc::Aggregate { func, arg, filter } => BoundWindowFunc::Aggregate {
+                func,
+                arg: match arg {
+                    BoundAggregateArg::Wildcard => BoundAggregateArg::Wildcard,
+                    BoundAggregateArg::Expr(e) => BoundAggregateArg::Expr(m(e)),
+                },
+                filter: filter.map(&mut m),
+            },
+            BoundWindowFunc::Ntile(n) => BoundWindowFunc::Ntile(m(n)),
+            BoundWindowFunc::Lag {
+                expr,
+                offset,
+                default,
+            } => BoundWindowFunc::Lag {
+                expr: m(expr),
+                offset: offset.map(&mut m),
+                default: default.map(&mut m),
+            },
+            BoundWindowFunc::Lead {
+                expr,
+                offset,
+                default,
+            } => BoundWindowFunc::Lead {
+                expr: m(expr),
+                offset: offset.map(&mut m),
+                default: default.map(&mut m),
+            },
+            BoundWindowFunc::FirstValue(e) => BoundWindowFunc::FirstValue(m(e)),
+            BoundWindowFunc::LastValue(e) => BoundWindowFunc::LastValue(m(e)),
+            BoundWindowFunc::NthValue { expr, n } => BoundWindowFunc::NthValue {
+                expr: m(expr),
+                n: m(n),
+            },
+            other => other,
+        };
+        let partition_by = self.spec.partition_by.into_iter().map(&mut *f).collect();
+        let order_by = self
+            .spec
+            .order_by
+            .into_iter()
+            .map(|o| BoundOrderByItem {
+                expr: f(o.expr),
+                descending: o.descending,
+                nulls: o.nulls,
+            })
+            .collect();
+        let mut bound = |b: BoundFrameBound| match b {
+            BoundFrameBound::Preceding(e) => BoundFrameBound::Preceding(Box::new(f(*e))),
+            BoundFrameBound::Following(e) => BoundFrameBound::Following(Box::new(f(*e))),
+            other => other,
+        };
+        let start = bound(self.spec.frame.start);
+        let end = bound(self.spec.frame.end);
+        BoundWindowCall {
+            func,
+            spec: BoundWindowSpec {
+                partition_by,
+                order_by,
+                frame: BoundFrame {
+                    units: self.spec.frame.units,
+                    start,
+                    end,
+                    explicit: self.spec.frame.explicit,
+                },
+            },
+        }
+    }
+}
+
+impl BoundExpr {
+    /// The direct sub-expressions of this node, for read-only walks. A
+    /// subquery contributes only its `IN` operand (its query is a separate
+    /// bound tree); a window call contributes everything it evaluates.
+    pub fn children(&self) -> Vec<&BoundExpr> {
+        match &self.kind {
+            BoundExprKind::Literal(_)
+            | BoundExprKind::Parameter { .. }
+            | BoundExprKind::Column(_)
+            | BoundExprKind::AggregateRef(_)
+            | BoundExprKind::WindowRef(_)
+            | BoundExprKind::GroupKeyRef(_)
+            | BoundExprKind::Grouping(_) => Vec::new(),
+            BoundExprKind::UnaryOp { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+                vec![expr]
+            }
+            BoundExprKind::BinaryOp { left, right, .. } => vec![left, right],
+            BoundExprKind::Between {
+                expr, low, high, ..
+            } => vec![expr, low, high],
+            BoundExprKind::InList { expr, list, .. } => {
+                let mut v: Vec<&BoundExpr> = vec![expr];
+                v.extend(list.iter());
+                v
+            }
+            BoundExprKind::Like { expr, pattern, .. } => vec![expr, pattern],
+            BoundExprKind::Case {
+                operand,
+                branches,
+                else_result,
+            } => {
+                let mut v: Vec<&BoundExpr> = Vec::new();
+                v.extend(operand.iter().map(|b| b.as_ref()));
+                for (w, t) in branches {
+                    v.push(w);
+                    v.push(t);
+                }
+                v.extend(else_result.iter().map(|b| b.as_ref()));
+                v
+            }
+            BoundExprKind::Function { args, .. } => args.iter().collect(),
+            BoundExprKind::Aggregate(agg) => {
+                let mut v: Vec<&BoundExpr> = Vec::new();
+                if let BoundAggregateArg::Expr(e) = &agg.arg {
+                    v.push(e);
+                }
+                v.extend(agg.filter.iter().map(|b| b.as_ref()));
+                v
+            }
+            BoundExprKind::Window(call) => call.exprs(),
+            BoundExprKind::Subquery(sq) => sq.operand.iter().collect(),
+        }
+    }
+
+    /// Rebuilds this node with `f` applied to each of `children()`'s
+    /// expressions (same order, same coverage), keeping the node's own type
+    /// and nullability.
+    pub fn map_children(self, f: &mut dyn FnMut(BoundExpr) -> BoundExpr) -> BoundExpr {
+        let BoundExpr { kind, ty, nullable } = self;
+        let mut b = |e: Box<BoundExpr>| Box::new(f(*e));
+        let kind = match kind {
+            leaf @ (BoundExprKind::Literal(_)
+            | BoundExprKind::Parameter { .. }
+            | BoundExprKind::Column(_)
+            | BoundExprKind::AggregateRef(_)
+            | BoundExprKind::WindowRef(_)
+            | BoundExprKind::GroupKeyRef(_)
+            | BoundExprKind::Grouping(_)) => leaf,
+            BoundExprKind::UnaryOp { op, expr } => BoundExprKind::UnaryOp { op, expr: b(expr) },
+            BoundExprKind::IsNull { expr, negated } => BoundExprKind::IsNull {
+                expr: b(expr),
+                negated,
+            },
+            BoundExprKind::BinaryOp { left, op, right } => BoundExprKind::BinaryOp {
+                left: b(left),
+                op,
+                right: b(right),
+            },
+            BoundExprKind::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => BoundExprKind::Between {
+                expr: b(expr),
+                negated,
+                low: b(low),
+                high: b(high),
+            },
+            BoundExprKind::InList {
+                expr,
+                list,
+                negated,
+            } => BoundExprKind::InList {
+                expr: b(expr),
+                list: list.into_iter().map(|e| *b(Box::new(e))).collect(),
+                negated,
+            },
+            BoundExprKind::Like {
+                expr,
+                pattern,
+                negated,
+                case_insensitive,
+            } => BoundExprKind::Like {
+                expr: b(expr),
+                pattern: b(pattern),
+                negated,
+                case_insensitive,
+            },
+            BoundExprKind::Case {
+                operand,
+                branches,
+                else_result,
+            } => BoundExprKind::Case {
+                operand: operand.map(&mut b),
+                branches: branches
+                    .into_iter()
+                    .map(|(w, t)| (*b(Box::new(w)), *b(Box::new(t))))
+                    .collect(),
+                else_result: else_result.map(&mut b),
+            },
+            BoundExprKind::Function { name, args } => BoundExprKind::Function {
+                name,
+                args: args.into_iter().map(|e| *b(Box::new(e))).collect(),
+            },
+            BoundExprKind::Aggregate(agg) => BoundExprKind::Aggregate(BoundAggregateExpr {
+                func: agg.func,
+                arg: match agg.arg {
+                    BoundAggregateArg::Wildcard => BoundAggregateArg::Wildcard,
+                    BoundAggregateArg::Expr(e) => BoundAggregateArg::Expr(b(e)),
+                },
+                distinct: agg.distinct,
+                filter: agg.filter.map(&mut b),
+            }),
+            BoundExprKind::Window(call) => {
+                BoundExprKind::Window(Box::new((*call).map_exprs(&mut *f)))
+            }
+            BoundExprKind::Subquery(mut sq) => {
+                sq.operand = sq.operand.take().map(f);
+                BoundExprKind::Subquery(sq)
+            }
+        };
+        BoundExpr { kind, ty, nullable }
+    }
+
+    /// `true` iff this node or a descendant satisfies `pred`.
+    pub fn any(&self, pred: &dyn Fn(&BoundExpr) -> bool) -> bool {
+        pred(self) || self.children().into_iter().any(|c| c.any(pred))
+    }
+}
+
+// =======================================================================
+// SQL-mission-2: GROUPING SETS / ROLLUP / CUBE
+// =======================================================================
+
+/// One element of a `GROUP BY` clause that uses `ROLLUP` / `CUBE` /
+/// `GROUPING SETS`; members are indexes into `BoundSelect::group_by`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundGroupElement {
+    Expr(usize),
+    Rollup(Vec<Vec<usize>>),
+    Cube(Vec<Vec<usize>>),
+    Sets(Vec<Vec<usize>>),
+}
+
+impl BoundGroupElement {
+    /// How many grouping sets this element stands for (saturating).
+    pub fn set_count(&self) -> u128 {
+        match self {
+            BoundGroupElement::Expr(_) => 1,
+            BoundGroupElement::Rollup(m) => m.len() as u128 + 1,
+            BoundGroupElement::Cube(m) => {
+                if m.len() >= 120 {
+                    u128::MAX
+                } else {
+                    1u128 << m.len()
+                }
+            }
+            BoundGroupElement::Sets(s) => s.len() as u128,
+        }
+    }
+
+    fn sets(&self) -> Vec<Vec<usize>> {
+        match self {
+            BoundGroupElement::Expr(i) => vec![vec![*i]],
+            BoundGroupElement::Rollup(members) => (0..=members.len())
+                .rev()
+                .map(|n| members[..n].iter().flatten().copied().collect())
+                .collect(),
+            BoundGroupElement::Cube(members) => {
+                let k = members.len();
+                (0..(1usize << k))
+                    .rev()
+                    .map(|mask| {
+                        (0..k)
+                            .filter(|i| mask & (1 << (k - 1 - i)) != 0)
+                            .flat_map(|i| members[i].iter().copied())
+                            .collect()
+                    })
+                    .collect()
+            }
+            BoundGroupElement::Sets(sets) => sets.clone(),
+        }
+    }
+}
+
+/// The structure of a `GROUP BY` with grouping extensions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundGrouping {
+    pub elements: Vec<BoundGroupElement>,
+}
+
+impl BoundGrouping {
+    /// The number of grouping sets the clause expands to (saturating), without
+    /// expanding it.
+    pub fn set_count(&self) -> u128 {
+        self.elements
+            .iter()
+            .fold(1u128, |acc, e| acc.saturating_mul(e.set_count()))
+    }
+
+    /// The grouping sets, each a sorted, duplicate-free list of `group_by`
+    /// indexes. The cross product of the elements, first element outermost
+    /// (`GROUP BY a, ROLLUP(b, c)` -> `(a,b,c) (a,b) (a)`); duplicate sets are
+    /// kept, as the SQL standard's default `GROUP BY ALL` quantifier says.
+    /// Fails with `ResourceLimit` instead of expanding past `cap` sets.
+    pub fn expand(&self, cap: usize) -> crate::error::Result<Vec<Vec<usize>>> {
+        let count = self.set_count();
+        if count > cap as u128 {
+            return Err(crate::error::SqlError::ResourceLimit {
+                detail: format!(
+                    "GROUP BY expands to {} grouping sets; max_grouping_sets_per_statement is {cap}",
+                    if count == u128::MAX {
+                        "more than 2^120".to_string()
+                    } else {
+                        count.to_string()
+                    }
+                ),
+            });
+        }
+        let mut acc: Vec<Vec<usize>> = vec![Vec::new()];
+        for element in &self.elements {
+            let sets = element.sets();
+            let mut next = Vec::with_capacity(acc.len() * sets.len());
+            for prefix in &acc {
+                for set in &sets {
+                    let mut merged = prefix.clone();
+                    merged.extend(set.iter().copied());
+                    merged.sort_unstable();
+                    merged.dedup();
+                    next.push(merged);
+                }
+            }
+            acc = next;
+        }
+        Ok(acc)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +714,25 @@ pub enum BoundRelation {
     Derived(Box<BoundDerived>),
     /// A reference to a CTE of an enclosing (or this) query's `WITH` list.
     Cte(BoundCteRef),
+    /// SQL-mission-1 Slice D: the reference to a recursive CTE inside its own
+    /// recursive term -- the rows of the previous iteration.
+    Working(BoundWorkingRef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundWorkingRef {
+    pub work_id: u32,
+    pub name: String,
+}
+
+/// What makes a `BoundCte` recursive (SQL-mission-1 Slice D).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundRecursion {
+    /// The relation id of the working table the recursive term reads.
+    pub work_id: u32,
+    /// `UNION ALL` (rows are kept) rather than `UNION` (rows are deduplicated
+    /// against everything produced so far).
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,7 +766,11 @@ pub struct BoundCte {
     pub name: String,
     /// Output column names after any column-name list.
     pub columns: Vec<String>,
+    /// For a recursive CTE, the set-operation shell `seed UNION [ALL]
+    /// recursive-term` (left operand = seed, right operand = recursive term).
     pub query: BoundSelect,
+    /// `Some` for a CTE that recurses (SQL-mission-1 Slice D).
+    pub recursion: Option<BoundRecursion>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,15 +799,53 @@ pub struct BoundOrderByItem {
     pub nulls: NullsOrder,
 }
 
+/// `left <op> [ALL] right` -- a bound set operation (SQL-mission-1 Slice E).
+///
+/// The two operands are whole bound queries; the operation's own output is a
+/// relation of its own, `set_ref`, whose columns are the unified columns of the
+/// operands (see `BoundSelect::set_op`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSetOp {
+    pub op: crate::ast::SetOperator,
+    pub all: bool,
+    pub left: BoundSelect,
+    pub right: BoundSelect,
+    /// Statement-unique table-reference id the operation's output rows are
+    /// exposed under: the `ORDER BY` of the set operation and the projection
+    /// of the enclosing shell read their columns as `ColumnRef { table_ref:
+    /// set_ref, ordinal }`.
+    pub set_ref: u32,
+    /// The unified type of each output column (`None` only where both
+    /// operands are an untyped `NULL`). Each operand's value is widened to it
+    /// (`exec::setop`) before rows are compared.
+    pub column_types: Vec<Option<RelationalType>>,
+    /// The operands' physical plans, attached by the planner.
+    pub left_plan: Option<crate::plan::physical::PhysicalPlan>,
+    pub right_plan: Option<crate::plan::physical::PhysicalPlan>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSelect {
     /// The `WITH` list this query wrote (SQL-mission-1 Slice C).
     pub ctes: Vec<BoundCte>,
+    /// SQL-mission-1 Slice E: `Some` makes this query a **set operation**.
+    /// `projection` then lists the operation's output columns (each a
+    /// `Column` of `BoundSetOp::set_ref`, carrying the unified type and the
+    /// first operand's name), `from` / `selection` / `group_by` / `aggregates`
+    /// / `having` are empty, and `order_by` / `limit` / `offset` apply to the
+    /// operation's result, with `order_by` bound against `set_ref`'s columns
+    /// only.
+    pub set_op: Option<Box<BoundSetOp>>,
     pub distinct: bool,
     pub from: Vec<BoundFromItem>,
     pub projection: Vec<BoundSelectItem>,
     pub selection: Option<BoundExpr>,
     pub group_by: Vec<BoundExpr>,
+    /// SQL-mission-2: `Some` when the `GROUP BY` uses `ROLLUP` / `CUBE` /
+    /// `GROUPING SETS`. `group_by` then lists every distinct grouping
+    /// expression (in order of first appearance) and the elements refer to it
+    /// by index.
+    pub grouping: Option<BoundGrouping>,
     /// Every distinct aggregate function call collected out of
     /// `projection`/`having`/`order_by` during binding — those trees now
     /// reference this list positionally via `BoundExprKind::AggregateRef`
@@ -255,6 +854,13 @@ pub struct BoundSelect {
     /// node's own output columns).
     pub aggregates: Vec<BoundAggregateExpr>,
     pub having: Option<BoundExpr>,
+    /// SQL-mission-2: every distinct window function call collected out of
+    /// `projection` / `qualify` / `order_by` (those trees reference it
+    /// positionally through `WindowRef`).
+    pub windows: Vec<BoundWindowCall>,
+    /// SQL-mission-2: `QUALIFY`, evaluated after the window functions and
+    /// before `DISTINCT` / `ORDER BY` / `LIMIT`.
+    pub qualify: Option<BoundExpr>,
     pub order_by: Vec<BoundOrderByItem>,
     pub limit: Option<BoundExpr>,
     pub offset: Option<BoundExpr>,

@@ -225,6 +225,155 @@ const CORPUS: &[(&str, &str, &[&str])] = &[
         "SELECT id, (WITH m AS (SELECT MAX(amount) AS mx FROM orders) SELECT mx FROM m) FROM t WHERE id <= 2 ORDER BY id",
         &["1|100", "2|100"],
     ),
+    // ---- Slice E: set operations (expected rows derived by hand from the
+    // seed data above: orders.t_id = {1,1,2,3,NULL}, t.id = {1,2,3,4,5}) ----
+    (
+        "E",
+        "SELECT t_id AS k FROM orders UNION SELECT id FROM t ORDER BY k",
+        &["1", "2", "3", "4", "5", "NULL"],
+    ),
+    (
+        "E",
+        "SELECT COUNT(*) FROM (SELECT t_id FROM orders UNION ALL SELECT id FROM t) AS u",
+        &["10"],
+    ),
+    (
+        "E",
+        "SELECT t_id FROM orders INTERSECT SELECT id FROM t ORDER BY t_id",
+        &["1", "2", "3"],
+    ),
+    (
+        "E",
+        "SELECT t_id FROM orders INTERSECT ALL SELECT id FROM t ORDER BY t_id",
+        &["1", "2", "3"],
+    ),
+    (
+        "E",
+        "SELECT id FROM t EXCEPT SELECT t_id FROM orders ORDER BY id",
+        &["4", "5"],
+    ),
+    (
+        "E",
+        "SELECT t_id FROM orders EXCEPT ALL SELECT id FROM t ORDER BY t_id",
+        &["1", "NULL"],
+    ),
+    (
+        "E",
+        "SELECT active, name FROM t WHERE id = 4 UNION SELECT active, name FROM t WHERE id = 4",
+        &["true|NULL"],
+    ),
+    ("E", "SELECT NULL, NULL UNION SELECT NULL, NULL", &["NULL|NULL"]),
+    (
+        "E",
+        "SELECT id FROM t WHERE id <= 2 UNION SELECT id FROM t WHERE id BETWEEN 2 AND 3 INTERSECT SELECT id FROM t WHERE id >= 3 ORDER BY id",
+        &["1", "2", "3"],
+    ),
+    (
+        "E",
+        "(SELECT id FROM t WHERE id <= 2 UNION SELECT id FROM t WHERE id BETWEEN 2 AND 3) INTERSECT SELECT id FROM t WHERE id >= 3 ORDER BY id",
+        &["3"],
+    ),
+    (
+        "E",
+        "SELECT COUNT(*) FROM (SELECT id FROM t UNION SELECT t_id FROM orders) AS u",
+        &["6"],
+    ),
+    (
+        "E",
+        "WITH u AS (SELECT id FROM t WHERE id < 3 UNION ALL SELECT id FROM t WHERE id < 2) SELECT id FROM u ORDER BY id",
+        &["1", "1", "2"],
+    ),
+    (
+        "E",
+        "SELECT (SELECT t_id FROM orders WHERE id = 12 UNION SELECT id FROM t WHERE id = 2)",
+        &["2"],
+    ),
+    (
+        "E",
+        "SELECT id FROM t WHERE id IN (SELECT t_id FROM orders UNION SELECT 4) ORDER BY id",
+        &["1", "2", "3", "4"],
+    ),
+    (
+        "E",
+        "SELECT id FROM t WHERE id NOT IN (SELECT t_id FROM orders UNION SELECT 4)",
+        &[],
+    ),
+    (
+        "E",
+        "SELECT id FROM t WHERE EXISTS (SELECT id FROM t EXCEPT SELECT t_id FROM orders) ORDER BY id",
+        &["1", "2", "3", "4", "5"],
+    ),
+    (
+        "E",
+        "SELECT id FROM t WHERE EXISTS (SELECT amount FROM orders WHERE t_id = t.id AND amount > 60 UNION SELECT amount FROM orders WHERE t_id = t.id AND amount IS NULL) ORDER BY id",
+        &["1", "2", "3"],
+    ),
+    (
+        "E",
+        "SELECT id FROM orders UNION SELECT id FROM t ORDER BY id",
+        &["1", "2", "3", "4", "5", "10", "11", "12", "13", "14"],
+    ),
+    // ---- Slice D: WITH RECURSIVE (expected rows derived by hand) ----
+    (
+        "D",
+        "WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 5) SELECT n FROM cnt ORDER BY n",
+        &["1", "2", "3", "4", "5"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE cnt(n) AS (SELECT 1 UNION SELECT n + 1 FROM cnt WHERE n < 5) SELECT n FROM cnt ORDER BY n",
+        &["1", "2", "3", "4", "5"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE f(n, acc) AS (SELECT 1, 1 UNION ALL SELECT n + 1, acc * (n + 1) FROM f WHERE n < 5) SELECT acc FROM f ORDER BY acc",
+        &["1", "2", "6", "24", "120"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT t.id FROM r JOIN t ON t.id = r.id + 1) SELECT id FROM r ORDER BY id",
+        &["1", "2", "3", "4", "5"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE r(n) AS (SELECT COUNT(*) FROM orders UNION ALL SELECT n - 1 FROM r WHERE n > 3) SELECT n FROM r ORDER BY n DESC",
+        &["5", "4", "3"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT (n % 3) + 1 FROM r) SELECT n FROM r ORDER BY n",
+        &["1", "2", "3"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3), v AS (SELECT n * 10 AS d FROM r) SELECT d FROM v ORDER BY d",
+        &["10", "20", "30"],
+    ),
+    (
+        "D",
+        "SELECT id FROM t WHERE id IN (WITH RECURSIVE r(n) AS (SELECT 2 UNION ALL SELECT n + 2 FROM r WHERE n < 4) SELECT n FROM r) ORDER BY id",
+        &["2", "4"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 100 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r ORDER BY n",
+        &["1", "2", "3", "100"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE r(n) AS (SELECT 1 WHERE FALSE UNION ALL SELECT n + 1 FROM r) SELECT COUNT(*) FROM r",
+        &["0"],
+    ),
+    (
+        "D",
+        "SELECT id, (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT COUNT(*) FROM r WHERE r.n <= t.id) FROM t WHERE id <= 4 ORDER BY id",
+        &["1|1", "2|2", "3|3", "4|3"],
+    ),
+    (
+        "D",
+        "WITH RECURSIVE orders(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM orders WHERE id < 3) SELECT id FROM orders ORDER BY id",
+        &["1", "2", "3"],
+    ),
 ];
 
 #[test]

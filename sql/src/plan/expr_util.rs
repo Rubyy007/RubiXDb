@@ -125,8 +125,19 @@ fn collect_table_refs(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
             if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
                 collect_table_refs(e, out);
             }
+            if let Some(f) = &agg.filter {
+                collect_table_refs(f, out);
+            }
         }
-        BoundExprKind::AggregateRef(_) => {}
+        BoundExprKind::AggregateRef(_)
+        | BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_) => {}
+        BoundExprKind::Window(call) => {
+            for e in call.exprs() {
+                collect_table_refs(e, out);
+            }
+        }
         // A subquery reads the *enclosing* query's tables only through its
         // outer references (and its `IN` operand); its own tables are its
         // own. This is what keeps predicate pushdown from moving a
@@ -210,8 +221,19 @@ fn collect_ordinals(expr: &BoundExpr, table_ref: u32, out: &mut BTreeSet<u16>) {
             if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
                 collect_ordinals(e, table_ref, out);
             }
+            if let Some(f) = &agg.filter {
+                collect_ordinals(f, table_ref, out);
+            }
         }
-        BoundExprKind::AggregateRef(_) => {}
+        BoundExprKind::AggregateRef(_)
+        | BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_) => {}
+        BoundExprKind::Window(call) => {
+            for e in call.exprs() {
+                collect_ordinals(e, table_ref, out);
+            }
+        }
         BoundExprKind::Subquery(sq) => {
             if let Some(operand) = &sq.operand {
                 collect_ordinals(operand, table_ref, out);
@@ -238,7 +260,13 @@ where
         BoundExprKind::Literal(_)
         | BoundExprKind::Parameter { .. }
         | BoundExprKind::Column(_)
-        | BoundExprKind::AggregateRef(_) => Ok(()),
+        | BoundExprKind::AggregateRef(_)
+        | BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_)
+        // The expressions inside a window call are bound without subquery
+        // support, so there is none to visit.
+        | BoundExprKind::Window(_) => Ok(()),
         BoundExprKind::UnaryOp { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
             for_each_subquery_mut(expr, f)
         }
@@ -291,6 +319,9 @@ where
             if let crate::aggregate::AggregateArg::Expr(e) = &mut agg.arg {
                 for_each_subquery_mut(e, f)?;
             }
+            if let Some(filter) = &mut agg.filter {
+                for_each_subquery_mut(filter, f)?;
+            }
             Ok(())
         }
         BoundExprKind::Subquery(sq) => {
@@ -311,7 +342,11 @@ pub fn contains_subquery(expr: &BoundExpr) -> bool {
         BoundExprKind::Literal(_)
         | BoundExprKind::Parameter { .. }
         | BoundExprKind::Column(_)
-        | BoundExprKind::AggregateRef(_) => false,
+        | BoundExprKind::AggregateRef(_)
+        | BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_)
+        | BoundExprKind::Window(_) => false,
         BoundExprKind::UnaryOp { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
             contains_subquery(expr)
         }
@@ -339,10 +374,12 @@ pub fn contains_subquery(expr: &BoundExpr) -> bool {
                 || else_result.as_deref().is_some_and(contains_subquery)
         }
         BoundExprKind::Function { args, .. } => args.iter().any(contains_subquery),
-        BoundExprKind::Aggregate(agg) => match &agg.arg {
-            crate::aggregate::AggregateArg::Expr(e) => contains_subquery(e),
-            crate::aggregate::AggregateArg::Wildcard => false,
-        },
+        BoundExprKind::Aggregate(agg) => {
+            (match &agg.arg {
+                crate::aggregate::AggregateArg::Expr(e) => contains_subquery(e),
+                crate::aggregate::AggregateArg::Wildcard => false,
+            }) || agg.filter.as_deref().is_some_and(contains_subquery)
+        }
     }
 }
 

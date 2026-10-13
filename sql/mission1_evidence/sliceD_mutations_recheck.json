@@ -1,0 +1,21 @@
+[
+  {
+    "id": "M15_rows_metric_ignores_the_iterations",
+    "why": "recursive_cte_rows_emitted_total counts the seed only",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 10,
+    "failed_tests": [
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union"
+    ]
+  }
+]

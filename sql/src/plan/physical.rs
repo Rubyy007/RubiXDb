@@ -13,12 +13,13 @@ use rubixdb::catalog::CatalogService;
 
 use crate::ast::JoinKind;
 use crate::bound::{
-    BoundAggregateExpr, BoundExpr, BoundExprKind, BoundOrderByItem, BoundSelectItem, NullsOrder,
+    BoundAggregateExpr, BoundExpr, BoundExprKind, BoundGrouping, BoundOrderByItem,
+    BoundSelectItem, BoundWindowSpec, NullsOrder,
 };
 use crate::error::Result;
 use crate::plan::access::{plan_table_access, IndexAccessMode, PhysicalAccess};
 use crate::plan::expr_util::{and_all, referenced_table_refs};
-use crate::plan::logical::LogicalPlan;
+use crate::plan::logical::{LogicalPlan, SetOpNode, WindowSlot};
 use crate::plan::metrics::PlannerMetrics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,23 @@ pub struct CtePlan {
     pub id: u32,
     pub name: String,
     pub plan: PhysicalPlan,
+}
+
+/// A recursive CTE's fixpoint (SQL-mission-1 Slice D): the plan of a
+/// `CtePlan` whose definition is `seed UNION [ALL] recursive-term`. It is a
+/// node of its own -- never a flat `UNION` -- because the seed runs once and the
+/// term runs repeatedly against the working table until it produces nothing new.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveCteNode {
+    pub name: String,
+    pub cte_id: u32,
+    /// The relation id the term's `WorkingTable` leaf reads.
+    pub work_id: u32,
+    /// `UNION` (the iteration stops when no new distinct row is produced) rather
+    /// than `UNION ALL` (it stops when no row is produced).
+    pub distinct: bool,
+    pub seed_plan: Box<PhysicalPlan>,
+    pub recursive_plan: Box<PhysicalPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +82,19 @@ pub enum PhysicalPlan {
         table_ref: u32,
         cte: Arc<CtePlan>,
     },
+    /// The previous iteration's rows of a recursive CTE, read inside its
+    /// recursive term, exposed as `table_ref`.
+    WorkingTable {
+        table_ref: u32,
+        work_id: u32,
+        name: String,
+    },
+    /// A recursive CTE's fixpoint; only ever the root plan of a `CtePlan`.
+    RecursiveCte(RecursiveCteNode),
+    /// A set operation (SQL-mission-1 Slice E): combines the rows of its two
+    /// operand plans as the operator says (never a join) and exposes the
+    /// result as the relation `set_ref`.
+    SetOp(SetOpNode),
     Join {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
@@ -96,6 +127,19 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         group_by: Vec<BoundExpr>,
         aggregates: Vec<BoundAggregateExpr>,
+        /// SQL-mission-2: the structure of a `ROLLUP` / `CUBE` / `GROUPING SETS`
+        /// clause; the operator expands it into grouping sets (after checking
+        /// `max_grouping_sets_per_statement`) and aggregates every set in one
+        /// pass over its input.
+        grouping: Option<BoundGrouping>,
+    },
+    /// The window functions of one window (SQL-mission-2): a blocking operator
+    /// that buffers its input, partitions and orders it as `spec` says, and
+    /// emits every input row (in input order) with each function's value added.
+    Window {
+        input: Box<PhysicalPlan>,
+        spec: BoundWindowSpec,
+        functions: Vec<WindowSlot>,
     },
     /// Retained whenever the input's own access path does not
     /// provably already produce this order (item 15). Never removed by
@@ -141,6 +185,16 @@ pub fn build_physical_plan(
         LogicalPlan::Cte { table, cte } => Ok(PhysicalPlan::CteNode {
             table_ref: table.id.0,
             cte: Arc::clone(cte),
+        }),
+        LogicalPlan::SetOp(node) => Ok(PhysicalPlan::SetOp(node.clone())),
+        LogicalPlan::Working {
+            table,
+            work_id,
+            name,
+        } => Ok(PhysicalPlan::WorkingTable {
+            table_ref: table.id.0,
+            work_id: *work_id,
+            name: name.clone(),
         }),
         LogicalPlan::Scan {
             table, predicate, ..
@@ -232,14 +286,25 @@ pub fn build_physical_plan(
             input,
             group_by,
             aggregates,
+            grouping,
         } => {
             metrics.record_aggregate_plan();
             Ok(PhysicalPlan::Aggregate {
                 input: Box::new(build_physical_plan(input, catalog, metrics)?),
                 group_by: group_by.clone(),
                 aggregates: aggregates.clone(),
+                grouping: grouping.clone(),
             })
         }
+        LogicalPlan::Window {
+            input,
+            spec,
+            functions,
+        } => Ok(PhysicalPlan::Window {
+            input: Box::new(build_physical_plan(input, catalog, metrics)?),
+            spec: spec.clone(),
+            functions: functions.clone(),
+        }),
         LogicalPlan::Sort { input, items } => {
             metrics.record_sort_node();
 
@@ -338,6 +403,12 @@ fn collect_table_refs(plan: &LogicalPlan) -> BTreeSet<u32> {
             | LogicalPlan::Cte { table, .. } => {
                 out.insert(table.id.0);
             }
+            LogicalPlan::SetOp(node) => {
+                out.insert(node.set_ref);
+            }
+            LogicalPlan::Working { table, .. } => {
+                out.insert(table.id.0);
+            }
             LogicalPlan::Join { left, right, .. } => {
                 walk(left, out);
                 walk(right, out);
@@ -346,6 +417,7 @@ fn collect_table_refs(plan: &LogicalPlan) -> BTreeSet<u32> {
             | LogicalPlan::Projection { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Window { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. } => walk(input, out),
         }

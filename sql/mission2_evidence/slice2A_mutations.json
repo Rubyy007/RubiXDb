@@ -1,0 +1,224 @@
+[
+  {
+    "id": "M08a_over_dropped_by_converter",
+    "why": "the Slice D bug reintroduced: the converter accepts OVER and drops it (SUM(x) OVER (...) runs as the plain aggregate)",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 42,
+    "failed_tests": [
+      "window_tests::binder::a_window_function_is_refused_outside_the_select_list_qualify_and_order_by",
+      "window_tests::binder::a_window_function_may_not_contain_another",
+      "window_tests::binder::an_order_by_default_follows_d5",
+      "window_tests::binder::calls_are_collected_into_the_windows_list",
+      "window_tests::binder::rank_functions_need_an_order_by",
+      "window_tests::binder::result_types_and_nullability",
+      "window_tests::binder::the_default_frame_is_resolved_at_bind_time",
+      "window_tests::binder::unknown_columns_and_windows_are_errors",
+      "window_tests::exec_2a::a_partition_larger_than_the_limit_is_a_resource_limit",
+      "window_tests::exec_2a::a_single_row_partition",
+      "window_tests::exec_2a::a_window_function_in_the_order_by_clause",
+      "window_tests::exec_2a::a_window_in_a_subquery_and_a_set_operation_branch",
+      "window_tests::exec_2a::a_window_over_a_join_derived_table_and_cte",
+      "window_tests::exec_2a::a_window_over_an_aggregated_query_runs_after_the_grouping",
+      "window_tests::exec_2a::a_window_reads_the_statement_snapshot",
+      "window_tests::exec_2a::aggregates_ignore_nulls_and_an_all_null_frame_is_null_but_count_is_zero",
+      "window_tests::exec_2a::an_all_null_order_column_makes_every_row_a_peer",
+      "window_tests::exec_2a::an_ungrouped_column_inside_a_window_of_an_aggregated_query_is_refused",
+      "window_tests::exec_2a::default_frame_with_an_order_by_runs_to_the_current_row_and_includes_peers",
+      "window_tests::exec_2a::default_frame_without_an_order_by_is_the_whole_partition",
+      "window_tests::exec_2a::distinct_limit_and_where_compose_with_windows",
+      "window_tests::exec_2a::empty_input_yields_no_rows",
+      "window_tests::exec_2a::explain_shows_the_window",
+      "window_tests::exec_2a::metrics_count_partitions_and_function_evaluations",
+      "window_tests::exec_2a::null_partition_keys_form_one_partition",
+      "window_tests::exec_2a::nulls_in_the_window_order_follow_d5",
+      "window_tests::exec_2a::over_empty_is_the_whole_relation_as_one_partition",
+      "window_tests::exec_2a::partition_by_restarts_the_window_per_group",
+      "window_tests::exec_2a::provably_identical_windows_share_one_operator",
+      "window_tests::exec_2a::rank_functions_on_tied_data",
+      "window_tests::exec_2a::rank_restarts_per_group",
+      "window_tests::exec_2a::running_total_is_a_sum_from_the_first_row_to_the_current_one",
+      "window_tests::exec_2a::the_buffer_is_bounded_by_the_materialization_limits",
+      "window_tests::exec_2a::the_input_row_order_is_preserved_without_an_outer_order_by",
+      "window_tests::exec_2a::the_window_is_in_the_physical_plan_not_dropped",
+      "window_tests::exec_2a::too_many_window_functions_is_a_resource_limit",
+      "window_tests::exec_2a::two_different_windows_in_one_select_are_not_merged",
+      "window_tests::parser::a_call_that_is_not_a_window_function_is_a_typed_error",
+      "window_tests::parser::an_over_clause_is_never_dropped",
+      "window_tests::parser::over_clause_forms_parse_into_a_window_call",
+      "window_tests::parser::the_spec_is_kept_in_full",
+      "window_tests::parser::what_stays_outside_the_grammar_is_a_typed_error"
+    ]
+  },
+  {
+    "id": "M08b_over_ignored_by_planner",
+    "why": "OVER accepted by parser and binder but the planner drops the Window nodes",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 27,
+    "failed_tests": [
+      "window_tests::exec_2a::a_partition_larger_than_the_limit_is_a_resource_limit",
+      "window_tests::exec_2a::a_single_row_partition",
+      "window_tests::exec_2a::a_window_function_in_the_order_by_clause",
+      "window_tests::exec_2a::a_window_in_a_subquery_and_a_set_operation_branch",
+      "window_tests::exec_2a::a_window_over_a_join_derived_table_and_cte",
+      "window_tests::exec_2a::a_window_over_an_aggregated_query_runs_after_the_grouping",
+      "window_tests::exec_2a::a_window_reads_the_statement_snapshot",
+      "window_tests::exec_2a::aggregates_ignore_nulls_and_an_all_null_frame_is_null_but_count_is_zero",
+      "window_tests::exec_2a::an_all_null_order_column_makes_every_row_a_peer",
+      "window_tests::exec_2a::default_frame_with_an_order_by_runs_to_the_current_row_and_includes_peers",
+      "window_tests::exec_2a::default_frame_without_an_order_by_is_the_whole_partition",
+      "window_tests::exec_2a::distinct_limit_and_where_compose_with_windows",
+      "window_tests::exec_2a::explain_shows_the_window",
+      "window_tests::exec_2a::metrics_count_partitions_and_function_evaluations",
+      "window_tests::exec_2a::null_partition_keys_form_one_partition",
+      "window_tests::exec_2a::nulls_in_the_window_order_follow_d5",
+      "window_tests::exec_2a::over_empty_is_the_whole_relation_as_one_partition",
+      "window_tests::exec_2a::partition_by_restarts_the_window_per_group",
+      "window_tests::exec_2a::provably_identical_windows_share_one_operator",
+      "window_tests::exec_2a::rank_functions_on_tied_data",
+      "window_tests::exec_2a::rank_restarts_per_group",
+      "window_tests::exec_2a::running_total_is_a_sum_from_the_first_row_to_the_current_one",
+      "window_tests::exec_2a::the_buffer_is_bounded_by_the_materialization_limits",
+      "window_tests::exec_2a::the_input_row_order_is_preserved_without_an_outer_order_by",
+      "window_tests::exec_2a::the_window_is_in_the_physical_plan_not_dropped",
+      "window_tests::exec_2a::too_many_window_functions_is_a_resource_limit",
+      "window_tests::exec_2a::two_different_windows_in_one_select_are_not_merged"
+    ]
+  },
+  {
+    "id": "M08c_over_ignored_by_executor",
+    "why": "the Window operator is replaced by a pass-through",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 23,
+    "failed_tests": [
+      "window_tests::exec_2a::a_partition_larger_than_the_limit_is_a_resource_limit",
+      "window_tests::exec_2a::a_single_row_partition",
+      "window_tests::exec_2a::a_window_function_in_the_order_by_clause",
+      "window_tests::exec_2a::a_window_in_a_subquery_and_a_set_operation_branch",
+      "window_tests::exec_2a::a_window_over_a_join_derived_table_and_cte",
+      "window_tests::exec_2a::a_window_over_an_aggregated_query_runs_after_the_grouping",
+      "window_tests::exec_2a::a_window_reads_the_statement_snapshot",
+      "window_tests::exec_2a::aggregates_ignore_nulls_and_an_all_null_frame_is_null_but_count_is_zero",
+      "window_tests::exec_2a::an_all_null_order_column_makes_every_row_a_peer",
+      "window_tests::exec_2a::default_frame_with_an_order_by_runs_to_the_current_row_and_includes_peers",
+      "window_tests::exec_2a::default_frame_without_an_order_by_is_the_whole_partition",
+      "window_tests::exec_2a::distinct_limit_and_where_compose_with_windows",
+      "window_tests::exec_2a::metrics_count_partitions_and_function_evaluations",
+      "window_tests::exec_2a::null_partition_keys_form_one_partition",
+      "window_tests::exec_2a::nulls_in_the_window_order_follow_d5",
+      "window_tests::exec_2a::over_empty_is_the_whole_relation_as_one_partition",
+      "window_tests::exec_2a::partition_by_restarts_the_window_per_group",
+      "window_tests::exec_2a::rank_functions_on_tied_data",
+      "window_tests::exec_2a::rank_restarts_per_group",
+      "window_tests::exec_2a::running_total_is_a_sum_from_the_first_row_to_the_current_one",
+      "window_tests::exec_2a::the_buffer_is_bounded_by_the_materialization_limits",
+      "window_tests::exec_2a::the_input_row_order_is_preserved_without_an_outer_order_by",
+      "window_tests::exec_2a::two_different_windows_in_one_select_are_not_merged"
+    ]
+  },
+  {
+    "id": "M01_default_frame_is_rows",
+    "why": "default frame with ORDER BY is ROWS instead of RANGE (peers not included)",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 5,
+    "failed_tests": [
+      "window_tests::binder::the_default_frame_is_resolved_at_bind_time",
+      "window_tests::exec_2a::an_all_null_order_column_makes_every_row_a_peer",
+      "window_tests::exec_2a::default_frame_with_an_order_by_runs_to_the_current_row_and_includes_peers",
+      "window_tests::exec_2a::explain_shows_the_window",
+      "window_tests::exec_2a::provably_identical_windows_share_one_operator"
+    ]
+  },
+  {
+    "id": "M02_default_frame_without_order_is_current_row",
+    "why": "default frame without ORDER BY ends at CURRENT ROW",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::binder::the_default_frame_is_resolved_at_bind_time"
+    ]
+  },
+  {
+    "id": "M03_rank_behaves_like_row_number",
+    "why": "RANK has no gaps after ties",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 3,
+    "failed_tests": [
+      "window_tests::exec_2a::an_all_null_order_column_makes_every_row_a_peer",
+      "window_tests::exec_2a::rank_functions_on_tied_data",
+      "window_tests::exec_2a::rank_restarts_per_group"
+    ]
+  },
+  {
+    "id": "M04_dense_rank_behaves_like_rank",
+    "why": "DENSE_RANK has gaps",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2a::rank_functions_on_tied_data"
+    ]
+  },
+  {
+    "id": "M09_distinct_windows_merged",
+    "why": "two different windows are merged into one operator",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 3,
+    "failed_tests": [
+      "window_tests::exec_2a::a_window_over_an_aggregated_query_runs_after_the_grouping",
+      "window_tests::exec_2a::metrics_count_partitions_and_function_evaluations",
+      "window_tests::exec_2a::two_different_windows_in_one_select_are_not_merged"
+    ]
+  },
+  {
+    "id": "M15_null_partition_keys_do_not_group",
+    "why": "each NULL partition key is its own partition",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2a::null_partition_keys_form_one_partition"
+    ]
+  },
+  {
+    "id": "M18_window_allowed_in_where",
+    "why": "a window function binds in WHERE",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 2,
+    "failed_tests": [
+      "window_tests::binder::a_window_function_is_refused_outside_the_select_list_qualify_and_order_by",
+      "window_tests::binder::a_window_function_may_not_contain_another"
+    ]
+  },
+  {
+    "id": "M21_peer_groups_ignore_nulls",
+    "why": "NULL order keys are not peers of each other",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 4,
+    "failed_tests": [
+      "window_tests::exec_2a::an_all_null_order_column_makes_every_row_a_peer",
+      "window_tests::exec_2a::default_frame_with_an_order_by_runs_to_the_current_row_and_includes_peers",
+      "window_tests::exec_2a::rank_functions_on_tied_data",
+      "window_tests::exec_2a::rank_restarts_per_group"
+    ]
+  },
+  {
+    "id": "M22_window_order_nulls_always_last",
+    "why": "a descending window order puts NULLs last regardless (D5 ignored)",
+    "compiled": true,
+    "tests_run": 48,
+    "failed_count": 2,
+    "failed_tests": [
+      "window_tests::binder::an_order_by_default_follows_d5",
+      "window_tests::exec_2a::nulls_in_the_window_order_follow_d5"
+    ]
+  }
+]

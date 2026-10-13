@@ -1,0 +1,426 @@
+[
+  {
+    "id": "M05a_range_current_row_ignores_peers",
+    "why": "RANGE ... CURRENT ROW behaves as ROWS (peers excluded)",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 8,
+    "failed_tests": [
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows",
+      "window_tests::exec_2a::an_all_null_order_column_makes_every_row_a_peer",
+      "window_tests::exec_2a::default_frame_with_an_order_by_runs_to_the_current_row_and_includes_peers",
+      "window_tests::exec_2b::a_descending_range_counts_distance_toward_larger_values_as_preceding",
+      "window_tests::exec_2b::null_order_keys_are_peers_and_outside_every_value_offset",
+      "window_tests::exec_2b::range_frames_count_value_distance_and_include_peers",
+      "window_tests::exec_2b::rows_and_range_differ_on_the_same_tie_containing_data",
+      "window_tests::exec_2c::last_value_with_the_default_range_frame_is_the_last_peer"
+    ]
+  },
+  {
+    "id": "M05b_range_offsets_ignore_the_order_direction",
+    "why": "a descending RANGE offset counts distance the wrong way (direction ignored)",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2b::a_descending_range_counts_distance_toward_larger_values_as_preceding"
+    ]
+  },
+  {
+    "id": "M06_last_value_is_the_partitions_last",
+    "why": "LAST_VALUE returns the partition's last row instead of the frame's",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 4,
+    "failed_tests": [
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows",
+      "window_tests::exec_2c::last_value_with_the_default_frame_is_the_current_row_not_the_last_row",
+      "window_tests::exec_2c::last_value_with_the_default_range_frame_is_the_last_peer",
+      "window_tests::exec_2c::value_functions_work_on_text_and_return_the_arguments_type"
+    ]
+  },
+  {
+    "id": "M07_lag_returns_the_current_row",
+    "why": "LAG returns the current row's value",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 7,
+    "failed_tests": [
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows",
+      "window_tests::exec_2c::lag_and_lead_take_an_offset_and_a_default",
+      "window_tests::exec_2c::lag_does_not_skip_nulls_and_restarts_per_partition",
+      "window_tests::exec_2c::lag_follows_the_window_order_not_the_input_order",
+      "window_tests::exec_2c::previous_value_is_null_for_the_first_row",
+      "window_tests::exec_2c::several_functions_of_different_kinds_in_one_select",
+      "window_tests::exec_2c::value_functions_work_on_text_and_return_the_arguments_type"
+    ]
+  },
+  {
+    "id": "M10_grouping_is_zero_for_aggregated_away_columns",
+    "why": "GROUPING() reports 0 for a column the grouping set leaves out",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 8,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::a_grouping_column_reads_null_in_a_set_that_leaves_it_out",
+      "aggregation_tests::exec_2e::a_window_function_over_grouping_sets",
+      "aggregation_tests::exec_2e::empty_input_still_yields_the_empty_sets_row",
+      "aggregation_tests::exec_2e::grouping_in_having_and_order_by",
+      "aggregation_tests::exec_2e::grouping_is_zero_for_a_real_null_and_one_for_an_aggregated_away_column",
+      "aggregation_tests::exec_2e::grouping_sets_work_in_a_subquery_cte_and_set_operation",
+      "aggregation_tests::exec_2e::grouping_with_several_arguments_is_a_bit_string",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M11_rollup_misses_the_full_set",
+    "why": "ROLLUP (a, b) = GROUPING SETS ((a), ()) (the (a, b) set is missing)",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 15,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::a_window_function_over_grouping_sets",
+      "aggregation_tests::exec_2e::cube_is_not_rollup",
+      "aggregation_tests::exec_2e::grouping_expressions_may_be_expressions_and_appear_in_the_select_list",
+      "aggregation_tests::exec_2e::grouping_in_having_and_order_by",
+      "aggregation_tests::exec_2e::grouping_is_zero_for_a_real_null_and_one_for_an_aggregated_away_column",
+      "aggregation_tests::exec_2e::grouping_set_expansion_unit",
+      "aggregation_tests::exec_2e::grouping_sets_compose_with_where_having_order_by_distinct_and_limit",
+      "aggregation_tests::exec_2e::grouping_sets_work_in_a_subquery_cte_and_set_operation",
+      "aggregation_tests::exec_2e::grouping_with_several_arguments_is_a_bit_string",
+      "aggregation_tests::exec_2e::mixing_plain_columns_with_an_extension_multiplies_the_sets",
+      "aggregation_tests::exec_2e::rollup_a_b_is_grouping_sets_ab_a_and_the_empty_set",
+      "aggregation_tests::exec_2e::rollup_and_cube_of_one_column",
+      "aggregation_tests::exec_2f::distinct_with_filter_and_with_grouping_sets",
+      "aggregation_tests::exec_2f::filter_with_grouping_sets_applies_in_every_set",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M12_cube_is_rollup",
+    "why": "CUBE (a, b) lacks the set (b)",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 4,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::cube_a_b_adds_the_set_of_b_alone",
+      "aggregation_tests::exec_2e::cube_is_not_rollup",
+      "aggregation_tests::exec_2e::rollup_and_cube_of_one_column",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M13_filter_applies_to_every_aggregate",
+    "why": "the first FILTER found is applied to every aggregate of the SELECT",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 6,
+    "failed_tests": [
+      "aggregation_tests::exec_2f::a_filter_that_is_always_false_or_always_true",
+      "aggregation_tests::exec_2f::a_null_filter_condition_excludes_the_row",
+      "aggregation_tests::exec_2f::filter_applies_to_one_aggregate_not_the_whole_select",
+      "aggregation_tests::exec_2f::filter_skips_are_counted",
+      "aggregation_tests::exec_2f::two_aggregates_with_different_filters_in_one_select",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M14a_distinct_ignored",
+    "why": "DISTINCT is accepted and ignored (every value counts)",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 9,
+    "failed_tests": [
+      "aggregation_tests::exec_2f::count_distinct_per_group",
+      "aggregation_tests::exec_2f::distinct_in_having_and_order_by_and_alongside_plain_aggregates",
+      "aggregation_tests::exec_2f::distinct_is_per_group_not_across_groups",
+      "aggregation_tests::exec_2f::distinct_state_is_bounded_by_max_aggregate_state_bytes",
+      "aggregation_tests::exec_2f::distinct_treats_negative_zero_and_zero_as_one_value",
+      "aggregation_tests::exec_2f::distinct_with_filter_and_with_grouping_sets",
+      "aggregation_tests::exec_2f::every_standard_aggregate_accepts_distinct",
+      "aggregation_tests::exec_2f::sum_and_avg_distinct",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M14b_distinct_across_groups",
+    "why": "DISTINCT deduplicates across groups instead of within each group",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 8,
+    "failed_tests": [
+      "aggregation_tests::exec_2f::count_distinct_per_group",
+      "aggregation_tests::exec_2f::distinct_in_having_and_order_by_and_alongside_plain_aggregates",
+      "aggregation_tests::exec_2f::distinct_is_per_group_not_across_groups",
+      "aggregation_tests::exec_2f::distinct_treats_negative_zero_and_zero_as_one_value",
+      "aggregation_tests::exec_2f::distinct_with_filter_and_with_grouping_sets",
+      "aggregation_tests::exec_2f::every_standard_aggregate_accepts_distinct",
+      "aggregation_tests::exec_2f::sum_and_avg_distinct",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M16_qualify_before_the_windows",
+    "why": "QUALIFY filters before the window functions have run",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 8,
+    "failed_tests": [
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows",
+      "window_tests::exec_2d::qualify_composes_with_distinct_and_subqueries",
+      "window_tests::exec_2d::qualify_is_neither_where_nor_having",
+      "window_tests::exec_2d::qualify_keeps_the_rows_a_window_predicate_selects",
+      "window_tests::exec_2d::qualify_may_filter_on_a_window_in_the_select_list_through_an_alias_or_expression",
+      "window_tests::exec_2d::qualify_may_use_a_select_list_alias",
+      "window_tests::exec_2d::qualify_on_an_aggregated_query",
+      "window_tests::exec_2d::qualify_runs_after_the_window_functions_and_before_order_by_and_limit"
+    ]
+  },
+  {
+    "id": "M17_qualify_after_limit",
+    "why": "QUALIFY filters after ORDER BY and LIMIT",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2d::qualify_runs_after_the_window_functions_and_before_order_by_and_limit"
+    ]
+  },
+  {
+    "id": "M19_ntile_puts_every_row_in_bucket_one",
+    "why": "NTILE assigns bucket 1 to every row",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 4,
+    "failed_tests": [
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows",
+      "window_tests::exec_2c::ntile_splits_the_partition_into_buckets",
+      "window_tests::exec_2c::ntile_works_per_partition_and_follows_the_order",
+      "window_tests::exec_2c::several_functions_of_different_kinds_in_one_select"
+    ]
+  },
+  {
+    "id": "M20_percent_rank_uses_row_number",
+    "why": "PERCENT_RANK is (row_number - 1) / (rows - 1)",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 3,
+    "failed_tests": [
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows",
+      "window_tests::exec_2c::percent_rank_and_cume_dist_on_tied_data",
+      "window_tests::exec_2c::percent_rank_uses_the_rank_not_the_row_number"
+    ]
+  },
+  {
+    "id": "M23_cume_dist_excludes_peers",
+    "why": "CUME_DIST counts rows up to the current one, not up to its last peer",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 2,
+    "failed_tests": [
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows",
+      "window_tests::exec_2c::percent_rank_and_cume_dist_on_tied_data"
+    ]
+  },
+  {
+    "id": "M26_grouping_sets_ignored",
+    "why": "ROLLUP / CUBE / GROUPING SETS aggregate as an ordinary GROUP BY",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 20,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::a_grouping_column_reads_null_in_a_set_that_leaves_it_out",
+      "aggregation_tests::exec_2e::a_window_function_over_grouping_sets",
+      "aggregation_tests::exec_2e::cube_a_b_adds_the_set_of_b_alone",
+      "aggregation_tests::exec_2e::cube_is_not_rollup",
+      "aggregation_tests::exec_2e::duplicate_grouping_sets_are_kept_as_the_standard_says",
+      "aggregation_tests::exec_2e::empty_input_still_yields_the_empty_sets_row",
+      "aggregation_tests::exec_2e::grouping_expressions_may_be_expressions_and_appear_in_the_select_list",
+      "aggregation_tests::exec_2e::grouping_in_having_and_order_by",
+      "aggregation_tests::exec_2e::grouping_is_zero_for_a_real_null_and_one_for_an_aggregated_away_column",
+      "aggregation_tests::exec_2e::grouping_sets_are_one_operator_and_one_pass",
+      "aggregation_tests::exec_2e::grouping_sets_compose_with_where_having_order_by_distinct_and_limit",
+      "aggregation_tests::exec_2e::grouping_sets_one_pass_three_groupings",
+      "aggregation_tests::exec_2e::grouping_sets_work_in_a_subquery_cte_and_set_operation",
+      "aggregation_tests::exec_2e::grouping_with_several_arguments_is_a_bit_string",
+      "aggregation_tests::exec_2e::groups_of_all_sets_count_against_max_group_count",
+      "aggregation_tests::exec_2e::mixing_plain_columns_with_an_extension_multiplies_the_sets",
+      "aggregation_tests::exec_2e::rollup_and_cube_of_one_column",
+      "aggregation_tests::exec_2f::distinct_with_filter_and_with_grouping_sets",
+      "aggregation_tests::exec_2f::filter_with_grouping_sets_applies_in_every_set",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M27_grouping_columns_read_the_representative_row",
+    "why": "an omitted grouping column keeps the representative row's value instead of NULL",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 12,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::a_grouping_column_reads_null_in_a_set_that_leaves_it_out",
+      "aggregation_tests::exec_2e::a_window_function_over_grouping_sets",
+      "aggregation_tests::exec_2e::cube_a_b_adds_the_set_of_b_alone",
+      "aggregation_tests::exec_2e::grouping_expressions_may_be_expressions_and_appear_in_the_select_list",
+      "aggregation_tests::exec_2e::grouping_in_having_and_order_by",
+      "aggregation_tests::exec_2e::grouping_is_zero_for_a_real_null_and_one_for_an_aggregated_away_column",
+      "aggregation_tests::exec_2e::grouping_sets_compose_with_where_having_order_by_distinct_and_limit",
+      "aggregation_tests::exec_2e::grouping_sets_one_pass_three_groupings",
+      "aggregation_tests::exec_2e::grouping_sets_work_in_a_subquery_cte_and_set_operation",
+      "aggregation_tests::exec_2f::distinct_with_filter_and_with_grouping_sets",
+      "aggregation_tests::exec_2f::filter_with_grouping_sets_applies_in_every_set",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M28_empty_set_has_no_row_over_empty_input",
+    "why": "the () grouping set yields no row when the input is empty",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 3,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::empty_input_still_yields_the_empty_sets_row",
+      "aggregation_tests::exec_2f::distinct_on_a_null_only_column_and_on_empty_input",
+      "aggregation_tests::exec_2f::filter_on_a_global_aggregate_over_no_rows"
+    ]
+  },
+  {
+    "id": "M29_grouping_set_limit_unchecked",
+    "why": "max_grouping_sets_per_statement is not enforced",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::the_number_of_grouping_sets_is_bounded"
+    ]
+  },
+  {
+    "id": "M30_partition_limit_unchecked",
+    "why": "max_window_partition_rows is not enforced",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2a::a_partition_larger_than_the_limit_is_a_resource_limit"
+    ]
+  },
+  {
+    "id": "M31_distinct_state_not_counted",
+    "why": "the DISTINCT seen-set is not counted against max_aggregate_state_bytes",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "aggregation_tests::exec_2f::distinct_state_is_bounded_by_max_aggregate_state_bytes"
+    ]
+  },
+  {
+    "id": "M32_null_filter_counts_as_true",
+    "why": "a FILTER condition that is UNKNOWN keeps the row",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 8,
+    "failed_tests": [
+      "aggregation_tests::exec_2f::a_filter_that_is_always_false_or_always_true",
+      "aggregation_tests::exec_2f::a_null_filter_condition_excludes_the_row",
+      "aggregation_tests::exec_2f::filter_applies_to_one_aggregate_not_the_whole_select",
+      "aggregation_tests::exec_2f::filter_in_having_and_order_by",
+      "aggregation_tests::exec_2f::filter_per_group",
+      "aggregation_tests::exec_2f::filter_skips_are_counted",
+      "aggregation_tests::exec_2f::filter_with_grouping_sets_applies_in_every_set",
+      "aggregation_tests::exec_2f::two_aggregates_with_different_filters_in_one_select"
+    ]
+  },
+  {
+    "id": "M33_null_row_range_offset_is_not_peers_only",
+    "why": "a NULL current row's RANGE offset start reaches back to the partition start",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2b::null_order_keys_are_peers_and_outside_every_value_offset"
+    ]
+  },
+  {
+    "id": "M34_nth_value_off_by_one",
+    "why": "NTH_VALUE(x, n) returns the (n+1)-th row",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2c::nth_value_counts_within_the_frame"
+    ]
+  },
+  {
+    "id": "M35_first_value_is_the_partitions_first",
+    "why": "FIRST_VALUE ignores the frame start",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 2,
+    "failed_tests": [
+      "window_tests::exec_2b::first_value_sees_the_whole_partition_only_under_an_explicit_frame",
+      "window_tests::exec_2c::first_value_is_the_frames_first_row"
+    ]
+  },
+  {
+    "id": "M36_rows_current_row_takes_peers",
+    "why": "ROWS ... CURRENT ROW end includes the row's peers",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 0,
+    "failed_tests": []
+  },
+  {
+    "id": "M37_lead_goes_backwards",
+    "why": "LEAD looks at the previous row",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 2,
+    "failed_tests": [
+      "window_tests::exec_2c::lag_and_lead_take_an_offset_and_a_default",
+      "window_tests::exec_2c::previous_value_is_null_for_the_first_row"
+    ]
+  },
+  {
+    "id": "M38_rows_following_start_goes_backwards",
+    "why": "N FOLLOWING as a ROWS frame start counts backwards",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 4,
+    "failed_tests": [
+      "window_tests::exec_2b::a_frame_that_falls_off_the_partition_is_clamped_or_empty",
+      "window_tests::exec_2b::first_value_sees_the_whole_partition_only_under_an_explicit_frame",
+      "window_tests::exec_2b::rows_frames_count_individual_rows",
+      "window_tests::exec_2c::nth_value_counts_within_the_frame"
+    ]
+  },
+  {
+    "id": "M39_grouping_sets_emitted_group_major",
+    "why": "groups are not emitted set by set",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 10,
+    "failed_tests": [
+      "aggregation_tests::exec_2e::a_window_function_over_grouping_sets",
+      "aggregation_tests::exec_2e::cube_a_b_adds_the_set_of_b_alone",
+      "aggregation_tests::exec_2e::duplicate_grouping_sets_are_kept_as_the_standard_says",
+      "aggregation_tests::exec_2e::grouping_expressions_may_be_expressions_and_appear_in_the_select_list",
+      "aggregation_tests::exec_2e::grouping_is_zero_for_a_real_null_and_one_for_an_aggregated_away_column",
+      "aggregation_tests::exec_2e::grouping_sets_one_pass_three_groupings",
+      "aggregation_tests::exec_2e::grouping_with_several_arguments_is_a_bit_string",
+      "aggregation_tests::exec_2f::distinct_with_filter_and_with_grouping_sets",
+      "aggregation_tests::exec_2f::filter_with_grouping_sets_applies_in_every_set",
+      "mission2_corpus_tests::the_mission_2_corpus_returns_the_expected_rows"
+    ]
+  },
+  {
+    "id": "M40_window_function_count_limit_off",
+    "why": "max_window_functions_per_statement is not enforced",
+    "compiled": true,
+    "tests_run": 147,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2a::too_many_window_functions_is_a_resource_limit"
+    ]
+  }
+]

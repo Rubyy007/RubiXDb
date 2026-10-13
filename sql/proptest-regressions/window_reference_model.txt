@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 82b927aaa53fb7766f13fe277090c593ffcdb262b860c8c9a0bf5199ec0a731d # shrinks to rows = [(1, None, None, None), (2, None, Some(0), None)], frame = Some(Frame { units: Range, start: UnboundedPreceding, end: Preceding(1) }), partition = false, desc = false, nulls = Some(true)
+cc 062c9e8d2225ee09fb74b78771e2b8cb1571f83e200fce596f6e4fc1287ecd77 # shrinks to rows = [(1, None, Some(-2), None), (2, None, Some(-2), None)], frame = Some(Frame { units: Rows, start: Preceding(2), end: CurrentRow }), partition = false, desc = false, nulls = None

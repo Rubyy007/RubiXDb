@@ -1,0 +1,13 @@
+[
+  {
+    "id": "M15_rows_metric_ignores_the_iterations",
+    "why": "recursive_cte_rows_emitted_total counts the seed only",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        ec.metrics\n            .record_recursive_cte_rows_emitted((result.len() - before) as u64);\n        // On an error the statement ends",
+        "new": "        let _ = before;\n        // On an error the statement ends"
+      }
+    ]
+  }
+]

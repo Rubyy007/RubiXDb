@@ -1,0 +1,687 @@
+[
+  {
+    "id": "M01_fixpoint_does_not_stop_on_an_empty_iteration",
+    "why": "the loop no longer ends when an iteration produces nothing (a query that should stop early runs to the depth bound)",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 48,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::contexts::a_recursive_cte_in_a_set_operation_and_under_order_by_and_limit",
+      "recursive_tests::contexts::a_recursive_cte_inside_a_derived_table",
+      "recursive_tests::contexts::a_recursive_cte_inside_scalar_in_and_exists_subqueries",
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::an_ordinary_cte_over_a_recursive_one_is_materialized_once_over_the_fixpoint",
+      "recursive_tests::contexts::earlier_and_enclosing_ctes_are_visible_where_the_rules_say",
+      "recursive_tests::contexts::inside_a_correlated_subquery_the_consumer_runs_per_outer_row_and_the_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::contexts::the_recursion_reads_the_statements_snapshot_while_another_session_writes",
+      "recursive_tests::contexts::two_recursive_ctes_with_different_operators_keep_their_own_stop_conditions",
+      "recursive_tests::contexts::with_recursive_before_delete_and_update_and_inside_their_subqueries",
+      "recursive_tests::counter::a_seed_with_an_aggregate_runs_once",
+      "recursive_tests::counter::a_tree_walk_visits_every_node_once_with_its_depth",
+      "recursive_tests::counter::an_empty_recursive_term_stops_after_one_iteration",
+      "recursive_tests::counter::an_empty_seed_terminates_at_once_with_no_rows",
+      "recursive_tests::counter::each_iteration_sees_the_previous_iterations_rows_and_only_those",
+      "recursive_tests::counter::the_ancestor_chain_comes_out_in_the_order_of_the_walk_up",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::counter::the_factorial_accumulator_ends_with_ten_factorial",
+      "recursive_tests::counter::the_recursive_reference_joined_to_a_base_table",
+      "recursive_tests::counter::the_result_works_with_the_outer_clauses",
+      "recursive_tests::counter::the_seed_is_evaluated_once_whatever_the_number_of_iterations",
+      "recursive_tests::counter::the_term_may_contain_uncorrelated_and_correlated_subqueries",
+      "recursive_tests::counter::the_working_table_beats_a_catalog_table_of_the_same_name",
+      "recursive_tests::diff::random_trees_walk_to_the_levels_the_model_computes",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::limits::the_definitions_bound_counts_the_recursive_ctes_a_statement_runs",
+      "recursive_tests::limits::the_depth_bound_is_configurable_and_exact_at_small_values_too",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::shape::a_seed_that_is_a_set_operation_runs_inside_the_seed",
+      "recursive_tests::shape::a_set_operation_inside_a_branch_of_the_term_runs_inside_the_term",
+      "recursive_tests::shape::the_term_may_be_an_intersect_or_except_with_the_reference_in_one_branch",
+      "recursive_tests::shape::with_three_operands_the_last_union_all_is_the_separator",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union",
+      "recursive_tests::union::a_seed_with_duplicates_is_deduplicated_under_union_and_kept_under_union_all",
+      "recursive_tests::union::distinct_in_the_term_is_allowed_under_union",
+      "recursive_tests::union::rows_with_nulls_are_one_row_for_the_stop_condition",
+      "recursive_tests::union::the_counter_with_union_gives_the_same_rows_and_stops_at_the_end",
+      "recursive_tests::union::union_compares_whole_rows_not_just_the_first_column",
+      "recursive_tests::union::union_deduplicates_against_everything_produced_so_far_not_just_the_last_iteration",
+      "recursive_tests::union::union_stops_when_nothing_new_appears_union_all_stops_when_nothing_appears"
+    ]
+  },
+  {
+    "id": "M02_union_compares_only_the_first_column",
+    "why": "the UNION stop condition / deduplication keys a row by its first column only",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 2,
+    "failed_tests": [
+      "recursive_tests::union::rows_with_nulls_are_one_row_for_the_stop_condition",
+      "recursive_tests::union::union_compares_whole_rows_not_just_the_first_column"
+    ]
+  },
+  {
+    "id": "M03_union_treats_null_as_different_from_null",
+    "why": "the null-safe distinctness predicate says NULL and NULL differ, so a row with a NULL is new every iteration",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 2,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::union::rows_with_nulls_are_one_row_for_the_stop_condition"
+    ]
+  },
+  {
+    "id": "M04_depth_bound_off_by_one",
+    "why": "the depth bound admits one iteration too many",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 7,
+    "failed_tests": [
+      "recursive_tests::diff::a_random_cycle_under_union_all_is_stopped_by_the_depth_bound_not_by_luck",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::the_depth_bound_is_configurable_and_exact_at_small_values_too",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound"
+    ]
+  },
+  {
+    "id": "M05_row_bound_off_by_one",
+    "why": "the row bound admits one row too many",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact"
+    ]
+  },
+  {
+    "id": "M06_seed_re_executed_every_iteration",
+    "why": "the seed plan is run again at the start of every iteration",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 2,
+    "failed_tests": [
+      "recursive_tests::counter::a_seed_with_an_aggregate_runs_once",
+      "recursive_tests::counter::the_seed_is_evaluated_once_whatever_the_number_of_iterations"
+    ]
+  },
+  {
+    "id": "M07_term_also_reads_the_current_iterations_output",
+    "why": "after an iteration the term is evaluated once more against the rows that iteration just produced, within the same iteration",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 42,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::contexts::a_recursive_cte_in_a_set_operation_and_under_order_by_and_limit",
+      "recursive_tests::contexts::a_recursive_cte_inside_a_derived_table",
+      "recursive_tests::contexts::a_recursive_cte_inside_scalar_in_and_exists_subqueries",
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::an_ordinary_cte_over_a_recursive_one_is_materialized_once_over_the_fixpoint",
+      "recursive_tests::contexts::earlier_and_enclosing_ctes_are_visible_where_the_rules_say",
+      "recursive_tests::contexts::inside_a_correlated_subquery_the_consumer_runs_per_outer_row_and_the_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::contexts::the_recursion_reads_the_statements_snapshot_while_another_session_writes",
+      "recursive_tests::contexts::two_recursive_ctes_with_different_operators_keep_their_own_stop_conditions",
+      "recursive_tests::counter::a_seed_with_an_aggregate_runs_once",
+      "recursive_tests::counter::a_tree_walk_visits_every_node_once_with_its_depth",
+      "recursive_tests::counter::each_iteration_sees_the_previous_iterations_rows_and_only_those",
+      "recursive_tests::counter::the_ancestor_chain_comes_out_in_the_order_of_the_walk_up",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::counter::the_factorial_accumulator_ends_with_ten_factorial",
+      "recursive_tests::counter::the_recursive_reference_joined_to_a_base_table",
+      "recursive_tests::counter::the_result_works_with_the_outer_clauses",
+      "recursive_tests::counter::the_seed_is_evaluated_once_whatever_the_number_of_iterations",
+      "recursive_tests::counter::the_term_may_contain_uncorrelated_and_correlated_subqueries",
+      "recursive_tests::counter::the_working_table_beats_a_catalog_table_of_the_same_name",
+      "recursive_tests::diff::a_random_cycle_under_union_all_is_stopped_by_the_depth_bound_not_by_luck",
+      "recursive_tests::diff::random_trees_walk_to_the_levels_the_model_computes",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::limits::the_depth_bound_is_configurable_and_exact_at_small_values_too",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::shape::a_seed_that_is_a_set_operation_runs_inside_the_seed",
+      "recursive_tests::shape::the_term_may_be_an_intersect_or_except_with_the_reference_in_one_branch",
+      "recursive_tests::shape::with_three_operands_the_last_union_all_is_the_separator",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union",
+      "recursive_tests::union::a_seed_with_duplicates_is_deduplicated_under_union_and_kept_under_union_all",
+      "recursive_tests::union::the_counter_with_union_gives_the_same_rows_and_stops_at_the_end",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound",
+      "recursive_tests::union::union_stops_when_nothing_new_appears_union_all_stops_when_nothing_appears"
+    ]
+  },
+  {
+    "id": "M08_working_table_accumulates_all_rows_so_far",
+    "why": "the term reads every row produced so far instead of only the previous iteration's",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 40,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::contexts::a_recursive_cte_in_a_set_operation_and_under_order_by_and_limit",
+      "recursive_tests::contexts::a_recursive_cte_inside_a_derived_table",
+      "recursive_tests::contexts::a_recursive_cte_inside_scalar_in_and_exists_subqueries",
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::an_ordinary_cte_over_a_recursive_one_is_materialized_once_over_the_fixpoint",
+      "recursive_tests::contexts::earlier_and_enclosing_ctes_are_visible_where_the_rules_say",
+      "recursive_tests::contexts::inside_a_correlated_subquery_the_consumer_runs_per_outer_row_and_the_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::contexts::the_recursion_reads_the_statements_snapshot_while_another_session_writes",
+      "recursive_tests::contexts::two_recursive_ctes_with_different_operators_keep_their_own_stop_conditions",
+      "recursive_tests::contexts::with_recursive_before_delete_and_update_and_inside_their_subqueries",
+      "recursive_tests::counter::a_seed_with_an_aggregate_runs_once",
+      "recursive_tests::counter::a_tree_walk_visits_every_node_once_with_its_depth",
+      "recursive_tests::counter::each_iteration_sees_the_previous_iterations_rows_and_only_those",
+      "recursive_tests::counter::the_ancestor_chain_comes_out_in_the_order_of_the_walk_up",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::counter::the_factorial_accumulator_ends_with_ten_factorial",
+      "recursive_tests::counter::the_recursive_reference_joined_to_a_base_table",
+      "recursive_tests::counter::the_result_works_with_the_outer_clauses",
+      "recursive_tests::counter::the_seed_is_evaluated_once_whatever_the_number_of_iterations",
+      "recursive_tests::counter::the_term_may_contain_uncorrelated_and_correlated_subqueries",
+      "recursive_tests::counter::the_working_table_beats_a_catalog_table_of_the_same_name",
+      "recursive_tests::diff::a_random_cycle_under_union_all_is_stopped_by_the_depth_bound_not_by_luck",
+      "recursive_tests::diff::random_trees_walk_to_the_levels_the_model_computes",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::limits::the_definitions_bound_counts_the_recursive_ctes_a_statement_runs",
+      "recursive_tests::limits::the_depth_bound_is_configurable_and_exact_at_small_values_too",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::shape::a_seed_that_is_a_set_operation_runs_inside_the_seed",
+      "recursive_tests::shape::the_term_may_be_an_intersect_or_except_with_the_reference_in_one_branch",
+      "recursive_tests::shape::with_three_operands_the_last_union_all_is_the_separator",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union",
+      "recursive_tests::union::a_seed_with_duplicates_is_deduplicated_under_union_and_kept_under_union_all",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound"
+    ]
+  },
+  {
+    "id": "M09_recursive_reference_resolves_to_the_catalog_table",
+    "why": "when a catalog table has the CTE's name, the recursive reference reads the catalog table instead of the working table",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 24,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::binder::a_self_referencing_union_body_is_a_recursive_cte_with_a_seed_and_a_term",
+      "recursive_tests::binder::column_names_come_from_the_list_or_the_seed_and_types_from_the_seed",
+      "recursive_tests::binder::inside_the_term_the_cte_name_is_the_working_table_not_the_catalog_table",
+      "recursive_tests::binder::several_recursive_ctes_and_a_dead_one_bind",
+      "recursive_tests::binder::the_terms_column_types_must_equal_the_seeds",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::counter::an_empty_recursive_term_stops_after_one_iteration",
+      "recursive_tests::counter::an_empty_seed_terminates_at_once_with_no_rows",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::counter::the_result_works_with_the_outer_clauses",
+      "recursive_tests::counter::the_working_table_beats_a_catalog_table_of_the_same_name",
+      "recursive_tests::limits::a_deadline_stops_a_recursion",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::a_refused_dml_statement_changes_nothing",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::limits::the_bytes_held_are_bounded",
+      "recursive_tests::limits::the_depth_bound_is_configurable_and_exact_at_small_values_too",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::explain_shows_the_seed_and_the_recursive_term_apart_never_a_flat_union",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::union::the_counter_with_union_gives_the_same_rows_and_stops_at_the_end"
+    ]
+  },
+  {
+    "id": "M10_two_references_silently_accepted",
+    "why": "a second reference to the recursive CTE in the term is accepted",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::binder::the_reference_must_appear_exactly_once_in_the_term"
+    ]
+  },
+  {
+    "id": "M11_aggregate_in_the_term_silently_accepted",
+    "why": "aggregates, GROUP BY and HAVING in the recursive term are accepted",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 2,
+    "failed_tests": [
+      "recursive_tests::binder::several_recursive_ctes_and_a_dead_one_bind",
+      "recursive_tests::binder::the_term_may_not_aggregate_group_having_order_or_limit"
+    ]
+  },
+  {
+    "id": "M12_order_by_in_the_term_silently_accepted",
+    "why": "ORDER BY in the recursive term is accepted",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::binder::the_term_may_not_aggregate_group_having_order_or_limit"
+    ]
+  },
+  {
+    "id": "M13_explain_prints_the_recursion_as_a_flat_union",
+    "why": "EXPLAIN labels the recursive CTE as a set operation",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 3,
+    "failed_tests": [
+      "recursive_tests::observability::a_recursive_cte_read_twice_is_printed_once",
+      "recursive_tests::observability::explain_of_a_term_with_a_set_operation_shows_it_inside_the_recursive_part",
+      "recursive_tests::observability::explain_shows_the_seed_and_the_recursive_term_apart_never_a_flat_union"
+    ]
+  },
+  {
+    "id": "M14_iteration_counter_not_incremented",
+    "why": "recursive_cte_iterations_total is never incremented",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 23,
+    "failed_tests": [
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::an_ordinary_cte_over_a_recursive_one_is_materialized_once_over_the_fixpoint",
+      "recursive_tests::contexts::inside_a_correlated_subquery_the_consumer_runs_per_outer_row_and_the_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::counter::a_seed_with_an_aggregate_runs_once",
+      "recursive_tests::counter::an_empty_recursive_term_stops_after_one_iteration",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::counter::the_seed_is_evaluated_once_whatever_the_number_of_iterations",
+      "recursive_tests::diff::a_random_cycle_under_union_all_is_stopped_by_the_depth_bound_not_by_luck",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::rows_with_nulls_are_one_row_for_the_stop_condition",
+      "recursive_tests::union::the_counter_with_union_gives_the_same_rows_and_stops_at_the_end",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound",
+      "recursive_tests::union::union_compares_whole_rows_not_just_the_first_column",
+      "recursive_tests::union::union_stops_when_nothing_new_appears_union_all_stops_when_nothing_appears"
+    ]
+  },
+  {
+    "id": "M15_rows_metric_ignores_the_iterations",
+    "why": "recursive_cte_rows_emitted_total counts the seed only",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 10,
+    "failed_tests": [
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union"
+    ]
+  },
+  {
+    "id": "M16_rows_metric_ignores_the_seed",
+    "why": "recursive_cte_rows_emitted_total omits the seed rows",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 11,
+    "failed_tests": [
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::counter::an_empty_recursive_term_stops_after_one_iteration",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union"
+    ]
+  },
+  {
+    "id": "M17_union_treated_as_union_all",
+    "why": "the planner ignores the distinct flag: a UNION recursion keeps duplicates and never sees a cycle close",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 13,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::contexts::two_recursive_ctes_with_different_operators_keep_their_own_stop_conditions",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::observability::explain_shows_the_seed_and_the_recursive_term_apart_never_a_flat_union",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::shape::a_set_operation_inside_a_branch_of_the_term_runs_inside_the_term",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union",
+      "recursive_tests::union::a_seed_with_duplicates_is_deduplicated_under_union_and_kept_under_union_all",
+      "recursive_tests::union::rows_with_nulls_are_one_row_for_the_stop_condition",
+      "recursive_tests::union::union_compares_whole_rows_not_just_the_first_column",
+      "recursive_tests::union::union_deduplicates_against_everything_produced_so_far_not_just_the_last_iteration",
+      "recursive_tests::union::union_stops_when_nothing_new_appears_union_all_stops_when_nothing_appears"
+    ]
+  },
+  {
+    "id": "M18_union_all_treated_as_union",
+    "why": "the planner always deduplicates: a UNION ALL recursion drops repeated rows",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 10,
+    "failed_tests": [
+      "recursive_tests::diff::a_random_cycle_under_union_all_is_stopped_by_the_depth_bound_not_by_luck",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::limits::the_row_bound_fires_for_a_recursion_whose_depth_is_small",
+      "recursive_tests::observability::explain_shows_the_seed_and_the_recursive_term_apart_never_a_flat_union",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::shape::a_seed_that_is_a_set_operation_runs_inside_the_seed",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union",
+      "recursive_tests::union::a_seed_with_duplicates_is_deduplicated_under_union_and_kept_under_union_all",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound",
+      "recursive_tests::union::union_stops_when_nothing_new_appears_union_all_stops_when_nothing_appears"
+    ]
+  },
+  {
+    "id": "M19_definitions_bound_not_enforced",
+    "why": "max_recursive_cte_definitions is never checked",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::limits::the_definitions_bound_counts_the_recursive_ctes_a_statement_runs"
+    ]
+  },
+  {
+    "id": "M20_byte_bound_removed",
+    "why": "the bytes held by a recursion are not bounded",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::limits::the_bytes_held_are_bounded"
+    ]
+  },
+  {
+    "id": "M21_earlier_ctes_visible_in_the_term",
+    "why": "a CTE defined before the recursive one is visible inside the recursive term",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::binder::what_other_ctes_may_see_inside_a_recursive_definition"
+    ]
+  },
+  {
+    "id": "M22_seed_may_name_the_cte",
+    "why": "the CTE's own name in its seed is not recognised as a seed reference",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::binder::the_cte_name_in_its_seed_is_an_error"
+    ]
+  },
+  {
+    "id": "M23_nullable_side_reference_accepted",
+    "why": "the recursive reference may be on the nullable side of an outer join",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::binder::the_reference_must_be_a_from_item_of_the_term_itself"
+    ]
+  },
+  {
+    "id": "M24_reference_inside_a_subquery_accepted",
+    "why": "the recursive reference may sit inside a subquery or derived table of the term",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::binder::the_reference_must_be_a_from_item_of_the_term_itself"
+    ]
+  },
+  {
+    "id": "M25_seed_and_term_swapped_in_the_plan",
+    "why": "the planner plans the term as the seed",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 58,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::contexts::a_recursive_cte_in_a_set_operation_and_under_order_by_and_limit",
+      "recursive_tests::contexts::a_recursive_cte_inside_a_derived_table",
+      "recursive_tests::contexts::a_recursive_cte_inside_scalar_in_and_exists_subqueries",
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::an_ordinary_cte_over_a_recursive_one_is_materialized_once_over_the_fixpoint",
+      "recursive_tests::contexts::earlier_and_enclosing_ctes_are_visible_where_the_rules_say",
+      "recursive_tests::contexts::inside_a_correlated_subquery_the_consumer_runs_per_outer_row_and_the_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::contexts::the_recursion_reads_the_statements_snapshot_while_another_session_writes",
+      "recursive_tests::contexts::two_recursive_ctes_with_different_operators_keep_their_own_stop_conditions",
+      "recursive_tests::contexts::with_recursive_before_delete_and_update_and_inside_their_subqueries",
+      "recursive_tests::counter::a_seed_with_an_aggregate_runs_once",
+      "recursive_tests::counter::a_tree_walk_visits_every_node_once_with_its_depth",
+      "recursive_tests::counter::an_empty_recursive_term_stops_after_one_iteration",
+      "recursive_tests::counter::an_empty_seed_terminates_at_once_with_no_rows",
+      "recursive_tests::counter::each_iteration_sees_the_previous_iterations_rows_and_only_those",
+      "recursive_tests::counter::the_ancestor_chain_comes_out_in_the_order_of_the_walk_up",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::counter::the_factorial_accumulator_ends_with_ten_factorial",
+      "recursive_tests::counter::the_recursive_reference_joined_to_a_base_table",
+      "recursive_tests::counter::the_result_works_with_the_outer_clauses",
+      "recursive_tests::counter::the_seed_is_evaluated_once_whatever_the_number_of_iterations",
+      "recursive_tests::counter::the_term_may_contain_uncorrelated_and_correlated_subqueries",
+      "recursive_tests::counter::the_working_table_beats_a_catalog_table_of_the_same_name",
+      "recursive_tests::diff::a_random_cycle_under_union_all_is_stopped_by_the_depth_bound_not_by_luck",
+      "recursive_tests::diff::random_trees_walk_to_the_levels_the_model_computes",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::a_deadline_stops_a_recursion",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::a_refused_dml_statement_changes_nothing",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::limits::the_bytes_held_are_bounded",
+      "recursive_tests::limits::the_definitions_bound_counts_the_recursive_ctes_a_statement_runs",
+      "recursive_tests::limits::the_depth_bound_is_configurable_and_exact_at_small_values_too",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::limits::the_row_bound_fires_for_a_recursion_whose_depth_is_small",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::explain_of_a_term_with_a_set_operation_shows_it_inside_the_recursive_part",
+      "recursive_tests::observability::explain_shows_the_seed_and_the_recursive_term_apart_never_a_flat_union",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::shape::a_seed_that_is_a_set_operation_runs_inside_the_seed",
+      "recursive_tests::shape::a_set_operation_inside_a_branch_of_the_term_runs_inside_the_term",
+      "recursive_tests::shape::the_term_may_be_an_intersect_or_except_with_the_reference_in_one_branch",
+      "recursive_tests::shape::with_three_operands_the_last_union_all_is_the_separator",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union",
+      "recursive_tests::union::a_seed_with_duplicates_is_deduplicated_under_union_and_kept_under_union_all",
+      "recursive_tests::union::distinct_in_the_term_is_allowed_under_union",
+      "recursive_tests::union::rows_with_nulls_are_one_row_for_the_stop_condition",
+      "recursive_tests::union::the_counter_with_union_gives_the_same_rows_and_stops_at_the_end",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound",
+      "recursive_tests::union::union_compares_whole_rows_not_just_the_first_column",
+      "recursive_tests::union::union_deduplicates_against_everything_produced_so_far_not_just_the_last_iteration",
+      "recursive_tests::union::union_stops_when_nothing_new_appears_union_all_stops_when_nothing_appears"
+    ]
+  },
+  {
+    "id": "M26_seed_term_type_check_removed",
+    "why": "the term's column types are not compared with the seed's",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::binder::the_terms_column_types_must_equal_the_seeds"
+    ]
+  },
+  {
+    "id": "M27_recursive_result_not_cached",
+    "why": "a recursive CTE read more than once runs its fixpoint once per reference",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 5,
+    "failed_tests": [
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::inside_a_correlated_subquery_the_consumer_runs_per_outer_row_and_the_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement"
+    ]
+  },
+  {
+    "id": "M28_over_clause_dropped_again",
+    "why": "the converter drops an OVER clause again (a window function silently runs as the plain function)",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 2,
+    "failed_tests": [
+      "recursive_tests::parser::a_window_function_is_refused_before_binding",
+      "recursive_tests::parser::an_over_clause_is_refused_everywhere_not_silently_dropped"
+    ]
+  },
+  {
+    "id": "M29_recursion_routed_through_the_materialization_node",
+    "why": "a recursive CTE reference is materialized by the non-recursive CTE path",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 56,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "recursive_tests::contexts::a_recursive_cte_in_a_set_operation_and_under_order_by_and_limit",
+      "recursive_tests::contexts::a_recursive_cte_inside_a_derived_table",
+      "recursive_tests::contexts::a_recursive_cte_inside_scalar_in_and_exists_subqueries",
+      "recursive_tests::contexts::a_recursive_cte_read_twice_runs_its_fixpoint_once",
+      "recursive_tests::contexts::an_ordinary_cte_over_a_recursive_one_is_materialized_once_over_the_fixpoint",
+      "recursive_tests::contexts::earlier_and_enclosing_ctes_are_visible_where_the_rules_say",
+      "recursive_tests::contexts::inside_a_correlated_subquery_the_consumer_runs_per_outer_row_and_the_fixpoint_once",
+      "recursive_tests::contexts::several_recursive_ctes_in_one_with_are_each_their_own_fixpoint",
+      "recursive_tests::contexts::the_recursion_reads_the_statements_snapshot_while_another_session_writes",
+      "recursive_tests::contexts::two_recursive_ctes_with_different_operators_keep_their_own_stop_conditions",
+      "recursive_tests::contexts::with_recursive_before_delete_and_update_and_inside_their_subqueries",
+      "recursive_tests::counter::a_seed_with_an_aggregate_runs_once",
+      "recursive_tests::counter::a_tree_walk_visits_every_node_once_with_its_depth",
+      "recursive_tests::counter::an_empty_recursive_term_stops_after_one_iteration",
+      "recursive_tests::counter::an_empty_seed_terminates_at_once_with_no_rows",
+      "recursive_tests::counter::each_iteration_sees_the_previous_iterations_rows_and_only_those",
+      "recursive_tests::counter::the_ancestor_chain_comes_out_in_the_order_of_the_walk_up",
+      "recursive_tests::counter::the_counter_yields_one_to_ten",
+      "recursive_tests::counter::the_factorial_accumulator_ends_with_ten_factorial",
+      "recursive_tests::counter::the_recursive_reference_joined_to_a_base_table",
+      "recursive_tests::counter::the_result_works_with_the_outer_clauses",
+      "recursive_tests::counter::the_seed_is_evaluated_once_whatever_the_number_of_iterations",
+      "recursive_tests::counter::the_term_may_contain_uncorrelated_and_correlated_subqueries",
+      "recursive_tests::counter::the_working_table_beats_a_catalog_table_of_the_same_name",
+      "recursive_tests::diff::a_random_cycle_under_union_all_is_stopped_by_the_depth_bound_not_by_luck",
+      "recursive_tests::diff::random_trees_walk_to_the_levels_the_model_computes",
+      "recursive_tests::diff::union_all_over_random_dags_matches_the_model_rows_and_iteration_count",
+      "recursive_tests::diff::union_over_random_graphs_with_cycles_matches_the_model",
+      "recursive_tests::limits::a_deadline_stops_a_recursion",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::a_refused_dml_statement_changes_nothing",
+      "recursive_tests::limits::the_bound_is_per_cte_not_shared",
+      "recursive_tests::limits::the_bytes_held_are_bounded",
+      "recursive_tests::limits::the_definitions_bound_counts_the_recursive_ctes_a_statement_runs",
+      "recursive_tests::limits::the_depth_bound_is_configurable_and_exact_at_small_values_too",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact",
+      "recursive_tests::limits::the_row_bound_fires_for_a_recursion_whose_depth_is_small",
+      "recursive_tests::observability::a_failed_recursion_still_reports_the_work_it_did",
+      "recursive_tests::observability::the_metrics_count_iterations_and_rows_across_every_recursive_cte_in_the_statement",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::shape::a_seed_that_is_a_set_operation_runs_inside_the_seed",
+      "recursive_tests::shape::a_set_operation_inside_a_branch_of_the_term_runs_inside_the_term",
+      "recursive_tests::shape::the_term_may_be_an_intersect_or_except_with_the_reference_in_one_branch",
+      "recursive_tests::shape::with_three_operands_the_last_union_all_is_the_separator",
+      "recursive_tests::union::a_cycle_terminates_by_itself_under_union",
+      "recursive_tests::union::a_diamond_gives_the_shared_node_twice_under_union_all_and_once_under_union",
+      "recursive_tests::union::a_seed_with_duplicates_is_deduplicated_under_union_and_kept_under_union_all",
+      "recursive_tests::union::distinct_in_the_term_is_allowed_under_union",
+      "recursive_tests::union::rows_with_nulls_are_one_row_for_the_stop_condition",
+      "recursive_tests::union::the_counter_with_union_gives_the_same_rows_and_stops_at_the_end",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound",
+      "recursive_tests::union::union_compares_whole_rows_not_just_the_first_column",
+      "recursive_tests::union::union_deduplicates_against_everything_produced_so_far_not_just_the_last_iteration",
+      "recursive_tests::union::union_stops_when_nothing_new_appears_union_all_stops_when_nothing_appears"
+    ]
+  },
+  {
+    "id": "M30_default_depth_changed",
+    "why": "the default max_recursive_cte_depth is 100",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 6,
+    "failed_tests": [
+      "recursive_tests::contexts::the_recursion_reads_the_statements_snapshot_while_another_session_writes",
+      "recursive_tests::limits::a_recursion_with_no_stop_condition_ends_in_a_typed_error_naming_the_cte",
+      "recursive_tests::limits::the_defaults_are_the_documented_values",
+      "recursive_tests::limits::the_depth_bound_is_exact_one_thousand_iterations_pass_and_one_more_fails",
+      "recursive_tests::shape::a_parenthesised_right_operand_is_the_whole_recursive_term",
+      "recursive_tests::union::the_same_cycle_under_union_all_runs_into_the_depth_bound"
+    ]
+  },
+  {
+    "id": "M31_default_row_bound_changed",
+    "why": "the default max_recursive_cte_rows is 100,000",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::limits::the_defaults_are_the_documented_values"
+    ]
+  },
+  {
+    "id": "M32_default_definitions_changed",
+    "why": "the default max_recursive_cte_definitions is 9",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 2,
+    "failed_tests": [
+      "recursive_tests::limits::the_defaults_are_the_documented_values",
+      "recursive_tests::limits::the_definitions_bound_counts_the_recursive_ctes_a_statement_runs"
+    ]
+  },
+  {
+    "id": "M33_rows_emitted_not_checked_before_keeping",
+    "why": "the row bound is checked after the row is kept, not before",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 1,
+    "failed_tests": [
+      "recursive_tests::limits::the_row_bound_counts_every_row_the_seed_included_and_is_exact"
+    ]
+  },
+  {
+    "id": "M34_working_table_left_after_an_error",
+    "why": "the working table is not removed when the fixpoint fails (leaks into later reads)",
+    "compiled": true,
+    "tests_run": 141,
+    "failed_count": 0,
+    "failed_tests": []
+  }
+]

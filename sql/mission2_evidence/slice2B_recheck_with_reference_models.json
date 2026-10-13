@@ -1,0 +1,16 @@
+[
+  {
+    "id": "M36_rows_current_row_takes_peers",
+    "why": "ROWS ... CURRENT ROW end includes the row's peers",
+    "compiled": true,
+    "tests_run": 171,
+    "failed_count": 5,
+    "failed_tests": [
+      "window_reference_model::every_frame_boundary_combination_matches_the_model_on_every_dataset",
+      "window_reference_model::frames_without_an_order_by_match_the_model",
+      "window_reference_model::random_tables_and_windows_match_the_model",
+      "window_reference_model::two_functions_with_different_windows_in_one_select_each_match_the_model",
+      "window_tests::exec_2b::a_rows_frame_ignores_peers_even_when_the_order_by_has_ties"
+    ]
+  }
+]

@@ -997,7 +997,10 @@ async fn unsupported_grammar_is_a_stable_error_not_silently_accepted() {
     let (status, body) = sql_req(
         &router,
         ADMIN_KEY,
-        json!({ "sql": "SELECT id FROM t UNION SELECT id FROM t" }),
+        // SQL-mission-1 Slice E (2026-10-12): `UNION` used to be the example
+        // here; set operations are supported now, so this uses a join kind
+        // that is still outside the grammar. Nothing else in the test changed.
+        json!({ "sql": "SELECT id FROM t RIGHT JOIN t u ON t.id = u.id" }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1848,15 +1851,18 @@ async fn non_recursive_ctes_through_the_real_api() {
         assert_eq!(body["error"]["code"], "BIND_ERROR", "{sql}");
         assert!(body.to_string().contains(needle), "{sql}: {body}");
     }
-    // WITH RECURSIVE belongs to a later slice: typed, not a crash.
-    let (status, body) = sql_req(
+    // SQL-mission-1 Slice D (2026-10-12): this block asserted that `WITH
+    // RECURSIVE` was a typed UNSUPPORTED error ("belongs to a later slice").
+    // It is supported now; a list member that does not name itself is an
+    // ordinary CTE, so the statement runs (`recursive_ctes_through_the_real_api`
+    // holds the recursion assertions).
+    let r = exec_sql(
         &router,
         ADMIN_KEY,
-        json!({ "sql": "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT * FROM r" }),
+        "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT * FROM r",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "UNSUPPORTED");
+    assert_eq!(int_cells(&r), vec![1]);
     // A CTE inside a subquery does not leak; a dead CTE with a bad body is an error.
     let (status, body) = sql_req(
         &router,
@@ -1887,6 +1893,739 @@ async fn non_recursive_ctes_through_the_real_api() {
     let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": chain(65) })).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert_eq!(body["error"]["code"], "RESOURCE_LIMIT");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -----------------------------------------------------------------
+// SQL-mission-1, Slice E: set operations through the real HTTP stack.
+// -----------------------------------------------------------------
+
+/// `sa` = (1,1) (2,1) (3,2); `sb` = (1,1) (2,1) (3,1); `sc` = (1,3) (2,4);
+/// `sd` = (1,1); `se` empty; `sp` = (1, 1, NULL) (2, NULL, NULL);
+/// `sq` = (1, 1, NULL) (2, 1, 0) (3, NULL, NULL) -- columns `id, v` / `id, x, y`.
+async fn seed_set_tables(router: &Router) {
+    for t in ["sa", "sb", "sc", "sd", "se"] {
+        exec_sql(
+            router,
+            ADMIN_KEY,
+            &format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, v INTEGER)"),
+        )
+        .await;
+    }
+    for t in ["sp", "sq"] {
+        exec_sql(
+            router,
+            ADMIN_KEY,
+            &format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)"),
+        )
+        .await;
+    }
+    for sql in [
+        "INSERT INTO sa (id, v) VALUES (1, 1), (2, 1), (3, 2)",
+        "INSERT INTO sb (id, v) VALUES (1, 1), (2, 1), (3, 1)",
+        "INSERT INTO sc (id, v) VALUES (1, 3), (2, 4)",
+        "INSERT INTO sd (id, v) VALUES (1, 1)",
+        "INSERT INTO sp (id, x, y) VALUES (1, 1, NULL), (2, NULL, NULL)",
+        "INSERT INTO sq (id, x, y) VALUES (1, 1, NULL), (2, 1, 0), (3, NULL, NULL)",
+    ] {
+        exec_sql(router, ADMIN_KEY, sql).await;
+    }
+}
+
+#[tokio::test]
+async fn all_six_set_operators_through_the_real_api() {
+    let dir = temp_dir("setops_six");
+    let (state, router) = build_app(&dir);
+    seed_set_tables(&router).await;
+
+    // [1,1,2] against [1,1,1], each operator.
+    for (op, expected) in [
+        ("UNION", vec![1, 2]),
+        ("UNION ALL", vec![1, 1, 1, 1, 1, 2]),
+        ("INTERSECT", vec![1]),
+        ("INTERSECT ALL", vec![1, 1]),
+        ("EXCEPT", vec![2]),
+        ("EXCEPT ALL", vec![2]),
+    ] {
+        let r = exec_sql(
+            &router,
+            ADMIN_KEY,
+            &format!("SELECT v FROM sa {op} SELECT v FROM sb ORDER BY v"),
+        )
+        .await;
+        assert_eq!(int_cells(&r), expected, "{op}");
+    }
+    // [1,1,2] against [1]: the multiset forms keep one 1.
+    for (op, expected) in [("INTERSECT ALL", vec![1]), ("EXCEPT ALL", vec![1, 2]), ("EXCEPT", vec![2])] {
+        let r = exec_sql(
+            &router,
+            ADMIN_KEY,
+            &format!("SELECT v FROM sa {op} SELECT v FROM sd ORDER BY v"),
+        )
+        .await;
+        assert_eq!(int_cells(&r), expected, "{op}");
+    }
+
+    // The empty relation, in each position.
+    for (sql, expected) in [
+        ("SELECT v FROM sa UNION SELECT v FROM se ORDER BY v", vec![1, 2]),
+        ("SELECT v FROM se UNION ALL SELECT v FROM sa ORDER BY v", vec![1, 1, 2]),
+        ("SELECT v FROM sa INTERSECT SELECT v FROM se", vec![]),
+        ("SELECT v FROM se INTERSECT SELECT v FROM sa", vec![]),
+        ("SELECT v FROM sa EXCEPT SELECT v FROM se ORDER BY v", vec![1, 2]),
+        ("SELECT v FROM se EXCEPT SELECT v FROM sa", vec![]),
+    ] {
+        let r = exec_sql(&router, ADMIN_KEY, sql).await;
+        assert_eq!(int_cells(&r), expected, "{sql}");
+    }
+
+    // NULLs are one value for deduplication: {1, NULL} and {1, NULL} merge,
+    // {1, NULL} and {1, 0} do not, {NULL, NULL} and {NULL, NULL} merge.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT x, y FROM sp UNION SELECT x, y FROM sq ORDER BY x, y",
+    )
+    .await;
+    // sp u sq = {(1,NULL), (NULL,NULL), (1,0)}: ORDER BY x puts NULL last.
+    assert_eq!(r["result"]["row_count"], 3, "{r}");
+    assert_eq!(cell_values(&r, 0), vec![json!(1), json!(1), Value::Null], "{r}");
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT x, y FROM sp INTERSECT SELECT x, y FROM sq").await;
+    assert_eq!(r["result"]["row_count"], 2, "{r}");
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT x, y FROM sq EXCEPT SELECT x, y FROM sp").await;
+    assert_eq!(r["result"]["row_count"], 1, "{r}");
+    assert_eq!(cell_values(&r, 1), vec![json!(0)], "{r}");
+
+    // Column names come from the first branch; INTEGER and BIGINT widen to BIGINT.
+    exec_sql(&router, ADMIN_KEY, "CREATE TABLE sbig (id BIGINT PRIMARY KEY, w BIGINT)").await;
+    exec_sql(&router, ADMIN_KEY, "INSERT INTO sbig (id, w) VALUES (1, 9000000000)").await;
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT v AS first_name FROM sd UNION ALL SELECT w AS second_name FROM sbig ORDER BY first_name",
+    )
+    .await;
+    assert_eq!(r["result"]["columns"][0]["name"], "first_name");
+    assert_eq!(r["result"]["columns"][0]["type"], "bigint", "{r}");
+    assert_eq!(cell_values(&r, 0), vec![json!("1"), json!("9000000000")], "{r}");
+
+    // ORDER BY + LIMIT/OFFSET at the set level.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT v FROM sa UNION ALL SELECT v FROM sc ORDER BY v DESC LIMIT 2 OFFSET 1",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![3, 2]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "(SELECT v FROM sa) UNION ALL (SELECT v FROM sc) LIMIT 4",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 1, 2, 3], "the first rows of the concatenation");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_operation_precedence_and_associativity_through_the_real_api() {
+    let dir = temp_dir("setops_precedence");
+    let (state, router) = build_app(&dir);
+    // A = {1, 2}, B = {2, 3}, C = {3, 4}.
+    for (t, vals) in [("pa", "(1, 1), (2, 2)"), ("pb", "(1, 2), (2, 3)"), ("pc", "(1, 3), (2, 4)")] {
+        exec_sql(&router, ADMIN_KEY, &format!("CREATE TABLE {t} (id INTEGER PRIMARY KEY, v INTEGER)")).await;
+        exec_sql(&router, ADMIN_KEY, &format!("INSERT INTO {t} (id, v) VALUES {vals}")).await;
+    }
+    for (sql, expected) in [
+        // INTERSECT binds tighter.
+        ("SELECT v FROM pa UNION SELECT v FROM pb INTERSECT SELECT v FROM pc", vec![1, 2, 3]),
+        ("(SELECT v FROM pa UNION SELECT v FROM pb) INTERSECT SELECT v FROM pc", vec![3]),
+        ("SELECT v FROM pa EXCEPT SELECT v FROM pb INTERSECT SELECT v FROM pc", vec![1, 2]),
+        ("(SELECT v FROM pa EXCEPT SELECT v FROM pb) INTERSECT SELECT v FROM pc", vec![]),
+        // UNION / EXCEPT are left-associative.
+        ("SELECT v FROM pc EXCEPT SELECT v FROM pb UNION SELECT v FROM pa", vec![1, 2, 4]),
+        ("SELECT v FROM pc EXCEPT (SELECT v FROM pb UNION SELECT v FROM pa)", vec![4]),
+        ("SELECT v FROM pa UNION SELECT v FROM pb UNION SELECT v FROM pc", vec![1, 2, 3, 4]),
+    ] {
+        let wrapped = format!("SELECT v FROM ({sql}) AS r ORDER BY v");
+        let r = exec_sql(&router, ADMIN_KEY, &wrapped).await;
+        assert_eq!(int_cells(&r), expected, "{sql}");
+    }
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_operations_in_derived_tables_ctes_and_subqueries_through_the_real_api() {
+    let dir = temp_dir("setops_contexts");
+    let (state, router) = build_app(&dir);
+    seed_set_tables(&router).await;
+
+    // Derived table, with an outer WHERE.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT u.v FROM ((SELECT v FROM sa) UNION (SELECT v FROM sc)) AS u WHERE u.v > 1 ORDER BY u.v",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![2, 3, 4]);
+
+    // CTE body, the UNION ALL separator shape, and a CTE read twice.
+    let r = exec_sql(&router, ADMIN_KEY, "WITH cte AS (SELECT 1 UNION ALL SELECT 2) SELECT * FROM cte ORDER BY 1")
+        .await;
+    assert_eq!(r["result"]["row_count"], 2, "{r}");
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH u AS (SELECT v FROM sa UNION ALL SELECT v FROM sc) \
+         SELECT (SELECT COUNT(*) FROM u), (SELECT SUM(v) FROM u)",
+    )
+    .await;
+    assert_eq!(cell_values(&r, 0), vec![json!("5")], "{r}");
+    assert_eq!(cell_values(&r, 1), vec![json!("11")], "{r}");
+
+    // Scalar subquery: 0 rows -> NULL, 1 row -> the value, > 1 -> a runtime error.
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT (SELECT v FROM sa WHERE id = 99 UNION SELECT v FROM sc WHERE id = 99)").await;
+    assert_eq!(r["result"]["rows"][0][0]["type"], "null", "{r}");
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT (SELECT v FROM sa WHERE id = 3 UNION SELECT v FROM sb WHERE id = 99)").await;
+    assert_eq!(r["result"]["rows"][0][0]["value"], 2, "{r}");
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT (SELECT v FROM sa UNION SELECT v FROM sc)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "EXECUTION_ERROR");
+
+    // IN over the deduplicated result; NULL semantics.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM sa WHERE v IN (SELECT v FROM sc UNION SELECT v FROM sd) ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM sc WHERE v NOT IN (SELECT y FROM sq UNION SELECT v FROM sd)",
+    )
+    .await;
+    assert_eq!(r["result"]["row_count"], 0, "NOT IN over a set with a NULL keeps nothing: {r}");
+
+    // EXISTS.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM sd WHERE EXISTS (SELECT v FROM sa EXCEPT SELECT v FROM sb)",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id FROM sd WHERE EXISTS (SELECT v FROM sb EXCEPT SELECT v FROM sa)",
+    )
+    .await;
+    assert_eq!(r["result"]["row_count"], 0, "{r}");
+
+    // A correlated operand pair.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT id, (SELECT x.v FROM sc x WHERE x.id = sc.id UNION SELECT y.v FROM sc y WHERE y.id = sc.id) FROM sc ORDER BY id",
+    )
+    .await;
+    assert_eq!(cell_values(&r, 1), vec![json!(3), json!(4)], "{r}");
+
+    // UPDATE / DELETE WHERE.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "UPDATE sa SET v = v + 10 WHERE id IN (SELECT id FROM sc UNION SELECT id FROM sd)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 2, "{r}");
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "DELETE FROM sa WHERE v IN (SELECT v FROM sa INTERSECT SELECT v + 10 FROM sd)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 2, "{r}");
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT v FROM sa ORDER BY v").await;
+    assert_eq!(int_cells(&r), vec![2], "{r}");
+
+    // Parameters across operands.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({
+            "sql": "SELECT v FROM sc WHERE v >= $1 UNION SELECT v FROM sd WHERE v <= $2 ORDER BY v",
+            "params": [{"type": "integer", "value": 4}, {"type": "integer", "value": 1}]
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(int_cells(&body), vec![1, 4]);
+
+    // A reader may run set operations too.
+    let r = exec_sql(&router, READER_KEY, "SELECT v FROM sc UNION SELECT v FROM sd ORDER BY v").await;
+    assert_eq!(int_cells(&r), vec![1, 3, 4]);
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn set_operation_errors_and_limits_over_http() {
+    let dir = temp_dir("setops_errors");
+    let (state, router) = build_app(&dir);
+    seed_set_tables(&router).await;
+
+    let err = |sql: String| {
+        let router = router.clone();
+        async move { sql_req(&router, ADMIN_KEY, json!({ "sql": sql })).await }
+    };
+
+    // Column count and type problems are bind errors.
+    let (status, body) = err("SELECT id, v FROM sa UNION SELECT id FROM sc".to_string()).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("BIND_ERROR")), "{body}");
+    assert!(body.to_string().contains("same number of columns"), "{body}");
+    let (status, body) = err("SELECT 1 UNION SELECT 'a'".to_string()).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("BIND_ERROR")), "{body}");
+
+    // ORDER BY naming a table column of a branch is a bind error.
+    let (status, body) = err("SELECT v FROM sa UNION SELECT v FROM sc ORDER BY id".to_string()).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("BIND_ERROR")), "{body}");
+    assert!(body.to_string().contains("output columns"), "{body}");
+    let (status, _) = err("SELECT v FROM sa UNION SELECT v FROM sc ORDER BY sa.v".to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A missing table in branch 2 of 4 is NOT_FOUND, exactly like a forbidden one.
+    let (status, body) = err(
+        "SELECT v FROM sa UNION SELECT v FROM no_such UNION SELECT v FROM sc UNION SELECT v FROM sd".to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+
+    // Spellings outside the grammar fail closed.
+    for sql in [
+        "SELECT v FROM sa MINUS SELECT v FROM sc",
+        "SELECT v FROM sa UNION BY NAME SELECT v FROM sc",
+        "VALUES (1) UNION SELECT v FROM sc",
+    ] {
+        let (status, body) = err(sql.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}: {body}");
+        assert!(
+            body["error"]["code"] == "UNSUPPORTED" || body["error"]["code"] == "PARSE_ERROR",
+            "{sql}: {body}"
+        );
+    }
+
+    // 32 operands run; 33 are refused as RESOURCE_LIMIT.
+    let chain = |n: usize| (0..n).map(|_| "SELECT v FROM sd").collect::<Vec<_>>().join(" UNION ALL ");
+    let r = exec_sql(&router, ADMIN_KEY, &chain(32)).await;
+    assert_eq!(r["result"]["row_count"], 32);
+    let (status, body) = err(chain(33)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "RESOURCE_LIMIT");
+    assert!(body.to_string().contains("max_set_op_branches"), "{body}");
+    // A long chain (120 operands) is refused the same way -- and a longer one
+    // than the parser's nesting bound as a limit error too -- on the server's
+    // own threads, with no stack overflow.
+    let (status, body) = err(chain(120)).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::PAYLOAD_TOO_LARGE, Some("RESOURCE_LIMIT")), "{body}");
+    let (status, body) = err(chain(400)).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::PAYLOAD_TOO_LARGE, Some("RESOURCE_LIMIT")), "{body}");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn explain_of_a_set_operation_shows_the_precedence_and_executes_nothing_over_http() {
+    let dir = temp_dir("setops_explain");
+    let (state, router) = build_app(&dir);
+    seed_set_tables(&router).await;
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN SELECT v FROM sa UNION SELECT v FROM sb INTERSECT SELECT v FROM sc",
+    )
+    .await;
+    assert_eq!(r["result"]["kind"], "explain");
+    let text = r["result"]["plan_text"].as_str().unwrap();
+    assert!(text.contains("SetOp UNION branches=2 shape=UNION(#1, INTERSECT(#2, #3))"), "{text}");
+    assert!(text.contains("SetOp INTERSECT branches=2"), "{text}");
+    assert!(!text.contains("SetOp INTERSECT branches=2 shape"), "only the root prints the shape: {text}");
+    let union_at = text.find("SetOp UNION").unwrap();
+    let intersect_at = text.find("SetOp INTERSECT").unwrap();
+    assert!(union_at < intersect_at, "UNION is the parent of INTERSECT: {text}");
+
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "EXPLAIN SELECT v FROM sa INTERSECT (SELECT v FROM sb UNION SELECT v FROM sc)",
+    )
+    .await;
+    let text = r["result"]["plan_text"].as_str().unwrap();
+    assert!(text.contains("shape=INTERSECT(#1, UNION(#2, #3))"), "{text}");
+
+    // EXPLAIN never ran anything: the data is untouched and nothing was returned.
+    assert!(r["result"].get("rows").is_none(), "{r}");
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -----------------------------------------------------------------
+// SQL-mission-1, Slice D: WITH RECURSIVE through the real HTTP stack.
+// -----------------------------------------------------------------
+
+/// `rt(id, parent)`: 1 root; 2, 3 under 1; 4, 5 under 2; 6 under 3; 7 under 6.
+/// `cy(id, nxt)`: 1 -> 2 -> 3 -> 1. `ed(id, src, dst)`: the diamond 1->2, 1->3,
+/// 2->4, 3->4, 4->5. `bs(id, v)`: v = 1..5.
+async fn seed_recursion_tables(router: &Router) {
+    for sql in [
+        "CREATE TABLE rt (id INTEGER PRIMARY KEY, parent INTEGER)",
+        "INSERT INTO rt (id, parent) VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 2), (6, 3), (7, 6)",
+        "CREATE TABLE cy (id INTEGER PRIMARY KEY, nxt INTEGER)",
+        "INSERT INTO cy (id, nxt) VALUES (1, 2), (2, 3), (3, 1)",
+        "CREATE TABLE ed (id INTEGER PRIMARY KEY, src INTEGER, dst INTEGER)",
+        "INSERT INTO ed (id, src, dst) VALUES (1, 1, 2), (2, 1, 3), (3, 2, 4), (4, 3, 4), (5, 4, 5)",
+        "CREATE TABLE bs (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO bs (id, v) VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)",
+    ] {
+        exec_sql(router, ADMIN_KEY, sql).await;
+    }
+}
+
+const REC_COUNTER: &str =
+    "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 10) SELECT n FROM t";
+
+#[tokio::test]
+async fn recursive_ctes_through_the_real_api() {
+    let dir = temp_dir("rec_basic");
+    let (state, router) = build_app(&dir);
+    seed_recursion_tables(&router).await;
+
+    // The counter: ten rows, typed INTEGER, the column named by the list.
+    let r = exec_sql(&router, ADMIN_KEY, REC_COUNTER).await;
+    assert_eq!(int_cells(&r), (1..=10).collect::<Vec<i64>>());
+    assert_eq!(r["result"]["columns"][0]["name"], "n");
+    assert_eq!(r["result"]["columns"][0]["type"], "integer");
+
+    // The factorial accumulator.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE f(n, acc) AS (SELECT 1, 1 UNION ALL SELECT n + 1, acc * (n + 1) FROM f WHERE n < 10) SELECT acc FROM f ORDER BY n",
+    )
+    .await;
+    let acc = int_cells(&r);
+    assert_eq!(acc.len(), 10);
+    assert_eq!(*acc.last().unwrap(), 3_628_800);
+
+    // A tree walk: row count and depth.
+    let walk = "WITH RECURSIVE w(id, depth) AS (SELECT id, 0 FROM rt WHERE parent IS NULL \
+                UNION ALL SELECT rt.id, w.depth + 1 FROM w JOIN rt ON rt.parent = w.id) ";
+    let r = exec_sql(&router, ADMIN_KEY, &format!("{walk} SELECT id, depth FROM w ORDER BY id")).await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(cell_values(&r, 1), vec![json!(0), json!(1), json!(1), json!(2), json!(2), json!(2), json!(3)]);
+    let r = exec_sql(&router, ADMIN_KEY, &format!("{walk} SELECT COUNT(*), MAX(depth) FROM w")).await;
+    assert_eq!(cell_values(&r, 0), vec![json!("7")]);
+    assert_eq!(cell_values(&r, 1), vec![json!(3)]);
+
+    // Ancestors of node 7, in the order of the walk up.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE anc(id, parent, depth) AS (SELECT id, parent, 0 FROM rt WHERE id = 7 \
+         UNION ALL SELECT rt.id, rt.parent, anc.depth + 1 FROM anc JOIN rt ON rt.id = anc.parent) \
+         SELECT id FROM anc ORDER BY depth",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![7, 6, 3, 1]);
+
+    // UNION (distinct): the same counter; and a cycle that ends by itself.
+    let r = exec_sql(&router, ADMIN_KEY, &REC_COUNTER.replace("UNION ALL", "UNION")).await;
+    assert_eq!(int_cells(&r), (1..=10).collect::<Vec<i64>>());
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE reach(id) AS (SELECT 1 UNION SELECT cy.nxt FROM reach JOIN cy ON cy.id = reach.id) SELECT id FROM reach ORDER BY id",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3]);
+
+    // A diamond: the shared node twice under UNION ALL, once under UNION.
+    for (op, rows) in [("UNION ALL", 7), ("UNION", 5)] {
+        let r = exec_sql(
+            &router,
+            ADMIN_KEY,
+            &format!("WITH RECURSIVE w(id) AS (SELECT 1 {op} SELECT ed.dst FROM w JOIN ed ON ed.src = w.id) SELECT id FROM w"),
+        )
+        .await;
+        assert_eq!(r["result"]["row_count"], rows, "{op}");
+    }
+
+    // A seed with an aggregate; an ordinary CTE and a main query over the fixpoint.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE r(n) AS (SELECT COUNT(*) FROM bs UNION ALL SELECT n - 1 FROM r WHERE n > 0) SELECT n FROM r ORDER BY n DESC",
+    )
+    .await;
+    assert_eq!(cell_values(&r, 0), vec![json!("5"), json!("4"), json!("3"), json!("2"), json!("1"), json!("0")]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3), v AS (SELECT n * 2 AS d FROM r) SELECT d FROM v ORDER BY d",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![2, 4, 6]);
+
+    // Two recursive CTEs; a recursive CTE in a derived table and a scalar subquery.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM a WHERE n < 3), \
+         b(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM b WHERE n < 4) \
+         SELECT a.n FROM a JOIN b ON a.n = b.n ORDER BY a.n",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3]);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "SELECT (SELECT COUNT(*) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r) AS d)",
+    )
+    .await;
+    assert_eq!(cell_values(&r, 0), vec![json!("5")]);
+
+    // The empty seed and the empty term.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE t(n) AS (SELECT 1 WHERE FALSE UNION ALL SELECT n + 1 FROM t) SELECT * FROM t",
+    )
+    .await;
+    assert_eq!(r["result"]["row_count"], 0);
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM t WHERE FALSE) SELECT * FROM t",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1]);
+
+    // Two UNION ALLs: the last (outermost) one separates the seed from the term.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 100 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r ORDER BY n",
+    )
+    .await;
+    assert_eq!(int_cells(&r), vec![1, 2, 3, 100]);
+
+    // DML.
+    let r = exec_sql(
+        &router,
+        ADMIN_KEY,
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2) DELETE FROM bs WHERE v IN (SELECT n FROM r)",
+    )
+    .await;
+    assert_eq!(r["result"]["rows_affected"], 2, "{r}");
+
+    // A reader may run a recursion.
+    let r = exec_sql(&router, READER_KEY, REC_COUNTER).await;
+    assert_eq!(r["result"]["row_count"], 10);
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn recursive_cte_errors_and_bounds_over_http() {
+    let dir = temp_dir("rec_errors");
+    let (state, router) = build_app(&dir);
+    seed_recursion_tables(&router).await;
+
+    // Bind errors: 400 BIND_ERROR, with the clear message.
+    for (sql, needle) in [
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT x.n + y.n FROM r x JOIN r y ON x.n = y.n WHERE x.n < 3) SELECT n FROM r",
+            "recursive reference 'r' must appear exactly once in the recursive term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT COUNT(*) FROM r) SELECT n FROM r",
+            "aggregate functions, GROUP BY and HAVING are not allowed in the recursive term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM r WHERE n < 3 ORDER BY n)) SELECT n FROM r",
+            "ORDER BY is not allowed in the recursive term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM r WHERE n < 3 LIMIT 1)) SELECT n FROM r",
+            "LIMIT and OFFSET are not allowed in the recursive term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT n FROM r UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+            "must not appear in the seed",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT DISTINCT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+            "SELECT DISTINCT is not allowed in the recursive term",
+        ),
+        (
+            "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n FROM b), b(n) AS (SELECT 1 UNION ALL SELECT n FROM a) SELECT n FROM a",
+            "refer to each other are not supported",
+        ),
+        (
+            "WITH RECURSIVE s(x) AS (SELECT 5), r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r JOIN s ON r.n < s.x) SELECT n FROM r",
+            "not visible inside a recursive term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 10000000000 FROM r) SELECT n FROM r",
+            "has type INTEGER in the seed but BIGINT in the recursive term",
+        ),
+    ] {
+        let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": sql })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}: {body}");
+        assert_eq!(body["error"]["code"], "BIND_ERROR", "{sql}: {body}");
+        assert!(body.to_string().contains(needle), "{sql}: {body}");
+    }
+
+    // Mission 2: OVER / ROLLUP / COUNT(DISTINCT) is implemented; see MISSION2_FEATURE_MATRIX.md §6.2.
+    // A window function in the recursive term is a bind error (and used to be silently dropped).
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT SUM(n) OVER () FROM t) SELECT n FROM t" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "BIND_ERROR", "{body}");
+    assert!(body.to_string().contains("window functions"), "{body}");
+
+    // ... and anywhere else it runs as a window: one row per input row (7), each carrying the
+    // total (28). A dropped or ignored OVER would return the single aggregate row.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT SUM(id) OVER () FROM rt" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["result"]["rows"].as_array().unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(rows.len(), 7, "{body}");
+    assert!(rows.iter().all(|r| r[0]["value"] == "28"), "{body}");
+
+    // A forbidden-or-missing table in the seed or the term is NOT_FOUND.
+    for sql in [
+        "WITH RECURSIVE r(n) AS (SELECT id FROM no_such UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT no_such.id FROM r JOIN no_such ON no_such.id = r.n) SELECT n FROM r",
+    ] {
+        let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": sql })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{sql}: {body}");
+    }
+
+    // A counter with no stop condition: 413 RESOURCE_LIMIT naming the CTE and the bound.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT n FROM t" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "RESOURCE_LIMIT");
+    assert!(body.to_string().contains("recursive CTE 't'"), "{body}");
+    assert!(body.to_string().contains("max_recursive_cte_depth (1000)"), "{body}");
+    // The same cycle under UNION ALL runs into the bound; under UNION it ends.
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "WITH RECURSIVE reach(id) AS (SELECT 1 UNION ALL SELECT cy.nxt FROM reach JOIN cy ON cy.id = reach.id) SELECT id FROM reach" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.to_string().contains("recursive CTE 'reach'"), "{body}");
+
+    // More than eight recursive CTEs in one statement.
+    let defs: Vec<String> = (1..=9)
+        .map(|i| format!("c{i}(n) AS (SELECT {i} UNION ALL SELECT n + 1 FROM c{i} WHERE n < {})", i + 1))
+        .collect();
+    let uses: Vec<String> = (1..=9).map(|i| format!("SELECT n FROM c{i}")).collect();
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": format!("WITH RECURSIVE {} {}", defs.join(", "), uses.join(" UNION ALL ")) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.to_string().contains("max_recursive_cte_definitions is 8"), "{body}");
+
+    state.engine.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn recursive_cte_explain_and_a_failed_recursion_inside_a_transaction_over_http() {
+    let dir = temp_dir("rec_txn_explain");
+    let (state, router) = build_app(&dir);
+    seed_recursion_tables(&router).await;
+
+    // EXPLAIN: seed and term apart; nothing executes.
+    let r = exec_sql(&router, ADMIN_KEY, &format!("EXPLAIN {REC_COUNTER}")).await;
+    assert_eq!(r["result"]["kind"], "explain");
+    let text = r["result"]["plan_text"].as_str().unwrap();
+    assert!(text.contains("RecursiveCte name=t distinct=false"), "{text}");
+    assert!(text.contains("seed (runs once):"), "{text}");
+    assert!(text.contains("WorkingTable name=t"), "{text}");
+    assert!(!text.contains("SetOp"), "{text}");
+    assert!(r["result"].get("rows").is_none(), "{r}");
+
+    // A refused recursion inside a transaction changes nothing, and the
+    // transaction stays usable.
+    let begin = exec_sql(&router, ADMIN_KEY, "BEGIN").await;
+    let sid = begin["session_id"].as_str().unwrap().to_string();
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "DELETE FROM bs WHERE v = 1", "session_id": sid }),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (status, body) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({
+            "sql": "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) DELETE FROM bs WHERE v IN (SELECT n FROM t)",
+            "session_id": sid
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "RESOURCE_LIMIT");
+    // The earlier DELETE of the same transaction is still in place; the refused one did nothing.
+    let (status, own) = sql_req(
+        &router,
+        ADMIN_KEY,
+        json!({ "sql": "SELECT v FROM bs ORDER BY v", "session_id": sid }),
+    )
+    .await;
+    assert!(status.is_success(), "{own}");
+    assert_eq!(int_cells(&own), vec![2, 3, 4, 5]);
+    let (status, commit) = sql_req(&router, ADMIN_KEY, json!({ "sql": "COMMIT", "session_id": sid })).await;
+    assert!(status.is_success(), "{commit}");
+    let r = exec_sql(&router, ADMIN_KEY, "SELECT v FROM bs ORDER BY v").await;
+    assert_eq!(int_cells(&r), vec![2, 3, 4, 5]);
 
     state.engine.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

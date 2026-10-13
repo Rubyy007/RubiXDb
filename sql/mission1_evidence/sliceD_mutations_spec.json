@@ -1,0 +1,376 @@
+[
+  {
+    "id": "M01_fixpoint_does_not_stop_on_an_empty_iteration",
+    "why": "the loop no longer ends when an iteration produces nothing (a query that should stop early runs to the depth bound)",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "    while !working.is_empty() {",
+        "new": "    while true {"
+      }
+    ]
+  },
+  {
+    "id": "M02_union_compares_only_the_first_column",
+    "why": "the UNION stop condition / deduplication keys a row by its first column only",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "            let key = SetKey(row);\n            if seen.contains(&key) {",
+        "new": "            let key = SetKey(row.iter().take(1).cloned().collect());\n            if seen.contains(&key) {"
+      }
+    ]
+  },
+  {
+    "id": "M03_union_treats_null_as_different_from_null",
+    "why": "the null-safe distinctness predicate says NULL and NULL differ, so a row with a NULL is new every iteration",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "        (None, None) => true,",
+        "new": "        (None, None) => false,"
+      }
+    ]
+  },
+  {
+    "id": "M04_depth_bound_off_by_one",
+    "why": "the depth bound admits one iteration too many",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        if iterations >= max_depth {",
+        "new": "        if iterations > max_depth {"
+      }
+    ]
+  },
+  {
+    "id": "M05_row_bound_off_by_one",
+    "why": "the row bound admits one row too many",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "    if held.rows >= max_rows {",
+        "new": "    if held.rows > max_rows {"
+      }
+    ]
+  },
+  {
+    "id": "M06_seed_re_executed_every_iteration",
+    "why": "the seed plan is run again at the start of every iteration",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        iterations += 1;\n        ec.metrics.record_recursive_cte_iteration();",
+        "new": "        iterations += 1;\n        {\n            let mut s = build_operator(&node.seed_plan, &RowContext::new(), ec)?;\n            while s.next(ec)?.is_some() {}\n        }\n        ec.metrics.record_recursive_cte_iteration();"
+      }
+    ]
+  },
+  {
+    "id": "M07_term_also_reads_the_current_iterations_output",
+    "why": "after an iteration the term is evaluated once more against the rows that iteration just produced, within the same iteration",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        working = next;\n    }\n    ec.working_tables",
+        "new": "        working = next;\n        if !working.is_empty() {\n            ec.working_tables.borrow_mut().insert(node.work_id, Rc::new(working.clone()));\n            let mut op2 = build_operator(&node.recursive_plan, &RowContext::new(), ec)?;\n            while let Some(tuple) = op2.next(ec)? {\n                ec.check()?;\n                if accept(tuple.projected, &mut held, &mut result)? {\n                    working.push(result[result.len() - 1].clone());\n                }\n            }\n        }\n    }\n    ec.working_tables"
+      }
+    ]
+  },
+  {
+    "id": "M08_working_table_accumulates_all_rows_so_far",
+    "why": "the term reads every row produced so far instead of only the previous iteration's",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "Rc::new(std::mem::take(&mut working))",
+        "new": "Rc::new(result.clone())"
+      }
+    ]
+  },
+  {
+    "id": "M09_recursive_reference_resolves_to_the_catalog_table",
+    "why": "when a catalog table has the CTE's name, the recursive reference reads the catalog table instead of the working table",
+    "edits": [
+      {
+        "file": "sql/src/bind/select.rs",
+        "old": "            CteLookup::Working(w) => {\n                return bind_working_reference(env, scope, tref, w, null_extended);\n            }",
+        "new": "            CteLookup::Working(w) => {\n                if scope::resolve_table(catalog, ctx, auth, metrics, &tref.name, Privilege::Select).is_ok() {\n                    None\n                } else {\n                    return bind_working_reference(env, scope, tref, w, null_extended);\n                }\n            }"
+      }
+    ]
+  },
+  {
+    "id": "M10_two_references_silently_accepted",
+    "why": "a second reference to the recursive CTE in the term is accepted",
+    "edits": [
+      {
+        "file": "sql/src/bind/select.rs",
+        "old": "    if w.ordinal > 1 {",
+        "new": "    if false && w.ordinal > 1 {"
+      }
+    ]
+  },
+  {
+    "id": "M11_aggregate_in_the_term_silently_accepted",
+    "why": "aggregates, GROUP BY and HAVING in the recursive term are accepted",
+    "edits": [
+      {
+        "file": "sql/src/bind/recursive.rs",
+        "old": "    if !b.aggregates.is_empty() || !b.group_by.is_empty() || b.having.is_some() {",
+        "new": "    if false && (!b.aggregates.is_empty() || !b.group_by.is_empty() || b.having.is_some()) {"
+      }
+    ]
+  },
+  {
+    "id": "M12_order_by_in_the_term_silently_accepted",
+    "why": "ORDER BY in the recursive term is accepted",
+    "edits": [
+      {
+        "file": "sql/src/bind/recursive.rs",
+        "old": "    if !b.order_by.is_empty() {\n        return Err(refuse(format!(\"ORDER BY is not allowed in {here}\")));",
+        "new": "    if false && !b.order_by.is_empty() {\n        return Err(refuse(format!(\"ORDER BY is not allowed in {here}\")));"
+      }
+    ]
+  },
+  {
+    "id": "M13_explain_prints_the_recursion_as_a_flat_union",
+    "why": "EXPLAIN labels the recursive CTE as a set operation",
+    "edits": [
+      {
+        "file": "sql/src/plan/explain.rs",
+        "old": "\"RecursiveCte name={} distinct={} ({})\",",
+        "new": "\"SetOp UNION ALL branches=2 name={} distinct={} ({})\","
+      }
+    ]
+  },
+  {
+    "id": "M14_iteration_counter_not_incremented",
+    "why": "recursive_cte_iterations_total is never incremented",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        ec.metrics.record_recursive_cte_iteration();",
+        "new": "        let _ = ();"
+      }
+    ]
+  },
+  {
+    "id": "M15_rows_metric_ignores_the_iterations",
+    "why": "recursive_cte_rows_emitted_total counts the seed only",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        ec.metrics\n            .record_recursive_cte_rows_emitted((result.len() - before) as u64);\n        if let Err(e) = outcome {",
+        "new": "        let _ = before;\n        if let Err(e) = outcome {"
+      }
+    ]
+  },
+  {
+    "id": "M16_rows_metric_ignores_the_seed",
+    "why": "recursive_cte_rows_emitted_total omits the seed rows",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        ec.metrics\n            .record_recursive_cte_rows_emitted((result.len() - before) as u64);\n    }\n\n    let mut iterations",
+        "new": "        let _ = before;\n    }\n\n    let mut iterations"
+      }
+    ]
+  },
+  {
+    "id": "M17_union_treated_as_union_all",
+    "why": "the planner ignores the distinct flag: a UNION recursion keeps duplicates and never sees a cycle close",
+    "edits": [
+      {
+        "file": "sql/src/plan/mod.rs",
+        "old": "        distinct: !recursion.all,",
+        "new": "        distinct: false,"
+      }
+    ]
+  },
+  {
+    "id": "M18_union_all_treated_as_union",
+    "why": "the planner always deduplicates: a UNION ALL recursion drops repeated rows",
+    "edits": [
+      {
+        "file": "sql/src/plan/mod.rs",
+        "old": "        distinct: !recursion.all,",
+        "new": "        distinct: true,"
+      }
+    ]
+  },
+  {
+    "id": "M19_definitions_bound_not_enforced",
+    "why": "max_recursive_cte_definitions is never checked",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "    if stats.recursive_cte_definitions.len() as u64 > u64::from(limits.max_recursive_cte_definitions) {",
+        "new": "    if false && stats.recursive_cte_definitions.len() as u64 > u64::from(limits.max_recursive_cte_definitions) {"
+      }
+    ]
+  },
+  {
+    "id": "M20_byte_bound_removed",
+    "why": "the bytes held by a recursion are not bounded",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "    if held.bytes > max_bytes {",
+        "new": "    if false && held.bytes > max_bytes {"
+      }
+    ]
+  },
+  {
+    "id": "M21_earlier_ctes_visible_in_the_term",
+    "why": "a CTE defined before the recursive one is visible inside the recursive term",
+    "edits": [
+      {
+        "file": "sql/src/bind/recursive.rs",
+        "old": "    scope.hidden_ctes = earlier.to_vec();",
+        "new": "    scope.hidden_ctes = Vec::new();"
+      }
+    ]
+  },
+  {
+    "id": "M22_seed_may_name_the_cte",
+    "why": "the CTE's own name in its seed is not recognised as a seed reference",
+    "edits": [
+      {
+        "file": "sql/src/bind/scope.rs",
+        "old": "            } else if s.seed_phase {",
+        "new": "            } else if false {"
+      }
+    ]
+  },
+  {
+    "id": "M23_nullable_side_reference_accepted",
+    "why": "the recursive reference may be on the nullable side of an outer join",
+    "edits": [
+      {
+        "file": "sql/src/bind/select.rs",
+        "old": "    if null_extended {\n        return Err(SqlError::InvalidIdentifier {\n            detail: format!(\n                \"recursive reference",
+        "new": "    if false && null_extended {\n        return Err(SqlError::InvalidIdentifier {\n            detail: format!(\n                \"recursive reference"
+      }
+    ]
+  },
+  {
+    "id": "M24_reference_inside_a_subquery_accepted",
+    "why": "the recursive reference may sit inside a subquery or derived table of the term",
+    "edits": [
+      {
+        "file": "sql/src/bind/select.rs",
+        "old": "    if env.depth() != w.depth {",
+        "new": "    if false && env.depth() != w.depth {"
+      }
+    ]
+  },
+  {
+    "id": "M25_seed_and_term_swapped_in_the_plan",
+    "why": "the planner plans the term as the seed",
+    "edits": [
+      {
+        "file": "sql/src/plan/mod.rs",
+        "old": "    let seed = plan_select(&set.left, cx)?;",
+        "new": "    let seed = plan_select(&set.right, cx)?;"
+      }
+    ]
+  },
+  {
+    "id": "M26_seed_term_type_check_removed",
+    "why": "the term's column types are not compared with the seed's",
+    "edits": [
+      {
+        "file": "sql/src/bind/recursive.rs",
+        "old": "            if a != b {",
+        "new": "            if false && a != b {"
+      }
+    ]
+  },
+  {
+    "id": "M27_recursive_result_not_cached",
+    "why": "a recursive CTE read more than once runs its fixpoint once per reference",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "    ec.recursive_cache\n        .borrow_mut()\n        .insert(cte_id, Rc::clone(&rows));",
+        "new": "    let _ = cte_id;"
+      }
+    ]
+  },
+  {
+    "id": "M28_over_clause_dropped_again",
+    "why": "the converter drops an OVER clause again (a window function silently runs as the plain function)",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    if f.over.is_some() {",
+        "new": "    if false && f.over.is_some() {"
+      }
+    ]
+  },
+  {
+    "id": "M29_recursion_routed_through_the_materialization_node",
+    "why": "a recursive CTE reference is materialized by the non-recursive CTE path",
+    "edits": [
+      {
+        "file": "sql/src/exec/relation.rs",
+        "old": "        PhysicalPlan::RecursiveCte(node) => super::recursive::recursive_rows(cte.id, node, ec)?,",
+        "new": "        PhysicalPlan::RecursiveCte(_) => materialized_rows(cte.id, &cte.plan, true, ec)?,"
+      }
+    ]
+  },
+  {
+    "id": "M30_default_depth_changed",
+    "why": "the default max_recursive_cte_depth is 100",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "            max_recursive_cte_depth: 1_000,",
+        "new": "            max_recursive_cte_depth: 100,"
+      }
+    ]
+  },
+  {
+    "id": "M31_default_row_bound_changed",
+    "why": "the default max_recursive_cte_rows is 100,000",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "            max_recursive_cte_rows: 1_000_000,",
+        "new": "            max_recursive_cte_rows: 100_000,"
+      }
+    ]
+  },
+  {
+    "id": "M32_default_definitions_changed",
+    "why": "the default max_recursive_cte_definitions is 9",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "            max_recursive_cte_definitions: 8,",
+        "new": "            max_recursive_cte_definitions: 9,"
+      }
+    ]
+  },
+  {
+    "id": "M33_rows_emitted_not_checked_before_keeping",
+    "why": "the row bound is checked after the row is kept, not before",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "            check_room(name, held, &row, max_rows, max_bytes)?;\n            result.push(row);",
+        "new": "            result.push(row.clone());\n            check_room(name, held, &row, max_rows, max_bytes)?;"
+      }
+    ]
+  },
+  {
+    "id": "M34_working_table_left_after_an_error",
+    "why": "the working table is not removed when the fixpoint fails (leaks into later reads)",
+    "edits": [
+      {
+        "file": "sql/src/exec/recursive.rs",
+        "old": "        if let Err(e) = outcome {\n            ec.working_tables.borrow_mut().remove(&node.work_id);\n            return Err(e);\n        }",
+        "new": "        if let Err(e) = outcome {\n            return Err(e);\n        }"
+      }
+    ]
+  }
+]

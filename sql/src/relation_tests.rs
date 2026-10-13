@@ -146,18 +146,18 @@ mod parser {
 
     #[test]
     fn what_is_not_in_scope_is_a_typed_unsupported_error() {
-        for sql in [
-            "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r",
-            "WITH a AS (SELECT 1 UNION SELECT 2) SELECT * FROM a",
-            "SELECT * FROM (SELECT 1 UNION SELECT 2) AS u",
-            "UPDATE (SELECT 1) AS d SET a = 1",
-        ] {
-            let err = parse_statement(sql, &SqlLimits::default()).unwrap_err();
-            assert!(
-                matches!(err, crate::error::SqlError::Unsupported { .. }),
-                "{sql:?} -> {err:?}"
-            );
-        }
+        // SQL-mission-1 Slice D (2026-10-12) removed the case here that
+        // pinned `WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r` as
+        // Unsupported: `WITH RECURSIVE` is supported now (`recursive_tests`
+        // holds the replacement assertions). Slice E (2026-10-12) removed the
+        // two set-operation cases the same way (`setop_tests`). One case is
+        // left, so the loop over a list became a single assertion.
+        let sql = "UPDATE (SELECT 1) AS d SET a = 1";
+        let err = parse_statement(sql, &SqlLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, crate::error::SqlError::Unsupported { .. }),
+            "{sql:?} -> {err:?}"
+        );
         // Twin: the non-recursive forms next to them DO parse (so the
         // refusals above are about recursion / set operations / DML targets,
         // not a blanket refusal of WITH or of derived tables).

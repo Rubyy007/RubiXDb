@@ -1,0 +1,376 @@
+[
+  {
+    "id": "M01_union_behaves_as_union_all",
+    "why": "UNION keeps duplicates (no deduplication): the distinct kind is mapped to the concatenation operator",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "(SetOperator::Union, false) => Kind::Union,",
+        "new": "(SetOperator::Union, false) => Kind::UnionAll,"
+      }
+    ]
+  },
+  {
+    "id": "M02_union_all_behaves_as_union",
+    "why": "UNION ALL deduplicates",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "(SetOperator::Union, true) => Kind::UnionAll,",
+        "new": "(SetOperator::Union, true) => Kind::Union,"
+      }
+    ]
+  },
+  {
+    "id": "M03_intersect_behaves_as_except",
+    "why": "INTERSECT produces what EXCEPT would",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "(SetOperator::Intersect, false) => Kind::Intersect,",
+        "new": "(SetOperator::Intersect, false) => Kind::Except,"
+      }
+    ]
+  },
+  {
+    "id": "M04_intersect_all_treated_as_intersect",
+    "why": "INTERSECT ALL returns each common row once (a distinct count, not the minimum count)",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "(SetOperator::Intersect, true) => Kind::IntersectAll,",
+        "new": "(SetOperator::Intersect, true) => Kind::Intersect,"
+      }
+    ]
+  },
+  {
+    "id": "M05_except_all_counts_go_negative",
+    "why": "EXCEPT ALL keeps decrementing a right-hand count that is already zero (an unsigned count wrapping below zero), so every later copy of the row is removed",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "                Some(slot) if slot.remaining > 0 => {\n                    slot.remaining -= 1;\n                    Ok(None)\n                }",
+        "new": "                Some(slot) => {\n                    slot.remaining = slot.remaining.wrapping_sub(1);\n                    Ok(None)\n                }"
+      }
+    ]
+  },
+  {
+    "id": "M06_distinctness_treats_null_as_different_from_null",
+    "why": "the tuple-distinctness predicate says NULL and NULL are different values (the standard trap)",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "        (None, None) => true,",
+        "new": "        (None, None) => false,"
+      }
+    ]
+  },
+  {
+    "id": "M07_column_names_from_the_second_branch",
+    "why": "the output columns are named after the right operand",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "output_name: l.output_name.clone(),",
+        "new": "output_name: r.output_name.clone(),"
+      }
+    ]
+  },
+  {
+    "id": "M08_intersect_has_the_same_precedence_as_union",
+    "why": "the converter re-associates a right operand that is itself a set operation (what sqlparser built for a tighter-binding INTERSECT) to the left, so all three operators bind alike",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "        let right = convert_set_operand(right, dg, depth + 1)?;\n        acc = Select::set_operation(op, all, acc, right);",
+        "new": "        let right = convert_set_operand(right, dg, depth + 1)?;\n        acc = match right.set_op.clone().filter(|_| right.order_by.is_empty() && right.limit.is_none() && right.ctes.is_empty()) {\n            Some(r) => Select::set_operation(r.op, r.all, Select::set_operation(op, all, acc, *r.left), *r.right),\n            None => Select::set_operation(op, all, acc, right),\n        };"
+      }
+    ]
+  },
+  {
+    "id": "M09_order_by_resolves_unknown_names_to_the_first_column",
+    "why": "ORDER BY of a set operation, given a name that is not an output column, silently sorts by the first output column instead of failing",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "                Err(SqlError::UnknownObject { kind, detail })\n                    if kind == \"column\" || kind == \"table reference\" =>",
+        "new": "                Err(SqlError::UnknownObject { .. }) => {\n                    let col = ast::Expr::Column(ast::ColumnRef { parts: vec![ast::Ident::new(output_names[0].clone(), false)] });\n                    eb.bind(&col, None)?\n                }\n                Err(SqlError::UnknownObject { kind, detail })\n                    if kind == \"column\" || kind == \"table reference\" =>"
+      }
+    ]
+  },
+  {
+    "id": "M10_unification_falls_back_to_text",
+    "why": "two types with no common type unify to TEXT instead of being refused",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "        _ => None,\n    }\n}\n\n/// An operand that is itself",
+        "new": "        _ => Some(Text),\n    }\n}\n\n/// An operand that is itself"
+      }
+    ]
+  },
+  {
+    "id": "M11_set_operation_output_loses_a_column",
+    "why": "the shell's output columns skip the first operand column (the relation exposes the wrong column set to a derived table / CTE / subquery)",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "    for (i, (l, r)) in left.projection.iter().zip(&right.projection).enumerate() {",
+        "new": "    for (i, (l, r)) in left.projection.iter().zip(&right.projection).enumerate().skip(1) {"
+      }
+    ]
+  },
+  {
+    "id": "M12_cte_set_operation_rerun_per_reference",
+    "why": "a CTE whose body is a set operation is not stored after its first read, so every reference re-runs it (the Slice C materialization rule broken)",
+    "edits": [
+      {
+        "file": "sql/src/exec/relation.rs",
+        "old": "    ec.relation_cache.borrow_mut().insert(id, Rc::clone(&rows));",
+        "new": "    let _ = &id;"
+      }
+    ]
+  },
+  {
+    "id": "M13_operand_values_not_widened",
+    "why": "operand values keep their own types instead of being widened to the unified column type",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "            (Some(v), Some(ty)) => widen_value(v, *ty).map(Some),",
+        "new": "            (Some(v), Some(_)) => Ok(Some(v)),"
+      }
+    ]
+  },
+  {
+    "id": "M14_decimal_widening_does_not_rescale",
+    "why": "widening to a larger DECIMAL scale keeps the unscaled digits (1.00 becomes 0.0100)",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "    let scaled = value.checked_mul(factor).ok_or_else(|| out_of_range(to))?;",
+        "new": "    let scaled = value.checked_mul(1).ok_or_else(|| out_of_range(to))?;"
+      }
+    ]
+  },
+  {
+    "id": "M15_union_dedup_not_counted",
+    "why": "set_op_rows_deduplicated_total is never incremented by UNION",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "                    ec.metrics.record_set_op_rows_deduplicated(1);\n                    continue;",
+        "new": "                    continue;"
+      }
+    ]
+  },
+  {
+    "id": "M16_branches_metric_not_recorded",
+    "why": "set_op_branches_total is never recorded",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "    metrics.record_set_op_branches(set_op_branches);",
+        "new": "    let _ = set_op_branches;"
+      }
+    ]
+  },
+  {
+    "id": "M17_operand_limit_off_by_one",
+    "why": "the operand limit refuses a statement that is exactly at the limit",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "    if stats.set_op_branches > u64::from(limits.max_set_op_branches) {",
+        "new": "    if stats.set_op_branches >= u64::from(limits.max_set_op_branches) {"
+      }
+    ]
+  },
+  {
+    "id": "M18_row_bound_removed",
+    "why": "the materialized-rows bound on a set operation's held rows is removed",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "        if held >= ec.limits.max_materialized_rows {",
+        "new": "        if false && held >= ec.limits.max_materialized_rows {"
+      }
+    ]
+  },
+  {
+    "id": "M19_byte_bound_removed",
+    "why": "the materialized-bytes bound on a set operation's held rows is removed",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "        if self.bytes > ec.limits.max_materialized_bytes {",
+        "new": "        if false && self.bytes > ec.limits.max_materialized_bytes {"
+      }
+    ]
+  },
+  {
+    "id": "M20_intersect_does_not_deduplicate_the_left",
+    "why": "INTERSECT returns a left row once per left copy that is on the right (the distinct-left step removed)",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "                Some(slot) if !slot.emitted => {\n                    slot.emitted = true;\n                    Ok(Some(key.0))\n                }",
+        "new": "                Some(_slot) => Ok(Some(key.0)),\n                Some(slot) if !slot.emitted => {\n                    slot.emitted = true;\n                    Ok(Some(key.0))\n                }"
+      }
+    ]
+  },
+  {
+    "id": "M21_except_does_not_deduplicate_the_left",
+    "why": "EXCEPT remembers nothing about rows it has produced, so a repeated left row repeats in the result",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "                Some(slot) if slot.emitted => {",
+        "new": "                Some(slot) if false && slot.emitted => {"
+      }
+    ]
+  },
+  {
+    "id": "M22_union_all_reads_only_the_right_operand",
+    "why": "UNION ALL starts in the right phase and never reads the left operand",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "        phase: Phase::Left,",
+        "new": "        phase: Phase::Right,"
+      }
+    ]
+  },
+  {
+    "id": "M23_decimal_scale_unifies_to_the_smaller",
+    "why": "DECIMAL(s1) with DECIMAL(s2) unifies to the smaller scale",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "Some(Decimal { scale: x.max(y) })",
+        "new": "Some(Decimal { scale: x.min(y) })"
+      }
+    ]
+  },
+  {
+    "id": "M24_real_with_exact_numeric_unifies_to_real",
+    "why": "REAL with INTEGER / BIGINT / DECIMAL unifies to REAL (losing precision) instead of DOUBLE",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "        (Real, n) | (n, Real) if is_numeric(n) => Some(Double),",
+        "new": "        (Real, n) | (n, Real) if is_numeric(n) => Some(Real),"
+      }
+    ]
+  },
+  {
+    "id": "M25_column_count_not_checked",
+    "why": "operands with different column counts are combined (zip truncates)",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "    if left.projection.len() != right.projection.len() {",
+        "new": "    if false && left.projection.len() != right.projection.len() {"
+      }
+    ]
+  },
+  {
+    "id": "M26_nullability_and_instead_of_or",
+    "why": "an output column is nullable only if both operands can produce NULL",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "                nullable: l.expr.nullable || r.expr.nullable,",
+        "new": "                nullable: l.expr.nullable && r.expr.nullable,"
+      }
+    ]
+  },
+  {
+    "id": "M27_nan_is_distinct_from_nan",
+    "why": "the predicate treats two NaN doubles as different values",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "            (Double(p), Double(q)) => (p.is_nan() && q.is_nan()) || p == q,",
+        "new": "            (Double(p), Double(q)) => p == q,"
+      }
+    ]
+  },
+  {
+    "id": "M28_hash_does_not_canonicalise_zero_signs",
+    "why": "the hash of REAL +0.0 and -0.0 differs although the values compare equal (hash/eq inconsistency)",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "let bits = if f.is_nan() { f32::NAN.to_bits() } else if *f == 0.0 { 0 } else { f.to_bits() };",
+        "new": "let bits = if f.is_nan() { f32::NAN.to_bits() } else { f.to_bits() };"
+      }
+    ]
+  },
+  {
+    "id": "M29_explain_prints_a_wrong_branch_count",
+    "why": "EXPLAIN shows branches=2 for every set operation",
+    "edits": [
+      {
+        "file": "sql/src/plan/explain.rs",
+        "old": "        operands.len(),\n        node.set_ref,",
+        "new": "        2,\n        node.set_ref,"
+      }
+    ]
+  },
+  {
+    "id": "M30_set_level_limit_ignored",
+    "why": "LIMIT / OFFSET written after a set operation are dropped",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "    acc.max_parameter = max_parameter;\n    Ok(acc)",
+        "new": "    acc.max_parameter = max_parameter;\n    acc.limit = None;\n    Ok(acc)"
+      }
+    ]
+  },
+  {
+    "id": "M31_set_level_with_not_inherited",
+    "why": "the WITH list in front of a set operation is not visible in its operands",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "    let visible = scope.ctes.clone();",
+        "new": "    let visible: Vec<CteBinding> = inherited.to_vec();"
+      }
+    ]
+  },
+  {
+    "id": "M32_set_level_order_by_dropped",
+    "why": "the ORDER BY written after a set operation is not applied",
+    "edits": [
+      {
+        "file": "sql/src/bind/setop.rs",
+        "old": "        acc.order_by = bind_order_by(env, limits, stmt, &acc, set_ref, &output_names, &mut max_parameter)?;",
+        "new": "        let _ = bind_order_by(env, limits, stmt, &acc, set_ref, &output_names, &mut max_parameter)?;"
+      }
+    ]
+  },
+  {
+    "id": "M33_intersect_all_is_not_consumed",
+    "why": "INTERSECT ALL does not consume the right-hand count when it matches a left copy (every left copy of a common row survives)",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "                Some(slot) if slot.remaining > 0 => {\n                    slot.remaining -= 1;\n                    Ok(Some(key.0))\n                }",
+        "new": "                Some(slot) if slot.remaining > 0 => {\n                    let _ = &slot;\n                    Ok(Some(key.0))\n                }"
+      }
+    ]
+  },
+  {
+    "id": "M34_right_operand_counted_once_per_left_row_check",
+    "why": "the right operand's rows are all treated as one copy (count never exceeds 1)",
+    "edits": [
+      {
+        "file": "sql/src/exec/setop.rs",
+        "old": "            if let Some(slot) = slots.get_mut(&key) {\n                slot.remaining += 1;\n                continue;\n            }",
+        "new": "            if let Some(_slot) = slots.get_mut(&key) {\n                continue;\n            }"
+      }
+    ]
+  }
+]

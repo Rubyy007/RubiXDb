@@ -8,8 +8,11 @@ pub mod ddl;
 pub mod dml;
 pub mod env;
 pub mod expr;
+pub mod recursive;
 pub mod scope;
 pub mod select;
+pub mod setop;
+pub mod window;
 
 pub use env::BindEnv;
 pub use scope::BindContext;

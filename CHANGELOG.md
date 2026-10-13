@@ -2867,3 +2867,33 @@ Every source file, test and protected path; ADR-SST-01 behaviour.
 - New limits (`RESOURCE_LIMIT`): `max_cte_definitions` (64), `max_cte_references` (256), `max_derived_table_depth` (32); a materialized CTE / join-side derived table is bounded by `max_materialized_rows` and `max_materialized_bytes`. New counter `cte_materializations_total`. `EXPLAIN` shows a twice-read CTE once, marked materialized.
 ### Changed
 - `WITH` and derived tables were rejected as unsupported before; they now work. Still unsupported: `WITH RECURSIVE`, set operations (`UNION` etc.) inside a derived table or CTE, `FROM t, LATERAL (...)` and `CROSS JOIN LATERAL`.
+
+## 2026-10-12 -- SQL: set operations (under [Unreleased])
+### Added
+- **`UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`** between queries, with `INTERSECT` binding tighter than `UNION` / `EXCEPT` (which are left to right) and parentheses overriding. Usable at the top level, in a derived table, a CTE body (non-recursive), a scalar / `IN` / `EXISTS` subquery and in the `WHERE` / `SET` of `UPDATE` / `DELETE`. Rows are compared with SQL's "not distinct" rule (NULL and NULL are the same value). `ALL` keeps duplicates by count (`INTERSECT ALL` = min of the counts, `EXCEPT ALL` = max(0, left - right)).
+- Columns are named after the first query and unified by type: numeric types widen (INTEGER < BIGINT < DECIMAL(max scale); REAL with an exact numeric -> DOUBLE; DOUBLE absorbs all numerics), every other type combines with itself only; anything else is a bind error. Column counts must match. `ORDER BY` / `LIMIT` / `OFFSET` after the last query apply to the whole result; `ORDER BY` may name output columns only.
+- New limit `max_set_op_branches` (32 queries combined per statement, `RESOURCE_LIMIT`); the rows a set operation holds are bounded by `max_materialized_rows` / `max_materialized_bytes`. New counters `set_op_rows_deduplicated_total`, `set_op_branches_total`. `EXPLAIN` shows `SetOp <operator> branches=N shape=OP(#1, OP(#2, #3))`.
+### Changed
+- `UNION` / `INTERSECT` / `EXCEPT` were rejected as unsupported before; they now work. Still unsupported: `MINUS`, `UNION BY NAME`, `VALUES` / `TABLE` as a set-operation operand, `WITH RECURSIVE`.
+
+## 2026-10-12 -- SQL: WITH RECURSIVE (under [Unreleased])
+### Added
+- **`WITH RECURSIVE name [(columns)] AS (seed UNION [ALL] recursive-term)`** before `SELECT`, `UPDATE`, `DELETE`, and inside derived tables and subqueries. The seed runs once; the recursive term reads the previous iteration's rows (the CTE's name inside the term is that working table, even if a table of the same name exists) until an iteration produces no row (`UNION ALL`) or no new distinct row (`UNION`, which also ends a walk over a cyclic graph). A recursive CTE may be read many times (its rows are computed once), may be followed by ordinary CTEs that read it, and several recursive CTEs may share one `WITH`.
+- Rules: the recursive reference appears exactly once, in the term's own `FROM`; the term may not aggregate, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT` or `OFFSET`; `DISTINCT` only with `UNION`; the term's column types equal the seed's; a CTE of the same list defined before the recursive one is not visible in its term; mutually recursive CTEs and several references are refused with a clear error.
+- New limits (`RESOURCE_LIMIT`, naming the CTE): `max_recursive_cte_depth` (1,000 evaluations of the term), `max_recursive_cte_rows` (1,000,000), `max_recursive_cte_definitions` (8). New counters `recursive_cte_iterations_total`, `recursive_cte_rows_emitted_total`. `EXPLAIN` shows `RecursiveCte` with the seed and the recursive term apart.
+### Changed
+- **Window functions are refused.** `f(...) OVER (...)` used to have its `OVER` clause silently dropped, so `SUM(x) OVER ()` returned the plain aggregate; it is now a typed `Unsupported` error.
+- `WITH RECURSIVE` was rejected as unsupported before; it now works. Still unsupported: several references to the recursive CTE in its term, mutually recursive CTEs.
+
+## 2026-10-13 -- SQL: window functions and advanced aggregation (under [Unreleased])
+### Added
+- **Window functions**: `f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS|RANGE BETWEEN ... AND ...])` and `WINDOW name AS (...)` / `OVER name` / `OVER (name ...)`. Aggregates (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, optionally `FILTER`), `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`. Allowed in the select list, `QUALIFY` and `ORDER BY`; a window function elsewhere (`WHERE`, `HAVING`, `GROUP BY`, `ON`) is a bind error.
+- Frames: `ROWS` and `RANGE` with `UNBOUNDED PRECEDING`, `N PRECEDING`, `CURRENT ROW`, `N FOLLOWING`, `UNBOUNDED FOLLOWING`. Defaults as the standard says: with an `ORDER BY` the frame runs to the current row's last peer (`RANGE`), without one it is the whole partition -- so `LAST_VALUE` with the default frame is the current row's value, not the partition's last.
+- **`QUALIFY`** (after window functions, before `DISTINCT`/`ORDER BY`/`LIMIT`; select-list aliases usable).
+- **`GROUP BY GROUPING SETS (...)`, `ROLLUP (...)`, `CUBE (...)`** (plain columns may be mixed in) computed in one pass over the input, and **`GROUPING(col, ...)`**.
+- **Aggregate `FILTER (WHERE ...)`** and **`DISTINCT` aggregates** (`COUNT/SUM/AVG/MIN/MAX (DISTINCT x)`).
+- New limits (`RESOURCE_LIMIT`): `max_window_partition_rows` (1,000,000), `max_window_functions_per_statement` (64), `max_grouping_sets_per_statement` (64). New counters `window_functions_evaluated_total`, `window_partitions_created_total`, `aggregate_filter_rows_skipped_total`, `grouping_sets_evaluated_total` (engine-internal; not exposed over HTTP).
+### Changed
+- **Window functions are no longer refused**: `OVER` was `400 UNSUPPORTED` (since SQL Mission 1 Slice D; before that it was silently dropped) and now executes. `ROLLUP`, `CUBE`, `GROUPING SETS` and `COUNT(DISTINCT x)` were `UNSUPPORTED` and now execute.
+- A window operator returns rows in its input order; the window's `ORDER BY` decides what is computed, not the result order. Grouping-set rows come set by set.
+- Still unsupported (typed errors): `GROUPS` frames, frame `EXCLUDE`, `IGNORE NULLS`, `DISTINCT` inside a window aggregate, a subquery inside a window call, `GROUP BY ALL`, `WITH ROLLUP`.

@@ -1,0 +1,40 @@
+[
+  {
+    "id": "feature_off",
+    "why": "Slice-C-complete tree: the converter refuses every set operation as Unsupported, exactly as before Slice E. Every Slice E test still compiles, so each failure is the feature's absence.",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "        body @ sp::SetExpr::SetOperation { .. } => {\n            let mut shell = convert_set_operation(body, dg, depth)?;",
+        "new": "        body @ sp::SetExpr::SetOperation { .. } => {\n            if true {\n                return Err(unsupported(\"set operation\"));\n            }\n            let mut shell = convert_set_operation(body, dg, depth)?;"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "setop_tests",
+        "mission1_corpus",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "--",
+        "all_six_set_operators_through_the_real_api",
+        "set_operation_precedence_and_associativity_through_the_real_api",
+        "set_operations_in_derived_tables_ctes_and_subqueries_through_the_real_api",
+        "set_operation_errors_and_limits_over_http",
+        "explain_of_a_set_operation_shows_the_precedence_and_executes_nothing_over_http"
+      ]
+    ]
+  }
+]

@@ -1,0 +1,362 @@
+[
+  {
+    "id": "M05a_range_current_row_ignores_peers",
+    "why": "RANGE ... CURRENT ROW behaves as ROWS (peers excluded)",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "                FrameUnits::Range => self.peer_start[p],\n            },\n            RBound::Preceding(off) => self.offset_start",
+        "new": "                FrameUnits::Range => p,\n            },\n            RBound::Preceding(off) => self.offset_start"
+      },
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "                FrameUnits::Range => self.peer_end[p],\n            },\n            RBound::Preceding(off) => self.offset_end",
+        "new": "                FrameUnits::Range => p + 1,\n            },\n            RBound::Preceding(off) => self.offset_end"
+      }
+    ]
+  },
+  {
+    "id": "M05b_range_offsets_ignore_the_order_direction",
+    "why": "a descending RANGE offset counts distance the wrong way (direction ignored)",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "let target = num_shift(k, o, dir * self.direction());\n                    let asc = self.ascending;\n                    // First position",
+        "new": "let target = num_shift(k, o, dir);\n                    let asc = self.ascending;\n                    // First position"
+      },
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "let target = num_shift(k, o, dir * self.direction());\n                    let asc = self.ascending;\n                    // Last position",
+        "new": "let target = num_shift(k, o, dir);\n                    let asc = self.ascending;\n                    // Last position"
+      }
+    ]
+  },
+  {
+    "id": "M06_last_value_is_the_partitions_last",
+    "why": "LAST_VALUE returns the partition's last row instead of the frame's",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "BoundWindowFunc::LastValue(_) => Some(hi - 1),",
+        "new": "BoundWindowFunc::LastValue(_) => Some(part.len() - 1),"
+      }
+    ]
+  },
+  {
+    "id": "M07_lag_returns_the_current_row",
+    "why": "LAG returns the current row's value",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "p.checked_sub(off)\n                } else {",
+        "new": "Some(p)\n                } else {"
+      }
+    ]
+  },
+  {
+    "id": "M10_grouping_is_zero_for_aggregated_away_columns",
+    "why": "GROUPING() reports 0 for a column the grouping set leaves out",
+    "edits": [
+      {
+        "file": "sql/src/exec/expr_eval.rs",
+        "old": "if i < 64 && (mask >> i) & 1 == 1 {",
+        "new": "if i < 64 && (mask >> i) & 1 == 2 {"
+      }
+    ]
+  },
+  {
+    "id": "M11_rollup_misses_the_full_set",
+    "why": "ROLLUP (a, b) = GROUPING SETS ((a), ()) (the (a, b) set is missing)",
+    "edits": [
+      {
+        "file": "sql/src/bound.rs",
+        "old": "BoundGroupElement::Rollup(members) => (0..=members.len())\n                .rev()",
+        "new": "BoundGroupElement::Rollup(members) => (0..members.len())\n                .rev()"
+      }
+    ]
+  },
+  {
+    "id": "M12_cube_is_rollup",
+    "why": "CUBE (a, b) lacks the set (b)",
+    "edits": [
+      {
+        "file": "sql/src/bound.rs",
+        "old": "                (0..(1usize << k))\n                    .rev()\n                    .map(|mask| {",
+        "new": "                (0..(1usize << k))\n                    .rev()\n                    .filter(|mask| *mask != 1)\n                    .map(|mask| {"
+      }
+    ]
+  },
+  {
+    "id": "M13_filter_applies_to_every_aggregate",
+    "why": "the first FILTER found is applied to every aggregate of the SELECT",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "                if let Some(filter) = &agg.filter {\n                    if !eval_predicate(filter, &tuple.ctx, ec)?.is_true() {",
+        "new": "                if let Some(filter) = self.aggregates.iter().find_map(|a| a.filter.as_ref()) {\n                    if !eval_predicate(filter, &tuple.ctx, ec)?.is_true() {"
+      }
+    ]
+  },
+  {
+    "id": "M14a_distinct_ignored",
+    "why": "DISTINCT is accepted and ignored (every value counts)",
+    "edits": [
+      {
+        "file": "sql/src/aggregate.rs",
+        "old": "seen: distinct.then(std::collections::HashSet::new),",
+        "new": "seen: { let _ = distinct; None },"
+      }
+    ]
+  },
+  {
+    "id": "M14b_distinct_across_groups",
+    "why": "DISTINCT deduplicates across groups instead of within each group",
+    "edits": [
+      {
+        "file": "sql/src/aggregate.rs",
+        "old": "impl AggregateAccumulator {\n    pub fn new(",
+        "new": "thread_local! {\n    static CROSS_GROUP: std::cell::RefCell<std::collections::HashSet<GroupingValue>> = std::cell::RefCell::new(std::collections::HashSet::new());\n}\n\nimpl AggregateAccumulator {\n    pub fn new("
+      },
+      {
+        "file": "sql/src/aggregate.rs",
+        "old": "            if seen.contains(&key) {\n                return Ok(());\n            }",
+        "new": "            if seen.contains(&key) || !CROSS_GROUP.with(|g| g.borrow_mut().insert(key.clone())) {\n                return Ok(());\n            }"
+      },
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "        let mut index_of: HashMap<(usize, GroupingKey), usize> = HashMap::new();",
+        "new": "        crate::aggregate::clear_cross_group();\n        let mut index_of: HashMap<(usize, GroupingKey), usize> = HashMap::new();"
+      },
+      {
+        "file": "sql/src/aggregate.rs",
+        "old": "fn order_value(a: &RelationalValue, b: &RelationalValue)",
+        "new": "pub fn clear_cross_group() {\n    CROSS_GROUP.with(|g| g.borrow_mut().clear());\n}\n\nfn order_value(a: &RelationalValue, b: &RelationalValue)"
+      }
+    ]
+  },
+  {
+    "id": "M16_qualify_before_the_windows",
+    "why": "QUALIFY filters before the window functions have run",
+    "edits": [
+      {
+        "file": "sql/src/plan/logical.rs",
+        "old": "    for (spec, functions) in nodes {\n        plan = LogicalPlan::Window {\n            input: Box::new(plan),\n            spec,\n            functions,\n        };\n    }\n    if let Some(qualify) = &select.qualify {\n        plan = LogicalPlan::Filter {\n            input: Box::new(plan),\n            predicate: qualify.clone(),\n        };\n    }",
+        "new": "    if let Some(qualify) = &select.qualify {\n        plan = LogicalPlan::Filter {\n            input: Box::new(plan),\n            predicate: qualify.clone(),\n        };\n    }\n    for (spec, functions) in nodes {\n        plan = LogicalPlan::Window {\n            input: Box::new(plan),\n            spec,\n            functions,\n        };\n    }"
+      }
+    ]
+  },
+  {
+    "id": "M17_qualify_after_limit",
+    "why": "QUALIFY filters after ORDER BY and LIMIT",
+    "edits": [
+      {
+        "file": "sql/src/plan/logical.rs",
+        "old": "    if let Some(qualify) = &select.qualify {\n        plan = LogicalPlan::Filter {\n            input: Box::new(plan),\n            predicate: qualify.clone(),\n        };\n    }\n\n    plan = LogicalPlan::Projection {",
+        "new": "    plan = LogicalPlan::Projection {"
+      },
+      {
+        "file": "sql/src/plan/logical.rs",
+        "old": "    Ok(finish_order_and_limit(plan, select))\n}\n\n/// `ORDER BY` then",
+        "new": "    let mut plan = finish_order_and_limit(plan, select);\n    if let Some(qualify) = &select.qualify {\n        plan = LogicalPlan::Filter {\n            input: Box::new(plan),\n            predicate: qualify.clone(),\n        };\n    }\n    Ok(plan)\n}\n\n/// `ORDER BY` then"
+      }
+    ]
+  },
+  {
+    "id": "M19_ntile_puts_every_row_in_bucket_one",
+    "why": "NTILE assigns bucket 1 to every row",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "out[part.rows[p]] = Some(RelationalValue::Bigint(bucket as i64));",
+        "new": "let _ = bucket;\n                out[part.rows[p]] = Some(RelationalValue::Bigint(1));"
+      }
+    ]
+  },
+  {
+    "id": "M20_percent_rank_uses_row_number",
+    "why": "PERCENT_RANK is (row_number - 1) / (rows - 1)",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "part.peer_start[p] as f64 / (n - 1) as f64",
+        "new": "p as f64 / (n - 1) as f64"
+      }
+    ]
+  },
+  {
+    "id": "M23_cume_dist_excludes_peers",
+    "why": "CUME_DIST counts rows up to the current one, not up to its last peer",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "part.peer_end[p] as f64 / n as f64",
+        "new": "(p + 1) as f64 / n as f64"
+      }
+    ]
+  },
+  {
+    "id": "M26_grouping_sets_ignored",
+    "why": "ROLLUP / CUBE / GROUPING SETS aggregate as an ordinary GROUP BY",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "Some(g) => g.expand(ec.limits.max_grouping_sets_per_statement as usize)?,",
+        "new": "Some(_) => vec![(0..self.group_by.len()).collect()],"
+      }
+    ]
+  },
+  {
+    "id": "M27_grouping_columns_read_the_representative_row",
+    "why": "an omitted grouping column keeps the representative row's value instead of NULL",
+    "edits": [
+      {
+        "file": "sql/src/bind/select.rs",
+        "old": "if let Some(i) = group_by.iter().position(|g| *g == expr) {\n        return BoundExpr {\n            kind: BoundExprKind::GroupKeyRef(i),",
+        "new": "if let Some(i) = group_by.iter().position(|_| false) {\n        return BoundExpr {\n            kind: BoundExprKind::GroupKeyRef(i),"
+      }
+    ]
+  },
+  {
+    "id": "M28_empty_set_has_no_row_over_empty_input",
+    "why": "the () grouping set yields no row when the input is empty",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "if set.is_empty() && !groups.iter().any(|g| g.set_index == set_index) {",
+        "new": "if false && set.is_empty() && !groups.iter().any(|g| g.set_index == set_index) {"
+      }
+    ]
+  },
+  {
+    "id": "M29_grouping_set_limit_unchecked",
+    "why": "max_grouping_sets_per_statement is not enforced",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "if stats.grouping_sets > u128::from(limits.max_grouping_sets_per_statement) {",
+        "new": "if false && stats.grouping_sets > u128::from(limits.max_grouping_sets_per_statement) {"
+      }
+    ]
+  },
+  {
+    "id": "M30_partition_limit_unchecked",
+    "why": "max_window_partition_rows is not enforced",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "if partitions[pi].len() as u64 >= limits.max_window_partition_rows {",
+        "new": "if partitions[pi].len() as u64 >= u64::MAX {"
+      }
+    ]
+  },
+  {
+    "id": "M31_distinct_state_not_counted",
+    "why": "the DISTINCT seen-set is not counted against max_aggregate_state_bytes",
+    "edits": [
+      {
+        "file": "sql/src/aggregate.rs",
+        "old": "self.state.estimated_bytes().saturating_add(self.seen_bytes)",
+        "new": "self.state.estimated_bytes()"
+      }
+    ]
+  },
+  {
+    "id": "M32_null_filter_counts_as_true",
+    "why": "a FILTER condition that is UNKNOWN keeps the row",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "if !eval_predicate(filter, &tuple.ctx, ec)?.is_true() {",
+        "new": "if eval_predicate(filter, &tuple.ctx, ec)? == crate::exec::expr_eval::Tri::False {"
+      }
+    ]
+  },
+  {
+    "id": "M33_null_row_range_offset_is_not_peers_only",
+    "why": "a NULL current row's RANGE offset start reaches back to the partition start",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "                None => self.peer_start[p],\n                Some(k) => {\n                    let target = num_shift(k, o, dir * self.direction());\n                    let asc = self.ascending;\n                    // First position",
+        "new": "                None => 0,\n                Some(k) => {\n                    let target = num_shift(k, o, dir * self.direction());\n                    let asc = self.ascending;\n                    // First position"
+      }
+    ]
+  },
+  {
+    "id": "M34_nth_value_off_by_one",
+    "why": "NTH_VALUE(x, n) returns the (n+1)-th row",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "lo.checked_add(k - 1).filter(|&t| t < hi)",
+        "new": "lo.checked_add(k).filter(|&t| t < hi)"
+      }
+    ]
+  },
+  {
+    "id": "M35_first_value_is_the_partitions_first",
+    "why": "FIRST_VALUE ignores the frame start",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "BoundWindowFunc::FirstValue(_) => Some(lo),",
+        "new": "BoundWindowFunc::FirstValue(_) => Some(0),"
+      }
+    ]
+  },
+  {
+    "id": "M36_rows_current_row_takes_peers",
+    "why": "ROWS ... CURRENT ROW end includes the row's peers",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "                FrameUnits::Rows => p + 1,\n                FrameUnits::Range => self.peer_end[p],",
+        "new": "                FrameUnits::Rows => self.peer_end[p],\n                FrameUnits::Range => self.peer_end[p],"
+      }
+    ]
+  },
+  {
+    "id": "M37_lead_goes_backwards",
+    "why": "LEAD looks at the previous row",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "p.checked_add(off).filter(|&t| t < n)",
+        "new": "p.checked_sub(off)"
+      }
+    ]
+  },
+  {
+    "id": "M38_rows_following_start_goes_backwards",
+    "why": "N FOLLOWING as a ROWS frame start counts backwards",
+    "edits": [
+      {
+        "file": "sql/src/exec/window.rs",
+        "old": "                    p.saturating_add(k.min(usize::MAX as u64) as usize)\n                }\n            }\n            (_, Offset::Range(o)) => match self.keys[p] {\n                // A NULL key",
+        "new": "                    p.saturating_sub(k.min(usize::MAX as u64) as usize)\n                }\n            }\n            (_, Offset::Range(o)) => match self.keys[p] {\n                // A NULL key"
+      }
+    ]
+  },
+  {
+    "id": "M39_grouping_sets_emitted_group_major",
+    "why": "groups are not emitted set by set",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "        groups.sort_by_key(|g| g.set_index);\n",
+        "new": "        groups.sort_by_key(|g| g.set_index == usize::MAX);\n"
+      }
+    ]
+  },
+  {
+    "id": "M40_window_function_count_limit_off",
+    "why": "max_window_functions_per_statement is not enforced",
+    "edits": [
+      {
+        "file": "sql/src/exec/mod.rs",
+        "old": "if stats.window_functions > u64::from(limits.max_window_functions_per_statement) {",
+        "new": "if false && stats.window_functions > u64::from(limits.max_window_functions_per_statement) {"
+      }
+    ]
+  }
+]

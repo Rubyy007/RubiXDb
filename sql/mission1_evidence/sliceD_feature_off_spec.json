@@ -1,0 +1,40 @@
+[
+  {
+    "id": "feature_off",
+    "why": "Slice-E-complete tree: the converter refuses WITH RECURSIVE as Unsupported, exactly as before Slice D. Every Slice D test still compiles, so each failure is the feature's absence.",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    let Some(with) = with else {\n        return Ok(Vec::new());\n    };",
+        "new": "    let Some(with) = with else {\n        return Ok(Vec::new());\n    };\n    if with.recursive {\n        return Err(unsupported(\"WITH RECURSIVE\"));\n    }"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests",
+        "mission1_corpus",
+        "parse_tests",
+        "relation_tests::parser"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "--",
+        "recursive_ctes_through_the_real_api",
+        "recursive_cte_errors_and_bounds_over_http",
+        "recursive_cte_explain_and_a_failed_recursion_inside_a_transaction_over_http",
+        "non_recursive_ctes_through_the_real_api"
+      ]
+    ]
+  }
+]

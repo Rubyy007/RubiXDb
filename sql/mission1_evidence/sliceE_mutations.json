@@ -1,0 +1,658 @@
+[
+  {
+    "id": "M01_union_behaves_as_union_all",
+    "why": "UNION keeps duplicates (no deduplication): the distinct kind is mapped to the concatenation operator",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 28,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::contexts::a_correlated_scalar_set_operation_is_evaluated_for_each_outer_row",
+      "setop_tests::contexts::a_cte_body_can_be_a_set_operation",
+      "setop_tests::contexts::a_derived_set_operation_joins_with_a_table_and_nests_in_another",
+      "setop_tests::contexts::a_derived_table_can_be_a_set_operation_with_the_outer_where_applied_on_top",
+      "setop_tests::contexts::a_scalar_set_operation_returns_null_for_zero_rows_the_value_for_one_and_errors_for_many",
+      "setop_tests::contexts::operands_that_contain_subqueries_derived_tables_and_ctes_mix_all_the_features",
+      "setop_tests::contexts::parameters_are_numbered_across_all_the_operands",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::except::a_chain_applies_left_to_right",
+      "setop_tests::limits::the_branches_metric_counts_operands_once_per_statement_however_often_they_run",
+      "setop_tests::union::a_union_over_a_wide_text_column_counts_the_text_bytes",
+      "setop_tests::union::an_empty_branch_is_a_no_op_apart_from_deduplicating_the_other",
+      "setop_tests::union::disjoint_relations_give_the_sum_of_their_distinct_rows",
+      "setop_tests::union::floating_point_zero_signs_are_one_row",
+      "setop_tests::union::it_returns_the_distinct_rows_of_both_sides",
+      "setop_tests::union::nulls_are_one_value_for_deduplication_in_one_and_two_columns",
+      "setop_tests::union::order_by_and_limit_apply_after_the_deduplication",
+      "setop_tests::union::rows_come_out_in_the_order_of_their_first_occurrence",
+      "setop_tests::union::rows_removed_by_the_distinct_step_are_counted",
+      "setop_tests::union::text_is_compared_exactly_and_other_types_deduplicate_too",
+      "setop_tests::union::the_bytes_held_are_bounded_by_max_materialized_bytes",
+      "setop_tests::union::the_distinct_rows_held_are_bounded_by_max_materialized_rows",
+      "setop_tests::union::three_branches_are_deduplicated_across_all_of_them",
+      "setop_tests::union::two_identical_relations_give_the_relation_once_each_row",
+      "setop_tests::union::values_of_different_numeric_types_that_are_equal_after_widening_are_one_row"
+    ]
+  },
+  {
+    "id": "M02_union_all_behaves_as_union",
+    "why": "UNION ALL deduplicates",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 15,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::contexts::a_correlated_scalar_set_operation_is_evaluated_for_each_outer_row",
+      "setop_tests::contexts::a_derived_set_operation_joins_with_a_table_and_nests_in_another",
+      "setop_tests::contexts::a_derived_table_can_be_a_set_operation_with_the_outer_where_applied_on_top",
+      "setop_tests::contexts::a_scalar_set_operation_returns_null_for_zero_rows_the_value_for_one_and_errors_for_many",
+      "setop_tests::contexts::a_set_operation_cte_read_twice_is_computed_once_and_both_reads_see_the_same_rows",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::union::the_bytes_held_are_bounded_by_max_materialized_bytes",
+      "setop_tests::union::three_branches_are_deduplicated_across_all_of_them",
+      "setop_tests::union_all::it_returns_every_row_of_both_sides_without_deduplicating",
+      "setop_tests::union_all::nulls_are_kept_and_never_merged",
+      "setop_tests::union_all::two_identical_relations_give_twice_the_rows",
+      "setop_tests::union_all::union_all_removes_no_rows_so_the_dedup_counter_stays_zero_and_the_branches_are_counted"
+    ]
+  },
+  {
+    "id": "M03_intersect_behaves_as_except",
+    "why": "INTERSECT produces what EXCEPT would",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 21,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::contexts::a_derived_set_operation_joins_with_a_table_and_nests_in_another",
+      "setop_tests::contexts::a_scalar_set_operation_returns_null_for_zero_rows_the_value_for_one_and_errors_for_many",
+      "setop_tests::contexts::exists_over_a_set_operation",
+      "setop_tests::contexts::in_sees_the_deduplicated_result_and_follows_three_valued_logic",
+      "setop_tests::contexts::update_where_and_set_accept_set_operation_subqueries",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::intersect::an_empty_branch_makes_the_result_empty_in_either_position",
+      "setop_tests::intersect::disjoint_relations_intersect_to_nothing",
+      "setop_tests::intersect::intersect_binds_tighter_than_union_and_except_on_data_that_tells_the_parses_apart",
+      "setop_tests::intersect::order_by_and_limit_apply_to_the_intersection",
+      "setop_tests::intersect::rows_with_nulls_intersect_as_not_distinct_values",
+      "setop_tests::intersect::the_all_form_counts_every_value_separately",
+      "setop_tests::intersect::the_distinct_form_returns_each_common_row_once",
+      "setop_tests::intersect::the_distinct_step_counts_the_duplicates_it_removes",
+      "setop_tests::intersect::the_right_operand_is_read_once_not_once_per_left_row",
+      "setop_tests::intersect::three_branches_intersect_left_to_right",
+      "setop_tests::intersect::two_identical_relations_intersect_to_the_relation",
+      "setop_tests::intersect::values_of_different_numeric_types_intersect_after_widening"
+    ]
+  },
+  {
+    "id": "M04_intersect_all_treated_as_intersect",
+    "why": "INTERSECT ALL returns each common row once (a distinct count, not the minimum count)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 8,
+    "failed_tests": [
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::intersect::rows_with_nulls_intersect_as_not_distinct_values",
+      "setop_tests::intersect::the_all_form_counts_every_value_separately",
+      "setop_tests::intersect::the_all_form_returns_min_of_the_counts_not_the_distinct_row",
+      "setop_tests::intersect::the_distinct_step_counts_the_duplicates_it_removes",
+      "setop_tests::intersect::two_identical_relations_intersect_to_the_relation"
+    ]
+  },
+  {
+    "id": "M05_except_all_counts_go_negative",
+    "why": "EXCEPT ALL keeps decrementing a right-hand count that is already zero (an unsigned count wrapping below zero), so every later copy of the row is removed",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 7,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::except::rows_with_nulls_are_removed_when_they_match_as_not_distinct_values",
+      "setop_tests::except::the_all_form_never_goes_below_zero",
+      "setop_tests::except::the_all_form_subtracts_counts_so_one_copy_of_a_duplicated_row_remains"
+    ]
+  },
+  {
+    "id": "M06_distinctness_treats_null_as_different_from_null",
+    "why": "the tuple-distinctness predicate says NULL and NULL are different values (the standard trap)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 16,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::contexts::in_sees_the_deduplicated_result_and_follows_three_valued_logic",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::distinctness::mixed_type_tuples_compare_column_by_column",
+      "setop_tests::distinctness::rows_with_nulls_compare_by_the_not_distinct_rule",
+      "setop_tests::distinctness::the_hash_key_agrees_with_the_predicate_and_with_the_grouping_key_on_every_pair_of_the_pool",
+      "setop_tests::distinctness::the_predicate_is_reflexive_symmetric_and_transitive_on_the_pool",
+      "setop_tests::distinctness::two_nulls_are_not_distinct_and_a_null_and_a_value_are",
+      "setop_tests::except::rows_with_nulls_are_removed_when_they_match_as_not_distinct_values",
+      "setop_tests::except::two_identical_relations_leave_nothing",
+      "setop_tests::intersect::rows_with_nulls_intersect_as_not_distinct_values",
+      "setop_tests::intersect::two_identical_relations_intersect_to_the_relation",
+      "setop_tests::union::nulls_are_one_value_for_deduplication_in_one_and_two_columns",
+      "setop_tests::union::two_identical_relations_give_the_relation_once_each_row"
+    ]
+  },
+  {
+    "id": "M07_column_names_from_the_second_branch",
+    "why": "the output columns are named after the right operand",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 9,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::binder::a_set_operation_in_a_derived_table_or_cte_exposes_the_unified_columns",
+      "setop_tests::binder::an_unaliased_expression_is_named_question_column_the_engines_default",
+      "setop_tests::binder::column_names_come_from_the_first_branch",
+      "setop_tests::binder::order_by_naming_a_table_column_is_a_bind_error",
+      "setop_tests::binder::order_by_on_a_duplicated_output_name_is_ambiguous_and_an_aggregate_or_subquery_is_refused",
+      "setop_tests::binder::order_by_resolves_output_column_names_and_expressions_over_them",
+      "setop_tests::contexts::a_non_lateral_derived_set_operation_cannot_read_the_query_around_it_but_lateral_can",
+      "setop_tests::union_all::the_output_schema_has_the_first_branchs_names_and_the_unified_types"
+    ]
+  },
+  {
+    "id": "M08_intersect_has_the_same_precedence_as_union",
+    "why": "the converter re-associates a right operand that is itself a set operation (what sqlparser built for a tighter-binding INTERSECT) to the left, so all three operators bind alike",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 8,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::except::a_chain_applies_left_to_right",
+      "setop_tests::intersect::intersect_binds_tighter_than_union_and_except_on_data_that_tells_the_parses_apart",
+      "setop_tests::parser::intersect_binds_tighter_than_union_and_except",
+      "setop_tests::parser::parentheses_override_precedence_and_associativity",
+      "setop_tests::parser::the_two_parses_of_union_then_intersect_give_different_answers_on_distinguishing_data",
+      "setop_tests::union::three_branches_are_deduplicated_across_all_of_them"
+    ]
+  },
+  {
+    "id": "M09_order_by_resolves_unknown_names_to_the_first_column",
+    "why": "ORDER BY of a set operation, given a name that is not an output column, silently sorts by the first output column instead of failing",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 1,
+    "failed_tests": [
+      "setop_tests::binder::order_by_naming_a_table_column_is_a_bind_error"
+    ]
+  },
+  {
+    "id": "M10_unification_falls_back_to_text",
+    "why": "two types with no common type unify to TEXT instead of being refused",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 3,
+    "failed_tests": [
+      "setop_tests::binder::a_chain_unifies_pairwise_and_one_bad_branch_anywhere_is_an_error",
+      "setop_tests::binder::a_with_list_in_front_of_a_set_operation_is_visible_in_every_operand",
+      "setop_tests::binder::types_with_no_common_type_are_a_bind_error_never_a_silent_cast"
+    ]
+  },
+  {
+    "id": "M11_set_operation_output_loses_a_column",
+    "why": "the shell's output columns skip the first operand column (the relation exposes the wrong column set to a derived table / CTE / subquery)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 93,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::binder::a_chain_unifies_pairwise_and_one_bad_branch_anywhere_is_an_error",
+      "setop_tests::binder::a_columns_nullability_is_true_if_either_branch_can_produce_null",
+      "setop_tests::binder::a_long_chain_binds_without_native_recursion_and_the_tree_is_left_nested",
+      "setop_tests::binder::a_set_operation_binds_in_update_and_delete_where_and_set",
+      "setop_tests::binder::a_set_operation_in_a_derived_table_or_cte_exposes_the_unified_columns",
+      "setop_tests::binder::a_set_operation_in_a_scalar_in_or_exists_subquery_binds_with_the_unified_type",
+      "setop_tests::binder::a_with_list_in_front_of_a_set_operation_is_visible_in_every_operand",
+      "setop_tests::binder::an_operand_may_read_the_enclosing_query_and_is_then_correlated",
+      "setop_tests::binder::an_unaliased_expression_is_named_question_column_the_engines_default",
+      "setop_tests::binder::an_untyped_null_adopts_the_other_branchs_type",
+      "setop_tests::binder::column_names_come_from_the_first_branch",
+      "setop_tests::binder::every_pair_of_numeric_types_widens_as_documented_through_the_real_binder",
+      "setop_tests::binder::order_by_on_a_duplicated_output_name_is_ambiguous_and_an_aggregate_or_subquery_is_refused",
+      "setop_tests::binder::order_by_on_an_untyped_null_column_is_refused_like_every_other_relation_column",
+      "setop_tests::binder::order_by_resolves_output_column_names_and_expressions_over_them",
+      "setop_tests::binder::the_integer_and_bigint_example_from_the_contract_is_bigint",
+      "setop_tests::binder::types_with_no_common_type_are_a_bind_error_never_a_silent_cast",
+      "setop_tests::contexts::a_correlated_scalar_set_operation_is_evaluated_for_each_outer_row",
+      "setop_tests::contexts::a_cte_body_can_be_a_set_operation",
+      "setop_tests::contexts::a_derived_set_operation_joins_with_a_table_and_nests_in_another",
+      "setop_tests::contexts::a_derived_table_can_be_a_set_operation_with_the_outer_where_applied_on_top",
+      "setop_tests::contexts::a_non_lateral_derived_set_operation_cannot_read_the_query_around_it_but_lateral_can",
+      "setop_tests::contexts::a_scalar_set_operation_returns_null_for_zero_rows_the_value_for_one_and_errors_for_many",
+      "setop_tests::contexts::a_set_operation_cte_read_twice_is_computed_once_and_both_reads_see_the_same_rows",
+      "setop_tests::contexts::delete_where_accepts_a_set_operation_subquery",
+      "setop_tests::contexts::exists_over_a_set_operation",
+      "setop_tests::contexts::in_sees_the_deduplicated_result_and_follows_three_valued_logic",
+      "setop_tests::contexts::operands_may_group_distinct_order_and_limit_on_their_own",
+      "setop_tests::contexts::operands_that_contain_subqueries_derived_tables_and_ctes_mix_all_the_features",
+      "setop_tests::contexts::parameters_are_numbered_across_all_the_operands",
+      "setop_tests::contexts::update_where_and_set_accept_set_operation_subqueries",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::except::a_chain_applies_left_to_right",
+      "setop_tests::except::an_empty_right_branch_leaves_the_left_and_an_empty_left_branch_leaves_nothing",
+      "setop_tests::except::disjoint_relations_leave_the_left",
+      "setop_tests::except::order_by_and_limit_apply_to_the_difference",
+      "setop_tests::except::rows_with_nulls_are_removed_when_they_match_as_not_distinct_values",
+      "setop_tests::except::the_all_form_never_goes_below_zero",
+      "setop_tests::except::the_all_form_subtracts_counts_so_one_copy_of_a_duplicated_row_remains",
+      "setop_tests::except::the_distinct_form_removes_every_copy_of_a_row_that_is_on_the_right",
+      "setop_tests::except::the_distinct_step_counts_the_duplicates_it_removes",
+      "setop_tests::except::the_rows_held_are_bounded_for_the_right_operand_and_for_the_distinct_left",
+      "setop_tests::except::values_of_different_numeric_types_are_removed_after_widening",
+      "setop_tests::intersect::disjoint_relations_intersect_to_nothing",
+      "setop_tests::intersect::intersect_binds_tighter_than_union_and_except_on_data_that_tells_the_parses_apart",
+      "setop_tests::intersect::order_by_and_limit_apply_to_the_intersection",
+      "setop_tests::intersect::rows_with_nulls_intersect_as_not_distinct_values",
+      "setop_tests::intersect::the_all_form_counts_every_value_separately",
+      "setop_tests::intersect::the_all_form_returns_min_of_the_counts_not_the_distinct_row",
+      "setop_tests::intersect::the_distinct_form_returns_each_common_row_once",
+      "setop_tests::intersect::the_distinct_step_counts_the_duplicates_it_removes",
+      "setop_tests::intersect::the_right_operand_is_read_once_not_once_per_left_row",
+      "setop_tests::intersect::the_rows_held_for_the_right_operand_are_bounded",
+      "setop_tests::intersect::three_branches_intersect_left_to_right",
+      "setop_tests::intersect::two_identical_relations_intersect_to_the_relation",
+      "setop_tests::intersect::values_of_different_numeric_types_intersect_after_widening",
+      "setop_tests::limits::a_long_chain_within_the_parse_limit_but_over_the_operand_limit_fails_cleanly",
+      "setop_tests::limits::the_branches_metric_counts_operands_once_per_statement_however_often_they_run",
+      "setop_tests::limits::the_count_is_per_statement_across_every_set_operation_in_it",
+      "setop_tests::limits::the_default_allows_32_operands_and_refuses_33_with_resource_limit",
+      "setop_tests::limits::update_and_delete_are_held_to_the_same_operand_limit",
+      "setop_tests::union::a_union_over_a_wide_text_column_counts_the_text_bytes",
+      "setop_tests::union::an_empty_branch_is_a_no_op_apart_from_deduplicating_the_other",
+      "setop_tests::union::disjoint_relations_give_the_sum_of_their_distinct_rows",
+      "setop_tests::union::it_returns_the_distinct_rows_of_both_sides",
+      "setop_tests::union::nulls_are_one_value_for_deduplication_in_one_and_two_columns",
+      "setop_tests::union::order_by_and_limit_apply_after_the_deduplication",
+      "setop_tests::union::rows_come_out_in_the_order_of_their_first_occurrence",
+      "setop_tests::union::rows_removed_by_the_distinct_step_are_counted",
+      "setop_tests::union::text_is_compared_exactly_and_other_types_deduplicate_too",
+      "setop_tests::union::the_bytes_held_are_bounded_by_max_materialized_bytes",
+      "setop_tests::union::the_distinct_rows_held_are_bounded_by_max_materialized_rows",
+      "setop_tests::union::three_branches_are_deduplicated_across_all_of_them",
+      "setop_tests::union::two_identical_relations_give_the_relation_once_each_row",
+      "setop_tests::union::values_of_different_numeric_types_that_are_equal_after_widening_are_one_row",
+      "setop_tests::union_all::a_parenthesised_operand_keeps_its_own_order_by_and_limit",
+      "setop_tests::union_all::an_empty_branch_in_any_position_changes_nothing",
+      "setop_tests::union_all::disjoint_relations_give_the_sum",
+      "setop_tests::union_all::explain_shows_a_set_op_node_with_its_operator_and_branch_count",
+      "setop_tests::union_all::it_returns_every_row_of_both_sides_without_deduplicating",
+      "setop_tests::union_all::it_works_over_aggregates_derived_tables_and_joins_in_its_operands",
+      "setop_tests::union_all::limit_applies_to_the_concatenation_less_than_equal_and_greater_than_the_total",
+      "setop_tests::union_all::nulls_are_kept_and_never_merged",
+      "setop_tests::union_all::numeric_values_are_widened_to_the_unified_column_type",
+      "setop_tests::union_all::order_by_and_limit_apply_to_the_whole_result",
+      "setop_tests::union_all::the_left_rows_come_first_then_the_right_rows",
+      "setop_tests::union_all::the_output_schema_has_the_first_branchs_names_and_the_unified_types",
+      "setop_tests::union_all::three_or_more_branches_concatenate_in_order",
+      "setop_tests::union_all::two_identical_relations_give_twice_the_rows",
+      "setop_tests::union_all::union_all_removes_no_rows_so_the_dedup_counter_stays_zero_and_the_branches_are_counted"
+    ]
+  },
+  {
+    "id": "M12_cte_set_operation_rerun_per_reference",
+    "why": "a CTE whose body is a set operation is not stored after its first read, so every reference re-runs it (the Slice C materialization rule broken)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 7,
+    "failed_tests": [
+      "relation_tests::cte::a_cte_joined_to_a_base_table_and_filtered_by_the_outer_query",
+      "relation_tests::cte::a_cte_read_from_a_correlated_subquery_is_materialized_once_not_per_outer_row",
+      "relation_tests::cte::a_cte_referenced_twice_is_materialized_once_and_both_references_see_the_same_rows",
+      "relation_tests::cte::a_nondeterministic_looking_body_gives_both_references_identical_rows",
+      "relation_tests::cte::multiple_ctes_in_one_with_are_independent_relations",
+      "relation_tests::materialization::a_right_side_derived_table_reads_its_source_once_not_once_per_left_row",
+      "setop_tests::contexts::a_set_operation_cte_read_twice_is_computed_once_and_both_reads_see_the_same_rows"
+    ]
+  },
+  {
+    "id": "M13_operand_values_not_widened",
+    "why": "operand values keep their own types instead of being widened to the unified column type",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 7,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::contexts::operands_that_contain_subqueries_derived_tables_and_ctes_mix_all_the_features",
+      "setop_tests::except::values_of_different_numeric_types_are_removed_after_widening",
+      "setop_tests::intersect::values_of_different_numeric_types_intersect_after_widening",
+      "setop_tests::union::values_of_different_numeric_types_that_are_equal_after_widening_are_one_row",
+      "setop_tests::union_all::numeric_values_are_widened_to_the_unified_column_type",
+      "setop_tests::union_all::the_output_schema_has_the_first_branchs_names_and_the_unified_types"
+    ]
+  },
+  {
+    "id": "M14_decimal_widening_does_not_rescale",
+    "why": "widening to a larger DECIMAL scale keeps the unscaled digits (1.00 becomes 0.0100)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 3,
+    "failed_tests": [
+      "setop_tests::intersect::values_of_different_numeric_types_intersect_after_widening",
+      "setop_tests::union::values_of_different_numeric_types_that_are_equal_after_widening_are_one_row",
+      "setop_tests::union_all::numeric_values_are_widened_to_the_unified_column_type"
+    ]
+  },
+  {
+    "id": "M15_union_dedup_not_counted",
+    "why": "set_op_rows_deduplicated_total is never incremented by UNION",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 1,
+    "failed_tests": [
+      "setop_tests::union::rows_removed_by_the_distinct_step_are_counted"
+    ]
+  },
+  {
+    "id": "M16_branches_metric_not_recorded",
+    "why": "set_op_branches_total is never recorded",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 4,
+    "failed_tests": [
+      "setop_tests::contexts::a_set_operation_cte_read_twice_is_computed_once_and_both_reads_see_the_same_rows",
+      "setop_tests::limits::the_branches_metric_counts_operands_once_per_statement_however_often_they_run",
+      "setop_tests::union::rows_removed_by_the_distinct_step_are_counted",
+      "setop_tests::union_all::union_all_removes_no_rows_so_the_dedup_counter_stays_zero_and_the_branches_are_counted"
+    ]
+  },
+  {
+    "id": "M17_operand_limit_off_by_one",
+    "why": "the operand limit refuses a statement that is exactly at the limit",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 3,
+    "failed_tests": [
+      "setop_tests::limits::the_count_is_per_statement_across_every_set_operation_in_it",
+      "setop_tests::limits::the_default_allows_32_operands_and_refuses_33_with_resource_limit",
+      "setop_tests::limits::update_and_delete_are_held_to_the_same_operand_limit"
+    ]
+  },
+  {
+    "id": "M18_row_bound_removed",
+    "why": "the materialized-rows bound on a set operation's held rows is removed",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 3,
+    "failed_tests": [
+      "setop_tests::except::the_rows_held_are_bounded_for_the_right_operand_and_for_the_distinct_left",
+      "setop_tests::intersect::the_rows_held_for_the_right_operand_are_bounded",
+      "setop_tests::union::the_distinct_rows_held_are_bounded_by_max_materialized_rows"
+    ]
+  },
+  {
+    "id": "M19_byte_bound_removed",
+    "why": "the materialized-bytes bound on a set operation's held rows is removed",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 2,
+    "failed_tests": [
+      "setop_tests::union::a_union_over_a_wide_text_column_counts_the_text_bytes",
+      "setop_tests::union::the_bytes_held_are_bounded_by_max_materialized_bytes"
+    ]
+  },
+  {
+    "id": "M20_intersect_does_not_deduplicate_the_left",
+    "why": "INTERSECT returns a left row once per left copy that is on the right (the distinct-left step removed)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 10,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::intersect::order_by_and_limit_apply_to_the_intersection",
+      "setop_tests::intersect::rows_with_nulls_intersect_as_not_distinct_values",
+      "setop_tests::intersect::the_all_form_counts_every_value_separately",
+      "setop_tests::intersect::the_distinct_form_returns_each_common_row_once",
+      "setop_tests::intersect::the_distinct_step_counts_the_duplicates_it_removes",
+      "setop_tests::intersect::two_identical_relations_intersect_to_the_relation"
+    ]
+  },
+  {
+    "id": "M21_except_does_not_deduplicate_the_left",
+    "why": "EXCEPT remembers nothing about rows it has produced, so a repeated left row repeats in the result",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 7,
+    "failed_tests": [
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::except::an_empty_right_branch_leaves_the_left_and_an_empty_left_branch_leaves_nothing",
+      "setop_tests::except::disjoint_relations_leave_the_left",
+      "setop_tests::except::order_by_and_limit_apply_to_the_difference",
+      "setop_tests::except::the_distinct_step_counts_the_duplicates_it_removes"
+    ]
+  },
+  {
+    "id": "M22_union_all_reads_only_the_right_operand",
+    "why": "UNION ALL starts in the right phase and never reads the left operand",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 42,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::contexts::a_correlated_scalar_set_operation_is_evaluated_for_each_outer_row",
+      "setop_tests::contexts::a_cte_body_can_be_a_set_operation",
+      "setop_tests::contexts::a_derived_set_operation_joins_with_a_table_and_nests_in_another",
+      "setop_tests::contexts::a_derived_table_can_be_a_set_operation_with_the_outer_where_applied_on_top",
+      "setop_tests::contexts::a_non_lateral_derived_set_operation_cannot_read_the_query_around_it_but_lateral_can",
+      "setop_tests::contexts::a_scalar_set_operation_returns_null_for_zero_rows_the_value_for_one_and_errors_for_many",
+      "setop_tests::contexts::a_set_operation_cte_read_twice_is_computed_once_and_both_reads_see_the_same_rows",
+      "setop_tests::contexts::delete_where_accepts_a_set_operation_subquery",
+      "setop_tests::contexts::in_sees_the_deduplicated_result_and_follows_three_valued_logic",
+      "setop_tests::contexts::operands_may_group_distinct_order_and_limit_on_their_own",
+      "setop_tests::contexts::operands_that_contain_subqueries_derived_tables_and_ctes_mix_all_the_features",
+      "setop_tests::contexts::parameters_are_numbered_across_all_the_operands",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::except::a_chain_applies_left_to_right",
+      "setop_tests::intersect::intersect_binds_tighter_than_union_and_except_on_data_that_tells_the_parses_apart",
+      "setop_tests::union::an_empty_branch_is_a_no_op_apart_from_deduplicating_the_other",
+      "setop_tests::union::disjoint_relations_give_the_sum_of_their_distinct_rows",
+      "setop_tests::union::it_returns_the_distinct_rows_of_both_sides",
+      "setop_tests::union::nulls_are_one_value_for_deduplication_in_one_and_two_columns",
+      "setop_tests::union::order_by_and_limit_apply_after_the_deduplication",
+      "setop_tests::union::rows_come_out_in_the_order_of_their_first_occurrence",
+      "setop_tests::union::rows_removed_by_the_distinct_step_are_counted",
+      "setop_tests::union::the_bytes_held_are_bounded_by_max_materialized_bytes",
+      "setop_tests::union::the_distinct_rows_held_are_bounded_by_max_materialized_rows",
+      "setop_tests::union::three_branches_are_deduplicated_across_all_of_them",
+      "setop_tests::union::values_of_different_numeric_types_that_are_equal_after_widening_are_one_row",
+      "setop_tests::union_all::a_parenthesised_operand_keeps_its_own_order_by_and_limit",
+      "setop_tests::union_all::an_empty_branch_in_any_position_changes_nothing",
+      "setop_tests::union_all::disjoint_relations_give_the_sum",
+      "setop_tests::union_all::it_returns_every_row_of_both_sides_without_deduplicating",
+      "setop_tests::union_all::it_works_over_aggregates_derived_tables_and_joins_in_its_operands",
+      "setop_tests::union_all::limit_applies_to_the_concatenation_less_than_equal_and_greater_than_the_total",
+      "setop_tests::union_all::nulls_are_kept_and_never_merged",
+      "setop_tests::union_all::numeric_values_are_widened_to_the_unified_column_type",
+      "setop_tests::union_all::order_by_and_limit_apply_to_the_whole_result",
+      "setop_tests::union_all::the_left_rows_come_first_then_the_right_rows",
+      "setop_tests::union_all::the_output_schema_has_the_first_branchs_names_and_the_unified_types",
+      "setop_tests::union_all::three_or_more_branches_concatenate_in_order",
+      "setop_tests::union_all::two_identical_relations_give_twice_the_rows"
+    ]
+  },
+  {
+    "id": "M23_decimal_scale_unifies_to_the_smaller",
+    "why": "DECIMAL(s1) with DECIMAL(s2) unifies to the smaller scale",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 4,
+    "failed_tests": [
+      "setop_tests::binder::every_pair_of_numeric_types_widens_as_documented_through_the_real_binder",
+      "setop_tests::binder::unify_types_agrees_with_the_documented_table_for_every_pair_and_is_symmetric",
+      "setop_tests::union::values_of_different_numeric_types_that_are_equal_after_widening_are_one_row",
+      "setop_tests::union_all::numeric_values_are_widened_to_the_unified_column_type"
+    ]
+  },
+  {
+    "id": "M24_real_with_exact_numeric_unifies_to_real",
+    "why": "REAL with INTEGER / BIGINT / DECIMAL unifies to REAL (losing precision) instead of DOUBLE",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 4,
+    "failed_tests": [
+      "setop_tests::binder::a_chain_unifies_pairwise_and_one_bad_branch_anywhere_is_an_error",
+      "setop_tests::binder::every_pair_of_numeric_types_widens_as_documented_through_the_real_binder",
+      "setop_tests::binder::unify_types_agrees_with_the_documented_table_for_every_pair_and_is_symmetric",
+      "setop_tests::union_all::numeric_values_are_widened_to_the_unified_column_type"
+    ]
+  },
+  {
+    "id": "M25_column_count_not_checked",
+    "why": "operands with different column counts are combined (zip truncates)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 3,
+    "failed_tests": [
+      "setop_tests::binder::a_column_count_mismatch_is_a_bind_error_for_every_operator",
+      "setop_tests::binder::a_count_mismatch_anywhere_in_a_longer_chain_is_found",
+      "setop_tests::contexts::a_set_operation_cte_nobody_reads_is_bound_but_never_run"
+    ]
+  },
+  {
+    "id": "M26_nullability_and_instead_of_or",
+    "why": "an output column is nullable only if both operands can produce NULL",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 1,
+    "failed_tests": [
+      "setop_tests::binder::a_columns_nullability_is_true_if_either_branch_can_produce_null"
+    ]
+  },
+  {
+    "id": "M27_nan_is_distinct_from_nan",
+    "why": "the predicate treats two NaN doubles as different values",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 3,
+    "failed_tests": [
+      "setop_tests::distinctness::floating_point_zero_signs_and_nans_follow_the_grouping_rule",
+      "setop_tests::distinctness::the_hash_key_agrees_with_the_predicate_and_with_the_grouping_key_on_every_pair_of_the_pool",
+      "setop_tests::distinctness::the_predicate_is_reflexive_symmetric_and_transitive_on_the_pool"
+    ]
+  },
+  {
+    "id": "M28_hash_does_not_canonicalise_zero_signs",
+    "why": "the hash of REAL +0.0 and -0.0 differs although the values compare equal (hash/eq inconsistency)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 1,
+    "failed_tests": [
+      "setop_tests::distinctness::the_hash_key_agrees_with_the_predicate_and_with_the_grouping_key_on_every_pair_of_the_pool"
+    ]
+  },
+  {
+    "id": "M29_explain_prints_a_wrong_branch_count",
+    "why": "EXPLAIN shows branches=2 for every set operation",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 1,
+    "failed_tests": [
+      "setop_tests::union_all::explain_shows_a_set_op_node_with_its_operator_and_branch_count"
+    ]
+  },
+  {
+    "id": "M30_set_level_limit_ignored",
+    "why": "LIMIT / OFFSET written after a set operation are dropped",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 8,
+    "failed_tests": [
+      "setop_tests::binder::limit_and_offset_bind_as_integers_and_count_parameters",
+      "setop_tests::contexts::parameters_are_numbered_across_all_the_operands",
+      "setop_tests::except::order_by_and_limit_apply_to_the_difference",
+      "setop_tests::intersect::order_by_and_limit_apply_to_the_intersection",
+      "setop_tests::union::order_by_and_limit_apply_after_the_deduplication",
+      "setop_tests::union_all::it_streams_so_a_limit_stops_the_scan_early",
+      "setop_tests::union_all::limit_applies_to_the_concatenation_less_than_equal_and_greater_than_the_total",
+      "setop_tests::union_all::order_by_and_limit_apply_to_the_whole_result"
+    ]
+  },
+  {
+    "id": "M31_set_level_with_not_inherited",
+    "why": "the WITH list in front of a set operation is not visible in its operands",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 3,
+    "failed_tests": [
+      "setop_tests::binder::a_with_list_in_front_of_a_set_operation_is_visible_in_every_operand",
+      "setop_tests::contexts::a_cte_body_can_be_a_set_operation",
+      "setop_tests::contexts::operands_that_contain_subqueries_derived_tables_and_ctes_mix_all_the_features"
+    ]
+  },
+  {
+    "id": "M32_set_level_order_by_dropped",
+    "why": "the ORDER BY written after a set operation is not applied",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 7,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::binder::order_by_resolves_output_column_names_and_expressions_over_them",
+      "setop_tests::contexts::operands_may_group_distinct_order_and_limit_on_their_own",
+      "setop_tests::except::order_by_and_limit_apply_to_the_difference",
+      "setop_tests::intersect::order_by_and_limit_apply_to_the_intersection",
+      "setop_tests::union::order_by_and_limit_apply_after_the_deduplication",
+      "setop_tests::union_all::order_by_and_limit_apply_to_the_whole_result"
+    ]
+  },
+  {
+    "id": "M33_intersect_all_is_not_consumed",
+    "why": "INTERSECT ALL does not consume the right-hand count when it matches a left copy (every left copy of a common row survives)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 8,
+    "failed_tests": [
+      "mission1_corpus_tests::corpus_statements_return_exactly_the_expected_rows",
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::intersect::order_by_and_limit_apply_to_the_intersection",
+      "setop_tests::intersect::rows_with_nulls_intersect_as_not_distinct_values",
+      "setop_tests::intersect::the_all_form_counts_every_value_separately",
+      "setop_tests::intersect::the_all_form_returns_min_of_the_counts_not_the_distinct_row"
+    ]
+  },
+  {
+    "id": "M34_right_operand_counted_once_per_left_row_check",
+    "why": "the right operand's rows are all treated as one copy (count never exceeds 1)",
+    "compiled": true,
+    "tests_run": 182,
+    "failed_count": 9,
+    "failed_tests": [
+      "setop_tests::diff::one_column_all_six_operators_match_the_model_on_random_multisets",
+      "setop_tests::diff::three_branches_with_every_pair_of_operators_follow_the_precedence_rules",
+      "setop_tests::diff::two_columns_with_nulls_in_either_column_match_the_model",
+      "setop_tests::except::the_all_form_never_goes_below_zero",
+      "setop_tests::except::two_identical_relations_leave_nothing",
+      "setop_tests::intersect::rows_with_nulls_intersect_as_not_distinct_values",
+      "setop_tests::intersect::the_all_form_counts_every_value_separately",
+      "setop_tests::intersect::the_all_form_returns_min_of_the_counts_not_the_distinct_row",
+      "setop_tests::intersect::two_identical_relations_intersect_to_the_relation"
+    ]
+  }
+]

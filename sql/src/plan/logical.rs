@@ -5,12 +5,13 @@
 //! 3) — every field is either already-bound catalog metadata
 //! (`BoundTableRef`) or an already-typed `BoundExpr`.
 
-use crate::ast::JoinKind;
+use crate::ast::{JoinKind, SetOperator};
+use rubixdb::relational::RelationalType;
 use std::sync::Arc;
 
 use crate::bound::{
-    BoundAggregateExpr, BoundExpr, BoundOrderByItem, BoundRelation, BoundSelect, BoundSelectItem,
-    BoundTableRef,
+    BoundAggregateExpr, BoundExpr, BoundGrouping, BoundOrderByItem, BoundRelation, BoundSelect,
+    BoundSelectItem, BoundTableRef, BoundWindowFunc, BoundWindowSpec,
 };
 use crate::plan::physical::{CtePlan, PhysicalPlan};
 use crate::error::{Result, SqlError};
@@ -52,6 +53,18 @@ pub enum LogicalPlan {
         table: BoundTableRef,
         cte: Arc<CtePlan>,
     },
+    /// The working table of a recursive CTE, read inside its recursive term
+    /// (SQL-mission-1 Slice D): a leaf whose rows are the previous iteration's.
+    Working {
+        table: BoundTableRef,
+        work_id: u32,
+        name: String,
+    },
+    /// A set operation (SQL-mission-1 Slice E): a leaf whose rows are the
+    /// result of combining its two already-planned operands. It is never a
+    /// join; `ORDER BY` / `LIMIT` of the operation sit above it as `Sort` /
+    /// `Limit` nodes that read its output relation.
+    SetOp(SetOpNode),
     Join {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
@@ -84,6 +97,21 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         group_by: Vec<BoundExpr>,
         aggregates: Vec<BoundAggregateExpr>,
+        /// SQL-mission-2: `Some` for `ROLLUP` / `CUBE` / `GROUPING SETS`; then
+        /// `group_by` lists the distinct grouping expressions and the output has
+        /// one row per group of every grouping set.
+        grouping: Option<BoundGrouping>,
+    },
+    /// Window functions (SQL-mission-2). Sits above `GROUP BY` / `HAVING` (or the
+    /// `WHERE` filter) and below `QUALIFY` and the final projection: it keeps
+    /// every input row and adds, for each of `functions`, the value of that
+    /// function for the row (read back through `WindowRef(slot)`). One node per
+    /// distinct window (same `PARTITION BY`, `ORDER BY` and frame); the functions
+    /// of provably identical windows share a node.
+    Window {
+        input: Box<LogicalPlan>,
+        spec: BoundWindowSpec,
+        functions: Vec<WindowSlot>,
     },
     Sort {
         input: Box<LogicalPlan>,
@@ -96,6 +124,30 @@ pub enum LogicalPlan {
     },
 }
 
+/// One window function of a `Window` node and the slot (index into
+/// `BoundSelect::windows`) its result is stored in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSlot {
+    pub slot: usize,
+    pub func: BoundWindowFunc,
+}
+
+/// The operands and shape of a set operation, shared by the logical and the
+/// physical plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOpNode {
+    pub op: SetOperator,
+    pub all: bool,
+    /// The operation's output relation (`BoundSetOp::set_ref`).
+    pub set_ref: u32,
+    pub left: Box<PhysicalPlan>,
+    pub right: Box<PhysicalPlan>,
+    /// Unified type of each output column; operand values are widened to it.
+    pub column_types: Vec<Option<RelationalType>>,
+    /// The output columns (names, unified types): what the operation yields.
+    pub items: Vec<BoundSelectItem>,
+}
+
 /// Builds the raw, unoptimized logical plan from a bound `SELECT`.
 /// Evaluation-order-correct node nesting (`FROM`/`JOIN` → `WHERE` →
 /// `SELECT`/`DISTINCT` → `ORDER BY` → `LIMIT`/`OFFSET`) — matches
@@ -104,6 +156,14 @@ pub enum LogicalPlan {
 /// `ORDER BY` may reference an output alias `DISTINCT` has already
 /// collapsed duplicates for).
 pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Result<LogicalPlan> {
+    // A set operation has no FROM / WHERE / GROUP BY / SELECT list of its own:
+    // its rows come from the operation, and only its ORDER BY / LIMIT remain.
+    if let Some(set) = &select.set_op {
+        return Ok(finish_order_and_limit(
+            LogicalPlan::SetOp(set_op_node(set, select)?),
+            select,
+        ));
+    }
     if select.from.len() > limits.max_joins {
         return Err(SqlError::ResourceLimit {
             detail: format!(
@@ -143,13 +203,16 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
     // decide `is_aggregated` — kept independently re-derivable here
     // (rather than carried as a redundant flag) so this function's own
     // output is provably a pure function of `BoundSelect`'s real fields.
-    let is_aggregated =
-        !select.group_by.is_empty() || select.having.is_some() || !select.aggregates.is_empty();
+    let is_aggregated = !select.group_by.is_empty()
+        || select.grouping.is_some()
+        || select.having.is_some()
+        || !select.aggregates.is_empty();
     if is_aggregated {
         plan = LogicalPlan::Aggregate {
             input: Box::new(plan),
             group_by: select.group_by.clone(),
             aggregates: select.aggregates.clone(),
+            grouping: select.grouping.clone(),
         };
         // HAVING = an ordinary Filter directly above Aggregate — item 20/
         // 21: reuses Filter's own three-valued-logic semantics verbatim,
@@ -164,6 +227,35 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
         }
     }
 
+    // SQL-mission-2: window functions, one node per distinct window, then
+    // QUALIFY -- after the window functions it filters on, before the
+    // projection, DISTINCT, ORDER BY and LIMIT.
+    let mut nodes: Vec<(BoundWindowSpec, Vec<WindowSlot>)> = Vec::new();
+    for (slot, call) in select.windows.iter().enumerate() {
+        let entry = WindowSlot {
+            slot,
+            func: call.func.clone(),
+        };
+        // Merged only when the window is provably the same one.
+        match nodes.iter_mut().find(|(spec, _)| spec.same_window(&call.spec)) {
+            Some((_, functions)) => functions.push(entry),
+            None => nodes.push((call.spec.clone(), vec![entry])),
+        }
+    }
+    for (spec, functions) in nodes {
+        plan = LogicalPlan::Window {
+            input: Box::new(plan),
+            spec,
+            functions,
+        };
+    }
+    if let Some(qualify) = &select.qualify {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: qualify.clone(),
+        };
+    }
+
     plan = LogicalPlan::Projection {
         input: Box::new(plan),
         items: select.projection.clone(),
@@ -175,6 +267,11 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
         };
     }
 
+    Ok(finish_order_and_limit(plan, select))
+}
+
+/// `ORDER BY` then `LIMIT` / `OFFSET` on top of `plan`.
+fn finish_order_and_limit(mut plan: LogicalPlan, select: &BoundSelect) -> LogicalPlan {
     if !select.order_by.is_empty() {
         plan = LogicalPlan::Sort {
             input: Box::new(plan),
@@ -190,7 +287,22 @@ pub fn build_logical_plan(select: &BoundSelect, limits: &PlannerLimits) -> Resul
         };
     }
 
-    Ok(plan)
+    plan
+}
+
+fn set_op_node(set: &crate::bound::BoundSetOp, shell: &BoundSelect) -> Result<SetOpNode> {
+    let missing = |side: &str| SqlError::PlanValidation {
+        detail: format!("a set operation reached logical planning without a physical plan for its {side} operand"),
+    };
+    Ok(SetOpNode {
+        op: set.op,
+        all: set.all,
+        set_ref: set.set_ref,
+        left: Box::new(set.left_plan.clone().ok_or_else(|| missing("left"))?),
+        right: Box::new(set.right_plan.clone().ok_or_else(|| missing("right"))?),
+        column_types: set.column_types.clone(),
+        items: shell.projection.clone(),
+    })
 }
 
 /// The leaf node for one `FROM` item: a `Scan` of a catalog table, or a
@@ -210,6 +322,11 @@ fn relation_leaf(item: &crate::bound::BoundFromItem) -> Result<LogicalPlan> {
             })?),
             correlated: d.lateral && !d.outer_refs.is_empty(),
         },
+        BoundRelation::Working(w) => LogicalPlan::Working {
+            table: item.table.clone(),
+            work_id: w.work_id,
+            name: w.name.clone(),
+        },
         BoundRelation::Cte(r) => LogicalPlan::Cte {
             table: item.table.clone(),
             cte: r.plan.clone().ok_or_else(|| SqlError::PlanValidation {
@@ -227,12 +344,15 @@ pub fn node_count(plan: &LogicalPlan) -> usize {
         LogicalPlan::EmptyRelation
         | LogicalPlan::Scan { .. }
         | LogicalPlan::Derived { .. }
-        | LogicalPlan::Cte { .. } => 1,
+        | LogicalPlan::Cte { .. }
+        | LogicalPlan::Working { .. }
+        | LogicalPlan::SetOp(_) => 1,
         LogicalPlan::Join { left, right, .. } => 1 + node_count(left) + node_count(right),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => 1 + node_count(input),
     }

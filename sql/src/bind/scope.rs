@@ -245,6 +245,33 @@ pub struct CteBinding {
     pub columns: Vec<ColumnRow>,
 }
 
+/// The working table of a recursive CTE while its recursive term is being
+/// bound (SQL-mission-1 Slice D): `FROM name` there means the rows of the
+/// previous iteration, whatever the catalog holds under that name.
+#[derive(Debug, Clone)]
+pub struct WorkingBinding {
+    pub name: String,
+    pub work_id: u32,
+    pub columns: Vec<ColumnRow>,
+    /// The binder's nesting depth at which a reference is legal: directly in
+    /// the `FROM` of the recursive term, not inside a subquery or a derived
+    /// table.
+    pub depth: usize,
+    /// How many references to the working table have been bound.
+    pub refs: Cell<u32>,
+}
+
+/// A resolved reference to a working table.
+#[derive(Debug, Clone)]
+pub struct WorkingRef {
+    pub name: String,
+    pub work_id: u32,
+    pub columns: Vec<ColumnRow>,
+    pub depth: usize,
+    /// This reference's number: 1 for the first, 2 for a second (an error).
+    pub ordinal: u32,
+}
+
 /// What a bare `FROM name` means when the CTE lists in scope are consulted.
 #[derive(Debug, Clone)]
 pub enum CteLookup {
@@ -256,6 +283,20 @@ pub enum CteLookup {
     ForwardReference,
     /// Not a CTE name at all: resolve it against the catalog.
     NotACte,
+    /// Slice D: the working table of the recursive CTE whose recursive term is
+    /// being bound. Wins over a catalog table of the same name.
+    Working(WorkingRef),
+    /// Slice D: a CTE defined earlier in the same `WITH RECURSIVE` list, named
+    /// inside a recursive term (visible in the seed, not in the term).
+    HiddenInRecursiveTerm,
+    /// Slice D: the CTE's own name inside its seed of a `WITH RECURSIVE` list.
+    SelfInSeed,
+    /// Slice D: the CTE's own name inside a body of a `WITH RECURSIVE` list
+    /// that is not of the form `seed UNION [ALL] recursive-term`.
+    SelfNotShaped,
+    /// Slice D: a later CTE of a `WITH RECURSIVE` list (forward or mutual
+    /// reference).
+    ForwardInRecursiveList,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -268,6 +309,15 @@ pub struct Scope {
     pub pending_cte_names: Vec<String>,
     /// The CTE whose body is being bound (its name is not visible there).
     pub defining_cte: Option<String>,
+    /// Slice D: the list was written `WITH RECURSIVE`.
+    pub recursive_keyword: bool,
+    /// Slice D: the seed of the CTE `defining_cte` is being bound.
+    pub seed_phase: bool,
+    /// Slice D: the working table of the recursive term being bound.
+    pub working: Option<WorkingBinding>,
+    /// Slice D: names of the CTEs defined before the recursive one in the same
+    /// list, which a recursive term must not name.
+    pub hidden_ctes: Vec<String>,
     pub entries: Vec<ScopeEntry>,
     /// Source of `ScopeEntry::table_ref_id`. A standalone scope owns a
     /// private counter (ids 0, 1, ... in push order -- exactly the previous
@@ -283,6 +333,10 @@ impl Scope {
             ctes: Vec::new(),
             pending_cte_names: Vec::new(),
             defining_cte: None,
+            recursive_keyword: false,
+            seed_phase: false,
+            working: None,
+            hidden_ctes: Vec::new(),
             entries: Vec::new(),
             ref_counter,
         }
@@ -499,15 +553,52 @@ impl<'a> OuterScopes<'a> {
             link = l.parent;
         }
         for s in &scopes {
-            if let Some(c) = s.ctes.iter().find(|c| c.name == name) {
+            // The working table of a recursive term, if this scope's recursive
+            // CTE has this name: structural, so it wins over everything else.
+            // (A hit is counted: a second one is an error for the caller.)
+            if let Some(w) = &s.working {
+                if w.name == name {
+                    let ordinal = w.refs.get() + 1;
+                    w.refs.set(ordinal);
+                    return CteLookup::Working(WorkingRef {
+                        name: w.name.clone(),
+                        work_id: w.work_id,
+                        columns: w.columns.clone(),
+                        depth: w.depth,
+                        ordinal,
+                    });
+                }
+            }
+            if s.hidden_ctes.iter().any(|n| n == name) {
+                return CteLookup::HiddenInRecursiveTerm;
+            }
+            // Latest first: an operand's own `WITH` shadows the CTEs it inherits
+            // from the set operation around it (both live in one list).
+            if let Some(c) = s.ctes.iter().rev().find(|c| c.name == name) {
                 return CteLookup::Found(c.clone());
             }
         }
-        if scopes.iter().any(|s| s.defining_cte.as_deref() == Some(name)) {
-            return CteLookup::SelfReference;
+        if let Some(s) = scopes
+            .iter()
+            .find(|s| s.defining_cte.as_deref() == Some(name))
+        {
+            return if !s.recursive_keyword {
+                CteLookup::SelfReference
+            } else if s.seed_phase {
+                CteLookup::SelfInSeed
+            } else {
+                CteLookup::SelfNotShaped
+            };
         }
-        if scopes.iter().any(|s| s.pending_cte_names.iter().any(|n| n == name)) {
-            return CteLookup::ForwardReference;
+        if let Some(s) = scopes
+            .iter()
+            .find(|s| s.pending_cte_names.iter().any(|n| n == name))
+        {
+            return if s.recursive_keyword {
+                CteLookup::ForwardInRecursiveList
+            } else {
+                CteLookup::ForwardReference
+            };
         }
         CteLookup::NotACte
     }

@@ -198,7 +198,7 @@ fn execute_write_inner(
     metrics: &WriteMetrics,
     cancellation: &CancellationToken,
 ) -> Result<WriteResult> {
-    crate::exec::check_relation_limits(plan, limits)?;
+    let _ = crate::exec::check_relation_limits(plan, limits)?;
     match plan {
         Plan::Insert(insert) => {
             metrics.record_insert_statement();

@@ -841,6 +841,61 @@ impl AggregateState {
     }
 }
 
+/// An `AggregateState` plus, for `AGG(DISTINCT x)`, the set of values already
+/// accumulated in its group (SQL-mission-2). This extends the one aggregate
+/// state machine above rather than adding a second: every number is still
+/// produced by `AggregateState::update` / `finalize`; the accumulator only
+/// decides *whether* a value reaches it. The seen-set is the only extra memory
+/// and is counted by `estimated_bytes`, so `max_aggregate_state_bytes` bounds
+/// it exactly as it bounds a `MIN`/`MAX` of a large `TEXT`.
+#[derive(Clone, Debug)]
+pub struct AggregateAccumulator {
+    state: AggregateState,
+    seen: Option<std::collections::HashSet<GroupingValue>>,
+    seen_bytes: usize,
+}
+
+/// Bookkeeping bytes charged per distinct value on top of the value itself
+/// (a `HashSet` entry holds the value plus control bytes and spare capacity).
+const SEEN_ENTRY_OVERHEAD: usize = 32;
+
+impl AggregateAccumulator {
+    pub fn new(state: AggregateState, distinct: bool) -> Self {
+        AggregateAccumulator {
+            state,
+            seen: distinct.then(std::collections::HashSet::new),
+            seen_bytes: 0,
+        }
+    }
+
+    /// Accumulates one row's value. Under `DISTINCT`, a `NULL` (which every
+    /// aggregate ignores) and a value already seen in this group are skipped;
+    /// values are compared in their canonical grouping form (`-0.0 = +0.0`,
+    /// all `NaN`s equal), the same notion of "same value" `GROUP BY` uses.
+    pub fn update(&mut self, val: Option<&RelationalValue>) -> Result<()> {
+        if let Some(seen) = &mut self.seen {
+            let Some(v) = val else { return Ok(()) };
+            let key = GroupingValue::from_optional_value(Some(v));
+            if seen.contains(&key) {
+                return Ok(());
+            }
+            self.seen_bytes = self
+                .seen_bytes
+                .saturating_add(key.estimated_bytes() + SEEN_ENTRY_OVERHEAD);
+            seen.insert(key);
+        }
+        self.state.update(val)
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.state.estimated_bytes().saturating_add(self.seen_bytes)
+    }
+
+    pub fn finalize(self) -> Option<RelationalValue> {
+        self.state.finalize()
+    }
+}
+
 fn order_value(a: &RelationalValue, b: &RelationalValue) -> Result<std::cmp::Ordering> {
     use RelationalValue::*;
     match (a, b) {

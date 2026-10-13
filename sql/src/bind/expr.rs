@@ -75,13 +75,24 @@ pub struct ExprBinder<'a> {
     /// the clauses of a nested query that may *read* an enclosing query's
     /// columns but may not themselves contain a subquery (`JOIN ... ON`,
     /// `GROUP BY`) are bound with this instead of `env`.
-    capture_env: Option<&'a BindEnv<'a>>,
+    pub(super) capture_env: Option<&'a BindEnv<'a>>,
     /// Column references resolved in `scope` / in an enclosing query so far,
     /// used to refuse an aggregate whose arguments name only outer columns
     /// (that aggregate would belong to the enclosing query, which this
     /// implementation does not evaluate there).
-    local_column_refs: usize,
-    outer_column_refs: usize,
+    pub(super) local_column_refs: usize,
+    pub(super) outer_column_refs: usize,
+    /// SQL-mission-2: window functions are legal here (the SELECT list,
+    /// `QUALIFY` and `ORDER BY` of a SELECT; nowhere else).
+    pub allow_window: bool,
+    /// SQL-mission-2: the `WINDOW name AS (...)` definitions of the query.
+    pub(super) named_windows: Option<&'a super::window::NamedWindows>,
+    /// SQL-mission-2: the query's grouping expressions, which `GROUPING(...)`
+    /// arguments must be among. `None` where `GROUPING` is not allowed.
+    pub(super) group_exprs: Option<&'a [BoundExpr]>,
+    /// SQL-mission-2: select-list aliases a name that resolves to no column may
+    /// fall back to (`QUALIFY rn = 1` where `rn` is a select-list alias).
+    pub(super) aliases: Option<&'a [(String, BoundExpr)]>,
 }
 
 impl<'a> ExprBinder<'a> {
@@ -96,7 +107,31 @@ impl<'a> ExprBinder<'a> {
             capture_env: None,
             local_column_refs: 0,
             outer_column_refs: 0,
+            allow_window: false,
+            named_windows: None,
+            group_exprs: None,
+            aliases: None,
         }
+    }
+
+    pub fn with_window(mut self, allow: bool) -> Self {
+        self.allow_window = allow;
+        self
+    }
+
+    pub fn with_named_windows(mut self, named: &'a super::window::NamedWindows) -> Self {
+        self.named_windows = Some(named);
+        self
+    }
+
+    pub fn with_group_exprs(mut self, groups: &'a [BoundExpr]) -> Self {
+        self.group_exprs = Some(groups);
+        self
+    }
+
+    pub fn with_aliases(mut self, aliases: &'a [(String, BoundExpr)]) -> Self {
+        self.aliases = Some(aliases);
+        self
     }
 
     pub fn with_capture_env(mut self, env: &'a BindEnv<'a>) -> Self {
@@ -209,14 +244,21 @@ impl<'a> ExprBinder<'a> {
                 else_result,
             } => self.bind_case(operand.as_deref(), branches, else_result.as_deref()),
             Expr::Function { name, args } => self.bind_function(name, args),
-            Expr::Aggregate { func, arg } => {
+            Expr::Aggregate {
+                func,
+                arg,
+                distinct,
+                filter,
+            } => {
                 if !self.allow_aggregate {
                     return Err(SqlError::TypeMismatch {
                         detail: "aggregate functions are not allowed in this context".to_string(),
                     });
                 }
-                self.bind_aggregate(*func, arg, expected)
+                self.bind_aggregate(*func, arg, *distinct, filter.as_deref(), expected)
             }
+            Expr::Window(call) => self.bind_window(call),
+            Expr::Grouping(args) => self.bind_grouping(args),
             Expr::ScalarSubquery(q) => self.bind_scalar_subquery(q),
             Expr::Exists { subquery, negated } => self.bind_exists(subquery, *negated),
             Expr::InSubquery {
@@ -370,12 +412,39 @@ impl<'a> ExprBinder<'a> {
         })
     }
 
+    /// Binds the `FILTER (WHERE cond)` of an aggregate: a boolean condition over
+    /// the rows being aggregated, which may not itself contain an aggregate or
+    /// a window function.
+    fn bind_aggregate_filter(&mut self, cond: &Expr) -> Result<Box<BoundExpr>> {
+        let (prev_agg, prev_win) = (self.allow_aggregate, self.allow_window);
+        self.allow_aggregate = false;
+        self.allow_window = false;
+        let bound = self.bind(cond, Some(RelationalType::Boolean));
+        self.allow_aggregate = prev_agg;
+        self.allow_window = prev_win;
+        let bound = match bound {
+            Err(SqlError::TypeMismatch { detail })
+                if detail == "aggregate functions are not allowed in this context" =>
+            {
+                return Err(type_mismatch(
+                    "an aggregate function cannot be used in the FILTER clause of an aggregate",
+                ));
+            }
+            other => other?,
+        };
+        check_assignable(bound.ty, RelationalType::Boolean)?;
+        Ok(Box::new(bound))
+    }
+
     fn bind_aggregate(
         &mut self,
         func: crate::aggregate::AggregateFunc,
         arg: &crate::aggregate::AggregateArg<Box<Expr>>,
+        distinct: bool,
+        filter: Option<&Expr>,
         expected: Option<RelationalType>,
     ) -> Result<BoundExpr> {
+        let filter = filter.map(|f| self.bind_aggregate_filter(f)).transpose()?;
         match arg {
             crate::aggregate::AggregateArg::Wildcard => {
                 crate::aggregate::AggregateContract::check_argument_type(func, true, None)?;
@@ -386,6 +455,8 @@ impl<'a> ExprBinder<'a> {
                     kind: BoundExprKind::Aggregate(BoundAggregateExpr {
                         func,
                         arg: crate::aggregate::AggregateArg::Wildcard,
+                        distinct: false,
+                        filter,
                     }),
                     ty: Some(ty),
                     nullable,
@@ -436,6 +507,8 @@ impl<'a> ExprBinder<'a> {
                     kind: BoundExprKind::Aggregate(BoundAggregateExpr {
                         func,
                         arg: crate::aggregate::AggregateArg::Expr(Box::new(bound_inner)),
+                        distinct,
+                        filter,
                     }),
                     ty: Some(ty),
                     nullable,
@@ -491,6 +564,15 @@ impl<'a> ExprBinder<'a> {
                         (entry, column, Some(level))
                     }
                     None => {
+                        // SQL-mission-2: a select-list alias, where the clause
+                        // being bound allows them (`QUALIFY`).
+                        if let (Some(aliases), [only]) = (self.aliases, col_ref.parts.as_slice()) {
+                            if let Some((_, expr)) =
+                                aliases.iter().find(|(name, _)| *name == only.value)
+                            {
+                                return Ok(expr.clone());
+                            }
+                        }
                         // Unknown at every level: reported exactly as it
                         // would be for a statement with no enclosing query.
                         return Err(match self.scope {

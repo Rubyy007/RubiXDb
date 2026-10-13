@@ -84,6 +84,20 @@ impl<'a> BindEnv<'a> {
         Scope::with_counter(Rc::clone(&self.ref_counter))
     }
 
+    /// Allocates a statement-unique table-reference id without a `FROM` item
+    /// behind it (the output relation of a set operation, SQL-mission-1 Slice
+    /// E), from the same counter every scope's entries use.
+    pub fn alloc_table_ref(&self) -> u32 {
+        let id = self.ref_counter.get();
+        self.ref_counter.set(id + 1);
+        id
+    }
+
+    /// The current subquery / derived-table / CTE-body nesting depth.
+    pub fn depth(&self) -> usize {
+        self.depth.get()
+    }
+
     /// Allocates the next statement-unique subquery id, failing closed past
     /// `max_subqueries_per_statement`.
     pub fn alloc_subquery_id(&self, limits: &SqlLimits) -> Result<u32> {

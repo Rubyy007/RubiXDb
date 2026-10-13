@@ -13,8 +13,11 @@ mod access_op;
 pub mod cost;
 pub mod expr_eval;
 pub mod operators;
+mod recursive;
 mod relation;
+pub(crate) mod setop;
 mod subquery;
+mod window;
 pub mod write;
 
 use std::cell::{Cell, RefCell};
@@ -58,21 +61,84 @@ pub struct RowContext {
     /// produces one outside an aggregated statement's projection/
     /// `HAVING`/`ORDER BY`).
     aggregates: Vec<Option<RelationalValue>>,
+    /// SQL-mission-2: the values the `Window` operators below computed for this
+    /// row, indexed by window slot (`BoundExprKind::WindowRef`). Slots no
+    /// operator has filled yet read as `NULL`.
+    windows: Vec<Option<RelationalValue>>,
+    /// SQL-mission-2: set only by `AggregateOp` for `ROLLUP` / `CUBE` /
+    /// `GROUPING SETS`: the value of each grouping expression for the output
+    /// row (`NULL` where its grouping set leaves the expression out), indexed
+    /// like `BoundSelect::group_by`.
+    group_keys: Vec<Option<RelationalValue>>,
+    /// Bit `i` is set when grouping expression `i` is left out of this row's
+    /// grouping set (what `GROUPING()` reports). 0 for every ordinary row.
+    grouping_mask: u64,
 }
 
 impl RowContext {
     pub fn new() -> Self {
-        RowContext {
-            rows: Vec::new(),
-            aggregates: Vec::new(),
-        }
+        RowContext::default()
     }
 
     pub fn single(table_ref: u32, row: Row) -> Self {
         RowContext {
             rows: vec![(table_ref, row)],
-            aggregates: Vec::new(),
+            ..RowContext::default()
         }
+    }
+
+    /// The same bindings with a different set of rows (every derived value --
+    /// aggregates, window results, group keys -- carries over).
+    fn with_rows(&self, rows: Vec<(u32, Row)>) -> RowContext {
+        RowContext {
+            rows,
+            aggregates: self.aggregates.clone(),
+            windows: self.windows.clone(),
+            group_keys: self.group_keys.clone(),
+            grouping_mask: self.grouping_mask,
+        }
+    }
+
+    /// `AggregateOp`'s constructor for the output row of a grouping set: the
+    /// grouping expressions' values and the set's "left out" bit mask.
+    pub fn with_grouping(
+        mut self,
+        keys: Vec<Option<RelationalValue>>,
+        mask: u64,
+    ) -> RowContext {
+        self.group_keys = keys;
+        self.grouping_mask = mask;
+        self
+    }
+
+    pub fn get_group_key(&self, index: usize) -> Option<&RelationalValue> {
+        self.group_keys.get(index).and_then(|v| v.as_ref())
+    }
+
+    pub fn grouping_mask(&self) -> u64 {
+        self.grouping_mask
+    }
+
+    /// Stores window slot `slot`'s value for this row.
+    pub fn set_window_value(&mut self, slot: usize, value: Option<RelationalValue>) {
+        if self.windows.len() <= slot {
+            self.windows.resize(slot + 1, None);
+        }
+        self.windows[slot] = value;
+    }
+
+    pub fn get_window(&self, slot: usize) -> Option<&RelationalValue> {
+        self.windows.get(slot).and_then(|v| v.as_ref())
+    }
+
+    /// Estimated bytes the rows of this context occupy (for the window
+    /// operator's materialization bound).
+    pub fn estimated_bytes(&self) -> usize {
+        self.rows
+            .iter()
+            .map(|(_, row)| crate::exec::setop::row_bytes(row))
+            .sum::<usize>()
+            + std::mem::size_of::<RowContext>()
     }
 
     /// `AggregateOp`'s own constructor for the tuple it emits per group —
@@ -117,10 +183,7 @@ impl RowContext {
         let mut rows = Vec::with_capacity(self.rows.len() + 1);
         rows.extend(self.rows.iter().cloned());
         rows.push((table_ref, row));
-        RowContext {
-            rows,
-            aggregates: self.aggregates.clone(),
-        }
+        self.with_rows(rows)
     }
 
     /// Combines this context with another (a `Join`'s own left/right row
@@ -138,7 +201,11 @@ impl RowContext {
         } else {
             other.aggregates.clone()
         };
-        RowContext { rows, aggregates }
+        RowContext {
+            rows,
+            aggregates,
+            ..RowContext::default()
+        }
     }
 
     /// Item 29/30: the unmatched-inner-row case for `LEFT JOIN` — see
@@ -146,10 +213,7 @@ impl RowContext {
     pub fn with_null_extension(&self, table_ref: u32) -> RowContext {
         let mut rows = self.rows.clone();
         rows.push((table_ref, Vec::new()));
-        RowContext {
-            rows,
-            aggregates: self.aggregates.clone(),
-        }
+        self.with_rows(rows)
     }
 }
 
@@ -329,6 +393,50 @@ pub struct ExecLimits {
     /// subquery nesting limit (`SqlLimits::max_subquery_depth`), which the
     /// binder also applies to derived tables.
     pub max_derived_table_depth: u32,
+    /// SQL-mission-1 Slice E: the most operand queries of set operations
+    /// (`UNION` / `INTERSECT` / `EXCEPT`) one statement may execute, counted
+    /// over the whole statement: for every set operation, one per operand that
+    /// is not itself directly a set operation, so `A UNION B INTERSECT C` is 3.
+    /// Checked when execution starts, before any work. Default 32: a
+    /// hand-written query combines a handful of queries; every operand is a
+    /// full query plan that runs (and, for `INTERSECT` / `EXCEPT` /
+    /// `UNION`, holds rows), so the count is what bounds the work and memory a
+    /// small statement can ask for. The rows a set operation holds are bounded
+    /// by the existing `max_materialized_rows` / `max_materialized_bytes`.
+    pub max_set_op_branches: u32,
+    /// SQL-mission-1 Slice D: the most times one recursive CTE's recursive term
+    /// may be evaluated (iterations of its fixpoint) in one statement. Default
+    /// 1,000: a hand-written recursion (a counter, a hierarchy, a graph walk)
+    /// finishes in tens of iterations, while a missing stop condition would
+    /// otherwise run for ever; the bound is per CTE and not shared. Exceeding it
+    /// is `RESOURCE_LIMIT` naming the CTE.
+    pub max_recursive_cte_depth: u32,
+    /// The most rows one recursive CTE may produce in total, the seed and every
+    /// iteration included. Default 1,000,000, the codebase's usual "about a
+    /// million rows" budget (`max_materialized_rows`). The rows held are also
+    /// bounded in bytes by `max_materialized_bytes`.
+    pub max_recursive_cte_rows: u64,
+    /// The most recursive CTEs one statement may run. Default 8: each owns a
+    /// working table and a result set, and a statement needing more is almost
+    /// certainly generated.
+    pub max_recursive_cte_definitions: u32,
+    /// SQL-mission-2: the most rows one window partition may hold. A partition
+    /// is buffered whole (its frame arithmetic needs random access to it), so
+    /// this bounds the memory of a window function over an unpartitioned or
+    /// skewed relation. Default 1,000,000, the codebase's "about a million rows"
+    /// budget (`max_materialized_rows`); the bytes the buffered rows occupy are
+    /// also bounded by `max_materialized_bytes`. Exceeding either is
+    /// `RESOURCE_LIMIT`, never a truncated result.
+    pub max_window_partition_rows: u64,
+    /// SQL-mission-2: the most distinct window function calls one statement may
+    /// evaluate (every call is a pass over the buffered rows). Default 64, the
+    /// same as `max_cte_definitions`: far more than a hand-written query uses.
+    pub max_window_functions_per_statement: u32,
+    /// SQL-mission-2: the most grouping sets all `ROLLUP` / `CUBE` /
+    /// `GROUPING SETS` clauses of one statement may expand to (each set holds
+    /// its own groups, so this multiplies the aggregation state). Default 64:
+    /// `CUBE` of six columns, or `ROLLUP` of sixty-three.
+    pub max_grouping_sets_per_statement: u32,
 }
 
 impl Default for ExecLimits {
@@ -348,6 +456,13 @@ impl Default for ExecLimits {
             max_cte_definitions: 64,
             max_cte_references: 256,
             max_derived_table_depth: 32,
+            max_set_op_branches: 32,
+            max_recursive_cte_depth: 1_000,
+            max_recursive_cte_rows: 1_000_000,
+            max_recursive_cte_definitions: 8,
+            max_window_partition_rows: 1_000_000,
+            max_window_functions_per_statement: 64,
+            max_grouping_sets_per_statement: 64,
         }
     }
 }
@@ -432,6 +547,36 @@ pub struct ExecMetrics {
     /// per execution, however many references read them; a CTE nobody
     /// reads is never materialized).
     cte_materializations_total: AtomicU64,
+    /// SQL-mission-1 Slice E: rows a set operation's distinct step removed --
+    /// for `UNION`, a row equal to one already produced; for `INTERSECT` and
+    /// `EXCEPT`, a left row that qualified but repeated one already produced.
+    /// (`ALL` forms remove nothing; rows an `INTERSECT` / `EXCEPT` filters
+    /// out for being absent from / present in the other side are not counted.)
+    set_op_rows_deduplicated_total: AtomicU64,
+    /// SQL-mission-1 Slice E: operand queries of the set operations a
+    /// statement executes (counted once per statement, when it starts; see
+    /// `ExecLimits::max_set_op_branches` for what is counted).
+    set_op_branches_total: AtomicU64,
+    /// SQL-mission-1 Slice D: evaluations of a recursive term (one per
+    /// iteration, across every recursive CTE the statement runs).
+    recursive_cte_iterations_total: AtomicU64,
+    /// SQL-mission-1 Slice D: rows the fixpoints added to their results (seed
+    /// rows and every iteration's new rows; under `UNION`, after deduplication).
+    recursive_cte_rows_emitted_total: AtomicU64,
+    /// SQL-mission-2: window function values computed -- one per window
+    /// function per input row of its `Window` operator.
+    window_functions_evaluated_total: AtomicU64,
+    /// SQL-mission-2: distinct window partitions (distinct `PARTITION BY` keys;
+    /// one for a window without `PARTITION BY` over a non-empty input) the
+    /// `Window` operators formed.
+    window_partitions_created_total: AtomicU64,
+    /// SQL-mission-2: (row, aggregate) pairs an aggregate's `FILTER` clause kept
+    /// out of its state (a `NULL` or false condition); counted for plain and
+    /// window aggregates, once per input row however many grouping sets it feeds.
+    aggregate_filter_rows_skipped_total: AtomicU64,
+    /// SQL-mission-2: grouping sets aggregated -- the expanded sets of every
+    /// `ROLLUP` / `CUBE` / `GROUPING SETS` aggregation the statement ran.
+    grouping_sets_evaluated_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -470,9 +615,34 @@ pub struct ExecMetricsSnapshot {
     pub subquery_cache_hits: u64,
     pub correlated_subquery_reexecs: u64,
     pub cte_materializations_total: u64,
+    pub set_op_rows_deduplicated_total: u64,
+    pub set_op_branches_total: u64,
+    pub recursive_cte_iterations_total: u64,
+    pub recursive_cte_rows_emitted_total: u64,
+    pub window_functions_evaluated_total: u64,
+    pub window_partitions_created_total: u64,
+    pub aggregate_filter_rows_skipped_total: u64,
+    pub grouping_sets_evaluated_total: u64,
 }
 
 impl ExecMetrics {
+    pub fn record_window_functions_evaluated(&self, n: u64) {
+        self.window_functions_evaluated_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_window_partitions_created(&self, n: u64) {
+        self.window_partitions_created_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_aggregate_filter_rows_skipped(&self, n: u64) {
+        self.aggregate_filter_rows_skipped_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_grouping_sets_evaluated(&self, n: u64) {
+        self.grouping_sets_evaluated_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn record_rows_scanned(&self, n: u64) {
         self.rows_scanned.fetch_add(n, Ordering::Relaxed);
     }
@@ -540,6 +710,21 @@ impl ExecMetrics {
     pub fn record_subquery_cache_hit(&self) {
         self.subquery_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_set_op_rows_deduplicated(&self, n: u64) {
+        self.set_op_rows_deduplicated_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_recursive_cte_iteration(&self) {
+        self.recursive_cte_iterations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_recursive_cte_rows_emitted(&self, n: u64) {
+        self.recursive_cte_rows_emitted_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_set_op_branches(&self, n: u64) {
+        self.set_op_branches_total.fetch_add(n, Ordering::Relaxed);
+    }
     pub fn record_cte_materialization(&self) {
         self.cte_materializations_total
             .fetch_add(1, Ordering::Relaxed);
@@ -582,6 +767,28 @@ impl ExecMetrics {
                 .correlated_subquery_reexecs
                 .load(Ordering::Relaxed),
             cte_materializations_total: self.cte_materializations_total.load(Ordering::Relaxed),
+            set_op_rows_deduplicated_total: self
+                .set_op_rows_deduplicated_total
+                .load(Ordering::Relaxed),
+            set_op_branches_total: self.set_op_branches_total.load(Ordering::Relaxed),
+            recursive_cte_iterations_total: self
+                .recursive_cte_iterations_total
+                .load(Ordering::Relaxed),
+            recursive_cte_rows_emitted_total: self
+                .recursive_cte_rows_emitted_total
+                .load(Ordering::Relaxed),
+            window_functions_evaluated_total: self
+                .window_functions_evaluated_total
+                .load(Ordering::Relaxed),
+            window_partitions_created_total: self
+                .window_partitions_created_total
+                .load(Ordering::Relaxed),
+            aggregate_filter_rows_skipped_total: self
+                .aggregate_filter_rows_skipped_total
+                .load(Ordering::Relaxed),
+            grouping_sets_evaluated_total: self
+                .grouping_sets_evaluated_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -645,6 +852,12 @@ pub struct ExecCtx<'a> {
     /// relation id. Such a relation cannot read an enclosing row, so its rows
     /// are the same whenever and however often it is read in one statement.
     relation_cache: RefCell<HashMap<u32, RelationRows>>,
+    /// SQL-mission-1 Slice D: the working table of each recursive CTE that is
+    /// iterating (the previous iteration's rows), keyed by working-table id.
+    working_tables: RefCell<HashMap<u32, RelationRows>>,
+    /// The finished rows of each recursive CTE run in this execution, keyed by
+    /// CTE id (a recursive CTE read twice runs its fixpoint once).
+    recursive_cache: RefCell<HashMap<u32, RelationRows>>,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -671,6 +884,8 @@ impl<'a> ExecCtx<'a> {
             correlated_total: Cell::new(0),
             correlated_by_subquery: RefCell::new(HashMap::new()),
             relation_cache: RefCell::new(HashMap::new()),
+            working_tables: RefCell::new(HashMap::new()),
+            recursive_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -806,7 +1021,8 @@ fn execute_inner(
         }
     };
 
-    check_relation_limits(plan, limits)?;
+    let set_op_branches = check_relation_limits(plan, limits)?;
+    metrics.record_set_op_branches(set_op_branches);
     let ctx = ExecCtx::new(
         txn,
         table_store,
@@ -844,10 +1060,29 @@ fn execute_inner(
 }
 
 /// Refuses, before any work, a statement whose CTE definitions, CTE
-/// references or derived-table nesting exceed the configured bounds
-/// (SQL-mission-1 Slice C). `RESOURCE_LIMIT`, never a truncation.
-pub(crate) fn check_relation_limits(plan: &Plan, limits: &ExecLimits) -> Result<()> {
+/// references, derived-table nesting or set-operation operands exceed the
+/// configured bounds (SQL-mission-1 Slices C and E). `RESOURCE_LIMIT`, never a
+/// truncation. Returns the statement's set-operation operand count (for the
+/// `set_op_branches_total` metric).
+pub(crate) fn check_relation_limits(plan: &Plan, limits: &ExecLimits) -> Result<u64> {
     let stats = crate::plan::relstats::plan_stats(plan);
+    if stats.recursive_cte_definitions.len() as u64 > u64::from(limits.max_recursive_cte_definitions) {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "statement runs {} recursive CTEs; max_recursive_cte_definitions is {}",
+                stats.recursive_cte_definitions.len(),
+                limits.max_recursive_cte_definitions
+            ),
+        });
+    }
+    if stats.set_op_branches > u64::from(limits.max_set_op_branches) {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "statement combines {} queries with UNION/INTERSECT/EXCEPT; max_set_op_branches is {}",
+                stats.set_op_branches, limits.max_set_op_branches
+            ),
+        });
+    }
     // Counts every definition in the statement, including ones nothing reads.
     let defined = crate::plan::relstats::defined_ctes(plan).max(stats.cte_definitions.len() as u32);
     if u64::from(defined) > u64::from(limits.max_cte_definitions) {
@@ -855,6 +1090,27 @@ pub(crate) fn check_relation_limits(plan: &Plan, limits: &ExecLimits) -> Result<
             detail: format!(
                 "statement defines {defined} CTEs; max_cte_definitions is {}",
                 limits.max_cte_definitions
+            ),
+        });
+    }
+    if stats.window_functions > u64::from(limits.max_window_functions_per_statement) {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "statement evaluates {} window functions; max_window_functions_per_statement is {}",
+                stats.window_functions, limits.max_window_functions_per_statement
+            ),
+        });
+    }
+    if stats.grouping_sets > u128::from(limits.max_grouping_sets_per_statement) {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "statement expands to {} grouping sets; max_grouping_sets_per_statement is {}",
+                if stats.grouping_sets == u128::MAX {
+                    "more than 2^120".to_string()
+                } else {
+                    stats.grouping_sets.to_string()
+                },
+                limits.max_grouping_sets_per_statement
             ),
         });
     }
@@ -875,7 +1131,7 @@ pub(crate) fn check_relation_limits(plan: &Plan, limits: &ExecLimits) -> Result<
             ),
         });
     }
-    Ok(())
+    Ok(stats.set_op_branches)
 }
 
 fn plan_kind(plan: &Plan) -> &'static str {
@@ -895,6 +1151,7 @@ fn plan_kind(plan: &Plan) -> &'static str {
 fn final_projection_items(plan: &PhysicalPlan) -> Option<&[BoundSelectItem]> {
     match plan {
         PhysicalPlan::Projection { items, .. } => Some(items),
+        PhysicalPlan::SetOp(node) => Some(&node.items),
         PhysicalPlan::Distinct { input }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::Limit { input, .. } => final_projection_items(input),

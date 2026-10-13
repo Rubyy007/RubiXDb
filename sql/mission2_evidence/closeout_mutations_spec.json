@@ -1,0 +1,266 @@
+[
+  {
+    "id": "C_M7a_over_dropped_by_converter",
+    "why": "the Slice D bug reintroduced: the converter accepts OVER and drops it (SUM(x) OVER (...) runs as the plain aggregate)",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    if let Some(over) = &f.over {\n        return convert_window_function(f, &name, over, dg, depth);\n    }",
+        "new": "    if let Some(_over) = &f.over {\n    }"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  },
+  {
+    "id": "C_M7b_over_ignored_by_planner",
+    "why": "OVER accepted by parser and binder but the planner drops the Window nodes",
+    "edits": [
+      {
+        "file": "sql/src/plan/logical.rs",
+        "old": "for (spec, functions) in nodes {",
+        "new": "for (spec, functions) in nodes.into_iter().take(0) {"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  },
+  {
+    "id": "C_M7c_over_ignored_by_executor",
+    "why": "the Window operator is replaced by a pass-through",
+    "edits": [
+      {
+        "file": "sql/src/exec/operators.rs",
+        "old": "        } => Ok(Box::new(super::window::WindowOp::build(\n            build_operator(input, outer, ec)?,\n            spec,\n            functions,\n        ))),",
+        "new": "        } => {\n            let _ = (spec, functions);\n            build_operator(input, outer, ec)\n        }"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  },
+  {
+    "id": "C_T3a_group_by_all_silently_accepted",
+    "why": "GROUP BY ALL runs as an ungrouped SELECT",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "sp::GroupByExpr::All(_) => return Err(unsupported(\"GROUP BY ALL\")),",
+        "new": "sp::GroupByExpr::All(_) => (Vec::new(), None),"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  },
+  {
+    "id": "C_T3b_rollup_silently_collapsed",
+    "why": "ROLLUP accepted but its grouping elements dropped",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "(Vec::new(), Some(elements))",
+        "new": "(Vec::new(), { let _ = elements; None })"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  },
+  {
+    "id": "C_T4a_distinct_window_aggregate_accepted",
+    "why": "COUNT(DISTINCT x) OVER () accepted (DISTINCT then ignored)",
+    "edits": [
+      {
+        "file": "sql/src/bind/window.rs",
+        "old": "            if *distinct {\n                return Err(SqlError::Unsupported {",
+        "new": "            if false && *distinct {\n                return Err(SqlError::Unsupported {"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  },
+  {
+    "id": "C_T4b_distinct_flag_dropped",
+    "why": "COUNT(DISTINCT x) bound as plain COUNT(x)",
+    "edits": [
+      {
+        "file": "sql/src/bind/expr.rs",
+        "old": "arg: crate::aggregate::AggregateArg::Expr(Box::new(bound_inner)),\n                        distinct,",
+        "new": "arg: crate::aggregate::AggregateArg::Expr(Box::new(bound_inner)),\n                        distinct: false,"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  },
+  {
+    "id": "C_T5_right_join_silently_accepted",
+    "why": "RIGHT JOIN accepted and run as LEFT",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinKind::Left, c),",
+        "new": "sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) | sp::JoinOperator::Right(c) | sp::JoinOperator::RightOuter(c) => (JoinKind::Left, c),"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "recursive_tests::parser",
+        "bind_tests",
+        "parse_tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_integration",
+        "recursive_cte_errors_and_bounds_over_http"
+      ]
+    ]
+  }
+]

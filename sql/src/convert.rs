@@ -267,16 +267,13 @@ fn convert_query_statement(q: &sp::Query, dg: &DepthGuard) -> Result<Statement> 
     }
 }
 
-/// A `WITH` list (SQL-mission-1 Slice C). Only non-recursive definitions
-/// with a plain name, an optional plain column-name list and a `SELECT` body
-/// are accepted; everything else is refused, never dropped.
+/// A `WITH [RECURSIVE]` list (SQL-mission-1 Slices C and D). Only definitions
+/// with a plain name, an optional plain column-name list and a query body are
+/// accepted; everything else is refused, never dropped.
 fn convert_with(with: Option<&sp::With>, dg: &DepthGuard, depth: usize) -> Result<Vec<Cte>> {
     let Some(with) = with else {
         return Ok(Vec::new());
     };
-    if with.recursive {
-        return Err(unsupported("WITH RECURSIVE"));
-    }
     with.cte_tables
         .iter()
         .map(|cte| {
@@ -301,6 +298,7 @@ fn convert_with(with: Option<&sp::With>, dg: &DepthGuard, depth: usize) -> Resul
                 name: convert_ident(&cte.alias.name, dg.limits)?,
                 columns,
                 query: Box::new(convert_query(&cte.query, dg, depth + 1)?),
+                recursive: with.recursive,
             })
         })
         .collect()
@@ -312,12 +310,146 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
     if q.fetch.is_some() || !q.locks.is_empty() || q.for_clause.is_some() {
         return Err(unsupported("FETCH/FOR UPDATE/FOR XML|JSON clauses"));
     }
-    let sp::SetExpr::Select(select) = q.body.as_ref() else {
-        return Err(unsupported(
-            "query body must be a plain SELECT (no UNION/EXCEPT/INTERSECT/VALUES/subquery-as-body)",
-        ));
-    };
+    match q.body.as_ref() {
+        sp::SetExpr::Select(select) => convert_select_core(
+            select,
+            q.order_by.as_ref(),
+            q.limit_clause.as_ref(),
+            ctes,
+            dg,
+            depth,
+        ),
+        // SQL-mission-1 Slice E: `a UNION b [ORDER BY ...] [LIMIT ...]`. The
+        // trailing `ORDER BY` / `LIMIT` belong to the whole set operation.
+        body @ sp::SetExpr::SetOperation { .. } => {
+            let mut shell = convert_set_operation(body, dg, depth)?;
+            shell.ctes = ctes;
+            shell.order_by = convert_order_by(q.order_by.as_ref(), dg, depth)?;
+            let (limit, offset) = convert_limit_clause(q.limit_clause.as_ref(), dg, depth)?;
+            shell.limit = limit;
+            shell.offset = offset;
+            Ok(shell)
+        }
+        _ => Err(unsupported(
+            "query body must be a SELECT or a UNION/INTERSECT/EXCEPT of queries (no VALUES/TABLE/subquery-as-body)",
+        )),
+    }
+}
 
+/// One operand of a set operation: a plain `SELECT` (it cannot carry its own
+/// `ORDER BY` / `LIMIT` -- those would belong to the whole operation), a
+/// parenthesised query (which can), or a nested set operation.
+fn convert_set_operand(expr: &sp::SetExpr, dg: &DepthGuard, depth: usize) -> Result<Select> {
+    dg.check(depth)?;
+    match expr {
+        sp::SetExpr::Select(select) => {
+            convert_select_core(select, None, None, Vec::new(), dg, depth + 1)
+        }
+        sp::SetExpr::Query(q) => convert_query(q, dg, depth + 1),
+        body @ sp::SetExpr::SetOperation { .. } => convert_set_operation(body, dg, depth + 1),
+        _ => Err(unsupported(
+            "a set-operation operand must be a SELECT or a parenthesised query (no VALUES/TABLE)",
+        )),
+    }
+}
+
+/// A `SetExpr::SetOperation` tree as an `ast::Select` shell. The **left
+/// spine** (`a UNION b UNION c` is `(a UNION b) UNION c`) is walked with a
+/// loop, not recursion, so a long chain costs no native stack here; the
+/// chain's length is bounded by `max_expression_depth` instead.
+fn convert_set_operation(body: &sp::SetExpr, dg: &DepthGuard, depth: usize) -> Result<Select> {
+    let mut spine: Vec<(&sp::SetOperator, &sp::SetQuantifier, &sp::SetExpr)> = Vec::new();
+    let mut cursor = body;
+    while let sp::SetExpr::SetOperation {
+        left,
+        op,
+        set_quantifier,
+        right,
+    } = cursor
+    {
+        dg.check(depth + spine.len())?;
+        spine.push((op, set_quantifier, right.as_ref()));
+        cursor = left.as_ref();
+    }
+    let mut acc = convert_set_operand(cursor, dg, depth + spine.len())?;
+    for (op, quantifier, right) in spine.into_iter().rev() {
+        let op = match op {
+            sp::SetOperator::Union => SetOperator::Union,
+            sp::SetOperator::Intersect => SetOperator::Intersect,
+            sp::SetOperator::Except => SetOperator::Except,
+            sp::SetOperator::Minus => return Err(unsupported("MINUS (use EXCEPT)")),
+        };
+        let all = match quantifier {
+            sp::SetQuantifier::None | sp::SetQuantifier::Distinct => false,
+            sp::SetQuantifier::All => true,
+            _ => return Err(unsupported("BY NAME set operations")),
+        };
+        let right = convert_set_operand(right, dg, depth + 1)?;
+        acc = Select::set_operation(op, all, acc, right);
+    }
+    Ok(acc)
+}
+
+fn convert_order_by(
+    order_by: Option<&sp::OrderBy>,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<Vec<OrderByItem>> {
+    match order_by {
+        None => Ok(Vec::new()),
+        Some(sp::OrderBy {
+            kind: sp::OrderByKind::Expressions(items),
+            interpolate: None,
+        }) => items
+            .iter()
+            .map(|item| convert_order_by_item(item, dg, depth + 1))
+            .collect(),
+        Some(_) => Err(unsupported("ORDER BY ALL / WITH INTERPOLATE")),
+    }
+}
+
+fn convert_limit_clause(
+    limit_clause: Option<&sp::LimitClause>,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<(Option<Expr>, Option<Expr>)> {
+    match limit_clause {
+        None => Ok((None, None)),
+        Some(sp::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            if !limit_by.is_empty() {
+                return Err(unsupported("LIMIT ... BY"));
+            }
+            let limit = limit
+                .as_ref()
+                .map(|e| convert_expr(e, dg, depth + 1))
+                .transpose()?;
+            let offset = offset
+                .as_ref()
+                .map(|o| convert_expr(&o.value, dg, depth + 1))
+                .transpose()?;
+            Ok((limit, offset))
+        }
+        Some(sp::LimitClause::OffsetCommaLimit { .. }) => {
+            Err(unsupported("MySQL LIMIT offset, limit syntax"))
+        }
+    }
+}
+
+/// A plain `SELECT ... [ORDER BY ...] [LIMIT ...]` (the query-level clauses
+/// are passed in: `sqlparser` keeps them on the enclosing `Query`, not on the
+/// `Select`).
+fn convert_select_core(
+    select: &sp::Select,
+    order_by_clause: Option<&sp::OrderBy>,
+    limit_clause: Option<&sp::LimitClause>,
+    ctes: Vec<Cte>,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<Select> {
     if select.top.is_some()
         || select.into.is_some()
         || !select.lateral_views.is_empty()
@@ -326,21 +458,19 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
         || select.value_table_mode.is_some()
         || select.exclude.is_some()
     {
         return Err(unsupported(
-            "SELECT with TOP/INTO/LATERAL/PREWHERE/CONNECT BY/CLUSTER BY/DISTRIBUTE BY/SORT BY/WINDOW/QUALIFY/value-table-mode/EXCLUDE",
+            "SELECT with TOP/INTO/LATERAL/PREWHERE/CONNECT BY/CLUSTER BY/DISTRIBUTE BY/SORT BY/value-table-mode/EXCLUDE",
         ));
     }
-    let group_by = match &select.group_by {
+    let (group_by, grouping) = match &select.group_by {
         sp::GroupByExpr::All(_) => return Err(unsupported("GROUP BY ALL")),
         sp::GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
                 return Err(unsupported(
-                    "GROUP BY with modifiers (ROLLUP/CUBE/GROUPING SETS)",
+                    "GROUP BY with WITH ROLLUP / WITH CUBE / WITH TOTALS modifiers (use ROLLUP(...), CUBE(...) or GROUPING SETS(...))",
                 ));
             }
             if exprs.len() > dg.limits.max_columns {
@@ -351,12 +481,41 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
                     ),
                 });
             }
-            exprs
-                .iter()
-                .map(|e| convert_expr(e, dg, depth + 1))
-                .collect::<Result<Vec<_>>>()?
+            let extended = exprs.iter().any(|e| {
+                matches!(
+                    e,
+                    sp::Expr::Rollup(_)
+                        | sp::Expr::Cube(_)
+                        | sp::Expr::GroupingSets(_)
+                        | sp::Expr::Tuple(_)
+                )
+            });
+            if extended {
+                let elements = exprs
+                    .iter()
+                    .map(|e| convert_group_element(e, dg, depth + 1))
+                    .collect::<Result<Vec<_>>>()?;
+                (Vec::new(), Some(elements))
+            } else {
+                let plain = exprs
+                    .iter()
+                    .map(|e| convert_expr(e, dg, depth + 1))
+                    .collect::<Result<Vec<_>>>()?;
+                (plain, None)
+            }
         }
     };
+
+    let named_windows = select
+        .named_window
+        .iter()
+        .map(|def| convert_named_window(def, dg, depth + 1))
+        .collect::<Result<Vec<_>>>()?;
+    let qualify = select
+        .qualify
+        .as_ref()
+        .map(|e| convert_expr(e, dg, depth + 1))
+        .transpose()?;
 
     let distinct = match &select.distinct {
         None | Some(sp::Distinct::All) => false,
@@ -392,55 +551,295 @@ fn convert_query(q: &sp::Query, dg: &DepthGuard, depth: usize) -> Result<Select>
         .map(|e| convert_expr(e, dg, depth + 1))
         .transpose()?;
 
-    let order_by = match &q.order_by {
-        None => Vec::new(),
-        Some(sp::OrderBy {
-            kind: sp::OrderByKind::Expressions(items),
-            interpolate: None,
-        }) => items
-            .iter()
-            .map(|item| convert_order_by_item(item, dg, depth + 1))
-            .collect::<Result<Vec<_>>>()?,
-        Some(_) => return Err(unsupported("ORDER BY ALL / WITH INTERPOLATE")),
-    };
-
-    let (limit, offset) = match &q.limit_clause {
-        None => (None, None),
-        Some(sp::LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        }) => {
-            if !limit_by.is_empty() {
-                return Err(unsupported("LIMIT ... BY"));
-            }
-            let limit = limit
-                .as_ref()
-                .map(|e| convert_expr(e, dg, depth + 1))
-                .transpose()?;
-            let offset = offset
-                .as_ref()
-                .map(|o| convert_expr(&o.value, dg, depth + 1))
-                .transpose()?;
-            (limit, offset)
-        }
-        Some(sp::LimitClause::OffsetCommaLimit { .. }) => {
-            return Err(unsupported("MySQL LIMIT offset, limit syntax"))
-        }
-    };
+    let order_by = convert_order_by(order_by_clause, dg, depth)?;
+    let (limit, offset) = convert_limit_clause(limit_clause, dg, depth)?;
 
     Ok(Select {
         ctes,
+        set_op: None,
         distinct,
         projection,
         from,
         selection,
         group_by,
+        grouping,
         having,
+        qualify,
+        named_windows,
         order_by,
         limit,
         offset,
     })
+}
+
+/// One element of a `GROUP BY` that uses `ROLLUP` / `CUBE` / `GROUPING SETS`.
+fn convert_group_element(e: &sp::Expr, dg: &DepthGuard, depth: usize) -> Result<GroupElement> {
+    dg.check(depth)?;
+    let members = |sets: &[Vec<sp::Expr>]| -> Result<Vec<Vec<Expr>>> {
+        sets.iter()
+            .map(|set| {
+                set.iter()
+                    .map(|e| convert_expr(e, dg, depth + 1))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect()
+    };
+    Ok(match e {
+        sp::Expr::Rollup(sets) => GroupElement::Rollup(members(sets)?),
+        sp::Expr::Cube(sets) => GroupElement::Cube(members(sets)?),
+        sp::Expr::GroupingSets(sets) => GroupElement::Sets(members(sets)?),
+        // `GROUP BY ()` is the empty grouping set; `GROUP BY (a, b)` is `a, b`.
+        sp::Expr::Tuple(es) => GroupElement::Sets(members(std::slice::from_ref(es))?),
+        other => GroupElement::Expr(convert_expr(other, dg, depth + 1)?),
+    })
+}
+
+fn convert_named_window(
+    def: &sp::NamedWindowDefinition,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<(Ident, WindowSpec)> {
+    let name = convert_ident(&def.0, dg.limits)?;
+    let spec = match &def.1 {
+        sp::NamedWindowExpr::WindowSpec(spec) => convert_window_spec(spec, dg, depth + 1)?,
+        sp::NamedWindowExpr::NamedWindow(base) => WindowSpec {
+            base: Some(convert_ident(base, dg.limits)?),
+            ..WindowSpec::default()
+        },
+    };
+    Ok((name, spec))
+}
+
+fn convert_window_spec(spec: &sp::WindowSpec, dg: &DepthGuard, depth: usize) -> Result<WindowSpec> {
+    dg.check(depth)?;
+    let max = dg.limits.max_columns;
+    if spec.partition_by.len() > max || spec.order_by.len() > max {
+        return Err(SqlError::ResourceLimit {
+            detail: format!("a window's PARTITION BY / ORDER BY exceeds max_columns ({max})"),
+        });
+    }
+    let base = spec
+        .window_name
+        .as_ref()
+        .map(|n| convert_ident(n, dg.limits))
+        .transpose()?;
+    let partition_by = spec
+        .partition_by
+        .iter()
+        .map(|e| convert_expr(e, dg, depth + 1))
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = spec
+        .order_by
+        .iter()
+        .map(|item| convert_order_by_item(item, dg, depth + 1))
+        .collect::<Result<Vec<_>>>()?;
+    let frame = spec
+        .window_frame
+        .as_ref()
+        .map(|f| convert_frame(f, dg, depth + 1))
+        .transpose()?;
+    Ok(WindowSpec {
+        base,
+        partition_by,
+        order_by,
+        frame,
+    })
+}
+
+fn convert_frame(f: &sp::WindowFrame, dg: &DepthGuard, depth: usize) -> Result<FrameSpec> {
+    let units = match f.units {
+        sp::WindowFrameUnits::Rows => FrameUnits::Rows,
+        sp::WindowFrameUnits::Range => FrameUnits::Range,
+        sp::WindowFrameUnits::Groups => return Err(unsupported("GROUPS window frames")),
+    };
+    let bound = |b: &sp::WindowFrameBound| -> Result<FrameBound> {
+        Ok(match b {
+            sp::WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
+            sp::WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
+            sp::WindowFrameBound::Following(None) => FrameBound::UnboundedFollowing,
+            sp::WindowFrameBound::Preceding(Some(e)) => {
+                FrameBound::Preceding(Box::new(convert_expr(e, dg, depth + 1)?))
+            }
+            sp::WindowFrameBound::Following(Some(e)) => {
+                FrameBound::Following(Box::new(convert_expr(e, dg, depth + 1)?))
+            }
+        })
+    };
+    let start = bound(&f.start_bound)?;
+    // `ROWS <start>` is the shorthand for `BETWEEN <start> AND CURRENT ROW`.
+    let end = match &f.end_bound {
+        Some(b) => bound(b)?,
+        None => FrameBound::CurrentRow,
+    };
+    Ok(FrameSpec { units, start, end })
+}
+
+/// The functions that may be called with an `OVER` clause besides the
+/// aggregates (SQL-mission-2).
+const WINDOW_ONLY_FUNCTIONS: &[&str] = &[
+    "row_number",
+    "rank",
+    "dense_rank",
+    "ntile",
+    "percent_rank",
+    "cume_dist",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
+];
+
+/// `f(args) [FILTER (WHERE ...)] OVER (...)`.
+fn convert_window_function(
+    f: &sp::Function,
+    name: &ObjectName,
+    over: &sp::WindowType,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<Expr> {
+    if f.null_treatment.is_some() {
+        return Err(unsupported("IGNORE NULLS / RESPECT NULLS on a window function"));
+    }
+    let over = match over {
+        sp::WindowType::NamedWindow(n) => WindowOver::Named(convert_ident(n, dg.limits)?),
+        sp::WindowType::WindowSpec(spec) => {
+            WindowOver::Spec(convert_window_spec(spec, dg, depth + 1)?)
+        }
+    };
+    let not_a_window_function = || SqlError::TypeMismatch {
+        detail: format!("{} is not a window function", name.last().value),
+    };
+    let function = if name.0.len() == 1 {
+        let lower = name.0[0].value.to_ascii_lowercase();
+        if let Some(func) = crate::aggregate::AggregateFunc::lookup(&lower) {
+            let (arg, distinct, filter) = convert_aggregate_call(func, f, dg, depth)?;
+            WindowFunction::Aggregate {
+                func,
+                arg,
+                distinct,
+                filter,
+            }
+        } else if WINDOW_ONLY_FUNCTIONS.contains(&lower.as_str()) {
+            if f.filter.is_some() {
+                return Err(unsupported("FILTER on a window function that is not an aggregate"));
+            }
+            let args = match &f.args {
+                sp::FunctionArguments::None => Vec::new(),
+                sp::FunctionArguments::List(list) => {
+                    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                        return Err(unsupported(
+                            "DISTINCT / ORDER BY / IGNORE NULLS inside a window function's argument list",
+                        ));
+                    }
+                    if list.args.len() > dg.limits.max_columns {
+                        return Err(SqlError::ResourceLimit {
+                            detail: "window function call has too many arguments".to_string(),
+                        });
+                    }
+                    list.args
+                        .iter()
+                        .map(|a| match a {
+                            sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                                convert_expr(e, dg, depth + 1)
+                            }
+                            _ => Err(unsupported("named/wildcard window function arguments")),
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+                sp::FunctionArguments::Subquery(_) => {
+                    return Err(unsupported("function call with a bare subquery argument"))
+                }
+            };
+            WindowFunction::Named { name: lower, args }
+        } else {
+            return Err(not_a_window_function());
+        }
+    } else {
+        return Err(not_a_window_function());
+    };
+    Ok(Expr::Window(Box::new(WindowCall { function, over })))
+}
+
+/// The argument, `DISTINCT` flag and `FILTER` clause of an aggregate call
+/// (shared by plain aggregates and aggregates used as window functions).
+#[allow(clippy::type_complexity)]
+fn convert_aggregate_call(
+    agg_func: crate::aggregate::AggregateFunc,
+    f: &sp::Function,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<(
+    crate::aggregate::AggregateArg<Box<Expr>>,
+    bool,
+    Option<Box<Expr>>,
+)> {
+    let filter = f
+        .filter
+        .as_ref()
+        .map(|e| convert_expr(e, dg, depth + 1).map(Box::new))
+        .transpose()?;
+    match &f.args {
+        sp::FunctionArguments::None => Err(SqlError::TypeMismatch {
+            detail: format!("aggregate function {} requires an argument", agg_func.name()),
+        }),
+        sp::FunctionArguments::Subquery(_) => {
+            Err(unsupported("function call with a bare subquery argument"))
+        }
+        sp::FunctionArguments::List(list) => {
+            if !list.clauses.is_empty() {
+                return Err(unsupported(
+                    "aggregate function with ORDER BY / LIMIT / IGNORE NULLS clauses inside the argument list",
+                ));
+            }
+            let distinct = matches!(
+                list.duplicate_treatment,
+                Some(sp::DuplicateTreatment::Distinct)
+            );
+            if list.args.is_empty() {
+                return Err(SqlError::TypeMismatch {
+                    detail: format!("aggregate function {} requires an argument", agg_func.name()),
+                });
+            }
+            if list.args.len() > 1 {
+                return Err(SqlError::TypeMismatch {
+                    detail: format!(
+                        "aggregate function {} requires exactly 1 argument, found {}",
+                        agg_func.name(),
+                        list.args.len()
+                    ),
+                });
+            }
+            match &list.args[0] {
+                sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
+                    if agg_func != crate::aggregate::AggregateFunc::Count {
+                        Err(SqlError::TypeMismatch {
+                            detail: format!(
+                                "aggregate function {} does not support wildcard argument (*)",
+                                agg_func.name()
+                            ),
+                        })
+                    } else if distinct {
+                        Err(SqlError::TypeMismatch {
+                            detail: "COUNT(DISTINCT *) is not valid; name the column to count"
+                                .to_string(),
+                        })
+                    } else {
+                        Ok((crate::aggregate::AggregateArg::Wildcard, false, filter))
+                    }
+                }
+                sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                    let arg_expr = convert_expr(e, dg, depth + 1)?;
+                    Ok((
+                        crate::aggregate::AggregateArg::Expr(Box::new(arg_expr)),
+                        distinct,
+                        filter,
+                    ))
+                }
+                _ => Err(unsupported("named or qualified wildcard function arguments")),
+            }
+        }
+    }
 }
 
 /// SQL-mission-1: a nested query (scalar / `EXISTS` / `IN` subquery) — the
@@ -1166,13 +1565,9 @@ fn convert_typed_string(ts: &sp::TypedString) -> Result<Expr> {
 }
 
 fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<Expr> {
-    if f.uses_odbc_syntax
-        || !f.within_group.is_empty()
-        || f.filter.is_some()
-        || f.null_treatment.is_some()
-    {
+    if f.uses_odbc_syntax || !f.within_group.is_empty() || f.null_treatment.is_some() {
         return Err(unsupported(
-            "function call with ODBC/WITHIN GROUP/FILTER/null-treatment modifiers",
+            "function call with ODBC/WITHIN GROUP/null-treatment modifiers",
         ));
     }
     if !matches!(f.parameters, sp::FunctionArguments::None) {
@@ -1180,73 +1575,60 @@ fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<E
     }
 
     let name = convert_object_name(&f.name, dg.limits)?;
+    // SQL-mission-2: an `OVER` clause makes the call a window function. (Before
+    // SQL-mission-1 Slice D the clause was silently dropped, turning
+    // `SUM(x) OVER ()` into the plain aggregate `SUM(x)`; Slice D refused it;
+    // SQL-mission-2 implements it. It is never ignored.)
+    if let Some(over) = &f.over {
+        return convert_window_function(f, &name, over, dg, depth);
+    }
     if name.0.len() == 1 {
         if let Some(agg_func) = crate::aggregate::AggregateFunc::lookup(&name.0[0].value) {
-            match &f.args {
-                sp::FunctionArguments::None => {
-                    return Err(SqlError::TypeMismatch {
-                        detail: format!(
-                            "aggregate function {} requires an argument",
-                            agg_func.name()
-                        ),
-                    });
-                }
-                sp::FunctionArguments::Subquery(_) => {
-                    return Err(unsupported("function call with a bare subquery argument"));
-                }
-                sp::FunctionArguments::List(list) => {
-                    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
-                        return Err(unsupported(
-                            "aggregate function with DISTINCT or clauses inside the argument list",
-                        ));
-                    }
-                    if list.args.is_empty() {
-                        return Err(SqlError::TypeMismatch {
-                            detail: format!(
-                                "aggregate function {} requires an argument",
-                                agg_func.name()
-                            ),
-                        });
-                    }
-                    if list.args.len() > 1 {
-                        return Err(SqlError::TypeMismatch {
-                            detail: format!(
-                                "aggregate function {} requires exactly 1 argument, found {}",
-                                agg_func.name(),
-                                list.args.len()
-                            ),
-                        });
-                    }
-                    return match &list.args[0] {
-                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
-                            if agg_func == crate::aggregate::AggregateFunc::Count {
-                                Ok(Expr::Aggregate {
-                                    func: agg_func,
-                                    arg: crate::aggregate::AggregateArg::Wildcard,
-                                })
-                            } else {
-                                Err(SqlError::TypeMismatch {
-                                    detail: format!(
-                                        "aggregate function {} does not support wildcard argument (*)",
-                                        agg_func.name()
-                                    ),
-                                })
-                            }
-                        }
-                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
-                            let arg_expr = convert_expr(e, dg, depth + 1)?;
-                            Ok(Expr::Aggregate {
-                                func: agg_func,
-                                arg: crate::aggregate::AggregateArg::Expr(Box::new(arg_expr)),
-                            })
-                        }
-                        _ => Err(unsupported(
-                            "named or qualified wildcard function arguments",
-                        )),
-                    };
-                }
-            }
+            let (arg, distinct, filter) = convert_aggregate_call(agg_func, f, dg, depth)?;
+            return Ok(Expr::Aggregate {
+                func: agg_func,
+                arg,
+                distinct,
+                filter,
+            });
         }
+        if name.0[0].value.eq_ignore_ascii_case("grouping") {
+            if f.filter.is_some() {
+                return Err(unsupported("FILTER on GROUPING"));
+            }
+            let sp::FunctionArguments::List(list) = &f.args else {
+                return Err(SqlError::TypeMismatch {
+                    detail: "GROUPING requires at least one argument".to_string(),
+                });
+            };
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(unsupported("DISTINCT / clauses inside GROUPING(...)"));
+            }
+            if list.args.is_empty() {
+                return Err(SqlError::TypeMismatch {
+                    detail: "GROUPING requires at least one argument".to_string(),
+                });
+            }
+            if list.args.len() > dg.limits.max_columns {
+                return Err(SqlError::ResourceLimit {
+                    detail: "GROUPING call has too many arguments".to_string(),
+                });
+            }
+            let args = list
+                .args
+                .iter()
+                .map(|a| match a {
+                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                        convert_expr(e, dg, depth + 1)
+                    }
+                    _ => Err(unsupported("named/wildcard GROUPING arguments")),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Expr::Grouping(args));
+        }
+    }
+    if f.filter.is_some() {
+        return Err(unsupported("FILTER on a function that is not an aggregate"));
     }
 
     let args = match &f.args {

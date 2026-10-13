@@ -48,6 +48,7 @@ use crate::bind::scope::{
     self, BindContext, Boundary, BoundaryKind, CteBinding, CteLookup, OuterScopes, Scope,
     ScopeEntry,
 };
+use crate::bind::window::NamedWindows;
 use crate::bound::*;
 use crate::error::{Result, SqlError};
 use crate::limits::SqlLimits;
@@ -76,7 +77,25 @@ pub fn bind_select_in(
     stmt: &ast::Select,
     outer: Option<&OuterScopes<'_>>,
 ) -> Result<BoundSelect> {
+    bind_select_in_with(env, limits, stmt, outer, &[])
+}
+
+/// `bind_select_in` for a query that is an operand of a set operation
+/// (SQL-mission-1 Slice E): `inherited` are the CTEs the set operation's own
+/// `WITH` list defined, which the operand sees as if it had written them (its
+/// own `WITH` list, if any, shadows them).
+pub(super) fn bind_select_in_with(
+    env: &BindEnv<'_>,
+    limits: &SqlLimits,
+    stmt: &ast::Select,
+    outer: Option<&OuterScopes<'_>>,
+    inherited: &[CteBinding],
+) -> Result<BoundSelect> {
+    if stmt.set_op.is_some() {
+        return super::setop::bind_set_operation(env, limits, stmt, outer, inherited);
+    }
     let mut scope = env.new_scope();
+    scope.ctes = inherited.to_vec();
     let mut from = Vec::new();
     let mut max_parameter = 0u32;
 
@@ -141,26 +160,22 @@ pub fn bind_select_in(
         .transpose()?;
 
     // GROUP BY — plain (non-aggregate) expressions against the same
-    // scope, item 12: no wildcard/aggregate allowed here.
-    let group_by = stmt
-        .group_by
-        .iter()
-        .map(|e| -> Result<BoundExpr> {
-            let mut eb = ExprBinder::new(Some(&scope), limits)
-                .with_capture_env(env)
-                .with_outer(outer);
-            let bound = eb.bind(e, None)?;
-            max_parameter = max_parameter.max(eb.max_parameter);
-            Ok(bound)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // scope, item 12: no wildcard/aggregate allowed here. SQL-mission-2:
+    // ROLLUP / CUBE / GROUPING SETS elements are interned into the same list.
+    let (group_by, grouping) =
+        bind_group_by(env, limits, &scope, outer, stmt, &mut max_parameter)?;
 
-    let projection = bind_projection(
+    // WINDOW name AS (...) definitions (SQL-mission-2).
+    let named_windows = collect_named_windows(&stmt.named_windows)?;
+
+    let (projection, projection_aliases) = bind_projection(
         env,
         &scope,
         outer,
         limits,
         &stmt.projection,
+        &named_windows,
+        &group_by,
         &mut max_parameter,
     )?;
     // The table references this query's own FROM defines: a column of any
@@ -177,20 +192,61 @@ pub fn bind_select_in(
             let mut eb = ExprBinder::new(Some(&scope), limits)
                 .with_aggregate(true)
                 .with_env(env)
-                .with_outer(outer);
+                .with_outer(outer)
+                .with_group_exprs(&group_by);
             let bound = eb.bind(e, Some(RelationalType::Boolean))?;
             max_parameter = max_parameter.max(eb.max_parameter);
             Ok(bound)
         })
         .transpose()?;
 
+    // QUALIFY (SQL-mission-2): a filter over window function results. It may
+    // use the select list's aliases (`QUALIFY rn = 1`) where no column of that
+    // name exists, and aggregates of an aggregated query.
+    let alias_exprs: Vec<(String, BoundExpr)> = projection_aliases
+        .iter()
+        .map(|(name, idx)| (name.clone(), projection[*idx].expr.clone()))
+        .collect();
+    let qualify = stmt
+        .qualify
+        .as_ref()
+        .map(|e| -> Result<BoundExpr> {
+            let mut eb = ExprBinder::new(Some(&scope), limits)
+                .with_aggregate(true)
+                .with_window(true)
+                .with_env(env)
+                .with_outer(outer)
+                .with_named_windows(&named_windows)
+                .with_group_exprs(&group_by)
+                .with_aliases(&alias_exprs);
+            let bound = eb.bind(e, Some(RelationalType::Boolean))?;
+            max_parameter = max_parameter.max(eb.max_parameter);
+            Ok(bound)
+        })
+        .transpose()?;
+    if let Some(q) = &qualify {
+        // Snowflake / DuckDB semantics: QUALIFY filters on window results, so a
+        // statement with no window function anywhere is a mistake (a WHERE or
+        // HAVING was meant); refused rather than run as a different clause.
+        let is_window = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Window(_));
+        if !q.any(&is_window) && !projection.iter().any(|i| i.expr.any(&is_window)) {
+            return Err(SqlError::TypeMismatch {
+                detail: "QUALIFY requires a window function in the SELECT list or in the QUALIFY condition".to_string(),
+            });
+        }
+    }
+
     // item 16: a statement is "aggregated" iff it has a GROUP BY, a
     // HAVING clause, or at least one aggregate call in its projection —
     // exactly the three SQL-standard triggers for ungrouped-column
-    // validation, never inferred from anything else.
+    // validation, never inferred from anything else. (SQL-mission-2: a
+    // ROLLUP / CUBE / GROUPING SETS clause is a GROUP BY, and QUALIFY may
+    // aggregate like the select list.)
     let is_aggregated = !group_by.is_empty()
+        || grouping.is_some()
         || having.is_some()
-        || projection.iter().any(|item| contains_aggregate(&item.expr));
+        || projection.iter().any(|item| contains_aggregate(&item.expr))
+        || qualify.as_ref().is_some_and(contains_aggregate);
 
     if is_aggregated {
         // item 17: every projection/HAVING expression must be either
@@ -200,6 +256,9 @@ pub fn bind_select_in(
         }
         if let Some(h) = &having {
             validate_group_compat(h, &group_by, &own_refs)?;
+        }
+        if let Some(q) = &qualify {
+            validate_group_compat(q, &group_by, &own_refs)?;
         }
     }
 
@@ -212,8 +271,11 @@ pub fn bind_select_in(
         .map(|item| -> Result<BoundOrderByItem> {
             let mut eb = ExprBinder::new(Some(&scope), limits)
                 .with_aggregate(is_aggregated)
+                .with_window(true)
                 .with_env(env)
-                .with_outer(outer);
+                .with_outer(outer)
+                .with_named_windows(&named_windows)
+                .with_group_exprs(&group_by);
             let bound = eb.bind(&item.expr, None)?;
             max_parameter = max_parameter.max(eb.max_parameter);
             if is_aggregated {
@@ -246,6 +308,7 @@ pub fn bind_select_in(
         })
         .collect();
     let having = having.map(|h| extract_aggregates(h, &mut aggregates));
+    let qualify = qualify.map(|q| extract_aggregates(q, &mut aggregates));
     let order_by: Vec<BoundOrderByItem> = order_by
         .into_iter()
         .map(|item| BoundOrderByItem {
@@ -254,6 +317,77 @@ pub fn bind_select_in(
             nulls: item.nulls,
         })
         .collect();
+
+    // SQL-mission-2: with ROLLUP / CUBE / GROUPING SETS a grouping column is
+    // NULL in the rows of a set that leaves it out, so its occurrences are
+    // rewritten to read the group's key (`GroupKeyRef`) instead of the
+    // representative input row -- which would still hold the column's value.
+    let (projection, having, qualify, order_by) = if grouping.is_some() {
+        let reads_grouped_row = |e: &BoundExpr| {
+            matches!(&e.kind, BoundExprKind::Subquery(sq)
+                if sq.outer_refs.iter().any(|c| own_refs.contains(&c.table_ref.0)))
+        };
+        let offending = projection.iter().any(|i| i.expr.any(&reads_grouped_row))
+            || having.as_ref().is_some_and(|e| e.any(&reads_grouped_row))
+            || qualify.as_ref().is_some_and(|e| e.any(&reads_grouped_row))
+            || order_by.iter().any(|i| i.expr.any(&reads_grouped_row));
+        if offending {
+            return Err(SqlError::Unsupported {
+                detail: "a correlated subquery that reads a column of the grouped query is not supported together with ROLLUP, CUBE or GROUPING SETS".to_string(),
+            });
+        }
+        (
+            projection
+                .into_iter()
+                .map(|item| BoundSelectItem {
+                    expr: rewrite_group_keys(item.expr, &group_by),
+                    output_name: item.output_name,
+                })
+                .collect::<Vec<_>>(),
+            having.map(|h| rewrite_group_keys(h, &group_by)),
+            qualify.map(|q| rewrite_group_keys(q, &group_by)),
+            order_by
+                .into_iter()
+                .map(|item| BoundOrderByItem {
+                    expr: rewrite_group_keys(item.expr, &group_by),
+                    descending: item.descending,
+                    nulls: item.nulls,
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (projection, having, qualify, order_by)
+    };
+
+    // SQL-mission-2: collect the window function calls out of the SELECT list,
+    // QUALIFY and ORDER BY into one list (identical calls share a slot); those
+    // trees now read each result through `WindowRef`.
+    let mut windows: Vec<BoundWindowCall> = Vec::new();
+    let projection: Vec<BoundSelectItem> = projection
+        .into_iter()
+        .map(|item| BoundSelectItem {
+            expr: extract_windows(item.expr, &mut windows),
+            output_name: item.output_name,
+        })
+        .collect();
+    let qualify = qualify.map(|q| extract_windows(q, &mut windows));
+    let order_by: Vec<BoundOrderByItem> = order_by
+        .into_iter()
+        .map(|item| BoundOrderByItem {
+            expr: extract_windows(item.expr, &mut windows),
+            descending: item.descending,
+            nulls: item.nulls,
+        })
+        .collect();
+    if windows.len() > limits.max_columns {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "statement uses {} distinct window function calls; max_columns is {}",
+                windows.len(),
+                limits.max_columns
+            ),
+        });
+    }
 
     // item 49/74: bound the number of distinct aggregate expressions one
     // statement may declare — reusing `SqlLimits::max_columns` (the same
@@ -286,18 +420,132 @@ pub fn bind_select_in(
 
     Ok(BoundSelect {
         ctes,
+        set_op: None,
         distinct: stmt.distinct,
         from,
         projection,
         selection,
         group_by,
+        grouping,
         aggregates,
         having,
+        windows,
+        qualify,
         order_by,
         limit,
         offset,
         max_parameter,
     })
+}
+
+/// `WINDOW name AS (...)` definitions by name; a name defined twice is an error.
+fn collect_named_windows(defs: &[(ast::Ident, ast::WindowSpec)]) -> Result<NamedWindows> {
+    let mut out = NamedWindows::new();
+    for (name, spec) in defs {
+        if out.insert(name.value.clone(), spec.clone()).is_some() {
+            return Err(SqlError::InvalidIdentifier {
+                detail: format!("window '{}' is defined more than once", name.value),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Binds the `GROUP BY` clause. Without grouping extensions it is the plain
+/// list of expressions. With `ROLLUP` / `CUBE` / `GROUPING SETS` (SQL-mission-2)
+/// every expression the clause names is interned into one list of distinct
+/// grouping expressions (structurally equal ones are the same grouping column),
+/// and the clause's structure is kept as indexes into it.
+fn bind_group_by(
+    env: &BindEnv<'_>,
+    limits: &SqlLimits,
+    scope: &Scope,
+    outer: Option<&OuterScopes<'_>>,
+    stmt: &ast::Select,
+    max_parameter: &mut u32,
+) -> Result<(Vec<BoundExpr>, Option<BoundGrouping>)> {
+    fn bind_one(
+        env: &BindEnv<'_>,
+        limits: &SqlLimits,
+        scope: &Scope,
+        outer: Option<&OuterScopes<'_>>,
+        e: &ast::Expr,
+        max_parameter: &mut u32,
+    ) -> Result<BoundExpr> {
+        let mut eb = ExprBinder::new(Some(scope), limits)
+            .with_capture_env(env)
+            .with_outer(outer);
+        let bound = eb.bind(e, None)?;
+        *max_parameter = (*max_parameter).max(eb.max_parameter);
+        Ok(bound)
+    }
+
+    let Some(elements) = &stmt.grouping else {
+        let plain = stmt
+            .group_by
+            .iter()
+            .map(|e| bind_one(env, limits, scope, outer, e, max_parameter))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok((plain, None));
+    };
+
+    // The GROUPING() bit string and the executor's key bookkeeping hold one
+    // bit per grouping expression.
+    const MAX_GROUPING_EXPRS: usize = 64;
+    let mut exprs: Vec<BoundExpr> = Vec::new();
+    let mut intern = |e: &ast::Expr, max_parameter: &mut u32| -> Result<usize> {
+        let bound = bind_one(env, limits, scope, outer, e, max_parameter)?;
+        if let Some(i) = exprs.iter().position(|g| *g == bound) {
+            return Ok(i);
+        }
+        if exprs.len() >= MAX_GROUPING_EXPRS {
+            return Err(SqlError::ResourceLimit {
+                detail: format!(
+                    "a GROUP BY with ROLLUP, CUBE or GROUPING SETS supports at most {MAX_GROUPING_EXPRS} distinct grouping expressions"
+                ),
+            });
+        }
+        exprs.push(bound);
+        Ok(exprs.len() - 1)
+    };
+    if elements.len() > limits.max_columns {
+        return Err(SqlError::ResourceLimit {
+            detail: format!("GROUP BY clause exceeds max_columns ({})", limits.max_columns),
+        });
+    }
+    let mut members = |sets: &[Vec<ast::Expr>], max_parameter: &mut u32| -> Result<Vec<Vec<usize>>> {
+        if sets.len() > limits.max_columns {
+            return Err(SqlError::ResourceLimit {
+                detail: format!("GROUP BY clause exceeds max_columns ({})", limits.max_columns),
+            });
+        }
+        sets.iter()
+            .map(|set| {
+                set.iter()
+                    .map(|e| intern(e, max_parameter))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect()
+    };
+    let mut bound_elements = Vec::with_capacity(elements.len());
+    for element in elements {
+        bound_elements.push(match element {
+            ast::GroupElement::Expr(e) => {
+                let one = std::slice::from_ref(e);
+                let sets = members(&[one.to_vec()], max_parameter)?;
+                BoundGroupElement::Expr(sets[0][0])
+            }
+            ast::GroupElement::Rollup(sets) => BoundGroupElement::Rollup(members(sets, max_parameter)?),
+            ast::GroupElement::Cube(sets) => BoundGroupElement::Cube(members(sets, max_parameter)?),
+            ast::GroupElement::Sets(sets) => BoundGroupElement::Sets(members(sets, max_parameter)?),
+        });
+    }
+    Ok((
+        exprs,
+        Some(BoundGrouping {
+            elements: bound_elements,
+        }),
+    ))
 }
 
 /// Binds a `WITH` list into `scope` (SQL-mission-1 Slice C) and returns the
@@ -325,22 +573,43 @@ pub fn bind_with_list(
         }
     }
     scope.pending_cte_names = ctes.iter().map(|c| c.name.value.clone()).collect();
-    let mut out = Vec::with_capacity(ctes.len());
+    scope.recursive_keyword = ctes.iter().any(|c| c.recursive);
+    let mut out: Vec<BoundCte> = Vec::with_capacity(ctes.len());
     for cte in ctes {
         let name = cte.name.value.clone();
         scope.defining_cte = Some(name.clone());
-        env.enter(limits)?;
-        let link = OuterScopes {
-            scope: &*scope,
-            parent: outer,
-            boundary: Some(Boundary {
-                kind: BoundaryKind::Cte,
-                name: &name,
-            }),
+        // SQL-mission-1 Slice D: a definition of a `WITH RECURSIVE` list that
+        // names itself is bound as `seed UNION [ALL] recursive-term`.
+        let recursive = cte.recursive && super::recursive::mentions_table(&cte.query, &name);
+        let (body, recursion) = if recursive {
+            let earlier: Vec<String> = out.iter().map(|c| c.name.clone()).collect();
+            let r = super::recursive::bind_recursive_body(
+                env,
+                limits,
+                cte,
+                scope,
+                outer,
+                &earlier,
+                max_parameter,
+            );
+            scope.seed_phase = false;
+            scope.working = None;
+            scope.hidden_ctes.clear();
+            r?
+        } else {
+            env.enter(limits)?;
+            let link = OuterScopes {
+                scope: &*scope,
+                parent: outer,
+                boundary: Some(Boundary {
+                    kind: BoundaryKind::Cte,
+                    name: &name,
+                }),
+            };
+            let body = bind_select_in(env, limits, &cte.query, Some(&link));
+            env.leave();
+            (body?, None)
         };
-        let body = bind_select_in(env, limits, &cte.query, Some(&link));
-        env.leave();
-        let body = body?;
         scope.defining_cte = None;
         *max_parameter = (*max_parameter).max(body.max_parameter);
 
@@ -357,9 +626,11 @@ pub fn bind_with_list(
             name,
             columns: names,
             query: body,
+            recursion,
         });
     }
     scope.pending_cte_names.clear();
+    scope.recursive_keyword = false;
     Ok(out)
 }
 
@@ -369,7 +640,7 @@ pub fn bind_with_list(
 /// `(name, type, nullable)` of one column of a derived table or CTE.
 type RelationColumn = (String, Option<RelationalType>, bool);
 
-fn relation_output(
+pub(super) fn relation_output(
     described: &str,
     body: &BoundSelect,
     column_names: &[ast::Ident],
@@ -458,6 +729,37 @@ fn bind_from_item(
         let cte = match OuterScopes::lookup_cte(scope, outer, name) {
             CteLookup::Found(binding) => Some(binding),
             CteLookup::NotACte => None,
+            CteLookup::Working(w) => {
+                return bind_working_reference(env, scope, tref, w, null_extended);
+            }
+            CteLookup::HiddenInRecursiveTerm => {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: format!(
+                        "CTE '{name}' is defined earlier in the same WITH RECURSIVE list and is not visible inside a recursive term; it is visible in the seed, in the CTEs after it and in the main query"
+                    ),
+                });
+            }
+            CteLookup::SelfInSeed => {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: format!(
+                        "recursive reference '{name}' must not appear in the seed (the non-recursive term) of CTE '{name}'; it belongs in the recursive term, after UNION [ALL]"
+                    ),
+                });
+            }
+            CteLookup::SelfNotShaped => {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: format!(
+                        "CTE '{name}' refers to itself but its body is not of the form `seed UNION [ALL] recursive-term`"
+                    ),
+                });
+            }
+            CteLookup::ForwardInRecursiveList => {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: format!(
+                        "CTE '{name}' is referenced before it is defined; a CTE can only use CTEs defined earlier in the same WITH list (recursive CTEs that refer to each other are not supported)"
+                    ),
+                });
+            }
             CteLookup::SelfReference | CteLookup::ForwardReference => {
                 // Not visible as a CTE here -- but a catalog table of that
                 // name is (SQL scoping): only when there is none is it an
@@ -523,6 +825,64 @@ fn bind_from_item(
     Ok((table, BoundRelation::Table))
 }
 
+/// The reference to a recursive CTE inside its own recursive term: the working
+/// table. It must be the only one, directly in the term's `FROM`, and not on the
+/// nullable side of an outer join.
+fn bind_working_reference(
+    env: &BindEnv<'_>,
+    scope: &mut Scope,
+    tref: &ast::TableRef,
+    w: scope::WorkingRef,
+    null_extended: bool,
+) -> Result<(BoundTableRef, BoundRelation)> {
+    let name = &w.name;
+    if w.ordinal > 1 {
+        return Err(SqlError::InvalidIdentifier {
+            detail: format!(
+                "recursive reference '{name}' must appear exactly once in the recursive term"
+            ),
+        });
+    }
+    if env.depth() != w.depth {
+        return Err(SqlError::InvalidIdentifier {
+            detail: format!(
+                "recursive reference '{name}' must be a table of the FROM clause of the recursive term itself, not inside a subquery, a derived table or a nested WITH"
+            ),
+        });
+    }
+    if null_extended {
+        return Err(SqlError::InvalidIdentifier {
+            detail: format!(
+                "recursive reference '{name}' must not be on the nullable side of an outer join"
+            ),
+        });
+    }
+    if !tref.column_aliases.is_empty() && tref.column_aliases.len() != w.columns.len() {
+        return Err(SqlError::InvalidIdentifier {
+            detail: format!(
+                "CTE '{name}' produces {} column(s) but {} column name(s) were given",
+                w.columns.len(),
+                tref.column_aliases.len()
+            ),
+        });
+    }
+    let effective = tref.alias.as_ref().map(|a| a.value.as_str()).unwrap_or(name);
+    check_alias_not_duplicate(scope, tref.alias.as_ref(), name)?;
+    let mut columns = w.columns.clone();
+    for (col, alias) in columns.iter_mut().zip(&tref.column_aliases) {
+        col.name = alias.value.clone();
+    }
+    scope.push(scope::synthetic_resolved(effective, columns), tref.alias.as_ref(), null_extended);
+    let table = scope.entries.last().expect("just pushed").to_bound_table_ref();
+    Ok((
+        table,
+        BoundRelation::Working(BoundWorkingRef {
+            work_id: w.work_id,
+            name: w.name.clone(),
+        }),
+    ))
+}
+
 fn check_alias_not_duplicate(
     scope: &Scope,
     alias: Option<&ast::Ident>,
@@ -537,15 +897,23 @@ fn check_alias_not_duplicate(
     Ok(())
 }
 
+/// The explicit aliases of a select list and the position each names.
+type ProjectionAliases = Vec<(String, usize)>;
+
+#[allow(clippy::too_many_arguments)]
 fn bind_projection(
     env: &BindEnv<'_>,
     scope: &Scope,
     outer: Option<&OuterScopes<'_>>,
     limits: &SqlLimits,
     items: &[ast::SelectItem],
+    named_windows: &NamedWindows,
+    group_by: &[BoundExpr],
     max_parameter: &mut u32,
-) -> Result<Vec<BoundSelectItem>> {
+) -> Result<(Vec<BoundSelectItem>, ProjectionAliases)> {
     let mut out = Vec::new();
+    // Explicit aliases and the select-list position they name (QUALIFY may use them).
+    let mut aliases: Vec<(String, usize)> = Vec::new();
     for item in items {
         match item {
             ast::SelectItem::Item(item_expr) => {
@@ -561,8 +929,11 @@ fn bind_projection(
                 // GROUP BY).
                 let mut eb = ExprBinder::new(Some(scope), limits)
                     .with_aggregate(true)
+                    .with_window(true)
                     .with_env(env)
-                    .with_outer(outer);
+                    .with_outer(outer)
+                    .with_named_windows(named_windows)
+                    .with_group_exprs(group_by);
                 let bound = eb.bind(&item_expr.expr, None)?;
                 *max_parameter = (*max_parameter).max(eb.max_parameter);
                 let output_name = item_expr
@@ -570,6 +941,9 @@ fn bind_projection(
                     .as_ref()
                     .map(|a| a.value.clone())
                     .unwrap_or_else(|| derive_output_name(&item_expr.expr));
+                if let Some(alias) = &item_expr.alias {
+                    aliases.push((alias.value.clone(), out.len()));
+                }
                 out.push(BoundSelectItem {
                     expr: bound,
                     output_name,
@@ -609,7 +983,7 @@ fn bind_projection(
             detail: "SELECT must project at least one column".to_string(),
         });
     }
-    Ok(out)
+    Ok((out, aliases))
 }
 
 fn expand_wildcard(
@@ -651,6 +1025,11 @@ fn derive_output_name(expr: &ast::Expr) -> String {
         ast::Expr::Column(col) => col.parts.last().expect("non-empty").value.clone(),
         ast::Expr::Function { name, .. } => name.last().value.clone(),
         ast::Expr::Aggregate { func, .. } => func.name().to_string(),
+        ast::Expr::Window(call) => match &call.function {
+            ast::WindowFunction::Aggregate { func, .. } => func.name().to_string(),
+            ast::WindowFunction::Named { name, .. } => name.clone(),
+        },
+        ast::Expr::Grouping(_) => "grouping".to_string(),
         _ => "?column?".to_string(),
     }
 }
@@ -664,42 +1043,11 @@ fn derive_output_name(expr: &ast::Expr) -> String {
 /// `extract_aggregates`, so every aggregate call is still a
 /// `BoundExprKind::Aggregate` node here, never yet an `AggregateRef`.
 fn contains_aggregate(expr: &BoundExpr) -> bool {
-    match &expr.kind {
-        BoundExprKind::Aggregate(_) => true,
-        BoundExprKind::AggregateRef(_)
-        | BoundExprKind::Literal(_)
-        | BoundExprKind::Parameter { .. }
-        | BoundExprKind::Column(_) => false,
-        BoundExprKind::UnaryOp { expr, .. } => contains_aggregate(expr),
-        BoundExprKind::BinaryOp { left, right, .. } => {
-            contains_aggregate(left) || contains_aggregate(right)
-        }
-        BoundExprKind::IsNull { expr, .. } => contains_aggregate(expr),
-        BoundExprKind::Between {
-            expr, low, high, ..
-        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
-        BoundExprKind::InList { expr, list, .. } => {
-            contains_aggregate(expr) || list.iter().any(contains_aggregate)
-        }
-        BoundExprKind::Like { expr, pattern, .. } => {
-            contains_aggregate(expr) || contains_aggregate(pattern)
-        }
-        BoundExprKind::Case {
-            operand,
-            branches,
-            else_result,
-        } => {
-            operand.as_deref().is_some_and(contains_aggregate)
-                || branches
-                    .iter()
-                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
-                || else_result.as_deref().is_some_and(contains_aggregate)
-        }
-        BoundExprKind::Function { args, .. } => args.iter().any(contains_aggregate),
-        // The subquery's own aggregates belong to the subquery; only its
-        // `IN` operand is an expression of *this* query.
-        BoundExprKind::Subquery(sq) => sq.operand.as_ref().is_some_and(contains_aggregate),
-    }
+    // `any` descends through every child of a node -- including, since
+    // SQL-mission-2, the arguments, `PARTITION BY` and `ORDER BY` of a window
+    // call (`SUM(SUM(x)) OVER ()` aggregates) -- but not into a subquery, whose
+    // own aggregates belong to it.
+    expr.any(&|e| matches!(e.kind, BoundExprKind::Aggregate(_)))
 }
 
 /// item 17/22: `expr` is legal in an aggregated statement's projection/
@@ -723,6 +1071,18 @@ fn validate_group_compat(
         // already rejected earlier, at aggregate-binding time).
         BoundExprKind::Aggregate(_) | BoundExprKind::AggregateRef(_) => Ok(()),
         BoundExprKind::Literal(_) | BoundExprKind::Parameter { .. } => Ok(()),
+        // SQL-mission-2: a window function runs over the *groups*, so
+        // everything it evaluates per row (arguments, PARTITION BY, ORDER BY)
+        // must itself be group-compatible. Its frame offsets are constants.
+        BoundExprKind::Window(call) => {
+            for e in call.exprs() {
+                validate_group_compat(e, group_by, own_refs)?;
+            }
+            Ok(())
+        }
+        BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_) => Ok(()),
         // A column of an enclosing query is a constant for one evaluation of
         // this (sub)query, so it needs no grouping.
         BoundExprKind::Column(c) if !own_refs.contains(&c.table_ref.0) => Ok(()),
@@ -826,6 +1186,15 @@ fn extract_aggregates(expr: BoundExpr, out: &mut Vec<BoundAggregateExpr>) -> Bou
             BoundExprKind::AggregateRef(idx)
         }
         already @ BoundExprKind::AggregateRef(_) => already,
+        already @ (BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_)) => already,
+        // SQL-mission-2: aggregates nested in a window call (`SUM(SUM(x))
+        // OVER ()`, `RANK() OVER (ORDER BY SUM(x))`) belong to the query's
+        // aggregation, so they are extracted here too.
+        BoundExprKind::Window(call) => {
+            BoundExprKind::Window(Box::new((*call).map_exprs(&mut |e| extract_aggregates(e, out))))
+        }
         already @ BoundExprKind::Literal(_) => already,
         already @ BoundExprKind::Parameter { .. } => already,
         already @ BoundExprKind::Column(_) => already,
@@ -904,4 +1273,43 @@ fn extract_aggregates(expr: BoundExpr, out: &mut Vec<BoundAggregateExpr>) -> Bou
         }
     };
     BoundExpr { kind, ty, nullable }
+}
+
+/// SQL-mission-2: rewrites every subtree equal to a grouping expression into a
+/// read of the group's key (`GroupKeyRef`), so that an output row of a grouping
+/// set that leaves the expression out sees `NULL` there. Marked nullable: the
+/// value is `NULL` in the rows of any set that omits it (conservatively assumed
+/// for every grouping expression of a ROLLUP / CUBE / GROUPING SETS query).
+fn rewrite_group_keys(expr: BoundExpr, group_by: &[BoundExpr]) -> BoundExpr {
+    if let Some(i) = group_by.iter().position(|g| *g == expr) {
+        return BoundExpr {
+            kind: BoundExprKind::GroupKeyRef(i),
+            ty: expr.ty,
+            nullable: true,
+        };
+    }
+    expr.map_children(&mut |c| rewrite_group_keys(c, group_by))
+}
+
+/// SQL-mission-2: replaces each window function call by a `WindowRef` to its
+/// slot in `out`. Identical calls (same function, arguments and window) share a
+/// slot, so a call written twice is evaluated once. Window calls cannot nest
+/// (the binder refuses that), so a `Window` node is replaced whole.
+fn extract_windows(expr: BoundExpr, out: &mut Vec<BoundWindowCall>) -> BoundExpr {
+    if let BoundExprKind::Window(call) = expr.kind {
+        let call = *call;
+        let idx = match out.iter().position(|c| *c == call) {
+            Some(i) => i,
+            None => {
+                out.push(call);
+                out.len() - 1
+            }
+        };
+        return BoundExpr {
+            kind: BoundExprKind::WindowRef(idx),
+            ty: expr.ty,
+            nullable: expr.nullable,
+        };
+    }
+    expr.map_children(&mut |c| extract_windows(c, out))
 }

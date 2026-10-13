@@ -5,6 +5,11 @@ internal AST, binder, authorization resolution. **No execution.** This
 document is the structural/reference map; `PHASE_RELATIONAL_SQL_
 INCREMENT6_RESULTS.md` has the certification matrix and measurements.
 
+> **PARTLY SUPERSEDED (2026-10-12):** subqueries, derived tables, `LATERAL`,
+> `WITH` / `WITH RECURSIVE` and `UNION` / `INTERSECT` / `EXCEPT` are supported
+> since SQL Mission 1. The original text below is unchanged; section 12 at
+> the end lists exactly what changed.
+
 ---
 
 ## 1. Parser dependency
@@ -243,3 +248,53 @@ a pre-existing, already-documented `CatalogService::list_tables` full-
 scan characteristic (`RELATIONAL ADR AMENDMENT 002` CA.2), newly
 exercised by the binder, not introduced by it; no cache was added
 (item 36's explicit "do not introduce caching automatically").
+
+
+---
+
+## 12. Addendum -- SQL Mission 1 (2026-10-11 / 2026-10-12): what is now supported
+
+**This section supersedes the "Explicitly not supported" list in section 2 and the
+"Known limitations" in section 11 for the items below. The original text above is
+kept as written (it describes Increment 6).** The live per-feature status, with
+the tests that verify each row, is `sql/MISSION1_FEATURE_MATRIX.md`. Nothing here
+is a claim of Snowflake compatibility.
+
+| Was "not supported" | Now | Slice | Notes |
+|---|---|---|---|
+| Scalar subqueries `(SELECT ...)` | **DONE** | A | 0 rows is NULL, 1 row its value, more than one row is a run-time error |
+| `expr [NOT] IN (SELECT ...)` | **DONE** | A | three-valued logic: a NULL in the set makes a non-match UNKNOWN |
+| `[NOT] EXISTS (SELECT ...)` | **DONE** | A | never NULL |
+| Subqueries in `UPDATE` / `DELETE` `WHERE` | **DONE** | A | |
+| Correlated subqueries (scalar / `IN` / `EXISTS`), nested to depth 32 | **DONE** | B | re-run per outer row; `UPDATE ... SET (subquery)` uses a pre-statement snapshot |
+| Derived tables `FROM (SELECT ...) AS alias [(columns)]` | **DONE** | C | the alias is required; a non-`LATERAL` body cannot read the query around it |
+| `[LEFT] JOIN LATERAL (SELECT ...) alias ON cond` | **DONE** | C | `FROM t, LATERAL (...)` and `CROSS JOIN LATERAL` stay unsupported (no comma / `CROSS` joins) |
+| `WITH` (non-recursive CTEs), before `SELECT` / `UPDATE` / `DELETE` | **DONE** | C | computed once per statement; `WITH` before `INSERT` is accepted and has no effect |
+| `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL` | **DONE** | E | `INTERSECT` binds tighter; NULLs are one value for deduplication; numeric columns widen, other types never convert; `ORDER BY` after the last query names output columns only |
+| `WITH RECURSIVE name AS (seed UNION [ALL] recursive-term)` | **DONE** | D | the term reads the previous iteration; stops on no new rows; depth 1,000 / rows 1,000,000 / 8 recursive CTEs per statement; the term may not aggregate, `ORDER BY` or `LIMIT` |
+| Window functions (`... OVER (...)`) | **still refused**, now reliably | D | the `OVER` clause used to be silently dropped (`SUM(x) OVER ()` ran as `SUM(x)`); it is a typed `Unsupported` error now |
+
+**Still not supported** (unchanged): `RIGHT` / `FULL` / `CROSS` / `NATURAL JOIN`, `JOIN ... USING`,
+comma joins, `INSERT ... SELECT`, `CAST`, `MINUS`, `UNION BY NAME`, `VALUES` / `TABLE` as a set-operation
+operand, multi-reference recursion, mutually recursive CTEs, table-level `UNIQUE` / `FOREIGN KEY` / `CHECK`.
+
+The "No SQL execution" and "No transactions" statements of section 11 were already superseded by
+Increments 7-18 and are not repeated here.
+
+
+## 13. Addendum -- SQL Mission 2 (2026-10-13): what is now supported
+
+This section is appended; sections 2, 3 and 11 above are the original text and are SUPERSEDED where they list window functions, `ROLLUP`/`CUBE`/`GROUPING SETS`,
+`COUNT(DISTINCT ...)` or aggregate `FILTER` as outside the grammar. The live status, the full matrix and every decision are in `sql/MISSION2_FEATURE_MATRIX.md`.
+
+Accepted now:
+
+* Window calls `f(args) [FILTER (WHERE ...)] OVER (spec | name)` with `spec` = `[base_window] [PARTITION BY e, ...] [ORDER BY e [ASC|DESC] [NULLS FIRST|LAST], ...] [ROWS|RANGE frame]`; `WINDOW name AS (spec), ...`;
+  frames `{ROWS|RANGE} {start | BETWEEN start AND end}` with bounds `UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | UNBOUNDED FOLLOWING`.
+  Functions: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`.
+* `SELECT ... QUALIFY condition` (after `HAVING`).
+* `GROUP BY` elements `expr`, `ROLLUP (m, ...)`, `CUBE (m, ...)`, `GROUPING SETS (m, ...)` with members `expr` or `(expr, ...)`; `GROUP BY ()`; `GROUPING(expr, ...)`.
+* `agg(expr) FILTER (WHERE cond)` and `agg(DISTINCT expr)` for `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.
+
+Still refused with a typed error: `GROUPS` frames, `EXCLUDE`, `IGNORE|RESPECT NULLS`, `DISTINCT` in a window aggregate, `COUNT(DISTINCT *)`, `GROUP BY ALL`, `GROUP BY ... WITH ROLLUP|CUBE|TOTALS`,
+window functions outside the select list / `QUALIFY` / `ORDER BY`.

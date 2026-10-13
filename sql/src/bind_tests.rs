@@ -1035,18 +1035,30 @@ fn group_by_all_and_rollup_remain_explicitly_unsupported() {
         parse_then_bind(&f, "SELECT id FROM t GROUP BY ALL").unwrap_err(),
         SqlError::Unsupported { .. }
     ));
-    assert!(matches!(
-        parse_then_bind(&f, "SELECT id, COUNT(*) FROM t GROUP BY ROLLUP(id)").unwrap_err(),
-        SqlError::Unsupported { .. }
-    ));
+    // Mission 2: OVER / ROLLUP / COUNT(DISTINCT) is implemented; see MISSION2_FEATURE_MATRIX.md §6.2.
+    // The ROLLUP case is now a positive assertion; `GROUP BY ALL` above is unchanged.
+    let bound = parse_then_bind(&f, "SELECT id, COUNT(*) FROM t GROUP BY ROLLUP(id)")
+        .unwrap_or_else(|e| panic!("ROLLUP binds: {e:?}"));
+    let BoundStatement::Select(s) = bound else { panic!("not a SELECT") };
+    assert!(s.grouping.is_some(), "ROLLUP must reach the bound tree as a grouping clause, not a plain GROUP BY");
     f.cleanup();
 }
 
 #[test]
 fn count_distinct_remains_explicitly_unsupported() {
     let f = Fixture::new("agg_bind_count_distinct_unsupported");
-    let err = parse_then_bind(&f, "SELECT COUNT(DISTINCT name) FROM t").unwrap_err();
-    assert!(matches!(err, SqlError::Unsupported { .. }));
+    // Mission 2: OVER / ROLLUP / COUNT(DISTINCT) is implemented; see MISSION2_FEATURE_MATRIX.md §6.2.
+    // `COUNT(DISTINCT x)` is now a positive assertion: it binds, and the DISTINCT flag
+    // is kept on the bound aggregate (a dropped flag would count duplicates).
+    let bound = parse_then_bind(&f, "SELECT COUNT(DISTINCT name) FROM t")
+        .unwrap_or_else(|e| panic!("COUNT(DISTINCT) binds: {e:?}"));
+    let BoundStatement::Select(s) = bound else { panic!("not a SELECT") };
+    assert!(s.aggregates.iter().any(|a| a.distinct), "the DISTINCT flag was dropped: {:?}", s.aggregates);
+    // The failure mode this test protects -- a form that is not implemented being
+    // silently accepted -- stays pinned by the DISTINCT form that is still refused
+    // (DISTINCT inside a window aggregate, matrix X3).
+    let err = parse_then_bind(&f, "SELECT COUNT(DISTINCT name) OVER () FROM t").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported { .. }), "{err:?}");
     f.cleanup();
 }
 

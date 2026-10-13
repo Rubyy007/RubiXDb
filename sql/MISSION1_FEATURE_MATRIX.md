@@ -53,6 +53,24 @@ maintainer's uncommitted F-08 changes under `src/sstable/`, `src/lsm/`, `src/ops
   the plan leaves `Derived` / `CteNode`, not an expression-level subquery node); and states that a CTE's
   self-reference is a bind error (implemented as: the name is not visible in its own body, so it means the
   catalog table if one exists and is the precise error otherwise).
+* **D-8** The Slice E prompt (a) quotes 235 API tests (it is 237 since Slice C); (b) says `INTERSECT ALL` of two
+  identical relations "has twice the rows" -- by the SQL standard it is `min(c, c) = c` copies of each row, i.e. the
+  relation itself, which is what is implemented and tested (`INTERSECT ALL` of `[1,1,2]` and `[1,1,1]` is `[1,1]`
+  as the prompt's own worked example says); (c) describes `INTERSECT` as a join and `EXCEPT` as an anti-join but also
+  forbids modelling a set operation as a join: they are implemented as hashed membership counting over the right
+  operand, with no join operator; (d) asks to reuse the existing distinct machinery: `DistinctOp` is an O(n^2)
+  `Vec` scan with its own bound and message (OPEN_ITEMS), so the set operations use a hash set under the same
+  `max_materialized_rows` / `max_materialized_bytes` bounds; (e) asks for an "inner distinct flag" on the node: the
+  node carries the operator and the `ALL` flag (distinct is `!all`).
+* **D-9** The Slice D prompt (a) says a CTE defined before the recursive one is visible in its seed "but not its recursive
+  term (SQL standard)" -- PostgreSQL, MySQL and Snowflake all make it visible in the term; the prompt is followed (a clear
+  bind error), see R18; (b) asks to verify that a recursive CTE "sees the correlated scope from the enclosing query" --
+  Slice C's boundary (pinned by a Slice C test) refuses any CTE body reading an outer column, so only a recursive CTE
+  defined inside a correlated subquery whose *consumer* is correlated is supported (R8, R17); (c) wants window functions
+  refused with a bind error -- they are refused by the parser as a typed `Unsupported`, after fixing a defect where the
+  `OVER` clause was silently dropped (R14); (d) names the node `RecursiveCteNode(name, seed_plan, recursive_plan, distinct)`
+  -- implemented with `cte_id` and `work_id` added; (e) suggests a snapshot-per-iteration mutant (M15), which cannot be a
+  one-line breakage because every read shares the statement's one `ExecCtx`.
 
 ## 1. Architecture facts this design rests on (read from source)
 
@@ -107,15 +125,15 @@ named is a gap unless stated.
 | C1 | `WITH name AS (SELECT …) SELECT … FROM name` | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests` -- parser / binder / derived / lateral / cte_binder / cte / materialization / diff_relations, corpus, `api_sql_integration`) | `convert.rs::convert_query` (`q.with`), `bind/scope.rs`, new relation node | all four | C |
 | C2 | Multiple CTEs in one `WITH` (later CTE may reference an earlier one) | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests` -- parser / binder / derived / lateral / cte_binder / cte / materialization / diff_relations, corpus, `api_sql_integration`) | same | all four | C |
 | C3 | A CTE referenced more than once (same rows each time) | IMPLEMENTED AND VERIFIED (materialized once per statement: `relation_tests::cte`, `::materialization`, `::diff_relations`) | new `CteRef` + per-statement materialization cache in `ExecCtx` | Planner, Executor | C |
-| C4 | `WITH RECURSIVE name AS (seed UNION ALL recursive) …` | MISSING | `convert.rs`, new recursive-CTE operator | all four | D (needs E's `SetOp` shape for the seed/recursive split) |
-| C5 | Recursive CTE bounded by depth (default 1,000, configurable) | MISSING | new limit in `exec::ExecLimits` | Executor | D |
-| C6 | Recursive CTE bounded by total rows (default 1,000,000, configurable) | MISSING | new limit in `exec::ExecLimits` | Executor | D |
+| C4 | `WITH RECURSIVE name AS (seed UNION ALL recursive) …` | IMPLEMENTED AND VERIFIED (Slice D: `recursive_tests` -- `counter`, `union`, `shape`, `contexts`, `diff`, corpus, HTTP `recursive_ctes_through_the_real_api`) | `convert.rs`, new recursive-CTE operator | all four | D (delivered) |
+| C5 | Recursive CTE bounded by depth (default 1,000, configurable) | IMPLEMENTED AND VERIFIED (`max_recursive_cte_depth` 1,000, exact at the bound: `recursive_tests::limits`, HTTP `recursive_cte_errors_and_bounds_over_http`) | new limit in `exec::ExecLimits` | Executor | D |
+| C6 | Recursive CTE bounded by total rows (default 1,000,000, configurable) | IMPLEMENTED AND VERIFIED (`max_recursive_cte_rows` 1,000,000, checked before a row is kept: `recursive_tests::limits`; the default is pinned, exhaustion is exercised at small configured values) | new limit in `exec::ExecLimits` | Executor | D |
 | C7 | CTE shadowing a base table name | IMPLEMENTED AND VERIFIED (`relation_tests::cte_binder`, `::cte`; a qualified name is never a CTE) | `bind/scope.rs` name resolution order | Binder | C |
 | S5.1 | Derived-table alias required and unique; column-name list `AS t(a, b)` (exact count) | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::binder`, HTTP `derived_tables_through_the_real_api`) | `bind/select.rs::{bind_from_item, relation_output}` | Parser, Binder | C |
 | S5.2 | Non-LATERAL derived table / CTE body cannot read outer or sibling columns (`derived table 'd' cannot reference outer column 'c' without LATERAL`) | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::binder`, `::lateral`, `::cte_binder`) | `bind/scope.rs::{OuterScopes, Boundary}` | Binder | C |
 | S5.3 | Derived table with GROUP BY / HAVING / ORDER BY / LIMIT / DISTINCT inside; ORDER BY inside is applied (decision), LIMIT without ORDER BY allowed | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::derived`) | `plan/logical.rs`, `exec/relation.rs` | Planner, Executor | C |
 | S5.4 | Derived table in a join (right side materialized once, left side streamed); derived table in a subquery / correlated subquery / DML | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::derived`, `::materialization`) | `plan/physical.rs` (`rescanned`), `exec/relation.rs` | Planner, Executor | C |
-| S5.5 | Set operation inside a derived table | BLOCKED until Slice E (typed `Unsupported`, pinned by `relation_tests::parser`) | `convert.rs` | Parser | E |
+| S5.5 | Set operation inside a derived table | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests::contexts::a_derived_table_can_be_a_set_operation_*`, HTTP) | `convert.rs` | Parser | E |
 | C1.1 | CTE column-name list `WITH x(a, b) AS (...)` (exact count); reference rename `FROM x AS y(p, q)` | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::cte_binder`) | `bind/select.rs::bind_with_list` | Binder | C |
 | C1.2 | Self-reference without RECURSIVE: `CTE 'x' refers to itself; use WITH RECURSIVE` (a same-named catalog table is read instead, per SQL scoping) | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::cte_binder`) | `bind/scope.rs::OuterScopes::lookup_cte` | Binder | C |
 | C1.3 | Forward reference to a later CTE of the same list is a bind error | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::cte_binder`) | same | Binder | C |
@@ -123,24 +141,47 @@ named is a gap unless stated.
 | C1.5 | `WITH` before `UPDATE` / `DELETE` (usable) and `INSERT` (bound, never usable) | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::parser`, `::cte`, `::materialization`, HTTP) | `convert.rs::convert_query_statement`, `bind/dml.rs` | all four | C |
 | C1.6 | `WITH` inside a scalar subquery / derived table is scoped to it and never leaks; inner shadows outer only inside | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::cte_binder`, `::cte`) | `bind/scope.rs` | Binder | C |
 | C1.7 | CTE materialization bounded by `max_materialized_rows` / `_bytes`; `max_cte_definitions` 64, `max_cte_references` 256, `max_derived_table_depth` 32; metric `cte_materializations_total` | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::cte`, `::derived`; HTTP 64/65 definitions) | `exec/mod.rs::check_relation_limits`, `plan/relstats.rs`, `exec/relation.rs` | Executor | C |
-| C1.8 | CTE whose body is a set operation | BLOCKED until Slice E (typed `Unsupported`) | `convert.rs` | Parser | E |
+| C1.8 | CTE whose body is a set operation | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests::contexts::a_cte_body_can_be_a_set_operation`, `a_set_operation_cte_read_twice_is_computed_once_*`, HTTP; non-recursive only) | `convert.rs` | Parser | E |
 | C1.9 | `EXPLAIN` shows a twice-read CTE once, flagged materialized; a derived table with `outer_row_input` | IMPLEMENTED AND VERIFIED (Slice C: `relation_tests::cte`, `::derived`, `::lateral`, HTTP) | `plan/explain.rs` | Planner | C |
 
 ### 2.3 Set operations
 
 | # | Feature | Status | Where support lives | Gap | Slice |
 |---|---|---|---|---|---|
-| O1 | `UNION` | MISSING | `convert.rs::convert_query` (`sp::SetExpr::SetOperation`), new `BoundSetOp`, `plan/logical.rs::LogicalPlan::SetOp`, new operator | all four | E |
-| O2 | `UNION ALL` | MISSING | same | all four | E |
-| O3 | `INTERSECT` | MISSING | same | all four | E |
-| O4 | `INTERSECT ALL` | MISSING | same | all four | E |
-| O5 | `EXCEPT` | MISSING | same | all four | E |
-| O6 | `EXCEPT ALL` | MISSING | same | all four | E |
-| O7 | `INTERSECT` binds tighter than `UNION`/`EXCEPT` | MISSING (sqlparser builds the tree with standard precedence; the converter must preserve it) | `convert.rs` | Parser | E |
-| O8 | Output column names come from the first branch | MISSING | `bind/select.rs` (new set-op binder) | Binder | E |
-| O9 | Column-count and compatible-type check at bind time | MISSING | `bind/` (new), uses `bind/expr.rs::check_assignable` rules (exact type match, D21) | Binder | E |
-| O10 | NULL = NULL for set-operation distinctness | MISSING | new operator over `aggregate::GroupingKey` | Executor | E |
-| O11 | `ORDER BY` / `LIMIT` / `OFFSET` over the whole set result (output-column references only) | MISSING | `bind/` (new), `plan/logical.rs` | Binder, Planner, Executor | E |
+| O1 | `UNION` | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests` -- `union`, `diff`, `contexts`, corpus, HTTP `all_six_set_operators_through_the_real_api`) | `convert.rs::convert_query` (`sp::SetExpr::SetOperation`), new `BoundSetOp`, `plan/logical.rs::LogicalPlan::SetOp`, new operator | all four | E |
+| O2 | `UNION ALL` | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests` -- `union_all`, `diff`, `contexts`, corpus, HTTP) | same | all four | E |
+| O3 | `INTERSECT` | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests` -- `intersect`, `diff`, `contexts`, corpus, HTTP) | same | all four | E |
+| O4 | `INTERSECT ALL` | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests` -- `intersect` (min of the counts), `diff`, corpus, HTTP) | same | all four | E |
+| O5 | `EXCEPT` | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests` -- `except`, `diff`, `contexts`, corpus, HTTP) | same | all four | E |
+| O6 | `EXCEPT ALL` | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests` -- `except` (max(0, l - r), never negative), `diff`, corpus, HTTP) | same | all four | E |
+| O7 | `INTERSECT` binds tighter than `UNION`/`EXCEPT` | IMPLEMENTED AND VERIFIED (the converter keeps sqlparser's tree: `setop_tests::parser`; executed on data that tells the parses apart: `intersect::intersect_binds_tighter_than_...`, `diff::three_branches_with_every_pair_of_operators...`, HTTP `set_operation_precedence_and_associativity_through_the_real_api`) | `convert.rs` | Parser | E |
+| O8 | Output column names come from the first branch | IMPLEMENTED AND VERIFIED (`setop_tests::binder::column_names_come_from_the_first_branch`; an unaliased expression is named `?column?`, the engine's existing default) | `bind/select.rs` (new set-op binder) | Binder | E |
+| O9 | Column-count and compatible-type check at bind time | IMPLEMENTED AND VERIFIED (column count, and the numeric widening table in section 6 / Slice E: `setop_tests::binder`; no implicit cast to TEXT or between non-numeric types) | `bind/` (new), uses `bind/expr.rs::check_assignable` rules (exact type match, D21) | Binder | E |
+| O10 | NULL = NULL for set-operation distinctness | IMPLEMENTED AND VERIFIED (dedicated predicate `exec::setop::rows_not_distinct` + `SetKey`, not `=` and not `GroupingKey`: `setop_tests::distinctness`, `::union`, `::intersect`, `::except`) | new operator over `aggregate::GroupingKey` | Executor | E |
+| O11 | `ORDER BY` / `LIMIT` / `OFFSET` over the whole set result (output-column references only) | IMPLEMENTED AND VERIFIED (output-column names only; a table column is `InvalidIdentifier`: `setop_tests::binder::order_by_*`, `::union_all`, `::union`) | `bind/` (new), `plan/logical.rs` | Binder, Planner, Executor | E |
+| O12 | Set operation in a derived table, CTE body, scalar / `IN` / `EXISTS` subquery, `UPDATE` / `DELETE` `WHERE` and `UPDATE ... SET`; operands that are correlated, grouped, ordered, limited, derived, CTE references or contain subqueries | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests::contexts`) | `bind/setop.rs`, `plan/mod.rs::plan_select_subqueries` | all four | E |
+| O13 | Bounded materialization: `max_materialized_rows` / `_bytes` for the rows a set operation holds; `max_set_op_branches` 32 | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests::union`, `::intersect`, `::except`, `::limits`, HTTP) | `exec/setop.rs`, `exec/mod.rs::check_relation_limits`, `plan/relstats.rs` | Executor | E |
+| O14 | Metrics `set_op_rows_deduplicated_total`, `set_op_branches_total` (ExecMetrics only) | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests::union`, `::intersect`, `::except`, `::limits`) | `exec/mod.rs` | Executor | E |
+| O15 | `EXPLAIN` shows `SetOp <operator> branches=N shape=OP(#1, OP(#2, #3))` | IMPLEMENTED AND VERIFIED (Slice E: `setop_tests::union_all`, `::union`, HTTP) | `plan/explain.rs` | Planner | E |
+| O16 | `MINUS`, `UNION BY NAME`, `VALUES` / `TABLE` operands, `ORDER BY <ordinal>` | BLOCKED / not in scope (typed `Unsupported`; `ORDER BY 1` sorts by the constant 1 exactly as in a plain `SELECT`) | `convert.rs` | Parser | - |
+| R1 | Recursive CTE, `UNION ALL`: seed once, term against the previous iteration only, stops on an empty iteration | IMPLEMENTED AND VERIFIED (Slice D: `recursive_tests::counter`, `::diff`, corpus, HTTP) | `exec/recursive.rs::run_fixpoint`, `plan/physical.rs::RecursiveCteNode` | all four | D |
+| R2 | Recursive CTE, `UNION`: deduplicated against everything produced so far (null-safe); stops on no new distinct row; a cycle ends by itself | IMPLEMENTED AND VERIFIED (Slice D: `recursive_tests::union`, `::diff`) | same, `exec/setop.rs::SetKey` | Executor | D |
+| R3 | In the term the CTE name is the working table, beating a catalog table of the same name | IMPLEMENTED AND VERIFIED (`recursive_tests::binder`, `::counter`) | `bind/scope.rs::lookup_cte` | Binder | D |
+| R4 | The recursive reference appears exactly once, directly in the term's `FROM`, not on the nullable side of an outer join | IMPLEMENTED AND VERIFIED (`recursive_tests::binder`) | `bind/select.rs::bind_working_reference` | Binder | D |
+| R5 | Term restrictions: no aggregate / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET; `DISTINCT` only under `UNION`; types equal the seed's | IMPLEMENTED AND VERIFIED (`recursive_tests::binder`) | `bind/recursive.rs::check_term` | Binder | D |
+| R6 | Separator = the outermost `UNION [ALL]` of the body (seed on its left, term on its right) | IMPLEMENTED AND VERIFIED (`recursive_tests::shape`) | `bind/recursive.rs` | Binder | D |
+| R7 | Several recursive CTEs in one `WITH`; ordinary CTEs before / after; a recursive CTE read many times runs once | IMPLEMENTED AND VERIFIED (`recursive_tests::contexts`) | `exec/relation.rs::open_cte`, `exec/recursive.rs::recursive_rows` | all four | D |
+| R8 | Recursive CTE in a derived table, scalar / `IN` / `EXISTS` subquery, a correlated subquery's consumer, `WITH RECURSIVE` before `UPDATE` / `DELETE` | IMPLEMENTED AND VERIFIED (`recursive_tests::contexts`, HTTP) | same | all four | D |
+| R9 | `EXPLAIN` shows `RecursiveCte` with the seed and the recursive term apart | IMPLEMENTED AND VERIFIED (`recursive_tests::observability`, HTTP) | `plan/explain.rs` | Planner | D |
+| R10 | Metrics `recursive_cte_iterations_total`, `recursive_cte_rows_emitted_total` (ExecMetrics only) | IMPLEMENTED AND VERIFIED (`recursive_tests::counter`, `::observability`) | `exec/mod.rs` | Executor | D |
+| R11 | `max_recursive_cte_definitions` 8 per statement | IMPLEMENTED AND VERIFIED (`recursive_tests::limits`, HTTP) | `exec/mod.rs::check_relation_limits`, `plan/relstats.rs` | Executor | D |
+| R12 | Same snapshot in every iteration | IMPLEMENTED AND VERIFIED (`recursive_tests::contexts::the_recursion_reads_the_statements_snapshot_...`) | `exec/recursive.rs` (one `ExecCtx`) | Executor | D |
+| R13 | Authorization of seed and term at bind time (404); the reference needs no grant | IMPLEMENTED AND VERIFIED (`recursive_tests::binder`, HTTP) | `bind/recursive.rs` | Binder | D |
+| R14 | Window functions (`OVER`) refused (previously dropped silently) | IMPLEMENTED AND VERIFIED (`recursive_tests::parser`, HTTP) | `convert.rs::convert_function` | Parser | D |
+| R15 | Multi-reference recursion (several references to the CTE in the term) | BLOCKED by decision: refused with "must appear exactly once in the recursive term" | `bind/select.rs` | Binder | - |
+| R16 | Mutually recursive CTEs | BLOCKED by decision: bind error ("recursive CTEs that refer to each other are not supported") | `bind/scope.rs` | Binder | - |
+| R17 | A recursive CTE body reading an outer column (correlated seed) | BLOCKED by the Slice C boundary (`CTE 'r' cannot reference outer column ...`) | `bind/scope.rs::Boundary` | Binder | - |
+| R18 | An earlier CTE of the same list named inside the recursive term | REFUSED as the prompt specifies (other engines allow it; see D-9) | `bind/scope.rs::lookup_cte` | Binder | - |
 
 ## 3. Blocked / out-of-scope decisions
 
@@ -151,6 +192,14 @@ evidence, not assumed.
 and the nested-loop join already re-runs its right side per left row; supported spelling `[LEFT] JOIN LATERAL
 (...) alias ON cond`. BLOCKED until Slice E: set operations inside a derived table or a CTE body (S5.5, C1.8).
 OUT OF SCOPE here, Slice D: `WITH RECURSIVE` (typed `Unsupported`).
+
+**Slice E decisions (2026-10-12):** set operations are **IMPLEMENTED** (O1-O15), which lifts the two BLOCKED rows
+S5.5 and C1.8. Still `Unsupported`: `MINUS`, `UNION BY NAME`, `VALUES` / `TABLE` operands (O16). `WITH RECURSIVE`
+remains Slice D.
+
+**Slice D decisions (2026-10-12):** `WITH RECURSIVE` is **IMPLEMENTED** (C4-C6, R1-R14), which completes Mission 1.
+Refused by decision: multi-reference recursion (R15), mutual recursion (R16). Kept refused: a recursive CTE body
+reading an outer column (R17, Slice C boundary), and an earlier CTE of the same list inside the term (R18).
 
 ## 4. Design commitments (one node family; no per-syntax special cases)
 
@@ -175,8 +224,8 @@ OUT OF SCOPE here, Slice D: `WITH RECURSIVE` (typed `Unsupported`).
 | A — scalar / IN / EXISTS, uncorrelated (+ UPDATE/DELETE WHERE) | **DELIVERED** (report in section 6) | 2026-10-11 |
 | B — correlated | **DELIVERED** (report in section 6) | 2026-10-11 |
 | C — derived tables, non-recursive CTEs (+ LATERAL decision) | **DELIVERED** (report in section 6) | 2026-10-11 |
-| D — recursive CTEs | not started | |
-| E — set operations | not started | |
+| D — recursive CTEs | **DELIVERED** (report in section 6) | 2026-10-12 |
+| E — set operations | **DELIVERED** (report in section 6) | 2026-10-12 |
 
 ## 6. Slice reports
 
@@ -693,3 +742,414 @@ M09 non-LATERAL sees outer, M10 reversed WITH order.)
 **Recommended next slice: E (set operations) before D.** `UNION [ALL]` is what a recursive CTE's seed/step
 split is built from and it is the one remaining BLOCKED item in this slice (set-operation bodies in derived
 tables and CTEs); Slice D then reuses the materialization and relation nodes added here.
+
+### Slice E -- set operations (`UNION`, `INTERSECT`, `EXCEPT`, each with and without `ALL`)
+
+Delivered 2026-10-12 on `master` @ `7a6ed9f` (the Slice A-C commit; the working tree was clean at the start),
+uncommitted. Baseline re-confirmed before editing: `--lib` 599 passed / 22 ignored, `subquery` filter 115,
+`correlated` 114, `relation` 89, corpus 1 test (39 statements), `rubixdb-api` 237 passed / 1 ignored.
+
+**Implemented semantics.**
+
+* **Shape.** A set operation is a `Select` whose `set_op` is `Some` (AST) and a `BoundSelect` whose `set_op` is
+  `Some(BoundSetOp)` (bound): two whole operand queries, an operator, the `ALL` flag and an output relation
+  (`set_ref`, a statement-unique table reference). Both are *additive fields* -- `Statement::Select`,
+  `QueryExpr::Select`, `TableRef.derived`, `Cte.query` and every other existing shape are unchanged, so a set
+  operation is accepted wherever a query is: top level, derived table, CTE body, scalar / `IN` / `EXISTS`
+  subquery, `UPDATE` / `DELETE` `WHERE` and `UPDATE ... SET`. The plan node is `LogicalPlan::SetOp` /
+  `PhysicalPlan::SetOp(SetOpNode)`; its output rows are exposed as the relation `set_ref`, so the set-level
+  `ORDER BY` (a `Sort` above it) reads columns of that relation.
+* **Not a join.** `UNION ALL` is a concatenation; `UNION` is concatenation + a hash-set distinct step;
+  `INTERSECT` / `EXCEPT` count the right operand's rows (hash map of tuple -> count) and stream the left operand
+  against it. `INTERSECT ALL` consumes one right copy per left copy (`min(l, r)`); `EXCEPT ALL` likewise
+  (`max(0, l - r)`, never negative).
+* **Precedence / associativity.** sqlparser builds the standard tree (`INTERSECT` 20, `UNION` / `EXCEPT` 10, left
+  associative); the converter keeps its shape (left spine walked in a loop, so a long chain costs no native
+  stack). `A UNION B INTERSECT C` is `UNION(A, INTERSECT(B, C))`; parentheses override.
+* **NULL equality.** Rows are compared by a dedicated predicate (`exec::setop::rows_not_distinct`): `NULL` is not
+  distinct from `NULL`, `NULL` is distinct from every value, `+0.0` / `-0.0` and all `NaN`s are one value, an empty
+  tuple equals an empty tuple, values of different types are distinct. The hash-map key (`SetKey`) uses exactly that
+  predicate as its `Eq`; a test checks it against `GroupingKey` and for hash consistency over a pool of 23 values
+  (single-column, empty and two-column rows). The `=` operator is never used.
+* **Column names and types.** Names come from the first operand (an unaliased expression is `?column?`, the
+  engine's existing default). Types are unified per column by the widening table below; operand values are widened
+  to the column type before any comparison.
+* **`ORDER BY` / `LIMIT` / `OFFSET`** after the last operand apply to the whole result. `ORDER BY` can name the
+  output columns (the first operand's names) and expressions over them, not a table column of any operand: a
+  qualified name, a second-branch alias or a hidden column is `InvalidIdentifier` ("ORDER BY of a set operation can
+  only name the output columns ..."). A parenthesised operand keeps its own `ORDER BY` / `LIMIT`. A `WITH` in front
+  of the operation is visible in every operand.
+* **Bounds.** `UNION ALL` holds nothing. `UNION` holds its distinct rows; `INTERSECT` / `EXCEPT` hold the right
+  operand's distinct rows (and, for the distinct forms, the left rows already produced). All are bounded by
+  `max_materialized_rows` (distinct rows) and `max_materialized_bytes`; exceeding either is `RESOURCE_LIMIT`, never
+  a truncated result. `max_set_op_branches` (default **32**) bounds the operand queries one statement executes.
+* **Metrics** (`ExecMetrics` only): `set_op_rows_deduplicated_total` (rows removed by the distinct step: for `UNION`
+  rows equal to one already produced; for `INTERSECT` / `EXCEPT` qualifying left rows that repeat one already
+  produced -- not the rows filtered for being absent from / present in the other side; `ALL` forms remove none),
+  `set_op_branches_total` (operand queries, once per statement when it starts).
+
+**Type-unification rule** (`bind::setop::unify_types`; symmetric and associative, tested over all pairs and
+triples). Numeric types widen to the wider one; every other type combines with itself only; anything else is a bind
+error (`TypeMismatch`, naming the column position and both types), never a silent cast, and never a cast to TEXT.
+
+| left \ right | INTEGER | BIGINT | REAL | DOUBLE | DECIMAL(s2) | BOOLEAN, TEXT, BLOB, DATE, TIME, TIMESTAMP |
+|---|---|---|---|---|---|---|
+| **INTEGER** | INTEGER | BIGINT | DOUBLE | DOUBLE | DECIMAL(s2) | error |
+| **BIGINT** | BIGINT | BIGINT | DOUBLE | DOUBLE | DECIMAL(s2) | error |
+| **REAL** | DOUBLE | DOUBLE | REAL | DOUBLE | DOUBLE | error |
+| **DOUBLE** | DOUBLE | DOUBLE | DOUBLE | DOUBLE | DOUBLE | error |
+| **DECIMAL(s1)** | DECIMAL(s1) | DECIMAL(s1) | DOUBLE | DOUBLE | DECIMAL(max(s1, s2)) | error |
+| **non-numeric X** | error | error | error | error | error | X with X only |
+
+An untyped `NULL` (literal or `$n` parameter) adopts the other operand's type. Widening an exact number to DOUBLE
+rounds a BIGINT / DECIMAL above 2^53; widening to a DECIMAL that overflows 128 bits is an execution error
+(`EXECUTION_ERROR`), never a wrapped value. Rationale for REAL: widening an exact integer to a 32-bit float loses
+digits, so REAL with an exact numeric goes to DOUBLE.
+
+**Sub-slices** (each tested before the next; the counts are tests in `sql/src/setop_tests.rs`, 129 in all):
+
+| Sub-slice | Semantics | Tests added |
+|---|---|---|
+| E1 parser | `ast::SetOperator` / `SetOperation`, `Select.set_op`; `convert_query` / `convert_set_operation` (left spine walked in a loop; chain bounded by `max_expression_depth`); `MINUS`, `BY NAME`, `VALUES` / `TABLE` operands refused | `parser` 13: six operators, `DISTINCT` = default, precedence and associativity (`UNION(A, INTERSECT(B, C))`), parentheses, **the two parses evaluated over A={1,2} B={2,3} C={3,4} give {1,2,3} vs {3}**, trailing `ORDER BY` / `LIMIT` belong to the whole operation, a parenthesised operand keeps its own, `WITH` in front, contexts, a 100-chain parses and a 400-chain is `RESOURCE_LIMIT` |
+| E2 binder | `bind/setop.rs`: column count, `unify_types`, first-branch names, nullability, set-level `ORDER BY` against the output relation only, `LIMIT` / `OFFSET`, inherited `WITH`, authorization through the ordinary operand binding | `binder` 24: count mismatch for every operator and chain position, all 36 numeric pairs through the real binder and via `unify_types` (symmetric, associative), every non-numeric type against every other, NULL adoption, names, `?column?`, `ORDER BY` accepted / refused cases, a forbidden-or-missing table in branch 2 of 4 (and in a derived table, CTE, subquery) is `UnknownObject`, contexts, DML, correlation, a 100-chain binds |
+| E3 `UNION ALL` | planner `LogicalPlan::SetOp` / `PhysicalPlan::SetOp(SetOpNode)`, `exec/setop.rs` streaming concatenation, value widening, `EXPLAIN`, metric `set_op_branches_total`, `max_set_op_branches` | `union_all` 16: rows, left-then-right order, identical / disjoint / empty branches, `LIMIT` less / equal / greater, `ORDER BY`, own-`LIMIT` operands, 3-4 branches, NULLs kept, schema and widened values (DECIMAL rescale, BIGINT, DOUBLE; overflow is an error), aggregates / joins / derived tables as operands, **streams: `LIMIT 3` reads < 50 of 1000 rows and never opens the right operand**, metrics, `EXPLAIN` |
+| E4 `UNION` | hash-set distinct under the dedicated predicate; first-occurrence order; bounded | `distinctness` 7 (predicate, `SetKey` vs `GroupingKey` and hash consistency, reflexive / symmetric / transitive), `union` 16: NULL tuples ({1,NULL} x2 -> 1 row, {1,NULL} vs {1,0} -> 2, {NULL,NULL} x2 -> 1), identical / disjoint / empty, after-dedup `ORDER BY` / `LIMIT`, 3 branches and mixed with `ALL`, equal-after-widening values collapse, -0.0, text case, dedup counter (4 of 6), row / byte bounds |
+| E5 `INTERSECT[ ALL]` | right operand counted once (hash map), left streamed; `ALL` consumes one right copy per left copy | `intersect` 14: the `[1,1,2]` / `[1,1,1]` worked example, per-value counts, identical / disjoint / empty, NULL tuples, widening, 3 branches, **precedence on distinguishing data (executed)**, right operand scanned once (2 scans), dedup counter, bound |
+| E6 `EXCEPT[ ALL]` | same machinery; `EXCEPT` remembers produced rows, `EXCEPT ALL` counts down and stops at zero | `except` 12: `[1,1,2] - [1]` (= `[1,2]` ALL, `[2]` distinct), no underflow (`[1,1,2] - [1,1,1]`), identical / disjoint / empty right and left, NULL tuples and counts, left-associativity, `A EXCEPT B UNION C`, widening, dedup counter, bounds. `diff` 4: every operator x 30 random one-column multisets, 30 two-column multisets with NULLs, all 36 operator pairs x parenthesisation x 6 random triples against an independent counting model, and the contract's examples against model *and* engine |
+| E7 contexts | derived table / CTE body / scalar / `IN` / `EXISTS` / `UPDATE` / `DELETE` use the same node; no new mechanism | `contexts` 17: derived (outer `WHERE`, join, nested, column list, non-`LATERAL` refused, `LATERAL` accepted), CTE body, the `UNION ALL` separator shape, **a CTE read twice: 1 materialization, 2 scans, 2 operands counted**, a dead CTE, scalar 0 / 1 / many rows (+ correlated; the error names the outer row), `IN` with NULL (UNKNOWN, not FALSE) for UNION / INTERSECT / EXCEPT, `EXISTS`, `DELETE` / `UPDATE` `WHERE` and `SET` (a failing `SET` changes nothing), operand shapes, all four slices mixed in one statement, parameters, a wrong-typed parameter, a forbidden table. `limits` 6: 32 ok / 33 refused for four operators, per statement across subqueries / CTE / derived, DML held to the limit, metric semantics, a 120-chain, deadline |
+
+Corpus: 18 hand-derived statements added (57 in all). HTTP: 5 tests added
+(`all_six_set_operators_through_the_real_api`, `set_operation_precedence_and_associativity_through_the_real_api`,
+`set_operations_in_derived_tables_ctes_and_subqueries_through_the_real_api`, `set_operation_errors_and_limits_over_http`,
+`explain_of_a_set_operation_shows_the_precedence_and_executes_nothing_over_http`).
+
+**Changed files (lines added / removed, `git diff --numstat`; new files by `wc -l`).** New: `sql/src/exec/setop.rs`
+530, `sql/src/bind/setop.rs` 318, `sql/src/setop_tests.rs` 3399, `sql/mission1_evidence/mutate_e.py` 73 plus specs and
+results. Modified: `ast.rs` +65, `convert.rs` +142/-41, `bound.rs` +33, `bind/select.rs` +19, `bind/env.rs` +9,
+`bind/scope.rs` +3/-1, `bind/mod.rs` +1, `plan/logical.rs` +54/-3, `plan/explain.rs` +67, `plan/mod.rs` +11,
+`plan/relstats.rs` +13, `plan/optimize.rs` +10/-4, `plan/physical.rs` +9/-1, `plan/validate.rs` +8,
+`exec/mod.rs` +53/-5, `exec/operators.rs` +2, `exec/write.rs` +1/-1, `lib.rs` +3,
+`mission1_corpus_tests.rs` +88, `parse_tests.rs` +7/-2, `plan_tests.rs` +5/-1, `relation_tests.rs` +4/-2,
+`api/tests/api_sql_integration.rs` +390/-1.
+
+**Design choice (extend, do not add a second mechanism).** The set operation is an additive field on the existing
+`Select` / `BoundSelect`, so `Statement::Select`, `QueryExpr`, derived tables, CTEs and subqueries accept it without a
+parallel type. Its operands are bound by the same `bind_select_in` against the same enclosing-query chain
+(correlation, authorization and boundaries are inherited, not re-implemented). Its output is a relation exactly as a
+derived table's is, so the Slice C materialization (a CTE body that is a set operation runs once) and the
+`ORDER BY` / `LIMIT` machinery apply unchanged. The only new engine pieces are the binder rules (`bind/setop.rs`) and
+the operator (`exec/setop.rs`).
+
+**Limit values and why.**
+
+| Limit | Value | Why |
+|---|---|---|
+| `ExecLimits::max_set_op_branches` | 32 | operand queries one statement executes, counted per statement over every set operation (an operand that is itself directly a set operation is expanded, so `A UNION B INTERSECT C` is 3; a CTE read twice counts once; a CTE nobody reads, not at all). Each operand is a full plan that runs (and, for the distinct forms, holds rows), so the count bounds the work a small statement can request; 32 equals `max_subquery_depth`, is far above hand-written queries and keeps the left-nested tree shallow. Checked when execution starts: `RESOURCE_LIMIT` (HTTP 413), also for `UPDATE` / `DELETE` |
+| rows a set operation holds | `max_materialized_rows` (1,000,000, existing) | distinct rows for `UNION`; the right operand's distinct rows (plus produced left rows for the distinct `EXCEPT` / `INTERSECT`); duplicates do not count |
+| bytes a set operation holds | `max_materialized_bytes` (256 MiB, existing) | the same per-value size estimates as `GROUP BY` / `DISTINCT` |
+| chain length | `max_expression_depth` (128, existing) | refuses a longer `UNION` chain at conversion; no native recursion along the chain |
+
+**Non-vacuity.** (1) *Real Slice-C tree*: `git archive HEAD` (7a6ed9f) with only the new corpus and HTTP test files
+copied in, own target directory: the 18 new corpus statements fail (`corpus_statements_return_exactly_the_expected_rows`
+reports "18 corpus statement(s) failed"), the 5 new HTTP tests fail, the 39 existing HTTP tests pass. `setop_tests.rs`
+itself does not compile there (`SetOperator`, `unify_types` and `exec::setop` do not exist). (2) *Feature-off
+simulation* (`sliceE_feature_off.json`; the converter refuses a set operation as `Unsupported`, all new code still
+compiled): 152 tests run, 125 fail. The 27 that pass are 18 existing `parse_tests` plus 9 new tests: `binder::unify_types_agrees_...`
+and the 6 `distinctness::*` tests exercise only new pure functions with no SQL path (on the real Slice-C tree they fail
+by non-compilation), and `diff::the_model_agrees_with_the_documented_examples`, a self-test of the reference model that
+asserted nothing about the engine. Per the "strengthen or remove" rule that test was **strengthened after the run**: it
+is now `the_model_and_the_engine_agree_with_the_documented_examples` and also runs the contract's examples through the
+engine, so it fails in the feature-off tree (not re-run through the harness; it fails there by construction since
+`SELECT ... UNION ...` is `Unsupported`).
+
+**Mutation evidence** (`sliceE_mutations.json`; 34 deliberate breakages, each applied alone to the Slice E tree, the
+filtered suite run -- 182 tests: `setop_tests`, corpus, `parse_tests`, `relation_tests::cte` / `::materialization` --
+and the source restored byte-for-byte; **34 of 34 caught**, at least one test fails for each). The 12 the prompt
+suggested are M01-M12: M08 re-associates a right operand that is a bare set operation (INTERSECT as loose as UNION),
+M09 sorts by the first column for an unknown name, M11 drops an output column (exposed to every derived table / CTE /
+subquery alike, since they share one mechanism), M12 is the Slice C materialization broken. The harness ran before
+two small edits (the strengthened model test, and the runtime widening error class `PlanValidation` ->
+`ExecutionParameter`, with a test); neither touches a mutated line.
+
+| id | breakage | failing tests (of 182 run) |
+|---|---|---|
+| M01_union_behaves_as_union_all | UNION keeps duplicates (no deduplication): the distinct kind is mapped to the concatenation operator | 28 |
+| M02_union_all_behaves_as_union | UNION ALL deduplicates | 15 |
+| M03_intersect_behaves_as_except | INTERSECT produces what EXCEPT would | 21 |
+| M04_intersect_all_treated_as_intersect | INTERSECT ALL returns each common row once (a distinct count, not the minimum count) | 8 |
+| M05_except_all_counts_go_negative | EXCEPT ALL keeps decrementing a right-hand count that is already zero (an unsigned count wrapping below zero), so every later copy of the row is removed | 7 |
+| M06_distinctness_treats_null_as_different_from_null | the tuple-distinctness predicate says NULL and NULL are different values (the standard trap) | 16 |
+| M07_column_names_from_the_second_branch | the output columns are named after the right operand | 9 |
+| M08_intersect_has_the_same_precedence_as_union | the converter re-associates a right operand that is itself a set operation (what sqlparser built for a tighter-binding INTERSECT) to the left, so all three operators bind alike | 8 |
+| M09_order_by_resolves_unknown_names_to_the_first_column | ORDER BY of a set operation, given a name that is not an output column, silently sorts by the first output column instead of failing | 1 |
+| M10_unification_falls_back_to_text | two types with no common type unify to TEXT instead of being refused | 3 |
+| M11_set_operation_output_loses_a_column | the shell's output columns skip the first operand column (the relation exposes the wrong column set to a derived table / CTE / subquery) | 93 |
+| M12_cte_set_operation_rerun_per_reference | a CTE whose body is a set operation is not stored after its first read, so every reference re-runs it (the Slice C materialization rule broken) | 7 |
+| M13_operand_values_not_widened | operand values keep their own types instead of being widened to the unified column type | 7 |
+| M14_decimal_widening_does_not_rescale | widening to a larger DECIMAL scale keeps the unscaled digits (1.00 becomes 0.0100) | 3 |
+| M15_union_dedup_not_counted | set_op_rows_deduplicated_total is never incremented by UNION | 1 |
+| M16_branches_metric_not_recorded | set_op_branches_total is never recorded | 4 |
+| M17_operand_limit_off_by_one | the operand limit refuses a statement that is exactly at the limit | 3 |
+| M18_row_bound_removed | the materialized-rows bound on a set operation's held rows is removed | 3 |
+| M19_byte_bound_removed | the materialized-bytes bound on a set operation's held rows is removed | 2 |
+| M20_intersect_does_not_deduplicate_the_left | INTERSECT returns a left row once per left copy that is on the right (the distinct-left step removed) | 10 |
+| M21_except_does_not_deduplicate_the_left | EXCEPT remembers nothing about rows it has produced, so a repeated left row repeats in the result | 7 |
+| M22_union_all_reads_only_the_right_operand | UNION ALL starts in the right phase and never reads the left operand | 42 |
+| M23_decimal_scale_unifies_to_the_smaller | DECIMAL(s1) with DECIMAL(s2) unifies to the smaller scale | 4 |
+| M24_real_with_exact_numeric_unifies_to_real | REAL with INTEGER / BIGINT / DECIMAL unifies to REAL (losing precision) instead of DOUBLE | 4 |
+| M25_column_count_not_checked | operands with different column counts are combined (zip truncates) | 3 |
+| M26_nullability_and_instead_of_or | an output column is nullable only if both operands can produce NULL | 1 |
+| M27_nan_is_distinct_from_nan | the predicate treats two NaN doubles as different values | 3 |
+| M28_hash_does_not_canonicalise_zero_signs | the hash of REAL +0.0 and -0.0 differs although the values compare equal (hash/eq inconsistency) | 1 |
+| M29_explain_prints_a_wrong_branch_count | EXPLAIN shows branches=2 for every set operation | 1 |
+| M30_set_level_limit_ignored | LIMIT / OFFSET written after a set operation are dropped | 8 |
+| M31_set_level_with_not_inherited | the WITH list in front of a set operation is not visible in its operands | 3 |
+| M32_set_level_order_by_dropped | the ORDER BY written after a set operation is not applied | 7 |
+| M33_intersect_all_is_not_consumed | INTERSECT ALL does not consume the right-hand count when it matches a left copy (every left copy of a common row survives) | 8 |
+| M34_right_operand_counted_once_per_left_row_check | the right operand's rows are all treated as one copy (count never exceeds 1) | 9 |
+
+**Regression** (final tree).
+
+| Check | Before | After |
+|---|---|---|
+| `cargo test -p rubixdb-sql --lib` | 599 passed, 22 ignored | 728 passed, 22 ignored (599 + 129 `setop_tests`) |
+| `subquery_tests::` / `correlated_tests::` / `relation_tests::` | 67 / 108 / 84 | 67 / 108 / 84 (unchanged) |
+| `bind_tests` / `exec_tests` / `plan_tests` | 62 / 63 / 43 | 62 / 63 / 43 |
+| `mission1_corpus` | 1 test, 39 statements | 1 test, 57 statements |
+| `write_crash_consistency` (`--features test-util`) | 2 | 2 |
+| `cargo test -p rubixdb-api` | 237 passed, 1 ignored | 242 passed, 1 ignored (`api_sql_integration` 39 -> 44) |
+| `cargo clippy -p rubixdb-sql -p rubixdb-api --tests` | 0 warnings | 0 warnings |
+
+(The prompt's name filters `subquery`, `correlated`, `relation` are substring matches and now also pick up Slice E
+tests whose names contain those words: 119 / 116 / 98.)
+
+**Existing tests edited (flagged; each pinned `UNION` as unsupported).**
+`parse_tests::unsupported_grammar_is_a_typed_error_not_a_panic` lost its `UNION` case (comment added; the removal
+announced in Slices A-C). `relation_tests::parser::what_is_not_in_scope_is_a_typed_unsupported_error` lost its two
+set-operation cases (comment added; they were the Slice C BLOCKED rows S5.5 / C1.8).
+`api_sql_integration::unsupported_grammar_is_a_stable_error_not_silently_accepted` now submits `... RIGHT JOIN ...`
+instead of `... UNION ...` (comment added; same 400 `UNSUPPORTED` assertions). `plan_tests.rs`: two exhaustive helper
+`match`es got the `SetOp` arm (no assertion changed). `api_http_fuzz` still submits a `UNION` statement as a hostile
+input; it asserts only that the server survives. No other Slice A / B / C test was touched.
+
+**Known limitations / outside the slice (named, not fixed).** `ORDER BY <ordinal>` is not an ordinal (it sorts by the
+constant, as in a plain `SELECT`); `MINUS`, `UNION BY NAME`, `VALUES` / `TABLE` operands are `Unsupported`; no predicate
+pushdown into operands; `UNION ALL` is unbounded by design (it streams); the metrics are not in the HTTP document (by
+instruction) and an `UPDATE` / `DELETE` statement's executor metrics are discarded, as for every Slice B / C metric; set
+operations in a CTE nobody reads are neither counted nor run; `SELECT NULL AS n UNION SELECT NULL ORDER BY n` is refused
+(no type to compare); a `$n` parameter of a type the column cannot take is an execution error; `PHASE_RELATIONAL_SQL_GRAMMAR.md`
+still lists `UNION` as outside the grammar (historical document, left as written).
+
+**Recommended next slice: D (`WITH RECURSIVE`).** `UNION ALL` / `UNION` now exist as the seed / step separator and the
+CTE materialization, bounds and scope chain are in place; D adds the iteration operator and its depth / row limits.
+
+### Slice D -- `WITH RECURSIVE`
+
+Delivered 2026-10-12 on `master` @ `7a6ed9f` (Slices A-C; Slice E, delivered earlier the same day, is still
+uncommitted underneath), uncommitted. **This completes the five slices of Mission 1.** Baseline re-confirmed before
+editing: `--lib` 728 passed / 22 ignored, `subquery` filter 119, `correlated` 116, `relation` 98, `setop` 129,
+corpus 1 test (57 statements), `rubixdb-api` 242 passed / 1 ignored.
+
+**Implemented semantics.**
+
+* **What recurses.** A definition of a `WITH RECURSIVE` list that names itself must have the body `seed UNION [ALL]
+  recursive-term`. The **outermost** set operator is the separator (found from the parse tree, not guessed):
+  `A UNION ALL B UNION ALL C` is `(A UNION ALL B) UNION ALL C`, so the seed is `A UNION ALL B` and the term is `C`;
+  `A UNION ALL (B UNION ALL C)` has the seed `A` and a term that is itself a set operation. A member that does not
+  name itself is an ordinary CTE (`WITH RECURSIVE x AS (SELECT 1)` works). `Cte.recursive` records the keyword; the
+  binder decides what really recurses.
+* **Plan node.** `PhysicalPlan::RecursiveCte(RecursiveCteNode { name, cte_id, work_id, distinct, seed_plan,
+  recursive_plan })` is the root of the CTE's `CtePlan`; the term's reference is the leaf `WorkingTable`. It is never
+  a flat `UNION`, and it is **not** the Slice C materialization: the fixpoint owns a working table and its own result
+  cache (`exec/recursive.rs`); it shares with the non-recursive kind only bind-time name resolution and
+  `CtePlan` / `CteNode` bookkeeping. A recursive CTE read many times (outer query, later CTEs, derived tables,
+  subqueries) runs its fixpoint once per statement.
+* **The fixpoint** (`run_fixpoint`): the seed runs once; then, while the working table is not empty, the term is
+  evaluated against the **previous iteration's rows only**. `UNION ALL`: the next working table is exactly what the
+  term produced; the loop ends when an iteration produces **no row**. `UNION`: rows are deduplicated by the null-safe
+  `SetKey` against **everything produced so far** (seed included); the loop ends when an iteration produces **no new
+  distinct row**, so a cyclic graph ends by itself, while the same cycle under `UNION ALL` runs into the depth bound.
+* **Name resolution.** In the seed the CTE's own name is an error ("must not appear in the seed"), as is a later CTE of
+  the list ("referenced before it is defined ... recursive CTEs that refer to each other are not supported"); in the
+  term the name is the **working table** and beats a catalog table of the same name (structural). It must appear
+  **exactly once** (message: "recursive reference 'r' must appear exactly once in the recursive term"), as a table of
+  the term's own `FROM` clause (not inside a subquery, derived table or nested `WITH`), and not on the nullable side
+  of an outer join. A CTE of the same list defined **before** the recursive one is visible in its seed but not
+  inside its term; a CTE of an enclosing query and every catalog table stay visible; a CTE defined **after** is
+  visible only to later definitions and the main query.
+* **Restrictions on a term.** A `SELECT` block that reads the working table may not aggregate, `GROUP BY`, use
+  `HAVING`, `ORDER BY`, `LIMIT` or `OFFSET`, and may use `DISTINCT` only under `UNION` (under `UNION ALL` it is
+  refused); a set operation containing the reference may not carry its own `ORDER BY` / `LIMIT`; the trailing
+  `ORDER BY` / `LIMIT` / `OFFSET` after the term are refused; the seed may do all of these. Blocks of the term that
+  never read the working table are just more seeds. The term's column **types must equal the seed's** (an untyped
+  `NULL` adopts them; Slice E's widening is deliberately not applied, because the term feeds its own input). All
+  columns of a recursive CTE are nullable. A `WITH` list inside the body is `Unsupported`.
+* **Window functions** are not in the grammar. While testing this restriction I found that the converter **silently
+  dropped** an `OVER (...)` clause (`SUM(id) OVER ()` ran as the plain aggregate `SUM(id)`, `ROW_NUMBER() OVER ()` as an
+  unknown function). It is now a typed `Unsupported` error everywhere. This is a behaviour change outside the
+  recursion (a statement that used to return a wrong answer now fails), made because the slice's rule is "do not
+  silently accept window functions"; `M28` reverts it and is caught.
+* **Authorization.** Seed and term bind independently against the catalog: a forbidden or missing table in either is
+  `UnknownObject` (HTTP 404), in the same shape; the working-table reference needs no grant.
+* **Snapshot.** Every iteration reads through the statement's single `ExecCtx` / pinned transaction, so a base table
+  written by another session during the recursion is never seen by a later iteration (test: a 300-row chain walked
+  while a writer extends it; the walk always equals the chain's size at the statement's snapshot).
+* **EXPLAIN** prints `RecursiveCte name=r distinct=false (UNION ALL: stops when ...)` with the indented blocks
+  `seed (runs once):` and `recursive (runs once per iteration, reads the working table 'r'):`, and
+  `WorkingTable name=r` under the latter; a recursive CTE read twice is printed once; a set operation inside the term
+  appears inside the recursive block. The seed/recursive split is never hidden behind a `SetOp`.
+
+**Limits** (`ExecLimits`, all reachable in tests; each fires as `RESOURCE_LIMIT`, HTTP 413, naming the CTE, never a
+truncated result and never a half-computed one):
+
+| Limit | Default | Counted | Why |
+|---|---|---|---|
+| `max_recursive_cte_depth` | 1,000 | evaluations of the recursive term, per CTE (not shared), the last, empty one included: `n < 1000` passes, `n < 1001` fails | a hand-written recursion (counter, hierarchy, graph walk) ends in tens of iterations; a missing stop condition must end in a typed error, not a hang |
+| `max_recursive_cte_rows` | 1,000,000 | rows added to the result of one recursive CTE, the seed included; checked **before** a row is kept (`>` bound exact: 20 pass, 21 fail at limit 20) | the codebase's usual "about a million rows" budget (`max_materialized_rows`) |
+| `max_recursive_cte_definitions` | 8 | distinct recursive CTEs a statement runs (one nobody reads is bound and planned but not run, so not counted); checked when execution starts, for queries and for `UPDATE` / `DELETE` | each owns a working table and a result |
+| `max_materialized_bytes` | 256 MiB (existing) | estimated bytes of the rows held | a few huge `TEXT` rows must not defeat the row bound |
+
+The two stop conditions (`UNION ALL`: no row; `UNION`: no new distinct row) and the bounds are the only things that
+end a recursion; the loop has no other exit and every bound is checked before the work it bounds.
+
+**Metrics** (`ExecMetrics` only): `recursive_cte_iterations_total` (term evaluations, across every recursive CTE in the
+statement, incremented before each) and `recursive_cte_rows_emitted_total` (rows added to results, seed included; under
+`UNION` counted after deduplication; a recursion that fails still reports the work it did).
+
+**Sub-slices** (each tested before the next; counts are tests in `sql/src/recursive_tests.rs`, 82 in all):
+
+| Sub-slice | Semantics | Tests added |
+|---|---|---|
+| D1 parser | `ast::Cte.recursive`; `convert_with` no longer refuses `RECURSIVE`; the `OVER` guard | `parser` 6: the flag on every definition, **a plain `WITH` parses exactly as before** (AST equal once the flag is cleared), every in-scope form parses, window functions refused (+ twin), `OVER` refused outside any recursion, `MATERIALIZED` / typed columns still refused (+ twin) |
+| D2 binder | `bind/recursive.rs`, `Scope.{working,hidden_ctes,seed_phase,recursive_keyword}`, `CteLookup::{Working,HiddenInRecursiveTerm,SelfInSeed,SelfNotShaped,ForwardInRecursiveList}`, `BoundRelation::Working`, `BoundCte.recursion` | `binder` 16: shape and separator, names and types, a non-recursive member, **working table beats the catalog**, seed reference, exactly-once (3 spellings), position (subquery / derived / scalar / nullable side), aggregate / GROUP BY / HAVING / DISTINCT / ORDER BY / LIMIT / OFFSET in the term and after it, DISTINCT only under UNION, un-splittable bodies, seed-vs-term types, visibility of earlier / later / enclosing CTEs, **mutual recursion**, several and dead recursive CTEs, **authorization** (seed, term, missing, shape, working table needs no grant), the Slice C boundary |
+| D3 `UNION ALL` | `exec/recursive.rs` fixpoint, `WorkingTable` operator, bounds | `counter` 13: **counter (1..10)**, **factorial (last row 10!, overflow is a typed error)**, **tree walk**, **ancestor chain**, join to a base table, **seed aggregate runs once**, seed once for many iterations, **empty seed**, **empty term**, working table beats the catalog table, subqueries in the term, outer clauses; `limits` 11: runaway counter names the CTE, depth exact at 1000/1001 and at small values, row bound exact and for a wide recursion, bytes, definitions (8/9, dead not counted, configurable), per CTE not shared, refused `UPDATE` / `DELETE` change nothing, deadline, defaults |
+| D4 `UNION` | `SetKey` dedup against all rows so far; own stop condition | `union` 10: counter, **cycle ends by itself** (and the same cycle under `UNION ALL` hits the bound), the two stop conditions side by side, dedup against everything so far, **NULL rows are one row**, a diamond (7 rows `UNION ALL` / 5 `UNION`), seed duplicates, whole rows not first columns, `DISTINCT` under `UNION` |
+| D5 shape | outermost-separator selection | `shape` 5: three operands, parenthesised right operand (outer operator decides), seed that is a set operation, `INTERSECT` / `EXCEPT` term, set operation inside a term branch |
+| D6 contexts | derived tables, subqueries, DML, several CTEs, snapshot | `contexts` 12: several recursive CTEs (7 iterations), different operators, ordinary CTE over a recursive one (materialized once), **read twice: one fixpoint**, dead CTE, visibility, derived table, scalar / `IN` / `EXISTS`, **correlated consumer (5 outer rows, 3 iterations in all)**, `WITH RECURSIVE` before `DELETE` / `UPDATE` and inside their subqueries, set operations and `ORDER BY` / `LIMIT` around it, **snapshot while another session writes** |
+| D7 observability | `EXPLAIN`, metrics, limits, authorization | `observability` 5: seed and term apart, set operation inside the term, printed once when read twice, metrics across statements, partial work reported on failure; authorization is in `binder` |
+| differential | independent working-list loop | `diff` 4: 25 random DAGs under `UNION ALL` and 25 random graphs with cycles under `UNION` against the model (rows, iterations, rows emitted), a cycle stopped by the bound, 15 random trees |
+
+Corpus: 12 hand-derived statements added (69 in all). HTTP: 3 tests added (`recursive_ctes_through_the_real_api`,
+`recursive_cte_errors_and_bounds_over_http`, `recursive_cte_explain_and_a_failed_recursion_inside_a_transaction_over_http`).
+
+**Changed files** (new: `sql/src/exec/recursive.rs` 196, `sql/src/bind/recursive.rs` 330, `sql/src/recursive_tests.rs`
+1821, `sql/mission1_evidence/mutate_d.py` 73 + specs / results. Modified, Slice D share, approximate because the working
+tree also carries Slice E: `ast.rs` +8, `convert.rs` +10 / -7, `bound.rs` +23, `bind/scope.rs` +85, `bind/select.rs`
++130, `bind/env.rs` +5, `bind/mod.rs` +1, `plan/logical.rs` +13, `plan/physical.rs` +38, `plan/optimize.rs` +4,
+`plan/validate.rs` +10, `plan/explain.rs` +27, `plan/relstats.rs` +9, `plan/mod.rs` +36, `exec/mod.rs` +60,
+`exec/operators.rs` +15, `exec/relation.rs` +15, `lib.rs` +3, `plan_tests.rs` +4, `mission1_corpus_tests.rs` +61,
+`api/tests/api_sql_integration.rs` +340; `setop_tests.rs` helper visibility only.)
+
+**Non-vacuity.** (1) *Real Slice-C tree* (`git archive HEAD` + the new corpus and HTTP test files; Slice E is
+uncommitted so there is no committed Slice-E tree): 30 corpus statements fail (the 12 `[D]` ones among them; the other
+18 are Slice E's) and the 3 new HTTP tests fail (with Slice E's 5 and the amended `non_recursive_ctes_...`); `recursive_tests.rs`
+does not compile there. (2) *Feature-off simulation* of the Slice-E tree (`sliceD_feature_off.json`: the converter refuses
+`WITH RECURSIVE` as before): 113 tests run, **85 fail**. The 28 that pass are 26 pre-existing tests and 2 new ones: `limits::the_defaults_are_the_documented_values`
+(pure constants of the new fields; it does not compile on the real tree) and `parser::an_over_clause_is_refused_everywhere_not_silently_dropped`
+(tests the `OVER` fix, which is independent of the keyword; on the real tree it fails -- `M28` reverts the fix and is caught). Three
+tests that first passed vacuously there (a window-function test and two grammar tests that were satisfied by `WITH RECURSIVE` itself being refused) were
+**strengthened with twins** (the same statement without the refused spelling must parse) and now fail there.
+
+**Mutation evidence** (`sliceD_mutations.json`; 34 deliberate breakages, each applied alone, the 141-test filtered
+suite -- `recursive_tests`, corpus, `parse_tests`, `relation_tests::cte` / `::parser` -- run, the source restored byte for
+byte). **33 of 34 caught.** The suggested M1-M14 are M01-M14; M15 ("fresh snapshot per iteration") **cannot be written as
+a one-line breakage**: every read goes through the statement's one `ExecCtx`, which has no way to open another snapshot,
+so the property is carried by the concurrent-writer test instead and the slot is used for M15 (rows metric ignores the
+iterations). **M34 survived and is equivalent**: it removed the cleanup of the working table on an error path, which is
+unobservable (the statement ends and its context is dropped); that code was **deleted** rather than kept unverifiable
+(`outcome?;` with a comment), and M15, whose anchor text changed, was re-run (`sliceD_mutations_recheck.json`, caught,
+10 failing).
+
+| id | breakage | failing tests (of 141 run) |
+|---|---|---|
+| M01_fixpoint_does_not_stop_on_an_empty_iteration | the loop no longer ends when an iteration produces nothing (a query that should stop early runs to the depth bound) | 48 |
+| M02_union_compares_only_the_first_column | the UNION stop condition / deduplication keys a row by its first column only | 2 |
+| M03_union_treats_null_as_different_from_null | the null-safe distinctness predicate says NULL and NULL differ, so a row with a NULL is new every iteration | 2 |
+| M04_depth_bound_off_by_one | the depth bound admits one iteration too many | 7 |
+| M05_row_bound_off_by_one | the row bound admits one row too many | 1 |
+| M06_seed_re_executed_every_iteration | the seed plan is run again at the start of every iteration | 2 |
+| M07_term_also_reads_the_current_iterations_output | after an iteration the term is evaluated once more against the rows that iteration just produced, within the same iteration | 42 |
+| M08_working_table_accumulates_all_rows_so_far | the term reads every row produced so far instead of only the previous iteration's | 40 |
+| M09_recursive_reference_resolves_to_the_catalog_table | when a catalog table has the CTE's name, the recursive reference reads the catalog table instead of the working table | 24 |
+| M10_two_references_silently_accepted | a second reference to the recursive CTE in the term is accepted | 1 |
+| M11_aggregate_in_the_term_silently_accepted | aggregates, GROUP BY and HAVING in the recursive term are accepted | 2 |
+| M12_order_by_in_the_term_silently_accepted | ORDER BY in the recursive term is accepted | 1 |
+| M13_explain_prints_the_recursion_as_a_flat_union | EXPLAIN labels the recursive CTE as a set operation | 3 |
+| M14_iteration_counter_not_incremented | recursive_cte_iterations_total is never incremented | 23 |
+| M15_rows_metric_ignores_the_iterations | recursive_cte_rows_emitted_total counts the seed only | 10 |
+| M16_rows_metric_ignores_the_seed | recursive_cte_rows_emitted_total omits the seed rows | 11 |
+| M17_union_treated_as_union_all | the planner ignores the distinct flag: a UNION recursion keeps duplicates and never sees a cycle close | 13 |
+| M18_union_all_treated_as_union | the planner always deduplicates: a UNION ALL recursion drops repeated rows | 10 |
+| M19_definitions_bound_not_enforced | max_recursive_cte_definitions is never checked | 1 |
+| M20_byte_bound_removed | the bytes held by a recursion are not bounded | 1 |
+| M21_earlier_ctes_visible_in_the_term | a CTE defined before the recursive one is visible inside the recursive term | 1 |
+| M22_seed_may_name_the_cte | the CTE's own name in its seed is not recognised as a seed reference | 1 |
+| M23_nullable_side_reference_accepted | the recursive reference may be on the nullable side of an outer join | 1 |
+| M24_reference_inside_a_subquery_accepted | the recursive reference may sit inside a subquery or derived table of the term | 1 |
+| M25_seed_and_term_swapped_in_the_plan | the planner plans the term as the seed | 58 |
+| M26_seed_term_type_check_removed | the term's column types are not compared with the seed's | 1 |
+| M27_recursive_result_not_cached | a recursive CTE read more than once runs its fixpoint once per reference | 5 |
+| M28_over_clause_dropped_again | the converter drops an OVER clause again (a window function silently runs as the plain function) | 2 |
+| M29_recursion_routed_through_the_materialization_node | a recursive CTE reference is materialized by the non-recursive CTE path | 56 |
+| M30_default_depth_changed | the default max_recursive_cte_depth is 100 | 6 |
+| M31_default_row_bound_changed | the default max_recursive_cte_rows is 100,000 | 1 |
+| M32_default_definitions_changed | the default max_recursive_cte_definitions is 9 | 2 |
+| M33_rows_emitted_not_checked_before_keeping | the row bound is checked after the row is kept, not before | 1 |
+| M34_working_table_left_after_an_error | the working table is not removed when the fixpoint fails (leaks into later reads) (equivalent: the code was deleted) | 0 |
+
+**Regression** (final tree).
+
+| Check | Before | After |
+|---|---|---|
+| `cargo test -p rubixdb-sql --lib` | 728 passed, 22 ignored | 810 passed, 22 ignored (728 + 82 `recursive_tests`) |
+| `subquery_tests::` / `correlated_tests::` / `relation_tests::` / `setop_tests::` | 67 / 108 / 84 / 129 | 67 / 108 / 84 / 129 (unchanged) |
+| `bind_tests` / `exec_tests` / `plan_tests` | 62 / 63 / 43 | 62 / 63 / 43 |
+| `mission1_corpus` | 1 test, 57 statements | 1 test, 69 statements |
+| `write_crash_consistency` (`--features test-util`) | 2 | 2 |
+| `cargo test -p rubixdb-api` | 242 passed, 1 ignored | 245 passed, 1 ignored (`api_sql_integration` 44 -> 47) |
+| `cargo clippy -p rubixdb-sql -p rubixdb-api --tests` | 0 warnings | 0 warnings |
+
+(The prompt's name filters `subquery`, `correlated`, `relation`, `setop` are substring matches and also pick up
+tests of later slices whose names contain those words: 119 / 116 / 98 / 129 before this slice.)
+
+**Existing tests edited (flagged; each pinned `WITH RECURSIVE` as unsupported).**
+`relation_tests::parser::what_is_not_in_scope_is_a_typed_unsupported_error` lost its `WITH RECURSIVE` case (comment
+added; the list of one became a single assertion to keep clippy clean). In
+`api_sql_integration::non_recursive_ctes_through_the_real_api` the block asserting `WITH RECURSIVE r AS (SELECT 1 AS n)`
+is `UNSUPPORTED` now asserts that it runs and returns 1 (comment added; the other assertions are untouched). `plan_tests.rs`: two exhaustive helper `match`es
+got the new arms (no assertion changed). `setop_tests.rs`: helper functions made `pub(crate)` so `recursive_tests` can
+use them (no assertion changed). No other Slice A-E test was touched.
+
+**Deviations from the prompt, stated honestly.**
+
+1. **Earlier CTEs and the recursive term.** The prompt says a CTE defined before the recursive one is visible in its
+   seed "but not its recursive term (SQL standard)". That is not what PostgreSQL, MySQL or Snowflake do (an earlier CTE
+   is visible in the term, a common pattern). I implemented the prompt as written: naming an earlier CTE of the same
+   list inside the term is a clear bind error. It is one line to relax (`hidden_ctes`, M21).
+2. **A recursive CTE reading an outer column.** The prompt asks to verify that "the recursive CTE sees the correlated
+   scope from the enclosing query". Slice C's boundary (pinned by a Slice C test) refuses any CTE body, recursive or not,
+   that reads an outer column: `CTE 'r' cannot reference outer column 't.id'`. That is kept. What works, and is tested:
+   a recursive CTE *defined inside* a correlated subquery whose consumer reads the outer row; the consumer re-runs per
+   outer row (5 rows), the recursion, which cannot depend on that row, runs once (3 iterations in all).
+3. **Window functions** are refused by the parser (`Unsupported`, HTTP 400 `UNSUPPORTED`), not by the binder, and the
+   dropped-`OVER` defect described above was fixed for every statement.
+4. **Type rule** is equality with the seed, not Slice E's widening, and all recursive columns are nullable (see above).
+5. **Extra restrictions** beyond the prompt: the reference must be directly in the term's `FROM` (not inside a
+   subquery / derived table), not on the nullable side of an outer join; `OFFSET` is refused with `LIMIT`; a `WITH`
+   inside a recursive body is `Unsupported`.
+6. **The default row bound (1,000,000) is not run to exhaustion** (it takes tens of seconds in a debug build); the
+   bound is exercised at configurable small values, including a wide recursion with a small depth, and the default is
+   pinned by `the_defaults_are_the_documented_values` and mutants M30-M32.
+7. **Mutants:** M15 (snapshot) is not expressible as a one-line breakage and M34 was equivalent (above).
+8. The prompt's `RecursiveCte(name=cte, seed=<plan>, recursive=<plan>)` EXPLAIN spelling is rendered as an indented
+   block with `seed (runs once):` / `recursive (...):` headings.
+9. `max_set_op_branches` does not count the `UNION [ALL]` that separates a seed from its term (it is not a `SetOp` node).
+
+**Known limitations / outside the slice (named, not fixed).** Multi-reference recursion and mutually recursive CTEs
+stay refused by design (matrix rows R15, R16); no predicate pushdown into a term; the working table is an in-memory
+`Vec` per iteration (bounded, never on disk); `recursive_cte_*` metrics are in `ExecMetrics` only and an `UPDATE` /
+`DELETE` statement's executor metrics are discarded, as for every Slice B-E metric; an unreferenced recursive CTE is
+bound and planned but never run.
+
+**Mission 1 is complete (Slices A-E).** **Recommended next: Mission 2** (the next family in the programme; Mission 1
+leaves no BLOCKED or MISSING row except the ones named above as decisions).

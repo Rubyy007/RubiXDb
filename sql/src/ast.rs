@@ -169,10 +169,18 @@ pub enum Expr {
         args: Vec<Expr>,
     },
     /// An aggregate function call (Increment 11) — COUNT, SUM, AVG, MIN, MAX.
+    /// SQL-mission-2: `distinct` is `AGG(DISTINCT x)`, `filter` is
+    /// `AGG(x) FILTER (WHERE cond)`.
     Aggregate {
         func: crate::aggregate::AggregateFunc,
         arg: crate::aggregate::AggregateArg<Box<Expr>>,
+        distinct: bool,
+        filter: Option<Box<Expr>>,
     },
+    /// SQL-mission-2: a window function call, `f(args) OVER (...)`.
+    Window(Box<WindowCall>),
+    /// SQL-mission-2: `GROUPING(e1, ...)`.
+    Grouping(Vec<Expr>),
     /// SQL-mission-1: a parenthesized scalar subquery, `(SELECT ...)`.
     ScalarSubquery(Box<QueryExpr>),
     /// SQL-mission-1: `[NOT] EXISTS (SELECT ...)`.
@@ -196,6 +204,79 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryExpr {
     Select(Box<Select>),
+}
+
+/// What a window function call computes (SQL-mission-2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFunction {
+    /// `SUM(x) OVER (...)` and the other aggregates used as window functions.
+    Aggregate {
+        func: crate::aggregate::AggregateFunc,
+        arg: crate::aggregate::AggregateArg<Box<Expr>>,
+        distinct: bool,
+        filter: Option<Box<Expr>>,
+    },
+    /// `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `PERCENT_RANK`,
+    /// `CUME_DIST`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`
+    /// (`name` is lower-case; the binder checks the arity and the types).
+    Named { name: String, args: Vec<Expr> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowCall {
+    pub function: WindowFunction,
+    pub over: WindowOver,
+}
+
+/// The `OVER` clause: a name defined by `WINDOW`, or an inline specification.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowOver {
+    Named(Ident),
+    Spec(WindowSpec),
+}
+
+/// `([base] [PARTITION BY ...] [ORDER BY ...] [frame])`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WindowSpec {
+    /// An existing window this one extends (`OVER (w ORDER BY x)`).
+    pub base: Option<Ident>,
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderByItem>,
+    pub frame: Option<FrameSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+/// `ROWS|RANGE BETWEEN start AND end`; the shorthand `ROWS start` is
+/// `BETWEEN start AND CURRENT ROW`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameSpec {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+/// One element of a `GROUP BY` that uses `ROLLUP`, `CUBE` or `GROUPING SETS`
+/// (SQL-mission-2). Each inner `Vec<Expr>` is one (possibly composite) member.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupElement {
+    Expr(Expr),
+    Rollup(Vec<Vec<Expr>>),
+    Cube(Vec<Vec<Expr>>),
+    Sets(Vec<Vec<Expr>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,13 +311,18 @@ pub struct TableRef {
     pub column_aliases: Vec<Ident>,
 }
 
-/// One `WITH name [(columns)] AS (SELECT ...)` definition (non-recursive;
-/// `WITH RECURSIVE` is refused at conversion).
+/// One `WITH name [(columns)] AS (SELECT ...)` definition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cte {
     pub name: Ident,
     pub columns: Vec<Ident>,
     pub query: Box<Select>,
+    /// SQL-mission-1 Slice D: the `WITH` list was written `WITH RECURSIVE`
+    /// (the keyword belongs to the whole list; it is set on every definition
+    /// in it). Whether a definition actually recurses is decided by the
+    /// binder: only a body of the form `seed UNION [ALL] recursive-term` that
+    /// names itself does.
+    pub recursive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,19 +354,95 @@ pub struct OrderByItem {
     pub nulls_first: Option<bool>,
 }
 
+/// The set operators (SQL-mission-1 Slice E). `INTERSECT` binds tighter than
+/// `UNION` and `EXCEPT`, which are left-associative at one level -- the parser
+/// (`sqlparser`) builds the tree that way and `crate::convert` keeps its shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOperator {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl SetOperator {
+    pub fn name(self) -> &'static str {
+        match self {
+            SetOperator::Union => "UNION",
+            SetOperator::Intersect => "INTERSECT",
+            SetOperator::Except => "EXCEPT",
+        }
+    }
+}
+
+/// `left <op> [ALL] right` (SQL-mission-1 Slice E). Both operands are whole
+/// queries: a plain `SELECT`, a parenthesised query with its own `ORDER BY` /
+/// `LIMIT` / `WITH`, or another set operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOperation {
+    pub op: SetOperator,
+    /// `ALL`: multiset semantics, no duplicate removal. `false` is the
+    /// default (and `DISTINCT`) quantifier.
+    pub all: bool,
+    pub left: Box<Select>,
+    pub right: Box<Select>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     /// SQL-mission-1 Slice C: the `WITH` list of this query (empty if none).
     pub ctes: Vec<Cte>,
+    /// SQL-mission-1 Slice E: `Some` makes this query a **set operation**. It
+    /// then has no select list, `FROM`, `WHERE`, `GROUP BY` or `HAVING` of its
+    /// own (`distinct` is `false`, `projection` and the other clauses are
+    /// empty) and its `ctes`, `order_by`, `limit` and `offset` apply to the
+    /// whole result of the set operation. Every consumer of a `Select` that
+    /// can see a set operation (the binder) checks this first.
+    pub set_op: Option<SetOperation>,
     pub distinct: bool,
     pub projection: Vec<SelectItem>,
     pub from: Option<FromClause>,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,
+    /// SQL-mission-2: `Some` when the `GROUP BY` uses `ROLLUP`, `CUBE` or
+    /// `GROUPING SETS`; it then holds *every* element of the clause in written
+    /// order (plain expressions included) and `group_by` is empty.
+    pub grouping: Option<Vec<GroupElement>>,
     pub having: Option<Expr>,
+    /// SQL-mission-2: `QUALIFY` -- a filter evaluated after window functions.
+    pub qualify: Option<Expr>,
+    /// SQL-mission-2: `WINDOW name AS (...)` definitions.
+    pub named_windows: Vec<(Ident, WindowSpec)>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+}
+
+impl Select {
+    /// `left <op> [ALL] right` as a query of its own: no clauses besides the
+    /// operation (the caller attaches `WITH` / `ORDER BY` / `LIMIT`).
+    pub fn set_operation(op: SetOperator, all: bool, left: Select, right: Select) -> Select {
+        Select {
+            ctes: Vec::new(),
+            set_op: Some(SetOperation {
+                op,
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+            distinct: false,
+            projection: Vec::new(),
+            from: None,
+            selection: None,
+            group_by: Vec::new(),
+            grouping: None,
+            having: None,
+            qualify: None,
+            named_windows: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

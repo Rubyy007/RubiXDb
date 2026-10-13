@@ -17,6 +17,21 @@ pub struct RelationStats {
     pub cte_references: BTreeSet<u32>,
     /// Deepest nesting of derived tables.
     pub max_derived_depth: usize,
+    /// Operand queries of the set operations the plan executes (SQL-mission-1
+    /// Slice E): for every set-operation node, one per operand that is not
+    /// itself directly a set-operation node. `A UNION B INTERSECT C` is 3;
+    /// a CTE read twice is counted once; a CTE nobody reads, not at all.
+    pub set_op_branches: u64,
+    /// Ids of the distinct recursive CTEs the plan runs (SQL-mission-1 Slice D);
+    /// one nobody reads is bound and planned but never runs, so is not counted.
+    pub recursive_cte_definitions: BTreeSet<u32>,
+    /// Window function calls the plan evaluates (SQL-mission-2), over the whole
+    /// statement including subqueries and CTEs (a CTE read twice counts once).
+    pub window_functions: u64,
+    /// Grouping sets the plan's aggregations expand to (SQL-mission-2), summed
+    /// over every aggregation of the statement; a plain `GROUP BY` counts as
+    /// none. Saturating, because `CUBE` of many columns is astronomically large.
+    pub grouping_sets: u128,
 }
 
 /// Every `WITH` definition the statement contains, referenced or not.
@@ -71,6 +86,20 @@ fn walk(plan: &PhysicalPlan, depth: usize, stats: &mut RelationStats) {
         PhysicalPlan::EmptyRelation => {}
         PhysicalPlan::Access(access) => walk_exprs(access_exprs(access), depth, stats),
         PhysicalPlan::Derived { plan, .. } => walk(plan, depth + 1, stats),
+        PhysicalPlan::WorkingTable { .. } => {}
+        PhysicalPlan::RecursiveCte(node) => {
+            stats.recursive_cte_definitions.insert(node.cte_id);
+            walk(&node.seed_plan, depth, stats);
+            walk(&node.recursive_plan, depth, stats);
+        }
+        PhysicalPlan::SetOp(node) => {
+            for operand in [&node.left, &node.right] {
+                if !matches!(operand.as_ref(), PhysicalPlan::SetOp(_)) {
+                    stats.set_op_branches += 1;
+                }
+                walk(operand, depth, stats);
+            }
+        }
         PhysicalPlan::CteNode { table_ref, cte } => {
             stats.cte_references.insert(*table_ref);
             // A definition is walked once, however many references it has.
@@ -98,16 +127,29 @@ fn walk(plan: &PhysicalPlan, depth: usize, stats: &mut RelationStats) {
             input,
             group_by,
             aggregates,
+            grouping,
         } => {
+            if let Some(g) = grouping {
+                stats.grouping_sets = stats.grouping_sets.saturating_add(g.set_count());
+            }
             walk_exprs(group_by.iter(), depth, stats);
             walk_exprs(
-                aggregates.iter().filter_map(|a| match &a.arg {
-                    crate::aggregate::AggregateArg::Expr(e) => Some(e.as_ref()),
-                    crate::aggregate::AggregateArg::Wildcard => None,
+                aggregates.iter().flat_map(|a| {
+                    let arg = match &a.arg {
+                        crate::aggregate::AggregateArg::Expr(e) => Some(e.as_ref()),
+                        crate::aggregate::AggregateArg::Wildcard => None,
+                    };
+                    arg.into_iter().chain(a.filter.as_deref())
                 }),
                 depth,
                 stats,
             );
+            walk(input, depth, stats);
+        }
+        PhysicalPlan::Window {
+            input, functions, ..
+        } => {
+            stats.window_functions += functions.len() as u64;
             walk(input, depth, stats);
         }
         PhysicalPlan::Sort { input, items } => {

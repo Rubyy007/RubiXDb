@@ -1,0 +1,88 @@
+[
+  {
+    "id": "C_M7a_over_dropped_by_converter",
+    "why": "the Slice D bug reintroduced: the converter accepts OVER and drops it (SUM(x) OVER (...) runs as the plain aggregate)",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 4,
+    "failed_tests": [
+      "bind_tests::count_distinct_remains_explicitly_unsupported",
+      "recursive_cte_errors_and_bounds_over_http",
+      "recursive_tests::parser::a_window_function_is_refused_before_binding",
+      "recursive_tests::parser::an_over_clause_is_refused_everywhere_not_silently_dropped"
+    ]
+  },
+  {
+    "id": "C_M7b_over_ignored_by_planner",
+    "why": "OVER accepted by parser and binder but the planner drops the Window nodes",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 2,
+    "failed_tests": [
+      "recursive_cte_errors_and_bounds_over_http",
+      "recursive_tests::parser::an_over_clause_is_refused_everywhere_not_silently_dropped"
+    ]
+  },
+  {
+    "id": "C_M7c_over_ignored_by_executor",
+    "why": "the Window operator is replaced by a pass-through",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 2,
+    "failed_tests": [
+      "recursive_cte_errors_and_bounds_over_http",
+      "recursive_tests::parser::an_over_clause_is_refused_everywhere_not_silently_dropped"
+    ]
+  },
+  {
+    "id": "C_T3a_group_by_all_silently_accepted",
+    "why": "GROUP BY ALL runs as an ungrouped SELECT",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 2,
+    "failed_tests": [
+      "bind_tests::group_by_all_and_rollup_remain_explicitly_unsupported",
+      "parse_tests::unsupported_grammar_is_a_typed_error_not_a_panic"
+    ]
+  },
+  {
+    "id": "C_T3b_rollup_silently_collapsed",
+    "why": "ROLLUP accepted but its grouping elements dropped",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 1,
+    "failed_tests": [
+      "bind_tests::group_by_all_and_rollup_remain_explicitly_unsupported"
+    ]
+  },
+  {
+    "id": "C_T4a_distinct_window_aggregate_accepted",
+    "why": "COUNT(DISTINCT x) OVER () accepted (DISTINCT then ignored)",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 1,
+    "failed_tests": [
+      "bind_tests::count_distinct_remains_explicitly_unsupported"
+    ]
+  },
+  {
+    "id": "C_T4b_distinct_flag_dropped",
+    "why": "COUNT(DISTINCT x) bound as plain COUNT(x)",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 1,
+    "failed_tests": [
+      "bind_tests::count_distinct_remains_explicitly_unsupported"
+    ]
+  },
+  {
+    "id": "C_T5_right_join_silently_accepted",
+    "why": "RIGHT JOIN accepted and run as LEFT",
+    "compiled": true,
+    "tests_run": 87,
+    "failed_count": 1,
+    "failed_tests": [
+      "parse_tests::unsupported_grammar_is_a_typed_error_not_a_panic"
+    ]
+  }
+]

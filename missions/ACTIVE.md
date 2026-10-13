@@ -34,3 +34,28 @@ maintainer's uncommitted text and are untouched.)
 - 2026-10-11 update: Slice B (correlated subqueries, B1..B6 incl. `UPDATE ... SET (subquery)`) delivered, awaiting maintainer review; report in `sql/MISSION1_FEATURE_MATRIX.md` section 6. Slices C, D, E not started.
 
 - 2026-10-11 update: Slice C (derived tables, `[LEFT] JOIN LATERAL`, non-recursive CTEs, C1..C6) delivered, awaiting maintainer review; report in `sql/MISSION1_FEATURE_MATRIX.md` section 6. Slices D, E not started (recommended order: E before D).
+
+- 2026-10-12 update: Slice E (set operations, E1..E7) delivered, awaiting maintainer review; report in `sql/MISSION1_FEATURE_MATRIX.md` section 6. Slice D (WITH RECURSIVE) not started; it can now build on `UNION [ALL]` and the CTE machinery.
+
+- 2026-10-12 update: Slice D (WITH RECURSIVE, D1..D7) delivered, awaiting maintainer review; report in `sql/MISSION1_FEATURE_MATRIX.md` section 6. **Mission 1 (SQL: subqueries, CTEs, set operations) is complete: Slices A-E delivered, none committed by this mission.** Next: Mission 2, on the maintainer's instruction.
+
+
+---
+
+## SQL Mission 2 of 4 -- Window Functions and Advanced Aggregation (opened and delivered 2026-10-13)
+
+Prompt: "RubixDB SQL Mission 2 of 4" (window functions -- `OVER`, frames, ranking, navigation, aggregates, `QUALIFY` -- and advanced
+aggregation -- `GROUPING SETS`/`ROLLUP`/`CUBE`/`GROUPING()`, aggregate `FILTER`, `DISTINCT` aggregates). Feature matrix, decisions, limits,
+evidence and per-sub-slice reports: `sql/MISSION2_FEATURE_MATRIX.md`; evidence `sql/mission2_evidence/`.
+
+| Sub-slice | State |
+|---|---|
+| 2A -- `OVER`, `PARTITION BY`, `ORDER BY`, default frames, ranking, aggregates (gate: the silent-drop mutation M08 caught) | delivered 2026-10-13, awaiting maintainer review |
+| 2B -- `ROWS` / `RANGE` frames | delivered 2026-10-13, awaiting maintainer review |
+| 2C -- `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`/`NTILE`/`PERCENT_RANK`/`CUME_DIST` | delivered 2026-10-13, awaiting maintainer review |
+| 2D -- `QUALIFY` | delivered 2026-10-13, awaiting maintainer review |
+| 2E -- `GROUPING SETS` / `ROLLUP` / `CUBE` / `GROUPING()` | delivered 2026-10-13, awaiting maintainer review |
+| 2F -- aggregate `FILTER`, `DISTINCT` aggregates | delivered 2026-10-13, awaiting maintainer review |
+
+**Mission 2 is complete: nothing is committed (instructed).** Six older tests that pin refusals the mission implements fail by design and were left
+untouched (`sql/MISSION2_FEATURE_MATRIX.md` 6.2). Next: Mission 3, on the maintainer's instruction.

@@ -1,0 +1,96 @@
+[
+  {
+    "id": "feature_off_2A_window_functions",
+    "why": "the Mission-1-complete tree: every OVER clause is refused as Unsupported ('window functions (OVER)'), as Slice D left it",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    if let Some(over) = &f.over {\n        return convert_window_function(f, &name, over, dg, depth);\n    }",
+        "new": "    if f.over.is_some() {\n        return Err(unsupported(\"window functions (OVER)\"));\n    }"
+      }
+    ],
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-sql",
+        "--lib",
+        "--",
+        "window_tests",
+        "aggregation_tests",
+        "mission2_corpus"
+      ],
+      [
+        "cargo",
+        "test",
+        "-p",
+        "rubixdb-api",
+        "--test",
+        "api_sql_mission2",
+        "--",
+        "--nocapture"
+      ]
+    ]
+  },
+  {
+    "id": "feature_off_2B_frames",
+    "why": "ROWS / RANGE frames are refused as Unsupported",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    let units = match f.units {\n        sp::WindowFrameUnits::Rows => FrameUnits::Rows,",
+        "new": "    if true {\n        return Err(unsupported(\"window frames\"));\n    }\n    let units = match f.units {\n        sp::WindowFrameUnits::Rows => FrameUnits::Rows,"
+      }
+    ]
+  },
+  {
+    "id": "feature_off_2C_navigation_and_distribution",
+    "why": "LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE, PERCENT_RANK and CUME_DIST are not window functions",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "        } else if WINDOW_ONLY_FUNCTIONS.contains(&lower.as_str()) {",
+        "new": "        } else if WINDOW_ONLY_FUNCTIONS.contains(&lower.as_str())\n            && !matches!(\n                lower.as_str(),\n                \"lag\" | \"lead\" | \"first_value\" | \"last_value\" | \"nth_value\" | \"ntile\" | \"percent_rank\" | \"cume_dist\"\n            )\n        {"
+      }
+    ]
+  },
+  {
+    "id": "feature_off_2D_qualify",
+    "why": "QUALIFY is refused as Unsupported",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    let named_windows = select\n        .named_window",
+        "new": "    if select.qualify.is_some() {\n        return Err(unsupported(\"QUALIFY\"));\n    }\n    let named_windows = select\n        .named_window"
+      }
+    ]
+  },
+  {
+    "id": "feature_off_2E_grouping_extensions",
+    "why": "ROLLUP / CUBE / GROUPING SETS and GROUPING() are refused",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "            let extended = exprs.iter().any(|e| {",
+        "new": "            if exprs.iter().any(|e| {\n                matches!(\n                    e,\n                    sp::Expr::Rollup(_) | sp::Expr::Cube(_) | sp::Expr::GroupingSets(_) | sp::Expr::Tuple(_)\n                )\n            }) {\n                return Err(unsupported(\"GROUP BY with modifiers (ROLLUP/CUBE/GROUPING SETS)\"));\n            }\n            let extended = exprs.iter().any(|e| {"
+      },
+      {
+        "file": "sql/src/convert.rs",
+        "old": "        if name.0[0].value.eq_ignore_ascii_case(\"grouping\") {",
+        "new": "        if false && name.0[0].value.eq_ignore_ascii_case(\"grouping\") {"
+      }
+    ]
+  },
+  {
+    "id": "feature_off_2F_filter_and_distinct",
+    "why": "aggregate FILTER and DISTINCT are refused as Unsupported",
+    "edits": [
+      {
+        "file": "sql/src/convert.rs",
+        "old": "    let filter = f\n        .filter\n        .as_ref()\n        .map(|e| convert_expr(e, dg, depth + 1).map(Box::new))\n        .transpose()?;\n    match &f.args {",
+        "new": "    if f.filter.is_some() {\n        return Err(unsupported(\"aggregate function with DISTINCT or clauses inside the argument list\"));\n    }\n    if let sp::FunctionArguments::List(l) = &f.args {\n        if l.duplicate_treatment.is_some() {\n            return Err(unsupported(\"aggregate function with DISTINCT or clauses inside the argument list\"));\n        }\n    }\n    let filter = f\n        .filter\n        .as_ref()\n        .map(|e| convert_expr(e, dg, depth + 1).map(Box::new))\n        .transpose()?;\n    match &f.args {"
+      }
+    ]
+  }
+]

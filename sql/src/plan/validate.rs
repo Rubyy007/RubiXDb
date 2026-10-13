@@ -96,6 +96,15 @@ fn validate_physical(plan: &PhysicalPlan, catalog: &CatalogService) -> Result<()
         // (`validate_subplan`); only its place in the tree is checked here.
         PhysicalPlan::Derived { plan, .. } => validate_physical(plan, catalog),
         PhysicalPlan::CteNode { cte, .. } => validate_physical(&cte.plan, catalog),
+        PhysicalPlan::SetOp(node) => {
+            validate_physical(&node.left, catalog)?;
+            validate_physical(&node.right, catalog)
+        }
+        PhysicalPlan::WorkingTable { .. } => Ok(()),
+        PhysicalPlan::RecursiveCte(node) => {
+            validate_physical(&node.seed_plan, catalog)?;
+            validate_physical(&node.recursive_plan, catalog)
+        }
         PhysicalPlan::Access(access) => validate_access(access, catalog),
         PhysicalPlan::Join { left, right, .. } => {
             validate_physical(left, catalog)?;
@@ -105,6 +114,7 @@ fn validate_physical(plan: &PhysicalPlan, catalog: &CatalogService) -> Result<()
         | PhysicalPlan::Projection { input, .. }
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Aggregate { input, .. }
+        | PhysicalPlan::Window { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::Limit { input, .. } => validate_physical(input, catalog),
     }
@@ -143,6 +153,15 @@ fn collect_parameters_physical(plan: &PhysicalPlan, out: &mut BTreeSet<u32>) {
         PhysicalPlan::EmptyRelation => {}
         PhysicalPlan::Derived { plan, .. } => collect_parameters_physical(plan, out),
         PhysicalPlan::CteNode { cte, .. } => collect_parameters_physical(&cte.plan, out),
+        PhysicalPlan::SetOp(node) => {
+            collect_parameters_physical(&node.left, out);
+            collect_parameters_physical(&node.right, out);
+        }
+        PhysicalPlan::WorkingTable { .. } => {}
+        PhysicalPlan::RecursiveCte(node) => {
+            collect_parameters_physical(&node.seed_plan, out);
+            collect_parameters_physical(&node.recursive_plan, out);
+        }
         PhysicalPlan::Access(access) => collect_parameters_access(access, out),
         PhysicalPlan::Join {
             left, right, on, ..
@@ -166,12 +185,37 @@ fn collect_parameters_physical(plan: &PhysicalPlan, out: &mut BTreeSet<u32>) {
             input,
             group_by,
             aggregates,
+            ..
         } => {
             for g in group_by {
                 collect_parameters_expr(g, out);
             }
             for a in aggregates {
                 if let crate::aggregate::AggregateArg::Expr(e) = &a.arg {
+                    collect_parameters_expr(e, out);
+                }
+                collect_parameters_expr_opt(a.filter.as_deref(), out);
+            }
+            collect_parameters_physical(input, out);
+        }
+        PhysicalPlan::Window {
+            input,
+            spec,
+            functions,
+        } => {
+            for e in &spec.partition_by {
+                collect_parameters_expr(e, out);
+            }
+            for o in &spec.order_by {
+                collect_parameters_expr(&o.expr, out);
+            }
+            for f in functions {
+                for e in (crate::bound::BoundWindowCall {
+                    func: f.func.clone(),
+                    spec: spec.clone(),
+                })
+                .exprs()
+                {
                     collect_parameters_expr(e, out);
                 }
             }
@@ -308,8 +352,17 @@ fn collect_parameters_expr(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
             if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
                 collect_parameters_expr(e, out);
             }
+            collect_parameters_expr_opt(agg.filter.as_deref(), out);
         }
-        BoundExprKind::AggregateRef(_) => {}
+        BoundExprKind::Window(call) => {
+            for e in call.exprs() {
+                collect_parameters_expr(e, out);
+            }
+        }
+        BoundExprKind::AggregateRef(_)
+        | BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_) => {}
         // A subquery's own plan is validated where it is planned
         // (`validate_subplan`); at this level only its `IN` operand is part
         // of the enclosing statement's parameter space check.

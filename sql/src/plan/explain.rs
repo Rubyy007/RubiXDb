@@ -10,8 +10,12 @@
 use std::fmt::Write as _;
 
 use crate::ast::{BinaryOp, JoinKind, UnaryOp};
-use crate::bound::{BoundExpr, BoundExprKind, BoundSubqueryExpr, SubqueryKind};
+use crate::bound::{
+    BoundExpr, BoundExprKind, BoundFrame, BoundFrameBound, BoundGroupElement, BoundGrouping,
+    BoundOrderByItem, BoundSubqueryExpr, BoundWindowFunc, NullsOrder, SubqueryKind,
+};
 use crate::plan::access::{IndexAccessMode, PhysicalAccess};
+use crate::plan::logical::SetOpNode;
 use crate::plan::physical::{JoinAlgorithm, PhysicalPlan};
 use crate::plan::Plan;
 
@@ -116,6 +120,34 @@ fn write_physical(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             );
             write_physical(plan, depth + 1, out);
         }
+        PhysicalPlan::SetOp(node) => write_set_op(node, depth, out, true),
+        PhysicalPlan::WorkingTable {
+            table_ref, name, ..
+        } => {
+            let _ = writeln!(
+                out,
+                "WorkingTable name={name} as t{table_ref} (the rows of the previous iteration)"
+            );
+        }
+        PhysicalPlan::RecursiveCte(node) => {
+            let _ = writeln!(
+                out,
+                "RecursiveCte name={} distinct={} ({})",
+                node.name,
+                node.distinct,
+                if node.distinct {
+                    "UNION: stops when an iteration produces no new distinct row"
+                } else {
+                    "UNION ALL: stops when an iteration produces no row"
+                }
+            );
+            indent(out, depth + 1);
+            let _ = writeln!(out, "seed (runs once):");
+            write_physical(&node.seed_plan, depth + 2, out);
+            indent(out, depth + 1);
+            let _ = writeln!(out, "recursive (runs once per iteration, reads the working table '{}'):", node.name);
+            write_physical(&node.recursive_plan, depth + 2, out);
+        }
         PhysicalPlan::CteNode { table_ref, cte } => {
             let marker = format!("cte#{} defined here", cte.id);
             if out.contains(&marker) {
@@ -176,23 +208,50 @@ fn write_physical(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             input,
             group_by,
             aggregates,
+            grouping,
         } => {
             let group_s: Vec<String> = group_by.iter().map(fmt_expr).collect();
-            let agg_s: Vec<String> = aggregates
-                .iter()
-                .map(|a| {
-                    let arg = match &a.arg {
-                        crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
-                        crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
-                    };
-                    format!("{}({})", a.func.name(), arg)
-                })
-                .collect();
-            let _ = writeln!(
+            let agg_s: Vec<String> = aggregates.iter().map(fmt_aggregate).collect();
+            let _ = write!(
                 out,
                 "Aggregate group_by=[{}] aggregates=[{}]",
                 group_s.join(", "),
                 agg_s.join(", ")
+            );
+            if let Some(g) = grouping {
+                let count = g.set_count();
+                let _ = write!(
+                    out,
+                    " grouping=[{}] grouping_sets={}",
+                    fmt_grouping(g),
+                    if count == u128::MAX {
+                        "more than 2^120".to_string()
+                    } else {
+                        count.to_string()
+                    }
+                );
+            }
+            out.push('\n');
+            write_physical(input, depth + 1, out);
+        }
+        PhysicalPlan::Window {
+            input,
+            spec,
+            functions,
+        } => {
+            let part: Vec<String> = spec.partition_by.iter().map(fmt_expr).collect();
+            let order: Vec<String> = spec.order_by.iter().map(fmt_order_item).collect();
+            let funcs: Vec<String> = functions
+                .iter()
+                .map(|f| format!("{} -> window[{}]", fmt_window_func(&f.func), f.slot))
+                .collect();
+            let _ = writeln!(
+                out,
+                "Window partition_by=[{}] order_by=[{}] frame={} functions=[{}]",
+                part.join(", "),
+                order.join(", "),
+                fmt_frame(&spec.frame),
+                funcs.join(", ")
             );
             write_physical(input, depth + 1, out);
         }
@@ -230,6 +289,71 @@ fn write_physical(plan: &PhysicalPlan, depth: usize, out: &mut String) {
                 "Limit limit={limit_s} offset={offset_s} pushable={pushable}"
             );
             write_physical(input, depth + 1, out);
+        }
+    }
+}
+
+/// The operands of a set operation in order, with a left-nested chain of one
+/// operator and quantifier (`A UNION B UNION C`) flattened into one list:
+/// applying them left to right is exactly what the chain means.
+fn set_op_operands(node: &SetOpNode) -> Vec<&PhysicalPlan> {
+    let mut out = Vec::new();
+    fn gather<'p>(node: &'p SetOpNode, out: &mut Vec<&'p PhysicalPlan>) {
+        match node.left.as_ref() {
+            PhysicalPlan::SetOp(inner) if inner.op == node.op && inner.all == node.all => {
+                gather(inner, out)
+            }
+            other => out.push(other),
+        }
+        out.push(node.right.as_ref());
+    }
+    gather(node, &mut out);
+    out
+}
+
+fn set_op_name(node: &SetOpNode) -> String {
+    format!("{}{}", node.op.name(), if node.all { " ALL" } else { "" })
+}
+
+/// `UNION(#1, INTERSECT(#2, #3))`: the tree of operators over the numbered
+/// operand queries -- the precedence of the statement, readable at a glance.
+fn set_op_shape(node: &SetOpNode, next: &mut usize) -> String {
+    let parts: Vec<String> = set_op_operands(node)
+        .into_iter()
+        .map(|operand| match operand {
+            PhysicalPlan::SetOp(inner) => set_op_shape(inner, next),
+            _ => {
+                *next += 1;
+                format!("#{}", *next)
+            }
+        })
+        .collect();
+    format!("{}({})", set_op_name(node), parts.join(", "))
+}
+
+fn write_set_op(node: &SetOpNode, depth: usize, out: &mut String, root: bool) {
+    let operands = set_op_operands(node);
+    let names: Vec<&str> = node.items.iter().map(|i| i.output_name.as_str()).collect();
+    let shape = if root {
+        format!(" shape={}", set_op_shape(node, &mut 0))
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        out,
+        "SetOp {} branches={}{shape} as t{} output=[{}]",
+        set_op_name(node),
+        operands.len(),
+        node.set_ref,
+        names.join(", ")
+    );
+    for operand in operands {
+        match operand {
+            PhysicalPlan::SetOp(inner) => {
+                indent(out, depth + 1);
+                write_set_op(inner, depth + 1, out, false);
+            }
+            other => write_physical(other, depth + 1, out),
         }
     }
 }
@@ -324,6 +448,138 @@ fn fmt_bound(bound: &std::ops::Bound<Vec<BoundExpr>>) -> String {
     }
 }
 
+fn fmt_aggregate(a: &crate::bound::BoundAggregateExpr) -> String {
+    let arg = match &a.arg {
+        crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
+        crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
+    };
+    let mut s = format!(
+        "{}({}{})",
+        a.func.name(),
+        if a.distinct { "DISTINCT " } else { "" },
+        arg
+    );
+    if let Some(f) = &a.filter {
+        let _ = write!(s, " FILTER (WHERE {})", fmt_expr(f));
+    }
+    s
+}
+
+fn fmt_order_item(i: &BoundOrderByItem) -> String {
+    format!(
+        "{} {} NULLS {}",
+        fmt_expr(&i.expr),
+        if i.descending { "DESC" } else { "ASC" },
+        match i.nulls {
+            NullsOrder::First => "FIRST",
+            NullsOrder::Last => "LAST",
+        }
+    )
+}
+
+fn fmt_frame_bound(b: &BoundFrameBound) -> String {
+    match b {
+        BoundFrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        BoundFrameBound::Preceding(e) => format!("{} PRECEDING", fmt_expr(e)),
+        BoundFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        BoundFrameBound::Following(e) => format!("{} FOLLOWING", fmt_expr(e)),
+        BoundFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+    }
+}
+
+fn fmt_frame(f: &BoundFrame) -> String {
+    format!(
+        "{} BETWEEN {} AND {}{}",
+        match f.units {
+            crate::ast::FrameUnits::Rows => "ROWS",
+            crate::ast::FrameUnits::Range => "RANGE",
+        },
+        fmt_frame_bound(&f.start),
+        fmt_frame_bound(&f.end),
+        if f.explicit { "" } else { " (default)" }
+    )
+}
+
+fn fmt_window_func(f: &BoundWindowFunc) -> String {
+    let opt = |e: &Option<Box<BoundExpr>>| {
+        e.as_ref()
+            .map(|e| format!(", {}", fmt_expr(e)))
+            .unwrap_or_default()
+    };
+    match f {
+        BoundWindowFunc::Aggregate { func, arg, filter } => {
+            let arg = match arg {
+                crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
+                crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
+            };
+            let mut s = format!("{}({arg})", func.name());
+            if let Some(f) = filter {
+                let _ = write!(s, " FILTER (WHERE {})", fmt_expr(f));
+            }
+            s
+        }
+        BoundWindowFunc::RowNumber
+        | BoundWindowFunc::Rank
+        | BoundWindowFunc::DenseRank
+        | BoundWindowFunc::PercentRank
+        | BoundWindowFunc::CumeDist => format!("{}()", f.name()),
+        BoundWindowFunc::Ntile(n) => format!("ntile({})", fmt_expr(n)),
+        BoundWindowFunc::Lag {
+            expr,
+            offset,
+            default,
+        }
+        | BoundWindowFunc::Lead {
+            expr,
+            offset,
+            default,
+        } => format!("{}({}{}{})", f.name(), fmt_expr(expr), opt(offset), opt(default)),
+        BoundWindowFunc::FirstValue(e) | BoundWindowFunc::LastValue(e) => {
+            format!("{}({})", f.name(), fmt_expr(e))
+        }
+        BoundWindowFunc::NthValue { expr, n } => {
+            format!("nth_value({}, {})", fmt_expr(expr), fmt_expr(n))
+        }
+    }
+}
+
+fn fmt_grouping(g: &BoundGrouping) -> String {
+    let members = |sets: &[Vec<usize>]| {
+        sets.iter()
+            .map(|s| {
+                let parts: Vec<String> = s.iter().map(|i| format!("key[{i}]")).collect();
+                if parts.len() == 1 {
+                    parts[0].clone()
+                } else {
+                    format!("({})", parts.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    g.elements
+        .iter()
+        .map(|e| match e {
+            BoundGroupElement::Expr(i) => format!("key[{i}]"),
+            BoundGroupElement::Rollup(m) => format!("ROLLUP({})", members(m)),
+            BoundGroupElement::Cube(m) => format!("CUBE({})", members(m)),
+            BoundGroupElement::Sets(s) => format!(
+                "GROUPING SETS({})",
+                s.iter()
+                    .map(|set| {
+                        format!(
+                            "({})",
+                            set.iter().map(|i| format!("key[{i}]")).collect::<Vec<_>>().join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A compact, deterministic, non-SQL-reconstructing rendering of a
 /// `BoundExpr` — column references by `(table_ref, ordinal)`, literals
 /// by their own typed `Debug` (never raw user-supplied SQL text, since
@@ -407,14 +663,18 @@ fn fmt_expr(expr: &BoundExpr) -> String {
                 args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
             )
         }
-        BoundExprKind::Aggregate(agg) => {
-            let arg = match &agg.arg {
-                crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
-                crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
-            };
-            format!("{}({})", agg.func.name(), arg)
-        }
+        BoundExprKind::Aggregate(agg) => fmt_aggregate(agg),
         BoundExprKind::AggregateRef(idx) => format!("agg[{idx}]"),
+        BoundExprKind::WindowRef(idx) => format!("window[{idx}]"),
+        BoundExprKind::GroupKeyRef(idx) => format!("key[{idx}]"),
+        BoundExprKind::Grouping(idxs) => format!(
+            "GROUPING({})",
+            idxs.iter().map(|i| format!("key[{i}]")).collect::<Vec<_>>().join(", ")
+        ),
+        BoundExprKind::Window(call) => format!(
+            "{} OVER (...)",
+            fmt_window_func(&call.func)
+        ),
         BoundExprKind::Subquery(sq) => match sq.kind {
             SubqueryKind::Scalar => format!("subquery#{}", sq.id),
             SubqueryKind::Exists { negated } => {
@@ -441,7 +701,11 @@ pub(super) fn collect_subqueries<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a Boun
         BoundExprKind::Literal(_)
         | BoundExprKind::Parameter { .. }
         | BoundExprKind::Column(_)
-        | BoundExprKind::AggregateRef(_) => {}
+        | BoundExprKind::AggregateRef(_)
+        | BoundExprKind::WindowRef(_)
+        | BoundExprKind::GroupKeyRef(_)
+        | BoundExprKind::Grouping(_)
+        | BoundExprKind::Window(_) => {}
         BoundExprKind::UnaryOp { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
             collect_subqueries(expr, out)
         }
@@ -484,6 +748,9 @@ pub(super) fn collect_subqueries<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a Boun
         BoundExprKind::Aggregate(agg) => {
             if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
                 collect_subqueries(e, out);
+            }
+            if let Some(f) = &agg.filter {
+                collect_subqueries(f, out);
             }
         }
         BoundExprKind::Subquery(sq) => {

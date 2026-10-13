@@ -1,0 +1,12 @@
+[
+  {
+    "id": "M36_rows_current_row_takes_peers",
+    "why": "ROWS ... CURRENT ROW end includes the row's peers",
+    "compiled": true,
+    "tests_run": 161,
+    "failed_count": 1,
+    "failed_tests": [
+      "window_tests::exec_2b::a_rows_frame_ignores_peers_even_when_the_order_by_has_ties"
+    ]
+  }
+]

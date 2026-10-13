@@ -142,10 +142,24 @@ fn pushdown_predicates(
             input,
             group_by,
             aggregates,
+            grouping,
         } => Ok(LogicalPlan::Aggregate {
             input: Box::new(pushdown_predicates(*input, limits, metrics)?),
             group_by,
             aggregates,
+            grouping,
+        }),
+        // SQL-mission-2: a window function sees the rows its input produces, so
+        // a predicate of the query above (QUALIFY) is never pushed below it;
+        // pushdown still reaches the scan below the node through WHERE.
+        LogicalPlan::Window {
+            input,
+            spec,
+            functions,
+        } => Ok(LogicalPlan::Window {
+            input: Box::new(pushdown_predicates(*input, limits, metrics)?),
+            spec,
+            functions,
         }),
         LogicalPlan::Sort { input, items } => Ok(LogicalPlan::Sort {
             input: Box::new(pushdown_predicates(*input, limits, metrics)?),
@@ -163,7 +177,9 @@ fn pushdown_predicates(
         leaf @ (LogicalPlan::EmptyRelation
         | LogicalPlan::Scan { .. }
         | LogicalPlan::Derived { .. }
-        | LogicalPlan::Cte { .. }) => Ok(leaf),
+        | LogicalPlan::Cte { .. }
+        | LogicalPlan::Working { .. }
+        | LogicalPlan::SetOp(_)) => Ok(leaf),
     }
 }
 
@@ -219,7 +235,11 @@ fn collect_required_columns(plan: &LogicalPlan, acc: &mut HashMap<u32, BTreeSet<
     match plan {
         // A derived table / CTE reference is opaque to column pruning: its
         // body was planned and pruned on its own.
-        LogicalPlan::EmptyRelation | LogicalPlan::Derived { .. } | LogicalPlan::Cte { .. } => {}
+        LogicalPlan::EmptyRelation
+        | LogicalPlan::Derived { .. }
+        | LogicalPlan::Cte { .. }
+        | LogicalPlan::Working { .. }
+        | LogicalPlan::SetOp(_) => {}
         LogicalPlan::Scan {
             table, predicate, ..
         } => {
@@ -254,12 +274,38 @@ fn collect_required_columns(plan: &LogicalPlan, acc: &mut HashMap<u32, BTreeSet<
             input,
             group_by,
             aggregates,
+            ..
         } => {
             for g in group_by {
                 note(g, acc);
             }
             for a in aggregates {
                 if let crate::aggregate::AggregateArg::Expr(e) = &a.arg {
+                    note(e, acc);
+                }
+                if let Some(f) = &a.filter {
+                    note(f, acc);
+                }
+            }
+            collect_required_columns(input, acc);
+        }
+        LogicalPlan::Window {
+            input,
+            spec,
+            functions,
+        } => {
+            for e in &spec.partition_by {
+                note(e, acc);
+            }
+            for o in &spec.order_by {
+                note(&o.expr, acc);
+            }
+            for f in functions {
+                let call = crate::bound::BoundWindowCall {
+                    func: f.func.clone(),
+                    spec: spec.clone(),
+                };
+                for e in call.exprs() {
                     note(e, acc);
                 }
             }
@@ -321,10 +367,21 @@ fn annotate_required_columns(
             input,
             group_by,
             aggregates,
+            grouping,
         } => LogicalPlan::Aggregate {
             input: Box::new(annotate_required_columns(*input, required)),
             group_by,
             aggregates,
+            grouping,
+        },
+        LogicalPlan::Window {
+            input,
+            spec,
+            functions,
+        } => LogicalPlan::Window {
+            input: Box::new(annotate_required_columns(*input, required)),
+            spec,
+            functions,
         },
         LogicalPlan::Sort { input, items } => LogicalPlan::Sort {
             input: Box::new(annotate_required_columns(*input, required)),
@@ -341,7 +398,9 @@ fn annotate_required_columns(
         },
         leaf @ (LogicalPlan::EmptyRelation
         | LogicalPlan::Derived { .. }
-        | LogicalPlan::Cte { .. }) => leaf,
+        | LogicalPlan::Cte { .. }
+        | LogicalPlan::Working { .. }
+        | LogicalPlan::SetOp(_)) => leaf,
     }
 }
 
@@ -401,10 +460,21 @@ fn mark_pushable_limits(plan: LogicalPlan, metrics: &PlannerMetrics) -> LogicalP
             input,
             group_by,
             aggregates,
+            grouping,
         } => LogicalPlan::Aggregate {
             input: Box::new(mark_pushable_limits(*input, metrics)),
             group_by,
             aggregates,
+            grouping,
+        },
+        LogicalPlan::Window {
+            input,
+            spec,
+            functions,
+        } => LogicalPlan::Window {
+            input: Box::new(mark_pushable_limits(*input, metrics)),
+            spec,
+            functions,
         },
         LogicalPlan::Sort { input, items } => LogicalPlan::Sort {
             input: Box::new(mark_pushable_limits(*input, metrics)),
@@ -413,7 +483,9 @@ fn mark_pushable_limits(plan: LogicalPlan, metrics: &PlannerMetrics) -> LogicalP
         leaf @ (LogicalPlan::EmptyRelation
         | LogicalPlan::Scan { .. }
         | LogicalPlan::Derived { .. }
-        | LogicalPlan::Cte { .. }) => leaf,
+        | LogicalPlan::Cte { .. }
+        | LogicalPlan::Working { .. }
+        | LogicalPlan::SetOp(_)) => leaf,
     }
 }
 

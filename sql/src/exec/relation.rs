@@ -72,13 +72,13 @@ pub(super) fn open_cte<'a>(
     outer: &RowContext,
     ec: &ExecCtx<'a>,
 ) -> Result<Box<dyn Operator<'a> + 'a>> {
-    let rows = materialized_rows(cte.id, &cte.plan, true, ec)?;
-    Ok(Box::new(RowsOp {
-        rows,
-        pos: 0,
-        table_ref,
-        outer: outer.clone(),
-    }))
+    // A recursive CTE owns its working table and its own result cache; it does
+    // not go through the materialization below.
+    let rows = match &cte.plan {
+        PhysicalPlan::RecursiveCte(node) => super::recursive::recursive_rows(cte.id, node, ec)?,
+        plan => materialized_rows(cte.id, plan, true, ec)?,
+    };
+    Ok(Box::new(RowsOp::new(rows, table_ref, outer.clone())))
 }
 
 /// The rows of relation `id`, running `plan` to produce them the first time
@@ -145,11 +145,22 @@ impl<'a> Operator<'a> for StreamOp<'a> {
 }
 
 /// Yields a stored row set, front to back.
-struct RowsOp {
+pub(super) struct RowsOp {
     rows: Rc<Vec<Row>>,
     pos: usize,
     table_ref: u32,
     outer: RowContext,
+}
+
+impl RowsOp {
+    pub(super) fn new(rows: Rc<Vec<Row>>, table_ref: u32, outer: RowContext) -> Self {
+        RowsOp {
+            rows,
+            pos: 0,
+            table_ref,
+            outer,
+        }
+    }
 }
 
 impl<'a> Operator<'a> for RowsOp {

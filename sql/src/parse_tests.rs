@@ -285,12 +285,23 @@ fn unsupported_grammar_is_a_typed_error_not_a_panic() {
     // `"WITH x AS (SELECT 1) SELECT * FROM x"`: non-recursive CTEs are now a
     // supported feature (`relation_tests::parser` and `::cte*` hold the
     // replacement assertions; `WITH RECURSIVE` is still Unsupported and is
-    // asserted there). The `UNION` case below leaves in Slice E.
+    // asserted there).
+    //
+    // SQL-mission-1 Slice E (2026-10-12) removed the last of the three, the
+    // `"SELECT id FROM t UNION SELECT id FROM orders"` case: set operations
+    // are now a supported feature (`setop_tests::parser` holds the
+    // replacement assertions, and the spellings that remain unsupported --
+    // MINUS, BY NAME, VALUES / TABLE operands -- are asserted there).
+    //
+    // SQL-mission-2 (2026-10-13) removed exactly one more case,
+    // `"SELECT id FROM t GROUP BY ROLLUP(id)"`: ROLLUP / CUBE / GROUPING SETS are
+    // now supported (`aggregation_tests::parser` holds the replacement
+    // assertions; `window_tests::parser::what_is_still_outside_the_grammar_after_mission_2_is_a_typed_error`
+    // re-pins the spellings that remain unsupported).
+    // Mission 2: OVER / ROLLUP / COUNT(DISTINCT) is implemented; see MISSION2_FEATURE_MATRIX.md §6.2.
     let cases = [
         "SELECT id FROM t GROUP BY ALL",
-        "SELECT id FROM t GROUP BY ROLLUP(id)",
         "SELECT * FROM t, orders",
-        "SELECT id FROM t UNION SELECT id FROM orders",
         "SELECT id FROM t RIGHT JOIN orders o ON t.id = o.id",
         "SELECT id FROM t FULL JOIN orders o ON t.id = o.id",
     ];

@@ -387,3 +387,228 @@ proptest! {
         fx.cleanup();
     }
 }
+
+// =======================================================================
+// SQL-mission-2: GROUPING SETS / ROLLUP / CUBE / GROUPING(), aggregate
+// FILTER and DISTINCT aggregates -- the same independent-oracle discipline.
+//
+// `reference` below groups with plain `Vec`s and linear searches (no hashing,
+// so no shared notion of key equality with the executor), builds each grouping
+// set's groups in first-seen order and emits set after set -- the order this
+// implementation documents -- and computes every aggregate from the group's
+// member rows by definition. It never calls `crate::exec`, `crate::plan`,
+// `crate::aggregate` or `crate::bound`.
+// =======================================================================
+
+mod mission2 {
+    use super::*;
+    use crate::aggregation_tests::{ag_db, seed_ag};
+    use crate::mission1_support::Db;
+
+    /// One input row: `(a, b, x, y)`.
+    type In = (Option<i32>, Option<i32>, Option<i32>, Option<i32>);
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Out {
+        a: Option<i32>,
+        b: Option<i32>,
+        grouping_a: i32,
+        grouping_b: i32,
+        sum: Option<i64>,
+        count_star: i64,
+        count_distinct: i64,
+        sum_distinct: Option<i64>,
+        sum_filter: Option<i64>,
+        count_filter: i64,
+    }
+
+    /// A group's key `(a, b)` and the indexes of its member rows.
+    type GroupMembers = ((Option<i32>, Option<i32>), Vec<usize>);
+
+    /// `sets`: grouping sets over the columns {0 = a, 1 = b}, in output order.
+    fn reference(rows: &[In], sets: &[Vec<usize>]) -> Vec<Out> {
+        let mut out = Vec::new();
+        for set in sets {
+            let (has_a, has_b) = (set.contains(&0), set.contains(&1));
+            // Groups in first-seen order: (key, member row indexes).
+            let mut groups: Vec<GroupMembers> = Vec::new();
+            for (i, r) in rows.iter().enumerate() {
+                let key = (if has_a { r.0 } else { None }, if has_b { r.1 } else { None });
+                match groups.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, members)) => members.push(i),
+                    None => groups.push((key, vec![i])),
+                }
+            }
+            // The empty set is a global aggregate: one group even over no rows.
+            if set.is_empty() && groups.is_empty() {
+                groups.push(((None, None), vec![]));
+            }
+            for (key, members) in groups {
+                let xs: Vec<i64> = members.iter().filter_map(|&i| rows[i].2.map(i64::from)).collect();
+                let mut distinct = xs.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                let passing: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|&i| rows[i].3.is_some_and(|y| y > 0))
+                    .collect();
+                let fx: Vec<i64> = passing.iter().filter_map(|&i| rows[i].2.map(i64::from)).collect();
+                out.push(Out {
+                    a: key.0,
+                    b: key.1,
+                    grouping_a: i32::from(!has_a),
+                    grouping_b: i32::from(!has_b),
+                    sum: (!xs.is_empty()).then(|| xs.iter().sum()),
+                    count_star: members.len() as i64,
+                    count_distinct: distinct.len() as i64,
+                    sum_distinct: (!distinct.is_empty()).then(|| distinct.iter().sum()),
+                    sum_filter: (!fx.is_empty()).then(|| fx.iter().sum()),
+                    count_filter: passing.len() as i64,
+                });
+            }
+        }
+        out
+    }
+
+    fn insert(db: &Db, rows: &[In]) {
+        let seed: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (a, b, x, y))| (i as i32 + 1, *a, *b, *x, *y))
+            .collect();
+        seed_ag(db, &seed);
+    }
+
+    fn opt32(v: &Option<RelationalValue>) -> Option<i32> {
+        match v {
+            None => None,
+            Some(RelationalValue::Integer(n)) => Some(*n),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn opt64(v: &Option<RelationalValue>) -> Option<i64> {
+        match v {
+            None => None,
+            Some(RelationalValue::Bigint(n)) => Some(*n),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn run(db: &Db, clause: &str) -> Vec<Out> {
+        let sql = format!(
+            "SELECT a, b, GROUPING(a), GROUPING(b), SUM(x), COUNT(*), COUNT(DISTINCT x), SUM(DISTINCT x), \
+             SUM(x) FILTER (WHERE y > 0), COUNT(*) FILTER (WHERE y > 0) FROM ag GROUP BY {clause}"
+        );
+        db.rows(&sql)
+            .iter()
+            .map(|r| Out {
+                a: opt32(&r[0]),
+                b: opt32(&r[1]),
+                grouping_a: opt32(&r[2]).unwrap(),
+                grouping_b: opt32(&r[3]).unwrap(),
+                sum: opt64(&r[4]),
+                count_star: opt64(&r[5]).unwrap(),
+                count_distinct: opt64(&r[6]).unwrap(),
+                sum_distinct: opt64(&r[7]),
+                sum_filter: opt64(&r[8]),
+                count_filter: opt64(&r[9]).unwrap(),
+            })
+            .collect()
+    }
+
+    /// Each clause and the grouping sets it means (columns 0 = a, 1 = b).
+    fn clauses() -> Vec<(&'static str, Vec<Vec<usize>>)> {
+        vec![
+            ("a, b", vec![vec![0, 1]]),
+            ("ROLLUP (a, b)", vec![vec![0, 1], vec![0], vec![]]),
+            ("ROLLUP (b, a)", vec![vec![0, 1], vec![1], vec![]]),
+            ("CUBE (a, b)", vec![vec![0, 1], vec![0], vec![1], vec![]]),
+            ("GROUPING SETS ((a), (b))", vec![vec![0], vec![1]]),
+            ("GROUPING SETS ((a), (b), ())", vec![vec![0], vec![1], vec![]]),
+            ("GROUPING SETS ((a, b), (a), (b), ())", vec![vec![0, 1], vec![0], vec![1], vec![]]),
+            ("GROUPING SETS ((b, a), ())", vec![vec![0, 1], vec![]]),
+            ("GROUPING SETS ((a, b), (a, b))", vec![vec![0, 1], vec![0, 1]]),
+            ("a, ROLLUP (b)", vec![vec![0, 1], vec![0]]),
+            ("ROLLUP (a), b", vec![vec![0, 1], vec![1]]),
+            ("ROLLUP (a), ROLLUP (b)", vec![vec![0, 1], vec![0], vec![1], vec![]]),
+            ("CUBE (a), ROLLUP (b)", vec![vec![0, 1], vec![0], vec![1], vec![]]),
+        ]
+    }
+
+    fn scenarios() -> Vec<Vec<In>> {
+        let mut v: Vec<Vec<In>> = vec![
+            vec![],
+            vec![(Some(1), Some(1), Some(5), Some(1))],
+            vec![(None, None, None, None)],
+            vec![(None, None, Some(1), Some(1)), (None, None, Some(1), Some(-1)), (None, Some(1), Some(2), None)],
+            vec![
+                (Some(1), Some(1), Some(1), Some(1)),
+                (Some(1), Some(2), Some(2), Some(-1)),
+                (Some(2), Some(1), Some(4), Some(3)),
+                (Some(2), Some(1), Some(4), None),
+                (None, Some(1), Some(16), Some(5)),
+            ],
+        ];
+        // A bigger table with repeated values (DISTINCT matters) and NULLs everywhere.
+        v.push(
+            (0..60)
+                .map(|i| {
+                    (
+                        if i % 7 == 0 { None } else { Some(i % 3) },
+                        if i % 5 == 0 { None } else { Some(i % 4) },
+                        if i % 6 == 0 { None } else { Some((i * 7) % 9) },
+                        if i % 4 == 0 { None } else { Some((i % 5) - 2) },
+                    )
+                })
+                .collect(),
+        );
+        v
+    }
+
+    #[test]
+    fn grouping_forms_match_the_reference_model_on_a_fixed_scenario_matrix() {
+        for (si, rows) in scenarios().into_iter().enumerate() {
+            let db = ag_db(&format!("aggref2_matrix_{si}"));
+            insert(&db, &rows);
+            for (clause, sets) in clauses() {
+                assert_eq!(
+                    run(&db, clause),
+                    reference(&rows, &sets),
+                    "scenario {si}, GROUP BY {clause}\nrows: {rows:?}"
+                );
+            }
+            db.cleanup();
+        }
+    }
+
+    fn arb_row() -> impl Strategy<Value = In> {
+        (
+            prop::option::weighted(0.8, 0i32..3),
+            prop::option::weighted(0.8, 0i32..3),
+            prop::option::weighted(0.8, -3i32..6),
+            prop::option::weighted(0.8, -2i32..3),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn grouping_forms_match_the_reference_model_for_random_tables(
+            rows in prop::collection::vec(arb_row(), 0..40),
+        ) {
+            let db = ag_db("aggref2_prop");
+            insert(&db, &rows);
+            for (clause, sets) in clauses() {
+                prop_assert_eq!(
+                    run(&db, clause),
+                    reference(&rows, &sets),
+                    "GROUP BY {} rows {:?}", clause, rows
+                );
+            }
+            db.cleanup();
+        }
+    }
+}

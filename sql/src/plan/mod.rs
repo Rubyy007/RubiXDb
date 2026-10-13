@@ -226,8 +226,14 @@ fn plan_select(select: &BoundSelect, cx: &Cx<'_>) -> Result<PhysicalPlan> {
 /// error) but is never executed.
 fn plan_ctes(ctes: &[BoundCte], cx: &Cx<'_>) -> Result<()> {
     for cte in ctes {
-        let plan = plan_select(&cte.query, cx)?;
-        validate::validate_subplan(&plan, cte.query.max_parameter, cx.catalog)?;
+        let plan = match &cte.recursion {
+            Some(recursion) => plan_recursive_cte(cte, recursion, cx)?,
+            None => {
+                let plan = plan_select(&cte.query, cx)?;
+                validate::validate_subplan(&plan, cte.query.max_parameter, cx.catalog)?;
+                plan
+            }
+        };
         cx.ctes.borrow_mut().insert(
             cte.id,
             Arc::new(CtePlan {
@@ -238,6 +244,33 @@ fn plan_ctes(ctes: &[BoundCte], cx: &Cx<'_>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A recursive CTE (SQL-mission-1 Slice D): its seed and its recursive term are
+/// planned separately -- each as the ordinary query it is -- and joined in a
+/// `RecursiveCte` node that keeps them apart. The shell's left operand is the
+/// seed, its right operand the term (whose `WorkingTable` leaf reads the
+/// previous iteration).
+fn plan_recursive_cte(
+    cte: &BoundCte,
+    recursion: &crate::bound::BoundRecursion,
+    cx: &Cx<'_>,
+) -> Result<PhysicalPlan> {
+    let set = cte.query.set_op.as_ref().ok_or_else(|| crate::error::SqlError::PlanValidation {
+        detail: "a recursive CTE reached planning without its seed and recursive term".to_string(),
+    })?;
+    let seed = plan_select(&set.left, cx)?;
+    validate::validate_subplan(&seed, set.left.max_parameter, cx.catalog)?;
+    let term = plan_select(&set.right, cx)?;
+    validate::validate_subplan(&term, set.right.max_parameter, cx.catalog)?;
+    Ok(PhysicalPlan::RecursiveCte(physical::RecursiveCteNode {
+        name: cte.name.clone(),
+        cte_id: cte.id,
+        work_id: recursion.work_id,
+        distinct: !recursion.all,
+        seed_plan: Box::new(seed),
+        recursive_plan: Box::new(term),
+    }))
 }
 
 fn plan_one_subquery(sq: &mut BoundSubqueryExpr, cx: &Cx<'_>) -> Result<()> {
@@ -262,9 +295,20 @@ fn plan_optional_expr(expr: Option<BoundExpr>, cx: &Cx<'_>) -> Result<Option<Bou
 }
 
 fn plan_select_subqueries(select: &mut BoundSelect, cx: &Cx<'_>) -> Result<()> {
+    // SQL-mission-1 Slice E: the operands of a set operation are whole
+    // queries; each is planned (and validated) on its own, like a derived
+    // table's body, and the operation's node carries the results.
+    if let Some(set) = &mut select.set_op {
+        let left = plan_select(&set.left, cx)?;
+        validate::validate_subplan(&left, set.left.max_parameter, cx.catalog)?;
+        set.left_plan = Some(left);
+        let right = plan_select(&set.right, cx)?;
+        validate::validate_subplan(&right, set.right.max_parameter, cx.catalog)?;
+        set.right_plan = Some(right);
+    }
     for item in &mut select.from {
         match &mut item.relation {
-            BoundRelation::Table => {}
+            BoundRelation::Table | BoundRelation::Working(_) => {}
             BoundRelation::Derived(d) => {
                 let plan = plan_select(&d.query, cx)?;
                 validate::validate_subplan(&plan, d.query.max_parameter, cx.catalog)?;
@@ -294,8 +338,14 @@ fn plan_select_subqueries(select: &mut BoundSelect, cx: &Cx<'_>) -> Result<()> {
         if let crate::aggregate::AggregateArg::Expr(e) = &mut agg.arg {
             plan_expr_subqueries(e, cx)?;
         }
+        if let Some(f) = &mut agg.filter {
+            plan_expr_subqueries(f, cx)?;
+        }
     }
     if let Some(e) = &mut select.having {
+        plan_expr_subqueries(e, cx)?;
+    }
+    if let Some(e) = &mut select.qualify {
         plan_expr_subqueries(e, cx)?;
     }
     for item in &mut select.order_by {
