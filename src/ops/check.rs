@@ -800,7 +800,7 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
         report: CheckReport::default(),
         max: 500,
     };
-    if !data_dir.is_dir() {
+    if !crate::persist::is_dir(data_dir) {
         sink.add(
             Severity::Error,
             fc::LAYOUT_MISSING,
@@ -811,7 +811,7 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
         return sink.report;
     }
     // ---- layout ----
-    if let Ok(rd) = std::fs::read_dir(data_dir) {
+    if let Ok(rd) = crate::persist::read_dir(data_dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             let known = name == "MANIFEST"
@@ -890,7 +890,7 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
     // ---- sstables ----
     let sst_dir = data_dir.join("sstables");
     let mut on_disk: BTreeMap<u64, std::path::PathBuf> = BTreeMap::new();
-    if let Ok(rd) = std::fs::read_dir(&sst_dir) {
+    if let Ok(rd) = crate::persist::read_dir(&sst_dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             if let Some(id) = crate::sstable::parse_sstable_id(&name) {
@@ -916,7 +916,7 @@ pub fn check_physical(data_dir: &Path) -> CheckReport {
             );
             continue;
         };
-        match std::fs::metadata(path) {
+        match crate::persist::metadata(path) {
             Ok(m) if m.len() != entry.file_size => sink.add(
                 Severity::Error,
                 fc::SSTABLE_SIZE_MISMATCH,

@@ -92,14 +92,42 @@ impl Point {
     }
 }
 
+impl Point {
+    /// The fault-point registry name of this checkpoint (`startup.<name>`, ADR-FAULTPOINTS-01 section 3.1).
+    pub const fn fault_point(self) -> crate::faults::Point {
+        use crate::faults::Point as F;
+        match self {
+            Point::GuardWalPreflightRecord => F::StartupGuardWalPreflightRecord,
+            Point::QuarantineTempWritten => F::StartupQuarantineTempWritten,
+            Point::QuarantineRenamed => F::StartupQuarantineRenamed,
+            Point::QuarantineTmpSwept => F::StartupQuarantineTmpSwept,
+            Point::AttestationConsumed => F::StartupAttestationConsumed,
+            Point::EngineWalReplayRecord => F::StartupEngineWalReplayRecord,
+            Point::EngineWalReplayed => F::StartupEngineWalReplayed,
+            Point::EngineWalOpened => F::StartupEngineWalOpened,
+            Point::ManifestOpened => F::StartupManifestOpened,
+            Point::ReconcileTmpSwept => F::StartupReconcileTmpSwept,
+            Point::ReconcileBeforeAdopt => F::StartupReconcileBeforeAdopt,
+            Point::ReconcileAfterAdopt => F::StartupReconcileAfterAdopt,
+            Point::EngineOpened => F::StartupEngineOpened,
+            Point::FormatMarkerTempWritten => F::StartupFormatMarkerTempWritten,
+            Point::HostReadySent => F::StartupHostReadySent,
+        }
+    }
+}
+
 /// Marks that execution reached `point`. A no-op unless the `startup-probe` feature is on and the environment selects
-/// this point.
+/// this point. With the `fault-points` feature the same call also feeds the fault-point registry (`startup.<name>`),
+/// so the 15 existing call sites are not edited.
 #[cfg(not(feature = "startup-probe"))]
 #[inline(always)]
-pub fn hit(_point: Point) {}
+pub fn hit(point: Point) {
+    crate::faults::hit(point.fault_point());
+}
 
 #[cfg(feature = "startup-probe")]
 pub fn hit(point: Point) {
+    crate::faults::hit(point.fault_point());
     imp::hit(point)
 }
 

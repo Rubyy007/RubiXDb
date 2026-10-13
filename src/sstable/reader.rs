@@ -5,7 +5,7 @@
 //! `Arc<SsTable>` without any lock, mirroring `wal::file_io`'s existing
 //! `write_all_at` positional-write pattern for the read direction).
 
-use std::fs::File;
+use crate::persist::PFile as File;
 use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -29,30 +29,9 @@ fn corrupt(detail: impl Into<String>) -> EngineError {
 /// call concurrently from multiple threads against the same `File`
 /// (mirrors `wal::file_io::WalFile::write_all_at`'s doc comment on why
 /// this holds on both platforms).
-#[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
+    // The platform loops (`pread` / `seek_read`) live in `crate::persist` (RealFs).
     file.read_exact_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut read = 0usize;
-    while read < buf.len() {
-        match FileExt::seek_read(file, &mut buf[read..], offset + read as u64) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "read_exact_at: seek_read returned 0 before buffer was full",
-                ))
-            }
-            Ok(n) => read += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }
 
 /// An open, fully-validated RUBIC SSTable. Immutable for its entire

@@ -25,11 +25,12 @@ pub use format::ManifestEdit;
 pub use recovery::ManifestReplayResult;
 pub use state::{CheckpointState, ManifestState, SstableManifestEntry};
 
-use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use crate::persist::{OpenOptions, PFile as File};
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::Result;
+use crate::faults::{self, Point as Fp};
 use crate::wal::{acquire_shared_lock_if_present, LOCK_FILE_NAME};
 
 const MANIFEST_FILE_NAME: &str = "MANIFEST";
@@ -62,6 +63,10 @@ pub fn replay_readonly(dir: &Path) -> Result<ManifestReplayResult> {
 #[derive(Debug)]
 pub struct Manifest {
     file: File,
+    /// Length of the valid prefix: where the next frame is appended and where a failed append is rolled back to.
+    len: u64,
+    /// A failed append whose rollback also failed: the file may hold a stray prefix, so nothing more may be appended.
+    poisoned: bool,
     /// Total valid edits ever appended or replayed this open session —
     /// inspection/observability only (`PHASE5_ARCHITECTURE.md` §7).
     record_count: u64,
@@ -83,7 +88,7 @@ impl Manifest {
     /// something this function can observe) — documented, not silently
     /// assumed.
     pub fn open_after_exclusive_lock(dir: &Path) -> Result<(Manifest, ManifestReplayResult)> {
-        std::fs::create_dir_all(dir)?;
+        crate::persist::create_dir_all(dir)?;
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         let mut file = OpenOptions::new()
             .create(true)
@@ -94,12 +99,15 @@ impl Manifest {
 
         let replay_result = recovery::replay(&mut file)?;
         if replay_result.truncated {
+            faults::fire(Fp::ManifestTailTruncate)?;
             file.set_len(replay_result.valid_length)?;
         }
         file.seek(SeekFrom::Start(replay_result.valid_length))?;
 
         let manifest = Manifest {
             file,
+            len: replay_result.valid_length,
+            poisoned: false,
             record_count: replay_result.edit_count,
             last_edit: replay_result.last_edit,
         };
@@ -112,9 +120,34 @@ impl Manifest {
     /// SPECIFICATION.md` §3.2's "append... and fsync it," applied
     /// identically to every edit type, not only `ADD_SSTABLE`).
     pub fn append_sync(&mut self, edit: ManifestEdit) -> Result<()> {
+        if self.poisoned {
+            return Err(crate::error::EngineError::Io(std::io::Error::other(
+                "manifest poisoned: an earlier append failed and its rollback also failed",
+            )));
+        }
         let frame = format::encode_frame(&edit);
-        self.file.write_all(&frame)?;
+        if let Err(write_err) = faults::write_all(Fp::ManifestWrite, &mut self.file, &frame) {
+            // Mirror `SegmentIo::append`: undo whatever prefix reached the file, so that a retry appends at a frame boundary.
+            let rolled_back = self
+                .file
+                .set_len(self.len)
+                .and_then(|()| self.file.seek(SeekFrom::Start(self.len)).map(|_| ()))
+                .and_then(|()| self.file.sync_all());
+            return Err(match rolled_back {
+                Ok(()) => write_err.into(),
+                Err(rollback_err) => {
+                    self.poisoned = true;
+                    crate::error::EngineError::Io(std::io::Error::other(format!(
+                        "manifest append failed ({write_err}) and the rollback (truncate + fsync) also failed ({rollback_err}); \
+                         the manifest is poisoned"
+                    )))
+                }
+            });
+        }
+        faults::fire(Fp::ManifestSync)?;
         self.file.sync_all()?;
+        faults::hit(Fp::ManifestSynced);
+        self.len += frame.len() as u64;
         self.record_count += 1;
         self.last_edit = Some(edit);
         Ok(())

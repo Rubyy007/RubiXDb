@@ -59,3 +59,27 @@ evidence and per-sub-slice reports: `sql/MISSION2_FEATURE_MATRIX.md`; evidence `
 
 **Mission 2 is complete: nothing is committed (instructed).** Six older tests that pin refusals the mission implements fail by design and were left
 untouched (`sql/MISSION2_FEATURE_MATRIX.md` 6.2). Next: Mission 3, on the maintainer's instruction.
+
+
+---
+
+## Durability / PITR / encrypted incremental backups / manifest versioning -- persistence-correctness mission (opened 2026-10-13)
+
+Slices run strictly one at a time, each reported and stopped; no commits or pushes without separate authorisation. Priority: correctness > durability > recoverability > security > resource safety > latency > throughput.
+
+| Slice | State |
+|---|---|
+| D0 -- reconnaissance (docs only) | done 2026-10-13, verdict PASS WITH OPEN ITEMS, awaiting maintainer direction; `docs/PERSISTENCE_MAP.md`, `docs/DURABILITY_CONTRACT.md`, `docs/PREREQUISITES.md`, `docs/D0_BASELINE.md` |
+| D1a fault injection + kill-9 | not started |
+| D1b power-loss persistence model | not started |
+| D1c power-loss recovery invariants | not started |
+| D2 manifest versioning | not started (requires D1c) |
+| D3 full backup / D4 incremental / D5 encryption | not started |
+| D6 PITR | BLOCKED at D0: no WAL retention or replay-to-seq primitive |
+| D7 integrated certification | not started |
+
+- 2026-10-13 D1a step 1: `docs/adr/ADR-FAULTPOINTS-01.md` written (PROPOSED, awaiting maintainer approval AD-1..AD-7). No source, test or Cargo file edited; no call site added. D1a implementation has not started.
+
+- 2026-10-13 D1a done, verdict PASS WITH OPEN ITEMS, awaiting maintainer direction: registry + kill-9 rig + oracle delivered and executed (`docs/CRASH_CLASS_MATRIX.md`, `docs/adr/ADR-FAULTPOINTS-01.md`, D1a appendix of `docs/D0_BASELINE.md`). Class A 34/34, class B single-writer 161/161, relational 30/30, concurrent 28/30 (2 FAIL: F-D1a-1, a pre-existing acknowledged-write loss under concurrent writers). Class C / D empty. Stop gate: maintainer decisions F-D1a-1, F-D0-1/2/3/4/5 (`docs/D0_BASELINE.md` D1a appendix D). D1b is gated on D1a + those decisions; not started.
+
+- 2026-10-13 D1a decision gate: STEP 1 documented, awaiting the maintainer's decisions on F-D1a-1 and F-D0-1/2/3/4/5 (`docs/D1a_DECISION_GATE.md`); STEP 2 (D1b) NOT started. Fixes are PROPOSED only (prototype outside the repository). Two existing F-07 tests pin the 64-byte zero WAL tail and need explicit authorisation to change if F-D0-1 is fixed.

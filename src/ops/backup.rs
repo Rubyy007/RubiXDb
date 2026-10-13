@@ -31,8 +31,8 @@
 //! No compression (v1). No file path, credential, API key or instance
 //! secret is ever written; `source_instance_id` is an opaque identifier.
 
+use crate::persist::{OpenOptions, PFile as File};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,7 @@ use xxhash_rust::xxh64::Xxh64;
 
 use crate::catalog::encoding::CATALOG_NAMESPACE;
 use crate::catalog::schema::{IndexKind, IndexState};
+use crate::faults::{self, Point as Fp};
 use crate::lsm::LsmEngine;
 use crate::ops::catalog_mirror::CatalogMirror;
 use crate::ops::{codes, unique_id_hex, OpsError};
@@ -257,7 +258,7 @@ pub fn create_backup(
     opts: &BackupOptions<'_>,
 ) -> Result<BackupReport, OpsError> {
     let started = Instant::now();
-    if dest.exists() {
+    if crate::persist::exists(dest) {
         return Err(OpsError::new(
             codes::DEST_EXISTS,
             format!("backup destination {} already exists", dest.display()),
@@ -265,7 +266,7 @@ pub fn create_backup(
     }
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            crate::persist::create_dir_all(parent)?;
         }
     }
     let partial = partial_path(dest);
@@ -273,7 +274,7 @@ pub fn create_backup(
     let (header, digest, chunks, payload_bytes, file_bytes) = match result {
         Ok(v) => v,
         Err(e) => {
-            let _ = std::fs::remove_file(&partial);
+            let _ = crate::persist::remove_file(&partial);
             return Err(e);
         }
     };
@@ -283,7 +284,7 @@ pub fn create_backup(
     let vr = match verified {
         Ok(v) => v,
         Err(e) => {
-            let _ = std::fs::remove_file(&partial);
+            let _ = crate::persist::remove_file(&partial);
             return Err(OpsError::new(
                 e.code,
                 format!(
@@ -294,7 +295,7 @@ pub fn create_backup(
         }
     };
     if vr.content_digest != digest.finish() || vr.entries != digest.entries {
-        let _ = std::fs::remove_file(&partial);
+        let _ = crate::persist::remove_file(&partial);
         return Err(OpsError::new(
             codes::FOOTER_MISMATCH,
             "read-back digest differs from the digest computed while writing",
@@ -302,12 +303,13 @@ pub fn create_backup(
     }
 
     // Publish without replacing anything.
-    match std::fs::hard_link(&partial, dest) {
+    match faults::fire(Fp::BackupPublish).and_then(|()| crate::persist::hard_link(&partial, dest)) {
         Ok(()) => {
-            let _ = std::fs::remove_file(&partial);
+            faults::hit(Fp::BackupPublished);
+            let _ = crate::persist::remove_file(&partial);
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = std::fs::remove_file(&partial);
+            let _ = crate::persist::remove_file(&partial);
             return Err(OpsError::new(
                 codes::DEST_EXISTS,
                 format!("backup destination {} already exists", dest.display()),
@@ -316,11 +318,11 @@ pub fn create_backup(
         Err(_) => {
             // Filesystem without hard links: fall back to rename, guarded by
             // an existence check.
-            if dest.exists() {
-                let _ = std::fs::remove_file(&partial);
+            if crate::persist::exists(dest) {
+                let _ = crate::persist::remove_file(&partial);
                 return Err(OpsError::new(codes::DEST_EXISTS, "destination exists"));
             }
-            std::fs::rename(&partial, dest)?;
+            crate::persist::rename(&partial, dest)?;
         }
     }
     Ok(BackupReport {
@@ -467,6 +469,7 @@ fn write_backup_file(
         .into_inner()
         .map_err(|e| OpsError::new(codes::IO, e.to_string()))?;
     file.sync_all()?;
+    faults::hit(Fp::BackupPartialSynced);
     let file_bytes = w.written;
     drop(snapshot);
     Ok((header, digest, chunk_no, payload_total, file_bytes))

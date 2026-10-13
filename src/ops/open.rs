@@ -39,7 +39,7 @@ pub fn open_engine_for_ops(dir: &Path) -> Result<LsmEngine, OpsError> {
     // Refuse a directory written by an incompatible build before anything
     // (including recovery) can touch it.
     let format_state = crate::ops::format::startup_guard(dir)?;
-    std::fs::create_dir_all(dir)?;
+    crate::persist::create_dir_all(dir)?;
     let engine = LsmEngine::open(
         dir,
         product_wal_config(),
@@ -73,19 +73,19 @@ struct TempCopy(std::path::PathBuf);
 
 impl Drop for TempCopy {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = crate::persist::remove_dir_all(&self.0);
     }
 }
 
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
+    crate::persist::create_dir_all(to)?;
+    for entry in crate::persist::read_dir(from)? {
         let entry = entry?;
         let (src, dst) = (entry.path(), to.join(entry.file_name()));
         if entry.file_type()?.is_dir() {
             copy_tree(&src, &dst)?;
         } else {
-            std::fs::copy(&src, &dst)?;
+            crate::persist::copy(&src, &dst)?;
         }
     }
     Ok(())

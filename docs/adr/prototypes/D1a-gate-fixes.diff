@@ -1,0 +1,361 @@
+--- a/src/lsm/mod.rs
++++ b/src/lsm/mod.rs
+@@ -30,7 +30,7 @@
+ //! boundary.
+ 
+ use std::cmp::Ordering as CmpOrdering;
+-use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
++use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
+ use std::io;
+ use std::ops::Bound;
+ use std::path::{Path, PathBuf};
+@@ -255,10 +255,55 @@
+ /// ADR-P4B-5). Not `pub` — an internal implementation detail of the
+ /// flush pipeline, never part of `LsmEngine`'s public surface.
+ enum FlushMsg {
+-    Flush(Arc<MemTable>),
++    /// The frozen MemTable and the contiguous-applied watermark read under the write lock at the instant it was frozen.
++    Flush(Arc<MemTable>, u64),
+     Shutdown,
+ }
+ 
++/// Which WAL sequence numbers are accounted for (applied to a MemTable, or known to need no apply). `contiguous()` is the
++/// highest `s` such that every seq `<= s` is accounted for.
++#[derive(Debug)]
++struct ApplyTracker {
++    inner: Mutex<TrackerInner>,
++}
++
++#[derive(Debug)]
++struct TrackerInner {
++    contiguous: u64,
++    above: BTreeSet<u64>,
++}
++
++impl ApplyTracker {
++    fn new(contiguous: u64) -> Self {
++        ApplyTracker {
++            inner: Mutex::new(TrackerInner {
++                contiguous,
++                above: BTreeSet::new(),
++            }),
++        }
++    }
++
++    fn account(&self, seq: u64) {
++        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
++        if seq <= g.contiguous {
++            return;
++        }
++        g.above.insert(seq);
++        loop {
++            let next = g.contiguous + 1;
++            if g.above.remove(&next) {
++                g.contiguous = next;
++            } else {
++                break;
++            }
++        }
++    }
++
++    fn contiguous(&self) -> u64 {
++        self.inner.lock().unwrap_or_else(|p| p.into_inner()).contiguous
++    }
++}
++
+ /// `ADR-COMPACTION-001` Increment 2 amendment: mirrors `FlushMsg`'s own
+ /// shape. `MaybeCompact` carries no payload deliberately -- it is a
+ /// pure "re-check `should_compact()` against current state" wake-up,
+@@ -1380,6 +1425,7 @@
+     /// architecture doc: belt-and-suspenders monotonicity, plus cheap
+     /// observability without re-reading the Manifest file).
+     checkpoint_seq: Arc<AtomicU64>,
++    apply_tracker: Arc<ApplyTracker>,
+     recovery_stats: RecoveryStats,
+     flush_sender: mpsc::Sender<FlushMsg>,
+     flush_handle: Mutex<Option<JoinHandle<()>>>,
+@@ -1558,7 +1604,7 @@
+         let mut wal_records_applied: u64 = 0;
+         let mut wal_records_skipped_by_checkpoint: u64 = 0;
+         let mut checkpoint_markers_replayed: u64 = 0;
+-        let _summary = wal::replay_streaming(dir, &wal_config, |seq, op| {
++        let replay_summary = wal::replay_streaming(dir, &wal_config, |seq, op| {
+             wal_records_visited += 1;
+             crate::startup_probe::hit(crate::startup_probe::Point::EngineWalReplayRecord);
+             if seq <= checkpoint_at_replay {
+@@ -1575,8 +1621,19 @@
+             Ok(())
+         })?;
+         crate::startup_probe::hit(crate::startup_probe::Point::EngineWalReplayed);
+-
+-        let (file_wal, _replay) = FileWal::open_for_recovery(dir, wal_config)?;
++        // Everything the WAL still holds has been replayed (or skipped as already flushed): all of it is accounted for.
++        let apply_tracker = Arc::new(ApplyTracker::new(
++            replay_summary.last_valid_position.seq.max(checkpoint_at_replay),
++        ));
++
++        let (mut file_wal, _replay) = FileWal::open_for_recovery(dir, wal_config)?;
++        if file_wal.ensure_next_seq_at_least(checkpoint_at_replay + 1) {
++            eprintln!(
++                "rubixdb: WARNING: the WAL ends below the manifest checkpoint {checkpoint_at_replay} (its content is missing); \
++                 sequence numbers continue from {} so that new commits are not skipped as already flushed",
++                checkpoint_at_replay + 1
++            );
++        }
+         crate::startup_probe::hit(crate::startup_probe::Point::EngineWalOpened);
+         let committer = GroupCommitter::new(file_wal)?;
+         let pool = Arc::new(BatchCoordinatorPool::new(committer, pool_config)?);
+@@ -1641,6 +1698,7 @@
+             Arc::clone(&pool),
+             Arc::clone(&manifest),
+             Arc::clone(&checkpoint_seq),
++            Arc::clone(&apply_tracker),
+             Arc::clone(&flush_fault_hook),
+             Arc::clone(&flush_io_fault_hook),
+             Arc::clone(&storage_state),
+@@ -1700,6 +1758,7 @@
+             sstables_dir,
+             manifest,
+             checkpoint_seq,
++            apply_tracker,
+             recovery_stats,
+             flush_sender,
+             flush_handle: Mutex::new(Some(flush_handle)),
+@@ -1969,6 +2028,7 @@
+         faults::hit(Fp::LsmBeforeApply);
+         let mut active = self.lock_active_write();
+         active.insert(key, seq, value);
++        self.apply_tracker.account(seq);
+         if active.is_full() {
+             self.freeze_locked(&mut active)?;
+         }
+@@ -2002,6 +2062,7 @@
+             };
+             apply_kv_to_memtable(&mut active, seq, key, value);
+         }
++        self.apply_tracker.account(seq);
+         if active.is_full() {
+             self.freeze_locked(&mut active)?;
+         }
+@@ -2079,7 +2140,7 @@
+         // rather than silently dropped (never silently discard an
+         // ImmutableMemTable, operating brief §25).
+         self.flush_sender
+-            .send(FlushMsg::Flush(old))
++            .send(FlushMsg::Flush(old, self.apply_tracker.contiguous()))
+             .expect("flush thread must outlive every in-flight write");
+         Ok(())
+     }
+@@ -3305,6 +3366,7 @@
+     pool: Arc<BatchCoordinatorPool>,
+     manifest: Arc<Mutex<Manifest>>,
+     checkpoint_seq: Arc<AtomicU64>,
++    apply_tracker: Arc<ApplyTracker>,
+     flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>>,
+     flush_io_fault_hook: Arc<Mutex<Option<FlushIoFaultHook>>>,
+     storage_state: Arc<AtomicU8>,
+@@ -3316,9 +3378,9 @@
+     thread::spawn(move || {
+         let _fault_scope = faults::scope(faults::Scope::Flush);
+         while let Ok(msg) = receiver.recv() {
+-            let frozen = match msg {
++            let (frozen, ckpt) = match msg {
+                 FlushMsg::Shutdown => break,
+-                FlushMsg::Flush(frozen) => frozen,
++                FlushMsg::Flush(frozen, ckpt) => (frozen, ckpt),
+             };
+             let mut attempt: u32 = 0;
+             // Per-step idempotence tracking, not just "was the SSTable
+@@ -3420,9 +3482,11 @@
+                             None => {
+                                 let position = pool
+                                     .submit(WalOpOwned::CheckpointMarker {
+-                                        flushed_through_seq: meta.max_seq,
++                                        flushed_through_seq: ckpt,
+                                     })?
+                                     .wait()?;
++                                // A marker consumes a seq that no writer will ever apply.
++                                apply_tracker.account(position.seq);
+                                 checkpoint_marker = Some(position);
+                                 fire_flush_fault_hook(
+                                     &flush_fault_hook,
+@@ -3437,7 +3501,7 @@
+                                 .lock()
+                                 .unwrap_or_else(|p| p.into_inner())
+                                 .append_sync(ManifestEdit::SetCheckpoint {
+-                                    flushed_through_seq: meta.max_seq,
++                                    flushed_through_seq: ckpt,
+                                     wal_segment_id: position.segment_id,
+                                     wal_offset: position.offset,
+                                 })?;
+@@ -3448,12 +3512,12 @@
+                             );
+                             faults::hit(Fp::FlushAfterSetCheckpoint);
+                         }
+-                        checkpoint_seq.store(meta.max_seq, Ordering::Release);
++                        checkpoint_seq.store(ckpt, Ordering::Release);
+                         immutables
+                             .write()
+                             .unwrap_or_else(|p| p.into_inner())
+                             .retain(|m| !Arc::ptr_eq(m, &frozen));
+-                        pool.purge_before(meta.max_seq)?;
++                        pool.purge_before(ckpt)?;
+                         Ok(())
+                     }))
+                     .unwrap_or_else(|panic_payload| {
+--- a/src/lsm/tests.rs
++++ b/src/lsm/tests.rs
+@@ -258,6 +258,7 @@
+         sstables_dir: dir.join("sstables"),
+         manifest: Arc::new(Mutex::new(manifest)),
+         checkpoint_seq: Arc::new(AtomicU64::new(0)),
++        apply_tracker: Arc::new(super::ApplyTracker::new(0)),
+         recovery_stats: RecoveryStats::default(),
+         flush_sender,
+         flush_handle: Mutex::new(None),
+--- a/src/wal/mod.rs
++++ b/src/wal/mod.rs
+@@ -707,6 +707,18 @@
+         data_dir.join("wal")
+     }
+ 
++    /// Raises `next_seq` to at least `floor` (and the durable mark with it); returns whether it had to. Called at engine open
++    /// with `checkpoint + 1`: a log whose content is missing or ends below the manifest checkpoint must not hand out sequence
++    /// numbers the checkpoint filter would later skip as "already flushed" (ADR-WAL-SEQ-FLOOR-01).
++    pub fn ensure_next_seq_at_least(&mut self, floor: u64) -> bool {
++        if self.next_seq >= floor {
++            return false;
++        }
++        self.next_seq = floor;
++        self.durable_seq = floor.saturating_sub(1);
++        true
++    }
++
+     /// `true` if the active segment is poisoned (Group 1.1) and can no
+     /// longer accept appends or syncs. A poisoned `FileWal` must be
+     /// discarded and its directory recovered fresh via
+--- a/src/wal/recovery.rs
++++ b/src/wal/recovery.rs
+@@ -86,6 +86,24 @@
+         // is `Result`-returning everywhere else in the crate (Group 2.2),
+         // so match that shape here too via `expect` on a provably-Ok value
+         // rather than silently discarding a `Result`.
++        // A tail that is zero-filled to the end of the segment (length extended, data never written) is a torn tail whatever
++        // its length: no real frame is all zero (its body holds at least a seq and an op byte).
++        if header_buf == [0u8; FRAME_HEADER_LEN] {
++            let mut left = remaining - FRAME_HEADER_LEN as u64;
++            let mut zero = true;
++            let mut chunk = [0u8; 4096];
++            while left > 0 && zero {
++                let want = left.min(chunk.len() as u64) as usize;
++                reader.read_exact(&mut chunk[..want])?;
++                zero = chunk[..want].iter().all(|b| *b == 0);
++                left -= want as u64;
++            }
++            if zero {
++                out.truncated = true;
++                break;
++            }
++            reader.seek(SeekFrom::Start(offset + FRAME_HEADER_LEN as u64))?;
++        }
+         let length =
+             read_u32_le(&header_buf[0..4]).expect("4-byte slice of a fixed local buffer") as u64;
+         let stored_crc =
+--- a/src/manifest/mod.rs
++++ b/src/manifest/mod.rs
+@@ -63,6 +63,10 @@
+ #[derive(Debug)]
+ pub struct Manifest {
+     file: File,
++    /// Length of the valid prefix: where the next frame is appended and where a failed append is rolled back to.
++    len: u64,
++    /// A failed append whose rollback also failed: the file may hold a stray prefix, so nothing more may be appended.
++    poisoned: bool,
+     /// Total valid edits ever appended or replayed this open session —
+     /// inspection/observability only (`PHASE5_ARCHITECTURE.md` §7).
+     record_count: u64,
+@@ -102,6 +106,8 @@
+ 
+         let manifest = Manifest {
+             file,
++            len: replay_result.valid_length,
++            poisoned: false,
+             record_count: replay_result.edit_count,
+             last_edit: replay_result.last_edit,
+         };
+@@ -114,11 +120,34 @@
+     /// SPECIFICATION.md` §3.2's "append... and fsync it," applied
+     /// identically to every edit type, not only `ADD_SSTABLE`).
+     pub fn append_sync(&mut self, edit: ManifestEdit) -> Result<()> {
++        if self.poisoned {
++            return Err(crate::error::EngineError::Io(std::io::Error::other(
++                "manifest poisoned: an earlier append failed and its rollback also failed",
++            )));
++        }
+         let frame = format::encode_frame(&edit);
+-        faults::write_all(Fp::ManifestWrite, &mut self.file, &frame)?;
++        if let Err(write_err) = faults::write_all(Fp::ManifestWrite, &mut self.file, &frame) {
++            // Mirror `SegmentIo::append`: undo whatever prefix reached the file, so that a retry appends at a frame boundary.
++            let rolled_back = self
++                .file
++                .set_len(self.len)
++                .and_then(|()| self.file.seek(SeekFrom::Start(self.len)).map(|_| ()))
++                .and_then(|()| self.file.sync_all());
++            return Err(match rolled_back {
++                Ok(()) => write_err.into(),
++                Err(rollback_err) => {
++                    self.poisoned = true;
++                    crate::error::EngineError::Io(std::io::Error::other(format!(
++                        "manifest append failed ({write_err}) and the rollback (truncate + fsync) also failed ({rollback_err}); \
++                         the manifest is poisoned"
++                    )))
++                }
++            });
++        }
+         faults::fire(Fp::ManifestSync)?;
+         self.file.sync_all()?;
+         faults::hit(Fp::ManifestSynced);
++        self.len += frame.len() as u64;
+         self.record_count += 1;
+         self.last_edit = Some(edit);
+         Ok(())
+--- a/src/manifest/recovery.rs
++++ b/src/manifest/recovery.rs
+@@ -56,6 +56,24 @@
+     Ok(ReadOutcome::Full)
+ }
+ 
++/// Reads exactly `remaining` more bytes and returns whether every one is zero.
++fn rest_is_zero(reader: &mut impl Read, remaining: u64) -> io::Result<bool> {
++    let mut buf = [0u8; 4096];
++    let mut left = remaining;
++    while left > 0 {
++        let want = left.min(buf.len() as u64) as usize;
++        match try_read_exact(reader, &mut buf[..want])? {
++            ReadOutcome::Short => return Ok(false),
++            ReadOutcome::Full => {}
++        }
++        if buf[..want].iter().any(|b| *b != 0) {
++            return Ok(false);
++        }
++        left -= want as u64;
++    }
++    Ok(true)
++}
++
+ /// Walks every frame in `file` from byte 0, applying valid edits to a
+ /// fresh `ManifestState` as they're found. `file`'s own cursor is left
+ /// undefined on return (callers needing to append afterward should
+@@ -86,6 +104,12 @@
+             }
+             ReadOutcome::Full => {}
+         }
++        // A tail that is zero-filled to the end of the file (a file whose length was extended but whose data never reached the
++        // disk) is a torn tail whatever its length: no real frame is all zero (its body holds at least an edit type byte).
++        if header == [0u8; FRAME_HEADER_LEN] && rest_is_zero(&mut reader, file_len - pos - FRAME_HEADER_LEN as u64)? {
++            truncated = true;
++            break;
++        }
+         let length = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+         let stored_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+ 

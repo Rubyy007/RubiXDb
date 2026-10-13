@@ -116,14 +116,15 @@ pub use group_commit::GroupCommitter;
 pub use metrics::FsyncLatencyTracker;
 pub use ops::{GroupMember, GroupMemberOwned, WalOp, WalOpOwned};
 
+use crate::persist::{self as fs, OpenOptions, PFile as File};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{EngineError, Result};
+use crate::faults::{self, Point as Fp};
 use file_io::SegmentIo;
 // Re-exported `pub(crate)` (not merely imported privately) so `crate::sstable`
 // can reuse this exact, already-tested Unix-real/Windows-no-op directory-fsync
@@ -259,7 +260,7 @@ fn next_segment_id(id: u64) -> Result<u64> {
 /// read-only counterpart (Group 4.1).
 fn canonicalize_data_dir(dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(dir)?;
-    let canonical = dir.canonicalize()?;
+    let canonical = fs::canonicalize(dir)?;
     Ok(canonical)
 }
 
@@ -269,7 +270,7 @@ fn canonicalize_data_dir(dir: &Path) -> Result<PathBuf> {
 /// permission denied), so a caller can tell "there is no WAL here yet"
 /// apart from "something is wrong trying to read it."
 fn canonicalize_existing_dir(dir: &Path) -> Result<PathBuf> {
-    match dir.canonicalize() {
+    match fs::canonicalize(dir) {
         Ok(p) => Ok(p),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Err(EngineError::NotFound),
         Err(e) => Err(e.into()),
@@ -353,8 +354,9 @@ fn create_new_segment_file(path: &Path, id: u64, canonical_dir: &Path) -> Result
         .write(true)
         .open(&tmp_path)?;
 
-    let init_result = file
-        .write_all(&encode_segment_header(id))
+    let init_result = faults::fire(Fp::WalSegmentTmpWrite)
+        .and_then(|()| file.write_all(&encode_segment_header(id)))
+        .and_then(|()| faults::fire(Fp::WalSegmentTmpSync))
         .and_then(|()| file.sync_all());
 
     if let Err(init_err) = init_result {
@@ -378,7 +380,9 @@ fn create_new_segment_file(path: &Path, id: u64, canonical_dir: &Path) -> Result
     // restriction entirely instead of depending on share-mode details.
     drop(file);
 
-    if let Err(rename_err) = fs::rename(&tmp_path, path) {
+    if let Err(rename_err) =
+        faults::fire(Fp::WalSegmentRename).and_then(|()| fs::rename(&tmp_path, path))
+    {
         return Err(match fs::remove_file(&tmp_path) {
             Ok(()) => rename_err.into(),
             Err(remove_err) => EngineError::Io(io::Error::new(
@@ -400,7 +404,9 @@ fn create_new_segment_file(path: &Path, id: u64, canonical_dir: &Path) -> Result
     // by `rotate_surfaces_dir_fsync_failure_and_leaves_state_unchanged`),
     // remove it best-effort before returning, same as every earlier
     // failure path above.
-    if let Err(dir_err) = fsync_dir(canonical_dir) {
+    if let Err(dir_err) =
+        faults::fire(Fp::WalSegmentDirSync).and_then(|()| fsync_dir(canonical_dir))
+    {
         return Err(match fs::remove_file(path) {
             Ok(()) => dir_err.into(),
             Err(remove_err) => EngineError::Io(io::Error::new(
@@ -414,6 +420,7 @@ fn create_new_segment_file(path: &Path, id: u64, canonical_dir: &Path) -> Result
     }
 
     fire_abort_hook(AbortPoint::AfterHeader);
+    faults::hit(Fp::WalSegmentPublished);
 
     // Re-open at the final path rather than reusing the temp-path handle:
     // `SegmentIo::append` writes positionally (`write_all_at`), never
@@ -575,6 +582,7 @@ fn scan_directory(
             if outcome.truncated {
                 result.truncated = true;
                 if mutate {
+                    faults::fire(Fp::WalTailTruncate)?;
                     scan.file.set_len(outcome.valid_end_offset)?;
                     scan.file.sync_all()?;
                     // No `fsync_dir` here on purpose: `set_len` mutates
@@ -697,6 +705,18 @@ pub struct FileWal {
 impl FileWal {
     fn wal_dir(data_dir: &Path) -> PathBuf {
         data_dir.join("wal")
+    }
+
+    /// Raises `next_seq` to at least `floor` (and the durable mark with it); returns whether it had to. Called at engine open
+    /// with `checkpoint + 1`: a log whose content is missing or ends below the manifest checkpoint must not hand out sequence
+    /// numbers the checkpoint filter would later skip as "already flushed" (ADR-WAL-SEQ-FLOOR-01).
+    pub fn ensure_next_seq_at_least(&mut self, floor: u64) -> bool {
+        if self.next_seq >= floor {
+            return false;
+        }
+        self.next_seq = floor;
+        self.durable_seq = floor.saturating_sub(1);
+        true
     }
 
     /// `true` if the active segment is poisoned (Group 1.1) and can no
@@ -882,7 +902,7 @@ impl FileWal {
                 }
             }
         }
-        match self.active.append(run) {
+        match faults::fire(Fp::WalRecordWrite).and_then(|()| self.active.append(run)) {
             Ok(base) => {
                 for &(i, s, off) in members.iter() {
                     results[i] = Some(Ok(WalPosition {
@@ -898,6 +918,7 @@ impl FileWal {
                 for _ in members.iter() {
                     fire_abort_hook(AbortPoint::MidAppend);
                 }
+                faults::hit(Fp::WalRecordWritten);
                 run.clear();
                 members.clear();
                 Ok(())
@@ -982,10 +1003,12 @@ impl Wal for FileWal {
             self.rotate()?;
         }
 
+        faults::fire(Fp::WalRecordWrite)?;
         let offset = self.active.append(&frame)?;
         self.active_segment_has_records = true;
         self.next_seq += 1;
         fire_abort_hook(AbortPoint::MidAppend);
+        faults::hit(Fp::WalRecordWritten);
         Ok(WalPosition {
             segment_id: self.active_id,
             offset,
@@ -995,6 +1018,7 @@ impl Wal for FileWal {
 
     fn sync(&mut self) -> Result<()> {
         fire_abort_hook(AbortPoint::BeforeSync);
+        faults::fire(Fp::WalSync)?;
         self.active.sync()?;
         fire_abort_hook(AbortPoint::AfterSync);
         // Only reached after a genuinely successful fsync — see
@@ -1068,7 +1092,7 @@ impl Wal for FileWal {
         let mut first_remove_err: Option<io::Error> = None;
         for id in eligible {
             let path = segment_path(&self.canonical_dir, id);
-            match fs::remove_file(&path) {
+            match faults::fire(Fp::WalPurgeUnlink).and_then(|()| fs::remove_file(&path)) {
                 Ok(()) => {
                     self.sealed_max_seq.remove(&id);
                     removed.push(id);
@@ -1090,7 +1114,7 @@ impl Wal for FileWal {
         let fsync_result = if removed.is_empty() {
             Ok(())
         } else {
-            fsync_dir(&self.canonical_dir)
+            faults::fire(Fp::WalPurgeDirSync).and_then(|()| fsync_dir(&self.canonical_dir))
         };
 
         // Fold both potential failures into one error so neither is lost.

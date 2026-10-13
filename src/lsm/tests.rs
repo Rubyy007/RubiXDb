@@ -258,6 +258,7 @@ fn wal_durability_ordering_is_respected_not_just_memtable_visibility() {
         sstables_dir: dir.join("sstables"),
         manifest: Arc::new(Mutex::new(manifest)),
         checkpoint_seq: Arc::new(AtomicU64::new(0)),
+        apply_tracker: Arc::new(super::ApplyTracker::new(0)),
         recovery_stats: RecoveryStats::default(),
         flush_sender,
         flush_handle: Mutex::new(None),

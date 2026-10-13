@@ -1176,7 +1176,6 @@ fn existing_wal_corrupt_refusals_are_unchanged_and_the_override_never_bypasses_t
         Mutation::C1HdrMagic,
         Mutation::C2HdrVersion,
         Mutation::C3HdrSegId,
-        Mutation::Z3Zero64,
     ] {
         let p = prepare("corrupt", Stop::Clean);
         m.apply(&p);
@@ -1291,7 +1290,9 @@ fn the_controls_have_no_false_positive_after_a_clean_stop_or_a_kill() {
 #[test]
 fn junk_after_an_intact_attested_end_is_not_a_missing_record() {
     let _g = serial();
-    for m in [Mutation::Z1Zero5, Mutation::Z2Zero8] {
+    // Z3Zero64 joined this list when ADR-TORN-TAIL-ZERO-01 (F-D0-1; authorised by the maintainer 2026-10-13) made a zero-filled
+    // tail of any length a torn tail; it used to be listed under "corrupt, refused, unchanged".
+    for m in [Mutation::Z1Zero5, Mutation::Z2Zero8, Mutation::Z3Zero64] {
         let p = prepare("zero_tail", Stop::Clean);
         m.apply(&p);
         let Attempt::Running(s) = attempt(&p.root, &[]) else {

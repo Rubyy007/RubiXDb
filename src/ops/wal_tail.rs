@@ -13,7 +13,7 @@
 //!
 //! The attestation is an integrity aid against accidental damage, not a security boundary.
 
-use std::fs::{self, File, OpenOptions};
+use crate::persist::{self as fs, OpenOptions, PFile as File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -293,7 +293,7 @@ pub(crate) fn ends_before_header_only_segments(
 /// is `NotEligible` with the same text as before. Only the sequence number of the attestation is compared at the next
 /// start (`missing_records`); its `segment` and `length` appear in messages only.
 pub fn write_attestation(data_dir: &Path) -> AttestWrite {
-    if !data_dir.join("wal").is_dir() {
+    if !crate::persist::is_dir(data_dir.join("wal")) {
         return AttestWrite::NotEligible("there is no WAL directory".to_string());
     }
     let summary = match crate::wal::replay_streaming(data_dir, &WalConfig::default(), |_, _| Ok(()))
@@ -653,7 +653,7 @@ pub fn quarantine_tail_with(
     let (final_path, tmp_path) = loop {
         let name = format!("wal-{segment}.{offset}.{ms}.tail");
         let p = qdir.join(&name);
-        if !p.exists() {
+        if !crate::persist::exists(&p) {
             break (p, qdir.join(format!("{name}.tmp")));
         }
         ms += 1;
@@ -1052,7 +1052,7 @@ pub struct TailPlan {
 /// start would quarantine, and applies the same attestation rule. Writes nothing and removes nothing. `Err` when the WAL
 /// cannot be classified (corrupt, unreadable): `check`'s physical pass reports those on its own.
 pub fn plan_tail(data_dir: &Path) -> Result<TailPlan, String> {
-    if !data_dir.join("wal").is_dir() {
+    if !crate::persist::is_dir(data_dir.join("wal")) {
         return Ok(TailPlan {
             tail: None,
             last_good_seq: 0,

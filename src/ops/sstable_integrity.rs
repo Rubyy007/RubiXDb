@@ -98,7 +98,7 @@ pub fn preflight(dir: &Path) -> Result<PreflightReport, OpsError> {
     // 1-4: every Manifest-live table, in id order.
     for (&id, entry) in &state.live_sstables {
         let path = sst_dir.join(sstable::sstable_filename(id));
-        let len = match std::fs::metadata(&path) {
+        let len = match crate::persist::metadata(&path) {
             Ok(m) => m.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(refuse(
@@ -160,9 +160,9 @@ pub fn preflight(dir: &Path) -> Result<PreflightReport, OpsError> {
 
     // 5: every other published table the engine would adopt (neither live nor ever recorded) must open. `*.sst.tmp`
     // and removed-but-undeleted tables are the engine's to sweep.
-    if sst_dir.is_dir() {
+    if crate::persist::is_dir(&sst_dir) {
         let mut unrecorded: BTreeMap<u64, PathBuf> = BTreeMap::new();
-        let entries = std::fs::read_dir(&sst_dir).map_err(|e| {
+        let entries = crate::persist::read_dir(&sst_dir).map_err(|e| {
             OpsError::new(
                 codes::IO,
                 format!(
@@ -430,7 +430,9 @@ pub fn run_verification(
                 continue;
             }
         };
-        let file_len = std::fs::metadata(&t.path).map(|m| m.len()).unwrap_or(0);
+        let file_len = crate::persist::metadata(&t.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         let per_block = file_len / (table.block_count().max(1) as u64);
         let mut records = 0u64;
         let mut blocks_seen = 0u64;

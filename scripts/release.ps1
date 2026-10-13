@@ -33,6 +33,8 @@ Pop-Location
 $env:RUSTFLAGS = "-C link-arg=/Brepro --remap-path-prefix=$((Get-Location).Path)=/src --remap-path-prefix=$env:USERPROFILE\.cargo=/cargo"
 Run "cargo build --release --locked" { cargo build --release --locked -p rubixdb-cli }
 Remove-Item Env:RUSTFLAGS
+# ADR-FAULTPOINTS-01 12.7: the test-only fault-point registry must not be in the shipped binary (RUBIXDB_FAULT_SPEC / _LOG / _TRACE / _READY).
+Run "no fault-point control variables in rubixdb.exe" { & (Join-Path $PSScriptRoot "check_no_fault_points.ps1") -Binary target\release\rubixdb.exe }
 
 $pkg = Join-Path $OutDir "rubixdb-$version"
 if (Test-Path $pkg) { throw "$pkg already exists; refusing to overwrite a release directory" }

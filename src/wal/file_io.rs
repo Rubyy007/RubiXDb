@@ -11,9 +11,9 @@
 //! write failures, and `fsync` failures — WAL Spec §11's `FaultInjectingIo`
 //! harness).
 
+use crate::persist::{OpenOptions, PFile as File, TryLockError};
 #[cfg(test)]
 use std::cell::RefCell;
-use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(test)]
@@ -161,7 +161,7 @@ impl SegmentIo<File> {
 }
 
 /// A file-like handle the WAL's segment I/O can read, write, seek, fsync,
-/// and truncate. Implemented for `std::fs::File`; test code implements it
+/// and truncate. Implemented for `std::fs::File` (in `crate::persist`, the `RealFs` adapter) and for `PFile`; test code implements it
 /// for `FaultInjectingIo<F>` to deterministically inject faults.
 pub trait WalFile: Read + Write + Seek {
     /// Equivalent to `File::sync_all` — flushes both file content and
@@ -207,56 +207,6 @@ pub trait WalFile: Read + Write + Seek {
     }
 }
 
-impl WalFile for std::fs::File {
-    fn sync_all(&self) -> io::Result<()> {
-        std::fs::File::sync_all(self)
-    }
-
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        std::fs::File::set_len(self, len)
-    }
-
-    fn size(&self) -> io::Result<u64> {
-        Ok(self.metadata()?.len())
-    }
-
-    #[cfg(unix)]
-    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        FileExt::write_all_at(self, buf, offset)
-    }
-
-    #[cfg(windows)]
-    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> io::Result<()> {
-        use std::os::windows::fs::FileExt;
-        // `seek_write` is a positional write (`WriteFile` + `OVERLAPPED`
-        // with an explicit offset): like `pwrite`, it does not move the
-        // file's own cursor. Unlike Unix's `FileExt::write_all_at`,
-        // Windows' `FileExt` has no `write_all_at` of its own (verified
-        // against this toolchain directly — it isn't merely missing from
-        // an older MSRV) — only the single-call `seek_write`, which can
-        // itself report a short write. Loop here to match Unix's
-        // `write_all_at` contract exactly, including the
-        // `Interrupted`-retry rule `std::io::Write::write_all` itself
-        // follows.
-        let mut written = 0usize;
-        while written < buf.len() {
-            match FileExt::seek_write(self, &buf[written..], offset + written as u64) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write_all_at: underlying seek_write returned 0",
-                    ))
-                }
-                Ok(n) => written += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Fsyncs a directory's metadata — required on most POSIX filesystems for
 /// a preceding create/rename/unlink of an entry inside it to be durable
 /// across a crash, not just the affected file's own contents (the LSM
@@ -281,7 +231,11 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     if let Some(result) = DIR_FSYNC_HOOK.with(|h| h.borrow().as_ref().map(|f| f(path))) {
         return result;
     }
-    let dir = std::fs::File::open(path)?;
+    #[cfg(feature = "sim-fs")]
+    if let Some(result) = crate::persist::sim_sync_dir(path) {
+        return result;
+    }
+    let dir = crate::persist::open(path)?;
     dir.sync_all()
 }
 
@@ -289,6 +243,10 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
 pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if let Some(result) = DIR_FSYNC_HOOK.with(|h| h.borrow().as_ref().map(|f| f(path))) {
+        return result;
+    }
+    #[cfg(feature = "sim-fs")]
+    if let Some(result) = crate::persist::sim_sync_dir(path) {
         return result;
     }
     let _ = path;

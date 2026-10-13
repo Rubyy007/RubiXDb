@@ -30,7 +30,7 @@
 //! boundary.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
 use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::compaction::CompactionStats;
 use crate::error::{EngineError, Result};
 use crate::execution::batch_coordinator::{BatchCoordinatorConfig, BatchCoordinatorPool};
+use crate::faults::{self, Point as Fp};
 use crate::manifest::{self, Manifest, ManifestEdit, ManifestState};
 use crate::memtable::{MemTable, MemtableValue, DEFAULT_MAX_SIZE_BYTES};
 use crate::sstable::format::DEFAULT_BLOOM_BITS_PER_KEY;
@@ -254,8 +255,56 @@ pub enum WriteOp {
 /// ADR-P4B-5). Not `pub` — an internal implementation detail of the
 /// flush pipeline, never part of `LsmEngine`'s public surface.
 enum FlushMsg {
-    Flush(Arc<MemTable>),
+    /// The frozen MemTable and the contiguous-applied watermark read under the write lock at the instant it was frozen.
+    Flush(Arc<MemTable>, u64),
     Shutdown,
+}
+
+/// Which WAL sequence numbers are accounted for (applied to a MemTable, or known to need no apply). `contiguous()` is the
+/// highest `s` such that every seq `<= s` is accounted for.
+#[derive(Debug)]
+struct ApplyTracker {
+    inner: Mutex<TrackerInner>,
+}
+
+#[derive(Debug)]
+struct TrackerInner {
+    contiguous: u64,
+    above: BTreeSet<u64>,
+}
+
+impl ApplyTracker {
+    fn new(contiguous: u64) -> Self {
+        ApplyTracker {
+            inner: Mutex::new(TrackerInner {
+                contiguous,
+                above: BTreeSet::new(),
+            }),
+        }
+    }
+
+    fn account(&self, seq: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if seq <= g.contiguous {
+            return;
+        }
+        g.above.insert(seq);
+        loop {
+            let next = g.contiguous + 1;
+            if g.above.remove(&next) {
+                g.contiguous = next;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn contiguous(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contiguous
+    }
 }
 
 /// `ADR-COMPACTION-001` Increment 2 amendment: mirrors `FlushMsg`'s own
@@ -1379,6 +1428,7 @@ pub struct LsmEngine {
     /// architecture doc: belt-and-suspenders monotonicity, plus cheap
     /// observability without re-reading the Manifest file).
     checkpoint_seq: Arc<AtomicU64>,
+    apply_tracker: Arc<ApplyTracker>,
     recovery_stats: RecoveryStats,
     flush_sender: mpsc::Sender<FlushMsg>,
     flush_handle: Mutex<Option<JoinHandle<()>>>,
@@ -1557,7 +1607,7 @@ impl LsmEngine {
         let mut wal_records_applied: u64 = 0;
         let mut wal_records_skipped_by_checkpoint: u64 = 0;
         let mut checkpoint_markers_replayed: u64 = 0;
-        let _summary = wal::replay_streaming(dir, &wal_config, |seq, op| {
+        let replay_summary = wal::replay_streaming(dir, &wal_config, |seq, op| {
             wal_records_visited += 1;
             crate::startup_probe::hit(crate::startup_probe::Point::EngineWalReplayRecord);
             if seq <= checkpoint_at_replay {
@@ -1574,8 +1624,22 @@ impl LsmEngine {
             Ok(())
         })?;
         crate::startup_probe::hit(crate::startup_probe::Point::EngineWalReplayed);
+        // Everything the WAL still holds has been replayed (or skipped as already flushed): all of it is accounted for.
+        let apply_tracker = Arc::new(ApplyTracker::new(
+            replay_summary
+                .last_valid_position
+                .seq
+                .max(checkpoint_at_replay),
+        ));
 
-        let (file_wal, _replay) = FileWal::open_for_recovery(dir, wal_config)?;
+        let (mut file_wal, _replay) = FileWal::open_for_recovery(dir, wal_config)?;
+        if file_wal.ensure_next_seq_at_least(checkpoint_at_replay + 1) {
+            eprintln!(
+                "rubixdb: WARNING: the WAL ends below the manifest checkpoint {checkpoint_at_replay} (its content is missing); \
+                 sequence numbers continue from {} so that new commits are not skipped as already flushed",
+                checkpoint_at_replay + 1
+            );
+        }
         crate::startup_probe::hit(crate::startup_probe::Point::EngineWalOpened);
         let committer = GroupCommitter::new(file_wal)?;
         let pool = Arc::new(BatchCoordinatorPool::new(committer, pool_config)?);
@@ -1640,6 +1704,7 @@ impl LsmEngine {
             Arc::clone(&pool),
             Arc::clone(&manifest),
             Arc::clone(&checkpoint_seq),
+            Arc::clone(&apply_tracker),
             Arc::clone(&flush_fault_hook),
             Arc::clone(&flush_io_fault_hook),
             Arc::clone(&storage_state),
@@ -1699,6 +1764,7 @@ impl LsmEngine {
             sstables_dir,
             manifest,
             checkpoint_seq,
+            apply_tracker,
             recovery_stats,
             flush_sender,
             flush_handle: Mutex::new(Some(flush_handle)),
@@ -1965,8 +2031,10 @@ impl LsmEngine {
     /// observing "full" at the same time cannot happen (operating brief
     /// §19).
     fn apply_after_durable(&self, key: &[u8], seq: u64, value: MemtableValue) -> Result<()> {
+        faults::hit(Fp::LsmBeforeApply);
         let mut active = self.lock_active_write();
         active.insert(key, seq, value);
+        self.apply_tracker.account(seq);
         if active.is_full() {
             self.freeze_locked(&mut active)?;
         }
@@ -1987,6 +2055,7 @@ impl LsmEngine {
     /// mid-batch, so a freeze can never split a batch across an active/
     /// immutable boundary (AA.3 step 4).
     fn apply_batch_after_durable(&self, ops: &[WriteOp], seq: u64) -> Result<()> {
+        faults::hit(Fp::LsmBeforeApply);
         let mut active = self.lock_active_write();
         let delay_ms = self.batch_apply_delay_ms.load(Ordering::Acquire);
         if delay_ms > 0 {
@@ -1999,6 +2068,7 @@ impl LsmEngine {
             };
             apply_kv_to_memtable(&mut active, seq, key, value);
         }
+        self.apply_tracker.account(seq);
         if active.is_full() {
             self.freeze_locked(&mut active)?;
         }
@@ -2076,7 +2146,7 @@ impl LsmEngine {
         // rather than silently dropped (never silently discard an
         // ImmutableMemTable, operating brief §25).
         self.flush_sender
-            .send(FlushMsg::Flush(old))
+            .send(FlushMsg::Flush(old, self.apply_tracker.contiguous()))
             .expect("flush thread must outlive every in-flight write");
         Ok(())
     }
@@ -2697,13 +2767,13 @@ fn reconcile_sstables_with_manifest(
     manifest: &mut Manifest,
     state: &mut ManifestState,
 ) -> Result<(Vec<Arc<SsTable>>, u64)> {
-    std::fs::create_dir_all(sstables_dir)?;
+    crate::persist::create_dir_all(sstables_dir)?;
 
     let mut seen_ids: HashSet<u64> = HashSet::new();
     let mut max_id_seen: u64 = 0;
     let mut opened: BTreeMap<u64, Arc<SsTable>> = BTreeMap::new();
 
-    for entry in std::fs::read_dir(sstables_dir)? {
+    for entry in crate::persist::read_dir(sstables_dir)? {
         let entry = entry?;
         let path = entry.path();
         let file_name = entry.file_name();
@@ -2711,7 +2781,8 @@ fn reconcile_sstables_with_manifest(
             continue;
         };
         if name.ends_with(".sst.tmp") {
-            std::fs::remove_file(&path)?;
+            faults::fire(Fp::LsmSweepTmpUnlink)?;
+            crate::persist::remove_file(&path)?;
             crate::startup_probe::hit(crate::startup_probe::Point::ReconcileTmpSwept);
             continue;
         }
@@ -2728,10 +2799,11 @@ fn reconcile_sstables_with_manifest(
             // Removed-but-undeleted orphan (LSM Engine Spec §7.2) —
             // unreachable this phase (no Compaction issues
             // REMOVE_SSTABLE yet), handled for forward compatibility.
-            std::fs::remove_file(&path)?;
+            faults::fire(Fp::LsmSweepOrphanUnlink)?;
+            crate::persist::remove_file(&path)?;
         } else {
             let table = SsTable::open(&path, id).map_err(|e| wrap_sstable_path_error(e, &path))?;
-            let file_size = std::fs::metadata(&path)?.len();
+            let file_size = crate::persist::metadata(&path)?.len();
             let edit = ManifestEdit::AddSstable {
                 id,
                 min_seq: table.min_seq(),
@@ -2839,7 +2911,7 @@ fn sweep_pending_compaction_deletes(pending_compaction_deletes: &Mutex<Vec<Arc<S
         .unwrap_or_else(|p| p.into_inner());
     deferred.retain(|input| {
         if Arc::strong_count(input) == 1 {
-            let _ = std::fs::remove_file(input.path());
+            let _ = crate::persist::remove_file(input.path());
             false
         } else {
             true
@@ -2918,6 +2990,7 @@ fn compact_once_impl(
     compaction_running: &Arc<AtomicBool>,
     compaction_metrics: &Arc<CompactionMetricCounters>,
 ) -> Result<Option<(SstableMeta, CompactionStats)>> {
+    let _fault_scope = faults::scope(faults::Scope::Compaction);
     let start = Instant::now();
 
     // Decision 11: observe only, never mutate `storage_state`.
@@ -2953,7 +3026,11 @@ fn compact_once_impl(
     let input_sstable_count = inputs.len();
     let input_bytes: u64 = inputs
         .iter()
-        .map(|t| std::fs::metadata(t.path()).map(|m| m.len()).unwrap_or(0))
+        .map(|t| {
+            crate::persist::metadata(t.path())
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
         .sum();
     // F-08 / GAP-B: the hint sizes the output bloom and nothing else (`write_from_sorted_records` inserts every record's key
     // and counts every record whatever the hint is). The sum of the inputs' counts can exceed the largest count whose bloom
@@ -2968,6 +3045,7 @@ fn compact_once_impl(
         compaction_fault_hook,
         CompactionFaultPoint::BeforeOutputWrite,
     );
+    faults::fire(Fp::CompactionBeforeOutputWrite)?;
 
     if let Some(e) = fire_compaction_io_fault_hook(compaction_io_fault_hook) {
         return Err(EngineError::Io(e));
@@ -2990,7 +3068,7 @@ fn compact_once_impl(
     // bound `SsTable::open` enforces). Nothing references the file yet, so it is removed; the error is a permanent-candidate
     // class (`Unsupported`), so the worker blocks after its budget instead of retrying forever.
     if !compaction_output_fits(output_meta.record_count, bloom_count_cap) {
-        let _ = std::fs::remove_file(&output_meta.path);
+        let _ = crate::persist::remove_file(&output_meta.path);
         // Make the removal durable like the writer made the rename (best effort): without it an OS crash could bring the
         // unreadable file back as an unrecorded published table.
         let _ = wal::fsync_dir(sstables_dir);
@@ -3001,7 +3079,7 @@ fn compact_once_impl(
             ),
         });
     }
-    let output_bytes = std::fs::metadata(&output_meta.path)
+    let output_bytes = crate::persist::metadata(&output_meta.path)
         .map(|m| m.len())
         .unwrap_or(0);
     let merge_stats = *merge_stats_handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -3010,6 +3088,7 @@ fn compact_once_impl(
         compaction_fault_hook,
         CompactionFaultPoint::BeforeManifestAdd,
     );
+    faults::fire(Fp::CompactionBeforeManifestAdd)?;
 
     {
         let mut manifest = manifest.lock().unwrap_or_else(|p| p.into_inner());
@@ -3025,6 +3104,7 @@ fn compact_once_impl(
         compaction_fault_hook,
         CompactionFaultPoint::AfterManifestAdd,
     );
+    faults::hit(Fp::CompactionAfterManifestAdd);
 
     {
         let mut manifest = manifest.lock().unwrap_or_else(|p| p.into_inner());
@@ -3034,10 +3114,12 @@ fn compact_once_impl(
                 compaction_fault_hook,
                 CompactionFaultPoint::DuringRemoveSequence,
             );
+            faults::hit(Fp::CompactionDuringRemoveSequence);
         }
     }
 
     fire_compaction_fault_hook(compaction_fault_hook, CompactionFaultPoint::AfterAllRemoves);
+    faults::hit(Fp::CompactionAfterAllRemoves);
 
     // §13: one brief write-lock — remove the input `Arc`s, insert the
     // output `Arc`. A concurrent flush's own splice (same `RwLock`) is
@@ -3059,6 +3141,7 @@ fn compact_once_impl(
         compaction_fault_hook,
         CompactionFaultPoint::BeforePhysicalDelete,
     );
+    faults::hit(Fp::CompactionBeforePhysicalDelete);
 
     // Decision 9: unlink each input only once its `Arc` strong count
     // has dropped to 1 (no reader — including this call's own now-
@@ -3069,7 +3152,8 @@ fn compact_once_impl(
         .unwrap_or_else(|p| p.into_inner());
     for input in inputs {
         if Arc::strong_count(&input) == 1 {
-            let _ = std::fs::remove_file(input.path());
+            faults::hit(Fp::CompactionObsoleteUnlink);
+            let _ = crate::persist::remove_file(input.path());
         } else {
             deferred.push(input);
         }
@@ -3292,6 +3376,7 @@ fn spawn_flush_thread(
     pool: Arc<BatchCoordinatorPool>,
     manifest: Arc<Mutex<Manifest>>,
     checkpoint_seq: Arc<AtomicU64>,
+    apply_tracker: Arc<ApplyTracker>,
     flush_fault_hook: Arc<Mutex<Option<FlushFaultHook>>>,
     flush_io_fault_hook: Arc<Mutex<Option<FlushIoFaultHook>>>,
     storage_state: Arc<AtomicU8>,
@@ -3301,10 +3386,11 @@ fn spawn_flush_thread(
     flush_completions: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let _fault_scope = faults::scope(faults::Scope::Flush);
         while let Ok(msg) = receiver.recv() {
-            let frozen = match msg {
+            let (frozen, ckpt) = match msg {
                 FlushMsg::Shutdown => break,
-                FlushMsg::Flush(frozen) => frozen,
+                FlushMsg::Flush(frozen, ckpt) => (frozen, ckpt),
             };
             let mut attempt: u32 = 0;
             // Per-step idempotence tracking, not just "was the SSTable
@@ -3346,6 +3432,7 @@ fn spawn_flush_thread(
                                     &flush_fault_hook,
                                     FlushFaultPoint::BeforeSstableWrite,
                                 );
+                                faults::fire(Fp::FlushBeforeSstableWrite)?;
                                 if let Some(injected) =
                                     fire_flush_io_fault_hook(&flush_io_fault_hook)
                                 {
@@ -3358,7 +3445,7 @@ fn spawn_flush_thread(
                                     &sstables_dir,
                                     &writer_config,
                                 )?;
-                                let file_size = std::fs::metadata(&meta.path)?.len();
+                                let file_size = crate::persist::metadata(&meta.path)?.len();
                                 manifest
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
@@ -3373,6 +3460,7 @@ fn spawn_flush_thread(
                                     &flush_fault_hook,
                                     FlushFaultPoint::AfterSstablePublish,
                                 );
+                                faults::hit(Fp::FlushAfterSstablePublish);
                                 (id, meta)
                             }
                         };
@@ -3398,19 +3486,23 @@ fn spawn_flush_thread(
 
                         pool.rotate()?;
                         fire_flush_fault_hook(&flush_fault_hook, FlushFaultPoint::AfterRotate);
+                        faults::hit(Fp::FlushAfterRotate);
                         let position = match checkpoint_marker {
                             Some(position) => position,
                             None => {
                                 let position = pool
                                     .submit(WalOpOwned::CheckpointMarker {
-                                        flushed_through_seq: meta.max_seq,
+                                        flushed_through_seq: ckpt,
                                     })?
                                     .wait()?;
+                                // A marker consumes a seq that no writer will ever apply.
+                                apply_tracker.account(position.seq);
                                 checkpoint_marker = Some(position);
                                 fire_flush_fault_hook(
                                     &flush_fault_hook,
                                     FlushFaultPoint::AfterCheckpointMarker,
                                 );
+                                faults::hit(Fp::FlushAfterCheckpointMarker);
                                 position
                             }
                         };
@@ -3419,7 +3511,7 @@ fn spawn_flush_thread(
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .append_sync(ManifestEdit::SetCheckpoint {
-                                    flushed_through_seq: meta.max_seq,
+                                    flushed_through_seq: ckpt,
                                     wal_segment_id: position.segment_id,
                                     wal_offset: position.offset,
                                 })?;
@@ -3428,13 +3520,14 @@ fn spawn_flush_thread(
                                 &flush_fault_hook,
                                 FlushFaultPoint::AfterSetCheckpoint,
                             );
+                            faults::hit(Fp::FlushAfterSetCheckpoint);
                         }
-                        checkpoint_seq.store(meta.max_seq, Ordering::Release);
+                        checkpoint_seq.store(ckpt, Ordering::Release);
                         immutables
                             .write()
                             .unwrap_or_else(|p| p.into_inner())
                             .retain(|m| !Arc::ptr_eq(m, &frozen));
-                        pool.purge_before(meta.max_seq)?;
+                        pool.purge_before(ckpt)?;
                         Ok(())
                     }))
                     .unwrap_or_else(|panic_payload| {

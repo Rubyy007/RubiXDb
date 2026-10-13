@@ -28,6 +28,7 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::faults::{self, Point as Fp};
 use crate::lsm::WriteOp;
 use crate::ops::backup::{read_backup, verify_backup, ContentDigest, VerifyReport};
 use crate::ops::check::{check_engine, CheckOptions, CheckReport};
@@ -79,7 +80,26 @@ pub struct RestoreReport {
     pub total_duration: Duration,
 }
 
+/// The registry point of a restore phase. `Promoted` is emitted at its own site (it is infallible there).
+fn phase_point(p: RestorePhase) -> Option<Fp> {
+    Some(match p {
+        RestorePhase::Verified => Fp::RestoreVerified,
+        RestorePhase::StagingCreated => Fp::RestoreStagingCreated,
+        RestorePhase::EngineOpened => Fp::RestoreEngineOpened,
+        RestorePhase::BatchApplied(_) => Fp::RestoreBatchApplied,
+        RestorePhase::Loaded => Fp::RestoreLoaded,
+        RestorePhase::DigestVerified => Fp::RestoreDigestVerified,
+        RestorePhase::CheckPassed => Fp::RestoreCheckPassed,
+        RestorePhase::EngineClosed => Fp::RestoreEngineClosed,
+        RestorePhase::Promoted => return None,
+        RestorePhase::MarkerRemoved => Fp::RestoreMarkerRemoved,
+    })
+}
+
 fn at(opts: &RestoreOptions<'_>, p: RestorePhase) -> Result<(), OpsError> {
+    if let Some(point) = phase_point(p) {
+        faults::fire(point)?;
+    }
     match opts.hook {
         Some(h) => h(p),
         None => Ok(()),
@@ -104,13 +124,13 @@ pub fn clean_stale_staging(dest: &Path) -> Result<usize, OpsError> {
     };
     let prefix = staging_prefix(name);
     let mut removed = 0;
-    let Ok(rd) = std::fs::read_dir(parent) else {
+    let Ok(rd) = crate::persist::read_dir(parent) else {
         return Ok(0);
     };
     for e in rd.flatten() {
         let fname = e.file_name().to_string_lossy().to_string();
-        if fname.starts_with(&prefix) && e.path().join(MARKER_FILE).is_file() {
-            std::fs::remove_dir_all(e.path())?;
+        if fname.starts_with(&prefix) && crate::persist::is_file(e.path().join(MARKER_FILE)) {
+            crate::persist::remove_dir_all(e.path())?;
             removed += 1;
         }
     }
@@ -137,8 +157,8 @@ pub fn restore_backup(
         .ok_or_else(|| OpsError::new(codes::BAD_NAME, "destination has no usable final component"))?
         .to_string();
     let mut replace_empty_dir = false;
-    if dest.exists() {
-        if dest.is_dir() && std::fs::read_dir(dest)?.next().is_none() {
+    if crate::persist::exists(dest) {
+        if crate::persist::is_dir(dest) && crate::persist::read_dir(dest)?.next().is_none() {
             replace_empty_dir = true;
         } else {
             return Err(OpsError::new(
@@ -154,13 +174,13 @@ pub fn restore_backup(
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    std::fs::create_dir_all(&parent)?;
+    crate::persist::create_dir_all(&parent)?;
     let stale = clean_stale_staging(dest)?;
 
     // 3. Staging directory + marker.
     let staging = parent.join(format!("{}{}", staging_prefix(&dest_name), unique_id_hex()));
-    std::fs::create_dir(&staging)?;
-    std::fs::write(
+    crate::persist::create_dir(&staging)?;
+    crate::persist::write(
         staging.join(MARKER_FILE),
         format!(
             "rubixdb restore in progress\nbackup_id={}\n",
@@ -173,7 +193,7 @@ pub fn restore_backup(
         Err(e) => {
             // Failed restores clean up after themselves (a crash cannot; the
             // marker lets the next restore do it).
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = crate::persist::remove_dir_all(&staging);
             return Err(e);
         }
     };
@@ -183,15 +203,18 @@ pub fn restore_backup(
     //    staging name is therefore marked and cleanable, and a database that
     //    was promoted is complete (everything was verified before the rename).
     if replace_empty_dir {
-        std::fs::remove_dir(dest)?;
+        crate::persist::remove_dir(dest)?;
     }
-    if let Err(e) = std::fs::rename(&staging, dest) {
-        let _ = std::fs::remove_dir_all(&staging);
+    if let Err(e) =
+        faults::fire(Fp::RestorePromote).and_then(|()| crate::persist::rename(&staging, dest))
+    {
+        let _ = crate::persist::remove_dir_all(&staging);
         return Err(e.into());
     }
+    faults::hit(Fp::RestorePromoted);
     at(opts, RestorePhase::Promoted)?;
     // Best effort: a leftover marker in a promoted directory is harmless.
-    let _ = std::fs::remove_file(dest.join(MARKER_FILE));
+    let _ = crate::persist::remove_file(dest.join(MARKER_FILE));
     at(opts, RestorePhase::MarkerRemoved)?;
 
     Ok(RestoreReport {

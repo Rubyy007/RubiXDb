@@ -13,6 +13,14 @@ test-util = []
 # F-11: named pause points on the startup / recovery path (`src/startup_probe.rs`), driven by environment variables. Off
 # in every product build; the interruption tests of `cli/tests/f11_startup_interruption_integration.rs` turn it on.
 startup-probe = []
+# D1a (ADR-FAULTPOINTS-01): the test-only fault-point registry (`src/faults.rs`): named persistence boundaries, env-driven
+# rules, execution log. Off in every product build and NEVER listed as a dependency feature by any workspace member
+# (tests/fault_points_absent_from_product.rs enforces that); only the root package's tests and examples turn it on.
+fault-points = []
+# D1b (ADR-PERSISTENCE-TRAIT-01): the power-loss simulator behind `src/persist` (`SimFs`). Off in every product build and never
+# listed by any workspace member as a dependency feature (tests/fault_points_absent_from_product.rs enforces both); only the
+# root package's tests and examples turn it on. Without it `src/persist` is a straight forward to `std::fs`.
+sim-fs = []
 bench = []
 # TEMPORARY, experiment-only — see PHASE1_ADR.md (window-size sweep ADR)
 # and PHASE1_TEST_RESULTS.md's window-size sweep section. Not enabled by
@@ -68,3 +76,31 @@ harness = false
 [[bench]]
 name = "transaction_bench"
 harness = false
+
+# D1a (ADR-FAULTPOINTS-01): the kill-9 rig. Both need the registry, so neither exists in a default build.
+[[example]]
+name = "fault_child"
+required-features = ["fault-points"]
+
+[[test]]
+name = "fault_points"
+path = "tests/fault_points/main.rs"
+required-features = ["fault-points"]
+
+# D1a decision gate (docs/D1a_DECISION_GATE.md): regression tests for F-D1a-1 and F-D0-1/2/3/5. They fail on the code as it
+# stands by design and pass when the corresponding PROPOSED ADR is implemented.
+[[test]]
+name = "pending_fixes"
+required-features = ["fault-points"]
+
+# D1b (docs/PERSISTENCE_MODEL.md §6): the four proof tests that gate every class-C claim, plus M7/M8 and an engine-on-SimFs run.
+[[test]]
+name = "sim_proof"
+required-features = ["sim-fs"]
+
+# D1b crash-injection cycle (smoke set; the D1c matrix reuses it). Spawns examples/fault_child, which must be built with the same
+# features: `cargo build --features fault-points,sim-fs --example fault_child`.
+[[test]]
+name = "sim_power_loss"
+path = "tests/sim_power_loss/main.rs"
+required-features = ["fault-points", "sim-fs"]

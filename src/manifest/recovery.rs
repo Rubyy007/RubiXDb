@@ -4,7 +4,7 @@
 //! the whole file into one buffer — one frame (at most a few dozen
 //! bytes) is materialized at a time, via a `BufReader` over the file.
 
-use std::fs::File;
+use crate::persist::PFile as File;
 use std::io::{self, BufReader, Read};
 
 use crate::error::{EngineError, Result};
@@ -56,6 +56,24 @@ fn try_read_exact(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<ReadOutc
     Ok(ReadOutcome::Full)
 }
 
+/// Reads exactly `remaining` more bytes and returns whether every one is zero.
+fn rest_is_zero(reader: &mut impl Read, remaining: u64) -> io::Result<bool> {
+    let mut buf = [0u8; 4096];
+    let mut left = remaining;
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        match try_read_exact(reader, &mut buf[..want])? {
+            ReadOutcome::Short => return Ok(false),
+            ReadOutcome::Full => {}
+        }
+        if buf[..want].iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+        left -= want as u64;
+    }
+    Ok(true)
+}
+
 /// Walks every frame in `file` from byte 0, applying valid edits to a
 /// fresh `ManifestState` as they're found. `file`'s own cursor is left
 /// undefined on return (callers needing to append afterward should
@@ -85,6 +103,14 @@ pub fn replay(file: &mut File) -> Result<ManifestReplayResult> {
                 break;
             }
             ReadOutcome::Full => {}
+        }
+        // A tail that is zero-filled to the end of the file (a file whose length was extended but whose data never reached the
+        // disk) is a torn tail whatever its length: no real frame is all zero (its body holds at least an edit type byte).
+        if header == [0u8; FRAME_HEADER_LEN]
+            && rest_is_zero(&mut reader, file_len - pos - FRAME_HEADER_LEN as u64)?
+        {
+            truncated = true;
+            break;
         }
         let length = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
         let stored_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
@@ -162,7 +188,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::OpenOptions::new()
+        crate::persist::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)

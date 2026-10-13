@@ -692,15 +692,24 @@ fn existing_corruption_refusals_take_precedence_and_are_unchanged() {
     for allow in [false, true] {
         assert_eq!(guard(&hdr, allow).unwrap_err().code, codes::WAL_CORRUPT);
     }
-    let zero = wal_dir_with(4);
-    attest(&zero);
-    fs::OpenOptions::new()
-        .append(true)
-        .open(seg(&zero))
-        .unwrap()
-        .set_len_pad(64);
+    // A 64-byte zero tail used to be pinned here as WAL_CORRUPT ("unchanged by F-07"). F-07 deferred that classification
+    // (PHASE_ITEM_F07_ADR.md); ADR-TORN-TAIL-ZERO-01 (F-D0-1), authorised by the maintainer on 2026-10-13, makes a tail that
+    // is zero from a frame boundary to the end of the file a TORN tail: quarantined, the start proceeds, nothing acknowledged
+    // is lost. Header damage and middle-frame damage above are unchanged and still refuse.
     for allow in [false, true] {
-        assert_eq!(guard(&zero, allow).unwrap_err().code, codes::WAL_CORRUPT);
+        let zero = wal_dir_with(4);
+        attest(&zero);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(seg(&zero))
+            .unwrap()
+            .set_len_pad(64);
+        let g = guard(&zero, allow).expect("a zero-filled tail is a torn tail, not corruption");
+        assert_eq!(
+            g.tail.quarantine.as_ref().map(|q| q.bytes),
+            Some(64),
+            "override={allow}: exactly the 64 zero bytes are quarantined"
+        );
     }
 }
 

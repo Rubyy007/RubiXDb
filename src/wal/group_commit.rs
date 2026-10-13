@@ -45,14 +45,15 @@
 //!   that a caller on the hot path (rather than at startup) should not
 //!   construct a fresh `GroupCommitter` per request.
 
+use crate::persist::PFile as File;
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::error::{EngineError, Result};
+use crate::faults::{self, Point as Fp};
 use crate::wal::metrics::FsyncLatencyTracker;
 use crate::wal::{FileWal, SyncMode, Wal, WalOp, WalOpOwned, WalPosition};
 
@@ -1532,7 +1533,10 @@ impl GroupCommitter {
                 return f();
             }
         }
-        file.sync_all()
+        faults::fire(Fp::WalFsync)?;
+        file.sync_all()?;
+        faults::hit(Fp::WalFsyncDone);
+        Ok(())
     }
 
     fn finish_batch_ok(&self) {

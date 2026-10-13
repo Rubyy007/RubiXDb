@@ -34,7 +34,7 @@ pub use bloom::{max_record_count_for_bloom_cap, BloomFilter};
 pub use reader::{SsTable, SsTableRangeCursor};
 pub use writer::{write_from_memtable, write_from_sorted_records, SsTableWriterConfig};
 
-use std::fs;
+use crate::persist as fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -99,7 +99,7 @@ pub(crate) fn parse_sstable_id(filename: &str) -> Option<u64> {
 /// (`max(id found) + 1`, or `1` for an empty/absent directory —
 /// `RUBIC_SSTABLE_FORMAT_SPECIFICATION.md` §3.1).
 pub fn discover(sstables_dir: &Path) -> Result<(Vec<Arc<SsTable>>, u64)> {
-    if !sstables_dir.exists() {
+    if !crate::persist::exists(sstables_dir) {
         return Ok((Vec::new(), 1));
     }
     let mut sst_ids: Vec<u64> = Vec::new();

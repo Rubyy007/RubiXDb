@@ -3,11 +3,12 @@
 //! to a path a reader might treat as live; the `.sst.tmp` -> `.sst`
 //! rename is the sole publication point.
 
-use std::fs::{self, File, OpenOptions};
+use crate::persist::{self as fs, OpenOptions, PFile as File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
+use crate::faults::{self, Point as Fp};
 use crate::memtable::{MemTable, MemtableValue};
 use crate::sstable::bloom::BloomFilter;
 use crate::sstable::format::{
@@ -198,12 +199,14 @@ where
     let bloom_offset = offset;
     let bloom_bytes =
         format::encode_bloom_block(bloom.num_bits(), bloom.num_hash_functions(), bloom.bits());
+    faults::fire(Fp::SstableTmpWrite)?;
     file.write_all(&bloom_bytes)?;
     offset += bloom_bytes.len() as u64;
     let bloom_length = bloom_bytes.len() as u64;
 
     let index_offset = offset;
     let index_bytes = format::encode_index_block(&index_entries)?;
+    faults::fire(Fp::SstableTmpWrite)?;
     file.write_all(&index_bytes)?;
     let index_length = index_bytes.len() as u64;
 
@@ -219,15 +222,19 @@ where
         index_offset,
         index_length,
     };
+    faults::fire(Fp::SstableTmpWrite)?;
     file.write_all(&footer.encode())?;
 
+    faults::fire(Fp::SstableTmpSync)?;
     file.sync_all()?;
     drop(file);
 
+    faults::fire(Fp::SstableRename)?;
     fs::rename(&tmp_path, &final_path)?;
     // Published: nothing left to clean up (a failure of the directory fsync below leaves the published
     // table for the next open's sweep, exactly as before).
     tmp_guard.disarm();
+    faults::fire(Fp::SstableDirSync)?;
     crate::wal::fsync_dir(sstables_dir)?;
 
     Ok(SstableMeta {
@@ -250,6 +257,7 @@ fn finalize_and_write_block(
     last_key: Vec<u8>,
 ) -> Result<u64> {
     let block = format::finalize_block(record_count, records_buf);
+    faults::fire(Fp::SstableTmpWrite)?;
     file.write_all(&block)?;
     let block_length: u32 =
         block

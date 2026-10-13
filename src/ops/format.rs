@@ -23,6 +23,7 @@
 
 use std::path::Path;
 
+use crate::faults::{self, Point as Fp};
 use crate::ops::{codes, OpsError};
 
 pub const DATA_FORMAT_FILE: &str = "DATA_FORMAT";
@@ -60,11 +61,11 @@ fn parse_marker(text: &str) -> Option<u32> {
 
 /// Read-only compatibility decision; never writes.
 pub fn ensure_compatible(dir: &Path) -> Result<FormatState, OpsError> {
-    if !dir.exists() {
+    if !crate::persist::exists(dir) {
         return Ok(FormatState::Fresh);
     }
     let marker = dir.join(DATA_FORMAT_FILE);
-    match std::fs::read_to_string(&marker) {
+    match crate::persist::read_to_string(&marker) {
         Ok(text) => match parse_marker(&text) {
             Some(CURRENT_DATA_FORMAT) => Ok(FormatState::Marked(CURRENT_DATA_FORMAT)),
             Some(other) => Err(OpsError::new(
@@ -85,7 +86,7 @@ pub fn ensure_compatible(dir: &Path) -> Result<FormatState, OpsError> {
             // A restore's own in-progress marker does not make the staging
             // directory "non-empty": it is still a brand-new database. Neither
             // does this build's own interrupted stamp (F-11, OI-F11-03).
-            let only_ours = std::fs::read_dir(dir)?.flatten().all(|e| {
+            let only_ours = crate::persist::read_dir(dir)?.flatten().all(|e| {
                 e.file_name() == crate::ops::restore::MARKER_FILE
                     || e.file_name() == DATA_FORMAT_TMP
             });
@@ -119,7 +120,7 @@ catalog-row=1
 /// A `DATA_FORMAT.tmp` that is byte-for-byte what this build writes: proof that this build's `stamp_if_fresh` ran on
 /// the directory.
 fn is_our_interrupted_stamp(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join(DATA_FORMAT_TMP)).is_ok_and(|t| t == marker_text())
+    crate::persist::read_to_string(dir.join(DATA_FORMAT_TMP)).is_ok_and(|t| t == marker_text())
 }
 
 /// Product-layer startup guard: the directory-format decision **plus** a
@@ -146,7 +147,7 @@ pub fn startup_guard(dir: &Path) -> Result<FormatState, OpsError> {
 /// The read-only WAL replay preflight shared by both guards. Its refusals (`WAL_CORRUPT`) and their messages are
 /// exactly those `startup_guard` always had; the summary is returned so the tail policy can use it.
 fn wal_preflight(dir: &Path) -> Result<Option<crate::wal::WalReplaySummary>, OpsError> {
-    if dir.join("wal").is_dir() {
+    if crate::persist::is_dir(dir.join("wal")) {
         let cfg = crate::wal::WalConfig::default();
         match crate::wal::replay_streaming(dir, &cfg, |_, _| {
             crate::startup_probe::hit(crate::startup_probe::Point::GuardWalPreflightRecord);
@@ -240,19 +241,20 @@ pub fn stamp_if_fresh(dir: &Path, state: FormatState) -> Result<(), OpsError> {
         return Ok(());
     }
     let marker = dir.join(DATA_FORMAT_FILE);
-    if marker.exists() {
+    if crate::persist::exists(&marker) {
         return Ok(());
     }
-    std::fs::create_dir_all(dir)?;
+    crate::persist::create_dir_all(dir)?;
     let tmp = dir.join(DATA_FORMAT_TMP);
     {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = crate::persist::create(&tmp)?;
         f.write_all(marker_text().as_bytes())?;
         f.sync_all()?;
     }
     crate::startup_probe::hit(crate::startup_probe::Point::FormatMarkerTempWritten);
-    std::fs::rename(&tmp, &marker)?;
+    faults::fire(Fp::FormatStampRename)?;
+    crate::persist::rename(&tmp, &marker)?;
     Ok(())
 }
 

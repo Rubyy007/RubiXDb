@@ -86,6 +86,24 @@ pub fn walk_segment<R: Read + Seek>(
         // is `Result`-returning everywhere else in the crate (Group 2.2),
         // so match that shape here too via `expect` on a provably-Ok value
         // rather than silently discarding a `Result`.
+        // A tail that is zero-filled to the end of the segment (length extended, data never written) is a torn tail whatever
+        // its length: no real frame is all zero (its body holds at least a seq and an op byte).
+        if header_buf == [0u8; FRAME_HEADER_LEN] {
+            let mut left = remaining - FRAME_HEADER_LEN as u64;
+            let mut zero = true;
+            let mut chunk = [0u8; 4096];
+            while left > 0 && zero {
+                let want = left.min(chunk.len() as u64) as usize;
+                reader.read_exact(&mut chunk[..want])?;
+                zero = chunk[..want].iter().all(|b| *b == 0);
+                left -= want as u64;
+            }
+            if zero {
+                out.truncated = true;
+                break;
+            }
+            reader.seek(SeekFrom::Start(offset + FRAME_HEADER_LEN as u64))?;
+        }
         let length =
             read_u32_le(&header_buf[0..4]).expect("4-byte slice of a fixed local buffer") as u64;
         let stored_crc =
