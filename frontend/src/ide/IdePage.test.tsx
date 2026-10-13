@@ -7,12 +7,15 @@ import { ApiRequestError } from "../api/types";
 import { IdePage } from "./IdePage";
 
 const sqlMock = vi.fn<(req: SqlRequestBody, signal?: AbortSignal) => Promise<SqlResponseBody>>();
+const invalidateMock = vi.fn();
+let fetching = false;
+const UPDATED_AT = new Date(2026, 9, 13, 21, 30, 15).getTime();
 
 vi.mock("../api/queries", () => ({
   useApiClient: () => ({ sql: sqlMock, describeTable: vi.fn() }),
-  invalidateCatalogQueries: () => {},
-  useDatabasesQuery: () => ({ data: [{ database_id: 1, name: "default" }], isError: false, isLoading: false }),
-  useSchemasQuery: () => ({ data: [{ schema_id: 1, database_id: 1, name: "public" }], isError: false, isLoading: false }),
+  invalidateCatalogQueries: (...a: unknown[]) => invalidateMock(...a),
+  useDatabasesQuery: () => ({ data: [{ database_id: 1, name: "default" }], isError: false, isLoading: false, isFetching: fetching, dataUpdatedAt: UPDATED_AT }),
+  useSchemasQuery: () => ({ data: [{ schema_id: 1, database_id: 1, name: "public" }], isError: false, isLoading: false, isFetching: fetching, dataUpdatedAt: UPDATED_AT }),
   useTablesQuery: () => ({
     data: [
       { table_id: 1, schema_id: 1, name: "customers" },
@@ -20,6 +23,8 @@ vi.mock("../api/queries", () => ({
     ],
     isError: false,
     isLoading: false,
+    isFetching: fetching,
+    dataUpdatedAt: UPDATED_AT,
   }),
   useInstanceQuery: () => ({ data: { instance_id: "abc", name: "default" } }),
   useObservedQueriesQuery: () => ({ data: { queries: [], returned: 0, active: 0, untracked_active: 0, max_records: 200 }, isError: false }),
@@ -215,5 +220,38 @@ describe("IdePage", () => {
     expect(screen.getByRole("tab", { name: /Revenue/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Close worksheet Revenue" }));
     expect(screen.queryByRole("tab", { name: /Revenue/ })).toBeNull();
+  });
+});
+
+describe("IdePage: refresh the databases section", () => {
+  const openRail = () => fireEvent.click(screen.getByRole("button", { name: /Expand left rail/ }));
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    sqlMock.mockReset();
+    invalidateMock.mockReset();
+    fetching = false;
+  });
+
+  it("has a Refresh databases button in the Databases section that re-reads the catalog", () => {
+    renderPage();
+    openRail();
+    const section = screen.getByRole("heading", { name: "Databases" }).closest("section") as HTMLElement;
+    const btn = within(section).getByRole("button", { name: "Refresh databases" });
+    expect(invalidateMock).not.toHaveBeenCalled();
+    fireEvent.click(btn);
+    expect(invalidateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("says when the catalog was last read, and that it is refreshing while it is", () => {
+    const first = renderPage();
+    openRail();
+    expect(screen.getByText(`Updated ${new Date(UPDATED_AT).toLocaleTimeString()}`)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh databases" })).toHaveAttribute("aria-busy", "false");
+    first.unmount();
+    fetching = true;
+    renderPage();
+    openRail();
+    expect(screen.getByText("Refreshing…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh databases" })).toHaveAttribute("aria-busy", "true");
   });
 });

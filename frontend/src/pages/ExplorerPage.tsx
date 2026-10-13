@@ -14,6 +14,7 @@ import { ApiRequestError } from "../api/types";
 import { b64ToUtf8, utf8ToB64 } from "../utils/base64";
 import { Card } from "../components/Card";
 import { Tabs } from "../components/Tabs";
+import { SchemaDesign } from "../erd/SchemaDesign";
 import { Input, TextArea } from "../components/Field";
 import { Button } from "../components/Button";
 import { Table, type Column } from "../components/Table";
@@ -378,6 +379,7 @@ export function ExplorerPage() {
       <Tabs
         tabs={[
           { id: "objects", label: "Objects" },
+          { id: "design", label: "Schema design" },
           { id: "lookup", label: "Point Lookup" },
           { id: "range", label: "Range Query" },
         ]}
@@ -386,6 +388,8 @@ export function ExplorerPage() {
       />
       {tab === "objects" ? (
         <ObjectsBrowser />
+      ) : tab === "design" ? (
+        <SchemaDesign />
       ) : tab === "lookup" ? (
         <PointLookup />
       ) : (

@@ -245,7 +245,7 @@ textarea {
   height: 32px;
   border-radius: 50%;
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-size: 12px;
   font-weight: 600;
 }
@@ -669,5 +669,47 @@ textarea {
 @media (max-width: 640px) {
   .tpl-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- theme: native controls and the light <-> dark cross-fade ---------------------------------------
+   `color-scheme` makes scrollbars, checkboxes, selects and form fields follow the theme the console is
+   showing, including when it is chosen with the toggle rather than by the operating system. */
+
+:root {
+  color-scheme: light dark;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+/* utils/theme.ts puts `theme-switching` on <html> for ~360 ms around a switch. While it is there every
+   colour fades instead of jumping. Layout properties are not listed, so nothing moves. */
+html.theme-switching,
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition:
+    background-color 280ms ease,
+    color 280ms ease,
+    border-color 280ms ease,
+    outline-color 280ms ease,
+    fill 280ms ease,
+    stroke 280ms ease,
+    box-shadow 280ms ease,
+    opacity 280ms ease !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.theme-switching,
+  html.theme-switching *,
+  html.theme-switching *::before,
+  html.theme-switching *::after {
+    transition: none !important;
   }
 }

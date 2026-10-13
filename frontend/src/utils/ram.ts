@@ -27,6 +27,19 @@ export function deriveRam(status: unknown): RamUsage | null {
   return { usedBytes: used, totalBytes: total, percent: Math.min(100, (used / total) * 100) };
 }
 
+/** Memory held by the rubiXDb process itself: admin `/v1/admin/status`
+ * `resources.rss_bytes`. A measured figure, but it has no machine total, so it
+ * is shown as bytes only (no percentage, no Healthy/Warning level). Returns
+ * `null` for anything that is not a finite, non-negative number. */
+export function deriveProcessMemory(adminStatus: unknown): number | null {
+  if (typeof adminStatus !== "object" || adminStatus === null) return null;
+  const resources = (adminStatus as Record<string, unknown>).resources;
+  if (typeof resources !== "object" || resources === null) return null;
+  const rss = (resources as Record<string, unknown>).rss_bytes;
+  if (typeof rss !== "number" || !Number.isFinite(rss) || rss < 0) return null;
+  return rss;
+}
+
 // Presentation thresholds for the pill only (not an engine contract).
 export function ramLevel(percent: number): RamLevel {
   if (percent >= 90) return "critical";

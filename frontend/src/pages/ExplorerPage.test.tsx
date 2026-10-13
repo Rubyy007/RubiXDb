@@ -22,7 +22,7 @@ describe("ExplorerPage (Catalog)", () => {
   it("opens on Objects, listed first, with the other sections after it", () => {
     render(<ExplorerPage />);
     const tabs = screen.getAllByRole("tab").map((t) => t.textContent);
-    expect(tabs).toEqual(["Objects", "Point Lookup", "Range Query"]);
+    expect(tabs).toEqual(["Objects", "Schema design", "Point Lookup", "Range Query"]);
     expect(screen.getByRole("tab", { name: "Objects" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("orders_status")).toBeInTheDocument();
   });

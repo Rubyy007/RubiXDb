@@ -8,6 +8,7 @@ import { ToastProvider } from "./components/Toast";
 import "./styles/global.css";
 import "./components/components.css";
 import { takeTokenFromLocation } from "./utils/tokenHandoff";
+import { initTheme } from "./utils/theme";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -17,6 +18,9 @@ const queryClient = new QueryClient({
     },
   },
 });
+
+// Apply the saved theme before anything renders, so every page starts in it (not only Settings).
+initTheme();
 
 const rootEl = document.getElementById("root");
 if (!rootEl) throw new Error("#root element not found");

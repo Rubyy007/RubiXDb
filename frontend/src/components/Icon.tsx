@@ -32,6 +32,8 @@ const PATHS = {
   runAll: "M3 5l8 7-8 7z M12 5l8 7-8 7z",
   runAbove: "M6 10l7 5-7 5z M17 15V4 M13 8l4-4 4 4",
   moon: "M20 14.5A8 8 0 019.5 4a8 8 0 1010.5 10.5z",
+  sun: "M12 8a4 4 0 100 8 4 4 0 000-8z M12 2v2 M12 20v2 M4.9 4.9l1.4 1.4 M17.7 17.7l1.4 1.4 M2 12h2 M20 12h2 M4.9 19.1l1.4-1.4 M17.7 6.3l1.4-1.4",
+  refresh: "M20 12a8 8 0 01-14.3 4.9 M4 12A8 8 0 0118.3 7.1 M18 3v4.5h-4.5 M6 21v-4.5h4.5",
   panelRight: "M4 5h16v14H4z M15 5v14",
   panelLeft: "M4 5h16v14H4z M9 5v14",
 } as const;

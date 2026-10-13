@@ -1,0 +1,387 @@
+/* Catalog > Schema design (src/erd/SchemaDesign.tsx). Uses the shell's theme variables only, so light and
+   dark follow the rest of the console. */
+
+.erd {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.erd-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.erd-summary strong {
+  color: var(--text-primary);
+}
+
+.erd-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+.erd-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+  color: var(--text-secondary);
+}
+
+.erd-legend-line {
+  stroke: var(--accent);
+  stroke-width: 1.6;
+  stroke-dasharray: 5 4;
+  fill: none;
+}
+
+.erd-legend-head {
+  fill: var(--accent);
+}
+
+/* ---- canvas ---- */
+
+.erd-viewport {
+  position: relative;
+  height: clamp(460px, 68vh, 820px);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background-color: var(--bg-card);
+  background-image: radial-gradient(circle, var(--border) 1px, transparent 1.4px);
+  background-size: 22px 22px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.erd-viewport:active {
+  cursor: grabbing;
+}
+
+.erd-stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+
+.erd-tools {
+  position: absolute;
+  z-index: 5;
+  top: var(--space-3);
+  right: var(--space-3);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-card);
+  cursor: default;
+}
+
+.erd-tools button {
+  min-width: 30px;
+  height: 28px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.erd-tools button:hover {
+  background: var(--bg-hover, rgba(127, 127, 127, 0.14));
+}
+
+.erd-tools svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.erd-zoom {
+  min-width: 42px;
+  text-align: center;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+}
+
+/* ---- schema frames ---- */
+
+.erd-frame {
+  position: absolute;
+  border: 1.5px dashed var(--border);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--accent) 3%, transparent);
+  pointer-events: none;
+}
+
+.erd-frame-name {
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+/* ---- table cards ---- */
+
+.erd-card {
+  position: absolute;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 6px 16px rgba(0, 0, 0, 0.06);
+  transition: opacity 0.12s, box-shadow 0.12s, border-color 0.12s;
+  cursor: default;
+  outline: none;
+}
+
+.erd-card[data-active="true"],
+.erd-card:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent), 0 8px 22px rgba(0, 0, 0, 0.14);
+}
+
+.erd-card[data-dim="true"] {
+  opacity: 0.38;
+}
+
+.erd-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-card));
+  color: var(--text-primary);
+  cursor: grab;
+  user-select: none;
+}
+
+.erd-card-head svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.erd-card-name {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 700;
+  font-size: var(--font-size-md);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.erd-card-schema {
+  margin-left: auto;
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.erd-cols {
+  margin: 0;
+  padding: 3px 0 0;
+  list-style: none;
+}
+
+.erd-col {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  font-size: var(--font-size-sm);
+}
+
+.erd-col + .erd-col {
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.erd-col.is-note {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-style: italic;
+}
+
+.erd-key {
+  flex: none;
+  width: 22px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.erd-col-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.erd-col[data-pk="true"] .erd-col-name {
+  font-weight: 700;
+}
+
+.erd-col-type {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+/* ---- relationship lines ---- */
+
+.erd-lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.erd-link {
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.erd-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  pointer-events: stroke;
+}
+
+.erd-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.6;
+  stroke-dasharray: 6 5;
+  opacity: 0.7;
+  transition: opacity 0.12s, stroke-width 0.12s;
+}
+
+.erd-dot {
+  fill: var(--bg-card);
+  stroke: var(--accent);
+  stroke-width: 1.6;
+}
+
+.erd-head {
+  fill: var(--accent);
+}
+
+.erd-link[data-on="true"] .erd-line {
+  stroke-width: 2.4;
+  opacity: 1;
+}
+
+.erd-link[data-dim="true"] {
+  opacity: 0.2;
+}
+
+/* ---- below the canvas ---- */
+
+.erd-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-7) var(--space-4);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-card);
+  color: var(--text-secondary);
+}
+
+.erd-picked {
+  padding: var(--space-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md, 8px);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+.erd-list h2 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-lg);
+}
+
+.erd-list ul {
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.erd-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  background: var(--bg-card);
+  font-size: var(--font-size-sm);
+}
+
+.erd-rule {
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.erd-note {
+  font-size: var(--font-size-sm);
+}
+
+@media (max-width: 640px) {
+  .erd-legend {
+    margin-left: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .erd-card,
+  .erd-line {
+    transition: none;
+  }
+}

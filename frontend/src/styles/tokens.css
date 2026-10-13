@@ -62,6 +62,7 @@
   --color-pressure-bg: #fdf3e0;
   --color-danger: #a4222f;
   --color-danger-bg: #fbe9eb;
+  --color-danger-contrast: #ffffff;
 
   --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
 }
@@ -75,7 +76,7 @@
     --color-border-strong: #3c414d;
     --color-text: #e8e9ec;
     --color-text-muted: #a7acb8;
-    --color-text-faint: #757b88;
+    --color-text-faint: #8e95a3;
 
     --color-accent: #6d87ff;
     --color-accent-hover: #8398ff;
@@ -87,6 +88,7 @@
     --color-pressure-bg: #3a2c0e;
     --color-danger: #f0616e;
     --color-danger-bg: #3a1418;
+    --color-danger-contrast: #14161a;
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
@@ -101,7 +103,7 @@
   --color-border-strong: #3c414d;
   --color-text: #e8e9ec;
   --color-text-muted: #a7acb8;
-  --color-text-faint: #757b88;
+  --color-text-faint: #8e95a3;
 
   --color-accent: #6d87ff;
   --color-accent-hover: #8398ff;
@@ -113,6 +115,7 @@
   --color-pressure-bg: #3a2c0e;
   --color-danger: #f0616e;
   --color-danger-bg: #3a1418;
+  --color-danger-contrast: #14161a;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
@@ -134,6 +137,7 @@
   --text-muted: #8b929c;
   --accent: #1f6feb;
   --accent-hover: #1a5fd0;
+  --on-accent: #ffffff;
   --success: #1a7f37;
   --warning: #b8860b;
   --danger: #cf222e;
@@ -154,6 +158,7 @@
     --text-muted: #757b88;
     --accent: #4c8dff;
     --accent-hover: #6aa0ff;
+    --on-accent: #0b0d10;
     --success: #3fb950;
     --warning: #d4a72c;
     --danger: #f85149;
@@ -178,6 +183,7 @@
   --text-muted: #757b88;
   --accent: #4c8dff;
   --accent-hover: #6aa0ff;
+  --on-accent: #0b0d10;
 }
 
 :root[data-theme="dark"] .rail-logo {

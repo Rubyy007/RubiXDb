@@ -5,6 +5,7 @@ import { useStatusQuery } from "../api/queries";
 import { Badge, storageStateTone } from "./Badge";
 import { Icon, type IconName } from "./Icon";
 import { RamCard } from "./RamCard";
+import { ThemeToggle } from "./ThemeToggle";
 import { clearSessionActivity } from "../utils/sessionActivity";
 import logoUrl from "../assets/rubixdb-logo.png";
 
@@ -235,6 +236,7 @@ export function AppShell() {
         </div>
         <div className="topbar-right">
           {status && <Badge tone={storageStateTone(status.storage_state)}>{status.storage_state}</Badge>}
+          <ThemeToggle />
           <Notifications />
           {session && (
             <span className="avatar" role="img" aria-label={`Signed in as ${session.principalName}`}>

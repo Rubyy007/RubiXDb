@@ -717,3 +717,45 @@
 .dot-failed {
   background: var(--danger);
 }
+
+/* ---- editor: error marker, suggestion list anchor, char measure ---- */
+
+.sqled-measure {
+  position: absolute;
+  visibility: hidden;
+  white-space: pre;
+  pointer-events: none;
+}
+
+/* the line of the statement that failed */
+.sqled-errband {
+  position: absolute;
+  z-index: -1;
+  left: 0;
+  right: 0;
+  height: 20px;
+  background: color-mix(in srgb, var(--danger) 13%, transparent);
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
+/* a wavy red line under the word the server pointed at */
+.sqled-squiggle {
+  position: absolute;
+  height: 4px;
+  background:
+    linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%) 0 0 / 6px 4px repeat-x,
+    linear-gradient(45deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%) 0 0 / 6px 4px repeat-x;
+  pointer-events: none;
+}
+
+.sqled-gutter .sqled-ln-err {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.sqled-popup {
+  /* placed in window coordinates by SqlEditor, so no cell can clip it */
+  position: fixed;
+  z-index: 60;
+  max-width: min(460px, calc(100vw - 16px));
+}

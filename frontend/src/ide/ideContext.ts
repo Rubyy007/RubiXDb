@@ -1,5 +1,6 @@
 import { createContext, useContext } from "react";
 import type { CatalogLists } from "./completion";
+import type { ColumnInfo } from "./suggest";
 import type { CellKind, FlatCell, IdeState, IdeWorksheet } from "./model";
 import type { HistoryEntry, RunError, RunnerState } from "./runner";
 
@@ -31,13 +32,26 @@ export interface IdeApi {
   history: HistoryEntry[];
   catalog: CatalogLists;
   catalogStatus: "loading" | "ready" | "error";
+  /** Re-read databases, schemas, tables (and drop cached column lists) from the server. */
+  refreshCatalog: () => void;
+  /** True while the catalog is being re-read. */
+  catalogRefreshing: boolean;
+  /** When the catalog was last read successfully (ms since epoch), or null. */
+  catalogUpdatedAt: number | null;
   fetchColumns: (table: string) => Promise<string[]>;
+  /** Columns with their types (cached); an empty list when the table cannot be described. */
+  fetchColumnInfo: (table: string) => Promise<ColumnInfo[]>;
+  /** Turn keywords typed in lower case into UPPER CASE as each word is finished. */
+  autoUpper: boolean;
+  setAutoUpper: (on: boolean) => void;
   plans: Record<string, PlanEntry>;
   requestPlan: (cellId: string) => void;
   selectedTable: string | null;
   setSelectedTable: (name: string) => void;
 
   setText: (cellId: string, text: string) => void;
+  /** Remember where the caret is in a cell's editor, so Run can pick the statement under it. */
+  setCursor: (cellId: string, offset: number, text: string) => void;
   setNotes: (text: string) => void;
   runCell: (cellId: string) => void;
   runAll: () => void;

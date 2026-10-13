@@ -95,9 +95,27 @@ export function LeftRail() {
       </section>
 
       <section className="ide-side-sec" aria-labelledby="ide-db-title">
-        <h2 id="ide-db-title" className="ide-side-title">
-          Databases
-        </h2>
+        <div className="ide-side-head">
+          <h2 id="ide-db-title" className="ide-side-title">
+            Databases
+          </h2>
+          <button
+            type="button"
+            className="ide-iconbtn ide-refresh"
+            aria-label="Refresh databases"
+            title="Refresh databases, schemas and tables"
+            aria-busy={ide.catalogRefreshing}
+            data-refreshing={ide.catalogRefreshing}
+            onClick={ide.refreshCatalog}
+          >
+            <Icon name="refresh" />
+          </button>
+        </div>
+        {ide.catalogUpdatedAt !== null && (
+          <p className="ide-small text-muted ide-updated" role="status">
+            {ide.catalogRefreshing ? "Refreshing…" : `Updated ${new Date(ide.catalogUpdatedAt).toLocaleTimeString()}`}
+          </p>
+        )}
         <label className="visually-hidden" htmlFor="ide-tree-filter">
           Filter databases, schemas, tables
         </label>

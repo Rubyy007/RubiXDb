@@ -41,9 +41,16 @@ const cell = (page: Page, n: number): Locator => page.locator(`section[aria-labe
 const editor = (page: Page, n: number) => page.getByLabel(`Cell ${n} SQL`);
 const runBtn = (page: Page, n: number) => page.getByRole("button", { name: `Run cell ${n}` });
 
+/** Types `text` and runs it: with one statement that is the whole cell; with several, only the statement at the caret. */
 async function runCell(page: Page, n: number, text: string) {
   await editor(page, n).fill(text);
   await runBtn(page, n).click();
+}
+
+/** Types a script and runs EVERY statement of it (Ctrl+Shift+Enter = Run all). */
+async function runScript(page: Page, n: number, text: string) {
+  await editor(page, n).fill(text);
+  await editor(page, n).press("Control+Shift+Enter");
 }
 
 test.describe("SQL IDE -- real rubixdb gui binary, embedded console, real CSP", () => {
@@ -65,7 +72,7 @@ test.describe("SQL IDE -- real rubixdb gui binary, embedded console, real CSP", 
     const errors = watchErrors(page);
     await sql(request, "DROP TABLE IF EXISTS ide_multi");
     await openIde(page);
-    await runCell(
+    await runScript(
       page,
       1,
       [
@@ -102,9 +109,30 @@ test.describe("SQL IDE -- real rubixdb gui binary, embedded console, real CSP", 
     await sql(request, "DROP TABLE IF EXISTS ide_multi");
   });
 
+  test("Ctrl+Enter runs only the statement at the caret; Ctrl+Shift+Enter runs all", async ({ page }) => {
+    await openIde(page);
+    const ed = editor(page, 1);
+    await ed.fill("SELECT 1 AS a;\nSELECT 2 AS b;\nSELECT 3 AS c;");
+    // Caret on line 2.
+    await ed.press("Control+Home");
+    await ed.press("ArrowDown");
+    await ed.press("Control+Enter");
+    await expect(cell(page, 1)).toHaveAttribute("data-status", "success", { timeout: 20_000 });
+    await expect(page.getByTestId("history-row")).toHaveCount(1);
+    await expect(page.getByTestId("history-row").first().getByLabel("Statement text")).toHaveText("SELECT 2 AS b");
+    // Move to line 3 and run again: that statement only.
+    await ed.press("ArrowDown");
+    await ed.press("Control+Enter");
+    await expect(page.getByTestId("history-row")).toHaveCount(2);
+    await expect(page.getByTestId("history-row").first().getByLabel("Statement text")).toHaveText("SELECT 3 AS c");
+    // Run all: every statement of the cell.
+    await ed.press("Control+Shift+Enter");
+    await expect(page.getByTestId("history-row")).toHaveCount(5);
+  });
+
   test("a failing statement stops the script and is pointed out", async ({ page }) => {
     await openIde(page);
-    await runCell(page, 1, "SELECT 1;\n\nSELEC 2;\nSELECT 3;");
+    await runScript(page, 1, "SELECT 1;\n\nSELEC 2;\nSELECT 3;");
     await expect(cell(page, 1)).toHaveAttribute("data-status", "error", { timeout: 20_000 });
     const alert = cell(page, 1).getByRole("alert");
     await expect(alert).toContainText("Statement 2 of 3 failed; the 1 after it did not run.");
@@ -149,13 +177,13 @@ test.describe("SQL IDE -- real rubixdb gui binary, embedded console, real CSP", 
     await sql(request, "DROP TABLE IF EXISTS ide_script_txn");
     await sql(request, "CREATE TABLE ide_script_txn (id INTEGER PRIMARY KEY)");
     await openIde(page);
-    await runCell(page, 1, "BEGIN;\nINSERT INTO ide_script_txn (id) VALUES (1);\nINSERT INTO ide_script_txn (id) VALUES (2);\nCOMMIT;");
+    await runScript(page, 1, "BEGIN;\nINSERT INTO ide_script_txn (id) VALUES (1);\nINSERT INTO ide_script_txn (id) VALUES (2);\nCOMMIT;");
     await expect(cell(page, 1)).toHaveAttribute("data-status", "success", { timeout: 20_000 });
     expect(JSON.stringify((await sql(request, "SELECT COUNT(*) FROM ide_script_txn")).body)).toContain('"2"');
     await expect(page.getByText(/open transaction/)).toHaveCount(0);
 
     // ROLLBACK in a script discards.
-    await runCell(page, 1, "BEGIN;\nINSERT INTO ide_script_txn (id) VALUES (3);\nROLLBACK;");
+    await runScript(page, 1, "BEGIN;\nINSERT INTO ide_script_txn (id) VALUES (3);\nROLLBACK;");
     await expect(cell(page, 1)).toHaveAttribute("data-status", "success", { timeout: 20_000 });
     expect(JSON.stringify((await sql(request, "SELECT COUNT(*) FROM ide_script_txn")).body)).toContain('"2"');
     await sql(request, "DROP TABLE IF EXISTS ide_script_txn");

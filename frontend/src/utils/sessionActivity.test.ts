@@ -6,7 +6,24 @@ import {
   setPendingSql,
   takePendingSql,
 } from "./sessionActivity";
-import { deriveRam, ramLevel } from "./ram";
+import { deriveProcessMemory, deriveRam, ramLevel } from "./ram";
+
+describe("deriveProcessMemory", () => {
+  it("reads admin resources.rss_bytes", () => {
+    expect(deriveProcessMemory({ resources: { rss_bytes: 123456 } })).toBe(123456);
+    expect(deriveProcessMemory({ resources: { rss_bytes: 0 } })).toBe(0);
+  });
+  it("is null for anything that is not a finite non-negative number", () => {
+    expect(deriveProcessMemory(undefined)).toBeNull();
+    expect(deriveProcessMemory(null)).toBeNull();
+    expect(deriveProcessMemory({})).toBeNull();
+    expect(deriveProcessMemory({ resources: null })).toBeNull();
+    expect(deriveProcessMemory({ resources: { rss_bytes: "5" } })).toBeNull();
+    expect(deriveProcessMemory({ resources: { rss_bytes: -1 } })).toBeNull();
+    expect(deriveProcessMemory({ resources: { rss_bytes: NaN } })).toBeNull();
+    expect(deriveProcessMemory({ resources: { rss_bytes: Infinity } })).toBeNull();
+  });
+});
 
 describe("queryTitle", () => {
   it("uses the first non-empty line, whitespace-collapsed", () => {

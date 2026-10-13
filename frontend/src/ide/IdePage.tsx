@@ -47,7 +47,8 @@ import {
 } from "./model";
 import type { PaletteAction } from "./palette";
 import { RightPanel } from "./RightPanel";
-import { hasSql, splitStatements } from "./sqlSplit";
+import { hasSql, isolateStatement, splitStatements, statementIndexAt } from "./sqlSplit";
+import type { ColumnInfo } from "./suggest";
 import { Runner, implicitSessionKey, toRunError, type HistoryEntry } from "./runner";
 import "../styles/console.css";
 import "../styles/ide.css";
@@ -180,19 +181,42 @@ export function IdePage() {
   const catalogStatus: "loading" | "ready" | "error" =
     databases.isError || schemas.isError || tables.isError ? "error" : databases.isLoading || schemas.isLoading || tables.isLoading ? "loading" : "ready";
 
-  const fetchColumns = useCallback(
-    async (table: string): Promise<string[]> => {
+  const catalogRefreshing = !!(databases.isFetching || schemas.isFetching || tables.isFetching);
+  const updated = Math.max(databases.dataUpdatedAt || 0, schemas.dataUpdatedAt || 0, tables.dataUpdatedAt || 0);
+  const catalogUpdatedAt = updated > 0 ? updated : null;
+  const refreshCatalog = useCallback(() => invalidateCatalogQueries(queryClient), [queryClient]);
+
+  const fetchColumnInfo = useCallback(
+    async (table: string): Promise<ColumnInfo[]> => {
       const c = clientRef.current;
       if (!c) return [];
       try {
         const d = await queryClient.fetchQuery({ queryKey: ["sql", "table", table], queryFn: () => c.describeTable(table), staleTime: 30_000 });
-        return d.columns.map((x) => x.name);
+        return d.columns.map((x) => ({ name: x.name, type: x.data_type }));
       } catch {
         return [];
       }
     },
     [queryClient],
   );
+  const fetchColumns = useCallback(async (table: string): Promise<string[]> => (await fetchColumnInfo(table)).map((c) => c.name), [fetchColumnInfo]);
+
+  // Auto-uppercase of keywords: remembered per browser, on unless switched off.
+  const [autoUpper, setAutoUpperState] = useState(() => {
+    try {
+      return window.localStorage.getItem("rubixdb-ide-auto-upper") !== "off";
+    } catch {
+      return true;
+    }
+  });
+  const setAutoUpper = useCallback((on: boolean) => {
+    setAutoUpperState(on);
+    try {
+      window.localStorage.setItem("rubixdb-ide-auto-upper", on ? "on" : "off");
+    } catch {
+      /* storage unavailable: applies for this page view */
+    }
+  }, []);
 
   const tableRefOf = useCallback(
     (name: string): TableRef | null => {
@@ -269,10 +293,37 @@ export function IdePage() {
     await runner.runSequence(todo, topKey);
   }
 
+  // Last caret offset seen in each cell's editor, with the text it was seen in (so it is ignored once
+  // the text has changed some other way, e.g. a history entry or a template was loaded into the cell).
+  const cursors = useRef<Record<string, { offset: number; text: string }>>({});
+  const setCursor = useCallback((cellId: string, offset: number, text: string) => {
+    cursors.current[cellId] = { offset, text };
+  }, []);
+
+  /** What "Run" sends for a cell: the whole text when it holds at most one statement, otherwise ONLY the
+   * statement the caret is in (Run all / Ctrl+Shift+Enter is the way to run every statement). `null` =
+   * nothing to run (the caret position is unknown, so no statement is guessed). */
+  function sqlAtCaret(cellId: string, text: string): string | null {
+    const stmts = splitStatements(text);
+    if (stmts.length <= 1) return text;
+    const ta = document.getElementById(editorId(cellId));
+    // The focused editor's live caret is the truth; otherwise the one remembered when it last moved.
+    const live = ta instanceof HTMLTextAreaElement && document.activeElement === ta && ta.value === text ? ta.selectionStart : null;
+    const known = cursors.current[cellId];
+    const offset = live ?? (known && known.text === text ? known.offset : null);
+    if (offset === null) {
+      flash(`This cell has ${stmts.length} statements. Click inside the one to run, or use Run all (Ctrl+Shift+Enter).`);
+      return null;
+    }
+    return isolateStatement(text, stmts[statementIndexAt(text, offset, stmts)]);
+  }
+
   function runCell(cellId: string) {
     const f = findCell(sheet, cellId);
     if (!f || f.cell.kind !== "sql") return;
-    const item = { cellId, sheetId: sheet.id, sql: f.cell.text };
+    const sql = sqlAtCaret(cellId, f.cell.text);
+    if (sql === null) return;
+    const item = { cellId, sheetId: sheet.id, sql };
     if (f.txnId) {
       if (!hasSql(item.sql)) return;
       void runner.runInSession({ ...item, sessionKey: f.txnId }).then((r) => {
@@ -517,12 +568,19 @@ export function IdePage() {
     history,
     catalog,
     catalogStatus,
+    refreshCatalog,
+    catalogRefreshing,
+    catalogUpdatedAt,
     fetchColumns,
+    fetchColumnInfo,
+    autoUpper,
+    setAutoUpper,
     plans,
     requestPlan,
     selectedTable,
     setSelectedTable,
     setText,
+    setCursor,
     setNotes: (t) => edit((s) => setNotes(s, t, Date.now())),
     runCell,
     runAll,
@@ -586,7 +644,7 @@ export function IdePage() {
     { id: "open-ws", label: "Open worksheet…", group: "Worksheet", shortcut: "Ctrl P", run: () => setPalette("sheets") },
     { id: "rename", label: "Rename worksheet", group: "Worksheet", run: () => document.getElementById("ide-title")?.focus() },
     { id: "clear", label: "Clear all cells", group: "Worksheet", run: clearAll },
-    { id: "run", label: "Run cell", group: "Run", shortcut: "Ctrl ↵", run: () => act.current.runFocused() },
+    { id: "run", label: "Run statement at cursor", group: "Run", shortcut: "Ctrl ↵", run: () => act.current.runFocused() },
     { id: "run-all", label: "Run all", group: "Run", shortcut: "Ctrl ⇧ ↵", run: runAll },
     { id: "run-above", label: "Run above", group: "Run", disabled: !focusedId, run: () => focusedId && runAbove(focusedId) },
     { id: "stop", label: "Stop all running cells", group: "Run", shortcut: "Ctrl .", run: () => runner.stopAll() },
@@ -616,6 +674,7 @@ export function IdePage() {
     { id: "csv", label: "Export results CSV", group: "Data", disabled: !hasRows, run: downloadFocusedCsv },
     { id: "left", label: "Toggle left rail", group: "View", shortcut: "Ctrl B", run: () => setLeftOpen((v) => !v) },
     { id: "right", label: "Toggle right panel", group: "View", shortcut: "Ctrl J", run: () => setRightOpen((v) => !v) },
+    { id: "auto-upper", label: autoUpper ? "Stop uppercasing keywords as I type" : "Uppercase keywords as I type", group: "Edit", run: () => setAutoUpper(!autoUpper) },
     { id: "autocommit", label: state.autocommit ? "Turn autocommit off" : "Turn autocommit on", group: "Run", run: () => setState((st) => ({ ...st, autocommit: !st.autocommit })) },
     { id: "dark", label: "Toggle dark mode", group: "View", run: () => void toggleTheme() },
     { id: "help", label: "Keyboard shortcuts and what is not yet developed", group: "Help", run: () => setHelp(true) },
@@ -706,7 +765,7 @@ export function IdePage() {
             </div>
 
             <div className="ide-toolbar" role="toolbar" aria-label="Worksheet actions">
-              <button type="button" className="btn btn-primary" title="Run current cell (Ctrl+Enter)" onClick={() => act.current.runFocused()}>
+              <button type="button" className="btn btn-primary" title="Run the statement at the cursor (Ctrl+Enter)" onClick={() => act.current.runFocused()}>
                 <Icon name="play" /> <span className="ide-lbl">Run cell</span> <kbd>Ctrl ↵</kbd>
               </button>
               <button type="button" className="btn btn-secondary" title="Run all (Ctrl+Shift+Enter)" onClick={runAll}>
@@ -729,6 +788,10 @@ export function IdePage() {
                 <i className="ide-dot is-ok" aria-hidden="true" /> {instName}
                 {port ? `:${port}` : ""}
               </span>
+              <label className="ide-switch" title="Turn select, from, where ... into SELECT, FROM, WHERE ... as you type. Names of tables and columns are never changed.">
+                <input type="checkbox" checked={autoUpper} onChange={(e) => setAutoUpper(e.target.checked)} />
+                <span>UPPERCASE keywords</span>
+              </label>
               <label className="ide-switch">
                 <input type="checkbox" checked={state.autocommit} onChange={(e) => setState((st) => ({ ...st, autocommit: e.target.checked }))} />
                 <span>Autocommit</span>
@@ -803,8 +866,11 @@ function TitleInput({ name, onCommit }: { name: string; onCommit: (n: string) =>
 }
 
 const SHORTCUTS: [string, string][] = [
-  ["Ctrl+Enter", "Run the current cell"],
-  ["Ctrl+Shift+Enter", "Run all autocommit cells"],
+  ["Ctrl+Enter", "Run the statement at the cursor (in a cell with several statements)"],
+  ["Ctrl+Shift+Enter", "Run all cells, every statement in each"],
+  ["Ctrl+Space", "Show suggestions (tables, columns, keywords) at the cursor"],
+  ["Tab", "Insert the highlighted suggestion (Enter too, once you moved to one with the arrow keys)"],
+  ["Esc", "Close the suggestions"],
   ["Ctrl+.", "Stop all running cells"],
   ["Ctrl+T", "New worksheet (some browsers keep this key for a new browser tab)"],
   ["Ctrl+/", "Toggle markdown cell (inside an editor it comments the line)"],

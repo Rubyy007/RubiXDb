@@ -90,6 +90,37 @@ export function splitStatements(script: string): SqlStatement[] {
   return out;
 }
 
+/** Index (into `splitStatements(script)`) of the statement the caret at `offset` belongs to, or -1 when
+ * the cell holds no statement.
+ *
+ * - Inside a statement, or right after its terminating `;` on the same line: that statement.
+ * - On a line between two statements (blank lines, or a comment above the next one): the NEXT one.
+ * - Before the first statement: the first. After the last: the last.
+ * Lexical only, like `splitStatements`. */
+export function statementIndexAt(script: string, offset: number, stmts: SqlStatement[] = splitStatements(script)): number {
+  if (stmts.length === 0) return -1;
+  // End of statement k including its own terminating `;` (if the only thing before it is whitespace).
+  const endOf = (s: SqlStatement) => {
+    const textEnd = s.offset + s.text.length;
+    const semi = /^\s*;/.exec(script.slice(textEnd));
+    return semi ? textEnd + semi[0].length : textEnd;
+  };
+  for (let k = 0; k < stmts.length; k++) {
+    if (offset > endOf(stmts[k])) continue;
+    if (offset >= stmts[k].offset || k === 0) return k;
+    // In the gap between statement k-1 and k: same line as k-1's end -> k-1, a later line -> k.
+    return /\n/.test(script.slice(endOf(stmts[k - 1]), offset)) ? k : k - 1;
+  }
+  return stmts.length - 1;
+}
+
+/** `script` with everything except `stmt` blanked out (spaces; line breaks kept). Run as a cell, this
+ * sends exactly `stmt.text` and nothing else, and the line/column of `stmt` inside the cell stays
+ * the same, so a server-reported error position still maps to the right place in the editor. */
+export function isolateStatement(script: string, stmt: SqlStatement): string {
+  return script.slice(0, stmt.offset).replace(/[^\n]/g, " ") + stmt.text;
+}
+
 /** True when the text holds at least one statement (not just blanks, `;` and comments). */
 export function hasSql(script: string): boolean {
   return splitStatements(script).length > 0;

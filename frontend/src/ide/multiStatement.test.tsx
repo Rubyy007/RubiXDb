@@ -138,7 +138,7 @@ describe("IdePage: several statements in one cell", () => {
     sqlMock.mockResolvedValueOnce(ok(7));
     renderPage();
     fireEvent.change(screen.getByLabelText("Cell 1 SQL"), { target: { value: "CREATE TABLE t (x INTEGER);\nSELECT 7;" } });
-    fireEvent.click(screen.getByRole("button", { name: "Run cell 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Run all/ }));
     const strip = await screen.findByRole("group", { name: "Statements in this cell" });
     expect(sqlMock.mock.calls.map((c) => c[0])).toEqual([{ sql: "CREATE TABLE t (x INTEGER)" }, { sql: "SELECT 7" }]);
     // The last statement's rows are showing; the first statement's outcome is one click away.
@@ -163,7 +163,7 @@ describe("IdePage: several statements in one cell", () => {
     );
     renderPage();
     fireEvent.change(screen.getByLabelText("Cell 1 SQL"), { target: { value: "SELECT 1;\n\nSELECT 2 +;\nSELECT 3;" } });
-    fireEvent.click(screen.getByRole("button", { name: "Run cell 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Run all/ }));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText("PARSE_ERROR")).toBeInTheDocument();
     expect(alert).toHaveTextContent("Statement 2 of 3 failed; the 1 after it did not run.");
@@ -178,7 +178,7 @@ describe("IdePage: several statements in one cell", () => {
     sqlMock.mockResolvedValueOnce(ok(2));
     renderPage();
     fireEvent.change(screen.getByLabelText("Cell 1 SQL"), { target: { value: "SELECT 1; -- next\nSELECT 2" } });
-    fireEvent.click(screen.getByRole("button", { name: "Run cell 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Run all/ }));
     const strip = await screen.findByRole("group", { name: "Statements in this cell" });
     const second = within(strip).getAllByRole("button")[1];
     expect(second).toHaveTextContent("SELECT 2");
@@ -200,5 +200,108 @@ describe("IdePage: several statements in one cell", () => {
     renderPage();
     fireEvent.change(screen.getByLabelText("Cell 1 SQL"), { target: { value: "-- just a note;" } });
     expect(screen.getByRole("button", { name: "Run cell 1" })).toBeDisabled();
+  });
+});
+
+describe("IdePage: Run sends the statement at the cursor; Run all sends everything", () => {
+  const SCRIPT = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+  const secondAt = SCRIPT.indexOf("SELECT 2") + 3;
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    sqlMock.mockReset();
+    sqlMock.mockResolvedValue(ok(1));
+  });
+
+  function editor() {
+    const ta = screen.getByLabelText("Cell 1 SQL") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: SCRIPT } });
+    return ta;
+  }
+  const sent = () => sqlMock.mock.calls.map((c) => c[0]);
+
+  it("Ctrl+Enter runs only the statement the caret is in", async () => {
+    renderPage();
+    const ta = editor();
+    ta.focus();
+    ta.setSelectionRange(secondAt, secondAt);
+    fireEvent.keyDown(ta, { key: "Enter", ctrlKey: true });
+    await screen.findByText("Showing 1–2 of 2 rows");
+    expect(sent()).toEqual([{ sql: "SELECT 2" }]);
+  });
+
+  it("moving the caret to another statement runs that one instead", async () => {
+    renderPage();
+    const ta = editor();
+    ta.focus();
+    ta.setSelectionRange(2, 2);
+    fireEvent.keyDown(ta, { key: "Enter", ctrlKey: true });
+    await screen.findByText("Showing 1–2 of 2 rows");
+    ta.setSelectionRange(SCRIPT.length, SCRIPT.length);
+    fireEvent.keyDown(ta, { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(sqlMock).toHaveBeenCalledTimes(2));
+    expect(sent()).toEqual([{ sql: "SELECT 1" }, { sql: "SELECT 3" }]);
+  });
+
+  it("Ctrl+Shift+Enter runs every statement, in order", async () => {
+    renderPage();
+    const ta = editor();
+    ta.focus();
+    ta.setSelectionRange(secondAt, secondAt);
+    fireEvent.keyDown(ta, { key: "Enter", ctrlKey: true, shiftKey: true });
+    await waitFor(() => expect(sqlMock).toHaveBeenCalledTimes(3));
+    expect(sent()).toEqual([{ sql: "SELECT 1" }, { sql: "SELECT 2" }, { sql: "SELECT 3" }]);
+  });
+
+  it("the Run button of the cell uses the caret the editor last had", async () => {
+    renderPage();
+    const ta = editor();
+    ta.focus();
+    ta.setSelectionRange(secondAt, secondAt);
+    fireEvent.keyUp(ta, { key: "ArrowLeft" }); // the editor reports where the caret is
+    ta.blur();
+    fireEvent.click(screen.getByRole("button", { name: "Run cell 1" }));
+    await screen.findByText("Showing 1–2 of 2 rows");
+    expect(sent()).toEqual([{ sql: "SELECT 2" }]);
+  });
+
+  it("a cell with one statement is unchanged: Ctrl+Enter sends all of its text", async () => {
+    renderPage();
+    const ta = screen.getByLabelText("Cell 1 SQL") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "SELECT 9;" } });
+    ta.focus();
+    fireEvent.keyDown(ta, { key: "Enter", ctrlKey: true });
+    await screen.findByText("Showing 1–2 of 2 rows");
+    expect(sent()).toEqual([{ sql: "SELECT 9" }]);
+  });
+
+  it("an error in the single statement maps back to its place in the cell", async () => {
+    sqlMock.mockReset();
+    sqlMock.mockRejectedValueOnce(
+      new ApiRequestError(400, { error: { code: "PARSE_ERROR", message: "the SQL text could not be parsed", detail: "expected FROM, found EOF at line 1 col 8" } }),
+    );
+    renderPage();
+    const ta = screen.getByLabelText("Cell 1 SQL") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "SELECT 1;\n\nSELECT 2 +;\nSELECT 3;" } });
+    ta.focus();
+    const at = "SELECT 1;\n\nSELECT".length;
+    ta.setSelectionRange(at, at);
+    fireEvent.keyDown(ta, { key: "Enter", ctrlKey: true });
+    const alert = await screen.findByRole("alert");
+    expect(sent()).toEqual([{ sql: "SELECT 2 +" }]);
+    // The statement starts on line 3 of the cell, exactly as when the whole cell is run.
+    fireEvent.click(within(alert).getByRole("button", { name: /Jump to line 3/ }));
+  });
+
+  it("does not guess when the caret is unknown (after a reload): says what to do and sends nothing", async () => {
+    const first = renderPage();
+    editor();
+    await waitFor(() => expect(window.sessionStorage.length + window.localStorage.length).toBeGreaterThan(0));
+    first.unmount();
+    renderPage();
+    expect((screen.getByLabelText("Cell 1 SQL") as HTMLTextAreaElement).value).toBe(SCRIPT);
+    fireEvent.click(screen.getByRole("button", { name: "Run cell 1" }));
+    expect(await screen.findByText(/This cell has 3 statements\. Click inside the one to run/)).toBeInTheDocument();
+    expect(sqlMock).not.toHaveBeenCalled();
   });
 });

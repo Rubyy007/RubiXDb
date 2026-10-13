@@ -1,33 +1,17 @@
-import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useSession } from "../context/SessionContext";
 import { useMetadataQuery } from "../api/queries";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import { Select } from "../components/Field";
-
-type Theme = "system" | "light" | "dark";
-
-function applyTheme(theme: Theme) {
-  if (theme === "system") {
-    document.documentElement.removeAttribute("data-theme");
-  } else {
-    document.documentElement.setAttribute("data-theme", theme);
-  }
-}
+import { useThemePref } from "../utils/useTheme";
+import { setThemePref, type ThemePref } from "../utils/theme";
 
 export function SettingsPage() {
   const { session, clearSession } = useSession();
   const navigate = useNavigate();
   const metadata = useMetadataQuery();
-  const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem("rubixdb-console-theme") as Theme | null) ?? "system",
-  );
-
-  useEffect(() => {
-    applyTheme(theme);
-    localStorage.setItem("rubixdb-console-theme", theme);
-  }, [theme]);
+  const theme = useThemePref();
 
   return (
     <div className="stack">
@@ -63,7 +47,7 @@ export function SettingsPage() {
         <Select
           label="Theme"
           value={theme}
-          onChange={(e) => setTheme(e.target.value as Theme)}
+          onChange={(e) => setThemePref(e.target.value as ThemePref)}
         >
           <option value="system">Match system</option>
           <option value="light">Light</option>
