@@ -139,7 +139,10 @@ def main():
     sig = [r for r in f if "F-D1a-1 SIGNATURE on all" in r["detail"]]
     w(f"Result: **{counts(conc)}**. Failing rows: {len(f)}; of those carrying the automatic **F-D1a-1 signature** (an acknowledged write whose seq is at or below the manifest checkpoint yet present in no live SSTable): {len(sig)}; **without** it: {len(f) - len(sig)}.")
     w("")
-    w("**These rows fail because of a pre-existing engine defect (F-D1a-1, `OPEN_ITEMS.md`), not because of the rig**: it reproduces on a pristine export of `dde8ae9` with no fault-point code, without any fault rule, and across a *graceful* stop (docs/D0_BASELINE.md, D1a section). The rows are reported as they came out; a PASS here does not show the defect absent (it is timing-dependent), a FAIL shows an acknowledged write lost. Reproducibility is per hit index, not per thread interleaving (ADR-FAULTPOINTS-01 §5.3).")
+    if f:
+        w("**These rows fail because of a pre-existing engine defect (F-D1a-1, `OPEN_ITEMS.md`), not because of the rig**: it reproduces on a pristine export of `dde8ae9` with no fault-point code, without any fault rule, and across a *graceful* stop (docs/D0_BASELINE.md, D1a section). The rows are reported as they came out; a PASS here does not show the defect absent (it is timing-dependent), a FAIL shows an acknowledged write lost. Reproducibility is per hit index, not per thread interleaving (ADR-FAULTPOINTS-01 §5.3).")
+    else:
+        w("**All rows pass since the F-D1a-1 fix (ADR-CHECKPOINT-CONTIGUITY-01, approved and landed 2026-10-13).** Before the fix this column failed (28 of 31 on the unfixed repository; the defect also reproduced on a pristine export of `dde8ae9` with no fault-point code and across a graceful stop - `docs/D0_BASELINE.md`, D1a section). The defect is timing-dependent, so a PASS shows no lost write in these runs, not that none can occur; the deterministic regression tests are `tests/pending_fixes.rs` `f_d1a_1_*`.")
     w("")
     w("| point | trigger | verdict | detail |")
     w("|---|---|---|---|")

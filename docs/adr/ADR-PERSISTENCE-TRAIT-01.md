@@ -49,3 +49,14 @@ Inventory by script (`fs_inventory`, production code only, `#[cfg(test)]` module
 ## 7. Blocker rule
 
 If the completeness test could not be made to pass — i.e. a persistence path could not be routed — D1b would be reported **BLOCKED** and the durability claim downgraded to "process-crash safety only". That did not happen; see the D1b report.
+
+---
+
+## 8. Implementation record (2026-10-13)
+
+* **Built:** `src/persist/mod.rs` (`RealFs`: `PFile`, `OpenOptions`, `Metadata`, `ReadDir`, the `std::fs`-named functions, `sync_dir`) and `src/persist/sim.rs` (`SimFs`, behind `sim-fs`). `Cargo.toml`: feature `sim-fs = []`, `[[test]] sim_proof`, `[[test]] sim_power_loss`. 17 production files converted (listed in `docs/PERSISTENCE_MODEL.md` §5.1).
+* **BLOCKER RULE: not triggered.** Every persistence path of the root crate was routed; the completeness scan passes (`tests/persistence_abstraction_complete.rs`, 2 tests) and the engine runs end to end on a virtual root that does not exist on the real disk.
+* **Deliberate deviations from §2:** (1) `crate::persist::sync_dir` forwards to the existing `wal::fsync_dir` rather than duplicating the Windows no-op; (2) `src/faults.rs` and `src/startup_probe.rs` are allow-listed in the scan because they write the test harness's own files; (3) the `instance`, `api`, `cli` and `sql` crates are out of scope and listed in `docs/PERSISTENCE_MODEL.md` §5.2 (credentials file, security log, backup-file delete, frontend cache — **power-loss behaviour NOT TESTED**).
+* **Zero behaviour change of `RealFs`:** a straight forward by construction; evidence is the unchanged default workspace suite (D0 counts plus only added tests: 2,181 passed / 2 failed / 32 ignored, the two failures being the pre-existing `repo_hygiene` checks), the D1a fault-point suite on the threaded code (class A 34/34, class B 164/164, concurrent 31/31, relational 31/31), clippy and rustfmt clean. A byte-level comparison of before/after release binaries was **not** made (the scratch builds prepared for it were lost; not repeated).
+* **Product build:** `cargo build --release --locked -p rubixdb-cli` (no features): `scripts/check_no_fault_points.ps1` passes (none of the four `RUBIXDB_FAULT_*` names and none of the simulator magic `RBXSIMD1`); the same script fails on a binary built with the features (positive control). `tests/fault_points_absent_from_product.rs` covers both features (7 tests).
+* **Proofs:** `tests/sim_proof.rs` P1–P4 plus M7, M8, the engine-on-SimFs run and a handle-semantics test: 8 of 8 pass. Findings produced by the model: F-D1b-1, F-D1b-2 (`docs/PERSISTENCE_MODEL.md` §7).

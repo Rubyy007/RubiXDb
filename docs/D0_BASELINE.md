@@ -521,3 +521,27 @@ Oracle and pipeline self-tests that must fail, and do: engine oracle — removed
 ## F. Not tested / limits (D1a)
 
 Power loss (any kind), torn sectors, reordering, lost directory entries, lying fsync — **NOT TESTED** (D1b/D1c; no capability on this platform). Linux/macOS — not run. Concurrency at M = 5 seeds (A4's D1c requirement) — not run (D1a used M = 1). SQL text path — not covered by the relational oracle. `manifest.write` `shortwrite=` — used once, as an observation (F-D0-3), not as a matrix row. Torn-tail / stale-file fixtures are synthetic. Release-profile behaviour of the rig — not run (debug only). The `hunt_lost_ack_without_faults` rates are small samples (15 runs per configuration), not probabilities.
+
+---
+
+# D1b appendix (2026-10-13; append-only; the D0 and D1a text above is unchanged)
+
+Slice D1b, preceded by STEP 1 of the gate (fixes approved 2026-10-13). Platform: Windows 10 Home 10.0.19045, NTFS, SATA SSD, `rustc 1.98.1`, debug builds; `TEMP` and `CARGO_TARGET_DIR` on D:. Nothing was run on Linux/macOS. **Real power loss: NOT tested.**
+
+## G. Test evidence (exact commands, counts)
+
+| # | Command (from `E:\RubiXDb`) | Result |
+|---|---|---|
+| 1 | `cargo test --workspace --no-fail-fast` (default features) — 30 min, exit 101 | **56 binaries: 2,181 passed, 2 failed, 32 ignored.** D0 baseline 2,168 / 2 / 32; D1a final 2,178 / 2 / 32. Differences from the D1a final run, binary by binary (`compare_suites.py`): `fault_points_absent_from_product` 6 → 7 (the `sim-fs` guard) and the new `persistence_abstraction_complete` (2). Nothing else differs. The 2 failures are the pre-existing `repo_hygiene` `no_tracked_credentials_json` and `no_tracked_file_contains_a_64_hex_admin_key_literal`. |
+| 2 | `cargo build --features fault-points --example fault_child`; `cargo test --features fault-points --test fault_points -- --test-threads=1` — 128 s | 24 passed, **0 failed**, 5 ignored (D1a final: 23 / **1** / 5; the failure was the F-D1a-1 concurrent column). Matrix: class A 34/34, class B single 164/164, concurrent **31/31**, relational 31/31. |
+| 3 | `cargo test --features fault-points --test pending_fixes` | 11 passed, 0 failed, 1 ignored (`observe_f_d1a_2_*`) |
+| 4 | `cargo test --features sim-fs --test sim_proof` | **8 passed**: P1, P2, P3, P4, M7, M8, engine-on-SimFs, handle semantics |
+| 5 | `cargo build --features fault-points,sim-fs --example fault_child`; `cargo test --features fault-points,sim-fs --test sim_power_loss` ×3 | 1 passed each (harness integrity asserted); rows 153 per run: class B 17/17 PASS; class C 80/80/79 PASS, 56/56/57 FAIL, all attributed to F-D1b-1 (5/5/6) or F-D1b-2 (51); UNCLASSIFIED 0 |
+| 6 | `cargo test --test persistence_abstraction_complete`; `cargo test --test fault_points_absent_from_product` | 2 passed; 7 passed |
+| 7 | `cargo clippy -p rubixdb --all-targets --all-features -- -D warnings`; `cargo fmt -p rubixdb -- --check` | clean; clean |
+| 8 | `cargo build --release --locked -p rubixdb-cli` then `scripts/check_no_fault_points.ps1 -Binary …rubixdb.exe` | built (2 m 20 s); gate exit 0; positive control on a feature-built binary: exit 1 |
+| 9 | `cargo test --features fault-points,sim-fs --lib` | **693 passed**, 0 failed, 4 ignored (default build: 687; the 6 extra are the `faults::` unit tests) — 219 s |
+
+## H. Not tested / limits (D1b)
+
+Real power loss, a real fsync lie, real sector tearing or reordering — **NOT TESTED**; every class C row is simulated under `docs/PERSISTENCE_MODEL.md` with A1–A5/W1 untested. Linux/macOS — not run. 4 KiB sectors — configurable, not run. Class C with concurrent writers, compaction on, the relational workload, and every fault point other than the six sampled — not run (D1c). Power-loss behaviour of `credentials.json`, `security.log`, instance bookkeeping, the frontend cache, directory creation by the host — NOT TESTED (outside the abstraction). Release binaries before/after the threading were not byte-compared.
