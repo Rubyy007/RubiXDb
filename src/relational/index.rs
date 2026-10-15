@@ -327,11 +327,10 @@ impl IndexBuilder {
         let snapshot = self.engine.snapshot();
         let (start, end) = index_entry_range(table_id, index.index_id);
         let mut previous: Option<Vec<u8>> = None;
-        for entry in self.engine.range_scan(
-            as_bound_ref(&start),
-            as_bound_ref(&end),
-            snapshot.seq(),
-        ) {
+        for entry in
+            self.engine
+                .range_scan(as_bound_ref(&start), as_bound_ref(&end), snapshot.seq())
+        {
             let (key, _) = entry?;
             let body = key.get(9..).unwrap_or(&[]);
             let (values, consumed) = decode_indexed_columns(&types, body)?;

@@ -21,19 +21,19 @@ use std::collections::HashMap;
 use rubixdb::catalog::schema::ColumnRow;
 
 use crate::aggregate::GroupingKey;
-use crate::check::{self, CompiledCheck};
-use crate::limits::SqlLimits;
 use crate::bound::{
     BoundAlterOp, BoundArbiter, BoundAssignment, BoundColumnDef, BoundConflictAction, BoundExpr,
     BoundExprKind, BoundInsert, BoundOnConflict, BoundReturning, BoundStatement, ColumnRef,
     TableRefId,
 };
+use crate::check::{self, CompiledCheck};
 use crate::error::{Result, SqlError};
 use crate::exec::expr_eval::{eval, eval_predicate};
 use crate::exec::operators::build_operator;
 use crate::exec::{
     CancellationToken, CorrelatedUsage, ExecCtx, ExecLimits, ExecMetrics, ResultSchema, RowContext,
 };
+use crate::limits::SqlLimits;
 use crate::plan::access::PhysicalAccess;
 use crate::plan::physical::PhysicalPlan;
 use crate::plan::Plan;

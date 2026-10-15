@@ -643,3 +643,154 @@ Per package: `rubixdb-sql` lib **1,119 passed (debug) / 1,120 passed (release), 
 
 SHA-256 of the combined `git diff` of `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`, `src/error.rs`, `Cargo.toml`, `Cargo.lock`, `tests/repo_hygiene.rs` is `3f5d912f2590c696b94f53019ea245f5b227fc8841cbab6928455e9080e2c86d` after Phase 2a, the same value recorded before and after Phase 1: **zero diff by this mission** (those paths carry the durability mission's earlier uncommitted work, unchanged). The tracked credentials file was not touched. Phase 2a changed `sql/` (`ast`, `bound`, `convert`, `bind/{dml,select}`, `plan/{mod,relstats,explain}`, `exec/{mod,write}`, `exec/write/metrics`, `lib`, `write_tests`, new `phase2a_tests`), one function in `api/src/routes/sql.rs` (`write_result_to_json`: a `RETURNING` result is sent as a `rows` body) and the new `api/tests/api_sql_phase2a.rs`. No WAL, MANIFEST, SSTable or catalog format changed, so the mission's "WAL format change: STOP" condition did not arise.
 
+
+## 17. Phase 2b + 3 (ALTER TABLE and foreign keys) -- appended 2026-10-15
+
+Phase 2b + 3 implemented the `ALTER TABLE` subset the matrix identified and foreign keys, together, because they share the catalog metadata layer and the transactional enforcement path. Design record, including the one decision the mission required (how foreign-key enforcement is made safe under snapshot isolation) and the catalog-format change: `docs/adr/ADR-DDL-FK-01.md`. **No WAL, MANIFEST or SSTable format changed; no protected path changed.** Status words below are the closed vocabulary only: PASS / FAIL / OPEN / NOT REQUIRED / NOT TESTED / NOT IMPLEMENTED. A form that cannot be done safely is "NOT IMPLEMENTED" with the reason (BLOCKED where the mission asked for that word).
+
+**Concurrency decision for foreign-key enforcement:** commit-time validation under the existing per-table epoch locks (exclusive on tables written, shared on the other side of each key, taken in table-id order, with a catalog generation check), plus statement-time checks for immediate errors; not parent-row locking (the engine has no row locks). ADR section D5.
+
+### 17.1 Rows whose status changed
+
+| ID | Feature | Phase 0 status | Status now | Evidence (tests run in this phase; `rel::` = `src/relational/fk_tests.rs`, `sql::` = `sql/src/phase2b3_tests.rs`, `api::` = `api/tests/api_sql_phase2b3.rs`) |
+|---|---|---|---|---|
+| H-1 | `ALTER TABLE ... ADD COLUMN [DEFAULT] [NOT NULL]` | BLOCKED_BY_ARCHITECTURE | PASS | Rows decode by their own `schema_version`; a column added later reads as its `backfill_value`. `rel::versioned_decode::*` (9: old rows read the default, `SET DEFAULT` does not change old rows, no-default reads `NULL`, three generations of rows in one table, `NOT NULL` needs a default unless empty, an index built afterwards indexes the backfill, a version-1 catalog row still decodes, restart, an open transaction conflicts); `sql::alter::{add_column_with_a_default_is_applied_to_existing_rows_everywhere_they_are_read, add_column_without_a_default_reads_null_for_existing_rows, rows_written_after_the_alter_store_the_column_and_old_rows_can_be_updated, add_column_not_null_needs_a_default_unless_the_table_is_empty, add_column_if_not_exists_and_duplicates, alter_survives_a_restart_catalog_and_data, alter_during_concurrent_writes_loses_and_corrupts_nothing}`; `catalog schema::tests::column_row_version_one_decodes_and_version_two_round_trips_backfill`; `api::alter_table_over_http_reports_a_ddl_result_and_changes_the_schema` |
+| H-2 | `DROP COLUMN` | BLOCKED_BY_ARCHITECTURE | NOT IMPLEMENTED (BLOCKED) | A column's identity is its ordinal; the primary key, every index, every foreign key, every stored row and the whole SQL layer use it as a position. Hiding a column would need a logical-to-physical map through all of them; the mission forbids a hiding that can mis-decode a row or mis-maintain an index. Refused at parse time with the reason: `sql::parser::the_forms_rubixdb_cannot_do_safely_are_refused_with_the_reason`, `sql::alter::drop_column_is_refused_as_blocked_and_changes_nothing`. Smallest sound design recorded in `OPEN_ITEMS.md` and ADR D3. |
+| H-3 | `RENAME COLUMN` | NOT_IMPLEMENTED | PASS | `sql::alter::rename_column_is_visible_everywhere_and_old_name_stops_working` (including an index on the column and a primary-key column), `sql::check_constraints::a_column_a_check_reads_cannot_be_renamed_but_others_can`, `rel::versioned_decode::schema_changes_survive_a_restart` |
+| H-3b | `RENAME TO` (table), `ALTER COLUMN ... TYPE` | NOT_IMPLEMENTED / NOT_PLANNED | NOT IMPLEMENTED | refused with a reason: `sql::parser::the_forms_rubixdb_cannot_do_safely_are_refused_with_the_reason` |
+| H-4 | `ALTER COLUMN SET/DROP NOT NULL`, `SET/DROP DEFAULT` | NOT_IMPLEMENTED | PASS | `sql::alter::{set_not_null_validates_existing_rows_and_leaves_nothing_on_failure, set_default_changes_new_rows_only}`; `rel::versioned_decode::set_default_does_not_change_what_old_rows_read`; `sql::fk_definition::set_null_needs_a_nullable_column_outside_the_primary_key` (a `NOT NULL` is refused on a column a `SET NULL` key writes) |
+| H-5 | `ADD/DROP CONSTRAINT`: `UNIQUE` | NOT_IMPLEMENTED | PASS | `sql::alter::add_unique_constraint_validates_existing_rows_and_enforces_afterwards`, `invalid_alters_are_rejected_without_partial_state`, `rel::versioned_decode::an_index_built_after_add_column_indexes_the_backfill_value` (unique over repeated values refused, no index row left) |
+| H-5b | `ADD/DROP CONSTRAINT`: `CHECK` | NOT_IMPLEMENTED | PASS | `sql::check_constraints::*` (10), `api::check_constraints_over_http_are_enforced_with_their_own_error_code` |
+| H-5c | `ADD/DROP PRIMARY KEY` | NOT_IMPLEMENTED | NOT IMPLEMENTED (by design) | a table's primary key is fixed at `CREATE TABLE` (D6); `sql::bind_and_plan::drop_constraint_finds_a_foreign_key_or_a_unique_index_by_name` pins that `<table>_pkey` cannot be dropped |
+| H-6 | `ADD FOREIGN KEY` | NOT_IMPLEMENTED | PASS | `sql::fk_enforcement::a_foreign_key_can_be_added_to_a_table_with_valid_rows_and_not_to_one_with_orphans`, `sql::alter::invalid_alters_are_rejected_without_partial_state`, `rel::commit_validation::adding_a_foreign_key_while_children_are_inserted_leaves_no_orphan` (15 rounds), `sql::fk_concurrency::adding_a_key_while_children_are_inserted_leaves_no_orphan` (6 rounds) |
+| I-1 | Inline `col ... REFERENCES t(c)` | NOT_IMPLEMENTED | PASS | `sql::parser::create_table_collects_inline_and_table_level_foreign_keys_in_order`, `sql::fk_definition::inline_and_table_level_declarations_both_record_a_key` |
+| I-2 | Table-level `FOREIGN KEY (a) REFERENCES t(b)` | NOT_IMPLEMENTED | PASS | same; `sql::fk_enforcement::*` |
+| I-3 | Composite FK (`MATCH SIMPLE`) | NOT_IMPLEMENTED | PASS | `sql::fk_enforcement::{composite_keys_are_enforced_and_a_partial_null_is_exempt, a_composite_key_over_a_unique_index_matches_columns_in_any_order, a_child_keyed_by_the_parent_reference_uses_the_key_prefix}`, `sql::fk_definition::composite_keys_need_matching_arity_and_types`. `MATCH FULL|PARTIAL` and `DEFERRABLE`: NOT IMPLEMENTED (refused, `sql::parser`) |
+| I-4 | Referenced PK / UNIQUE resolution | NOT_IMPLEMENTED | PASS | `sql::fk_definition::the_referenced_columns_must_be_the_primary_key_or_a_ready_unique_index`, `sql::fk_enforcement::a_key_over_a_unique_non_pk_column_is_enforced_and_cascades`, `sql::fk_paths::text_and_decimal_keys_are_matched_exactly`, `rel::lookup_paths::every_access_path_finds_the_same_rows`. Documented requirement: the referenced column set is exactly the primary key or exactly a `Ready` unique index; identical types |
+| I-5 | `ON DELETE` / `ON UPDATE`: `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT` | NOT_IMPLEMENTED | PASS | `sql::fk_enforcement::{delete_of_a_referenced_parent_is_refused_under_no_action_and_restrict, delete_cascades_through_several_levels, delete_sets_null_in_the_children, delete_sets_the_default_in_the_children_and_the_default_must_itself_be_valid, update_of_a_parent_key_cascades_to_the_children, update_of_a_parent_key_sets_null_or_is_refused, a_self_referencing_table_inserts_a_tree_in_one_statement_and_cascades_down}`, `sql::fk_paths::*` (8), `rel::enforcement::*` (3: a cascade past the write-set cap and a chain deeper than 32 fail closed) |
+| I-6 | Immediate enforcement and concurrency | BLOCKED_BY_ARCHITECTURE | PASS (decision: commit-time validation under the epoch locks; ADR D5) | both orderings at three layers: `rel::commit_validation::{child_insert_loses_to_a_parent_delete_that_committed_first, parent_delete_loses_to_a_child_insert_that_committed_first, racing_child_insert_and_parent_delete_never_leave_an_orphan (60 barrier rounds), many_concurrent_child_inserts_on_one_parent_all_commit, foreign_keys_in_opposite_directions_do_not_deadlock}`; `sql::fk_concurrency::*` (6 incl. a 3-writer stress); `sql::fk_snapshot_views::*` (3); `api::{concurrent_http_children_and_parent_deletes_leave_no_orphan, foreign_keys_inside_a_session_transaction_are_checked_at_the_statement_and_at_commit}` |
+| I-7 | Validation of existing rows when a FK is added | NOT_IMPLEMENTED | PASS | see H-6 |
+| I-8 | Metadata persistence of FKs | NOT_IMPLEMENTED | PASS | new system table 8; `catalog schema::tests::foreign_key_row_round_trips_with_and_without_a_parent_index`, `sql::fk_restart::definitions_and_enforcement_survive_a_restart`, `api::alter_table_and_foreign_keys_survive_a_restart` |
+| I-9 | FK recovery | NOT_IMPLEMENTED | PASS for a clean engine restart after commit and after an abandoned transaction; **NOT TESTED** for process kill / power loss in the middle of a cascade commit | `sql::fk_restart::{a_committed_cascade_is_whole_after_a_restart, an_uncommitted_cascade_is_nowhere_after_a_restart, a_dropped_key_stays_dropped_and_a_dropped_table_takes_its_keys}`; whole-or-absent rests on the certified single `write_batch` |
+| I-11 | Inline / table-level `UNIQUE` in `CREATE TABLE` | PARTIALLY | NOT IMPLEMENTED (unchanged) | `ALTER TABLE ... ADD CONSTRAINT UNIQUE` (H-5) is the supported spelling |
+| I-12 | `CHECK` constraints | NOT_IMPLEMENTED | PASS | see H-5b; column-level and table-level in `CREATE TABLE`, `ALTER ... ADD CONSTRAINT`, enforced on `INSERT`, `INSERT ... SELECT`, `ON CONFLICT`, `UPDATE` and on rows a foreign-key action rewrites |
+| G-8 | `UPDATE` of a primary-key column | NOT_IMPLEMENTED | PASS | `sql::primary_key_update::*` (7: move, shift among a statement's own rows, collision fails and changes nothing, `NULL` refused, `ON CONFLICT DO UPDATE` still refuses, in a transaction, two transactions racing for one key); the two Phase 0 tests that pinned the refusal are replaced (`bind_tests::update_of_primary_key_column_now_binds`, `write_tests::update_primary_key_column_moves_the_row_end_to_end`) |
+| AB-1 | Positional row decode | BLOCKED | resolved | H-1 |
+| AB-2 | No read-set under snapshot isolation | BLOCKED | resolved for foreign keys | I-6 |
+| AB-3 | Constraint record cannot express a foreign key | BLOCKED | resolved | I-8 |
+
+New rows found while implementing (not in the Phase 0 matrix):
+
+| ID | Feature | Status | Evidence / reason |
+|---|---|---|---|
+| X-1 | `CREATE UNIQUE INDEX` over rows that already hold a value twice | defect, FIXED | it used to succeed and mark the index `Ready`; a `UNIQUE` index is now verified (bounded memory, one pass in key order) before it becomes `Ready`. `rel::versioned_decode::an_index_built_after_add_column_indexes_the_backfill_value`, `sql::alter::add_unique_constraint_validates_existing_rows_and_enforces_afterwards` |
+| X-2 | Statement atomicity inside an explicit transaction | PASS | every DML statement runs in a savepoint; a failing statement undoes only itself: `rel::savepoints::*` (4), `sql::fk_atomicity::{a_failing_statement_inside_a_transaction_undoes_only_itself, a_cascade_that_exceeds_the_write_set_cap_fails_closed_and_leaves_the_transaction_untouched, an_autocommit_cascade_past_the_cap_changes_nothing_at_all}`. Also closes the Phase 2a caveat that a failure while buffering could leave earlier rows of the statement in the transaction |
+| X-3 | Transaction open across an `ALTER` or a key/constraint change | PASS (defined behaviour) | the commit fails with a `Conflict`: `rel::versioned_decode::a_transaction_that_wrote_before_an_alter_conflicts_at_commit`, `sql::alter::a_transaction_open_across_an_alter_conflicts_rather_than_writing_an_old_shape`, `sql::check_constraints::a_transaction_open_across_add_check_conflicts_and_a_racing_insert_never_slips_past` |
+| X-4 | Drop a table another table references; drop a unique index a key resolves to | PASS (refused) | `sql::fk_definition::{dropping_a_referenced_table_is_refused_and_dropping_the_child_removes_its_keys, the_referenced_columns_must_be_the_primary_key_or_a_ready_unique_index}`, `api::{dropping_a_referenced_table_is_a_client_error_over_sql, rest_drops_of_a_referenced_table_and_a_referenced_unique_index_are_client_errors}` |
+
+### 17.2 Semantics as implemented (each is pinned by a test named in 17.1)
+
+* **ADD COLUMN** appends a column; existing rows are not rewritten and read the new column as its `DEFAULT` (or `NULL`). `SET DEFAULT` / `DROP DEFAULT` affect only rows written afterwards. `NOT NULL` without a `DEFAULT` is accepted only on an empty table. Every `ALTER` and every foreign-key change bumps the table's persisted `schema_version` in the same atomic batch.
+* **Atomicity / recovery of every `ALTER`**: epoch write-lock on each table involved, validation (definition, and every existing row for `SET NOT NULL`, `ADD FOREIGN KEY`, `ADD UNIQUE`), then ONE catalog `write_batch`. A refused or failed `ALTER` changes nothing (tested by comparing the whole catalog before and after); a restart sees either the old or the new schema, never a mix. A transaction that wrote the table before an `ALTER` and commits after it gets a `Conflict`.
+* **One operation per `ALTER` statement.**
+* **Foreign keys**: inline (`col T REFERENCES p (c)`) and table-level, single column and composite (up to 16), referencing a primary key or a `Ready` `UNIQUE` index (any column order), identical types required. `MATCH SIMPLE`: a row with any `NULL` referencing column is never checked. `NO ACTION` and `RESTRICT` are the same (enforcement is always immediate, at the end of the statement). `ON DELETE` and `ON UPDATE`: `CASCADE`, `SET NULL`, `SET DEFAULT`. Enforced on `INSERT`, `INSERT ... SELECT`, `UPDATE`, `DELETE`, `ON CONFLICT DO NOTHING | DO UPDATE`.
+* **Composite-key requirement**: every referenced column must exist, have the same type as its referencing column, and the referenced column *set* must be exactly the parent's primary key or exactly the columns of a `Ready` `UNIQUE` index (a prefix of a key, or a non-unique index, is refused at definition).
+* **Violation errors** (`SqlError::ForeignKeyViolation`, HTTP 409 `FOREIGN_KEY_VIOLATION`) name the constraint, the tables and the columns, never a value.
+* **Statement atomicity**: every DML statement runs inside a savepoint; a statement that fails part-way (violation, cascade past a limit) leaves the transaction exactly as before it.
+* **Limits**: cascade depth 32; the transaction write-set cap (10,000 operations / 16 MiB) bounds a cascade; the children read for one statement are bounded by the same cap.
+* **`UPDATE` of a primary key** is now supported (G-8): delete of the old key and insert of the new, old keys removed first so keys can shift; a collision fails the statement.
+* **`CREATE UNIQUE INDEX` over existing duplicates** is now refused (defect found: it used to succeed).
+
+### 17.3 Tests added by Phase 2b + 3
+
+139 new tests, all in the repository's normal test run, plus two `#[ignore]`d micro-benchmarks:
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/relational/fk_tests.rs` | 29 | savepoints (4); versioned row decode / `ADD COLUMN` / restart / conflict with an open transaction (9); commit-time foreign-key validation and both race orderings (12, incl. a 60-round barrier stress, 8 concurrent writers on one parent, keys in opposite directions, `ADD FOREIGN KEY` racing inserts); statement-time enforcement and cascades (3, incl. write-set cap and depth limit failing closed); row-lookup access paths (1) |
+| `sql/src/phase2b3_tests.rs` | 98 | parser (4) / binder + planner (7) / `ALTER TABLE` (14) / `UPDATE` of a primary key (7) / foreign-key definition (6) / enforcement (20) / more paths (8) / statement-time views (3) / atomicity (5) / concurrency (6) / restart (4) / authorization (2) / catalog level (2) / `CHECK` (10) |
+| `api/tests/api_sql_phase2b3.rs` | 10 | `ALTER` over HTTP; 409 `FOREIGN_KEY_VIOLATION` / `CHECK_VIOLATION` with no row value; cascades with `RETURNING`; a session transaction; `DROP` of a referenced table; concurrent HTTP writers; restart |
+| `src/catalog/schema.rs` (unit) | 2 | foreign-key row round trip; version-1 / version-2 `system.columns` rows |
+| `src/relational/commit_bench_tests.rs`, `fk_bench_tests.rs` | 2 (`#[ignore]`) | commit-path micro-benchmarks, section 17.6 |
+
+Two older tests were replaced because the behaviour they pinned is gone by design (G-8): `bind_tests::update_of_primary_key_column_now_binds`, `write_tests::update_primary_key_column_moves_the_row_end_to_end`.
+
+Test categories required by the mission, and where they are:
+
+| Required | Where |
+|---|---|
+| ALTER: add column with rows, default applied | `sql::alter::add_column_with_a_default_*`, `rel::versioned_decode::old_rows_read_the_backfill_*` |
+| drop column | refused (BLOCKED): `sql::alter::drop_column_is_refused_as_blocked_and_changes_nothing` |
+| rename column; set / drop NOT NULL; add / drop constraint | `sql::alter::{rename_column_*, set_not_null_*, add_unique_constraint_*}`, `sql::check_constraints::add_check_*`, `sql::fk_definition::drop_constraint_removes_the_key_*` |
+| interrupted ALTER leaves no partial state | `sql::alter::invalid_alters_are_rejected_without_partial_state` (the whole catalog compared before and after each refused ALTER), `add_check_validates_every_existing_row_and_records_nothing_on_failure`; each ALTER is one `write_batch` (ADR D4). A process kill inside `write_batch` is the certified WAL's territory and was not injected: NOT TESTED |
+| restart after ALTER, catalog + data | `sql::alter::alter_survives_a_restart_catalog_and_data`, `rel::versioned_decode::schema_changes_survive_a_restart`, `api::alter_table_and_foreign_keys_survive_a_restart` |
+| ALTER during concurrent writes | `sql::alter::alter_during_concurrent_writes_loses_and_corrupts_nothing`, `sql::check_constraints::a_transaction_open_across_add_check_*`, `rel::versioned_decode::a_transaction_that_wrote_before_an_alter_conflicts_at_commit` |
+| invalid ALTER rejected without partial state | `sql::alter::invalid_alters_are_rejected_without_partial_state`, `sql::bind_and_plan::invalid_statements_fail_to_bind` |
+| FK: valid parent / missing parent / RESTRICT / CASCADE / SET NULL / cascade on PK update / composite / NULL not checked / add FK valid & invalid / UPDATE / UPSERT | `sql::fk_enforcement::*` (names in 17.1) |
+| two concurrent transactions racing on a FK | `rel::commit_validation::*`, `sql::fk_concurrency::*` |
+| crash during cascade → whole or none | commit is one `write_batch`: `sql::fk_restart::{a_committed_cascade_is_whole_after_a_restart, an_uncommitted_cascade_is_nowhere_after_a_restart}`; a failing cascade leaves nothing: `sql::fk_atomicity::*`, `rel::enforcement::*`. Process kill / power loss mid-commit: NOT TESTED |
+| restart after cascade — FK state verified | `sql::fk_restart::*` |
+
+### 17.4 Open / not tested / not required / not implemented after Phase 2b + 3
+
+**NOT IMPLEMENTED**
+* `DROP COLUMN` (BLOCKED -- a column's identity is its ordinal; ADR D3), `ALTER COLUMN ... TYPE`, `RENAME TO`, `ADD/DROP PRIMARY KEY`, `NOT VALID` / `VALIDATE CONSTRAINT`, `DEFERRABLE` keys, `MATCH FULL|PARTIAL`, `CHECK ... NOT ENFORCED`, several operations in one `ALTER`, `ADD COLUMN ... REFERENCES|CHECK`, inline / table-level `UNIQUE` inside `CREATE TABLE`.
+* `MERGE` (G-6), data-modifying CTEs (C-14), `UPDATE ... FROM` / `DELETE ... USING` (G-7), `INSERT ... AS alias` (G-4b): unchanged from section 16.
+
+**NOT TESTED**
+* A process kill or power loss in the middle of committing a cascade. A cascade reaches the engine as the single `write_batch` of the commit, so it is whole or absent by the certified batch atomicity; only a clean engine restart after commit, and after an abandoned transaction, were exercised here.
+* Foreign-key checks, cascades, `ADD FOREIGN KEY` and `ADD CHECK` validation over **large** tables (a child table with no usable access path is scanned once per statement/commit with the tables locked; no timing was taken); more than 16 concurrent writers; contention on a single hot parent beyond the micro-benchmarks in 17.6.
+* The engine's WAL gates (M1.2 / M1.3) re-run against the new commit path. M1.3 already fails at clean HEAD; the micro-benchmark below is fsync-bound and cannot see CPU cost.
+* CLI and browser rendering of `ALTER TABLE` results and of the `FOREIGN_KEY_VIOLATION` / `CHECK_VIOLATION` errors; the frontend keyword / completion lists and `SchemaDesign.tsx` ("rubiXDB has no foreign keys") were not touched.
+* Downgrade: an older binary opening a catalog that has foreign keys or an altered table (not a supported path; ADR D1).
+
+**Behaviours to know about (all pinned by tests)**
+* A transaction that wrote a table and commits after an `ALTER` / foreign-key / `CHECK` change on it fails with a `Conflict`.
+* A cascading delete that races a newly committed child is refused with a foreign-key violation (retrying cascades the new child); autocommit does not retry it.
+* Inside an explicit transaction a parent committed after `BEGIN` can be referenced (the statement-time check reads the latest committed parents too; commit decides).
+* `NO ACTION` = `RESTRICT`; a statement that deletes parents and their children together succeeds.
+* `DROP CONSTRAINT <name>` looks for a foreign key, then a `CHECK`, then a unique index of that name.
+* `RENAME COLUMN` of a column a `CHECK` reads is refused.
+* `TableStore::put_row` / `put_rows` (non-transactional test and maintenance entry points) are not constraint aware; `Transaction` and `autocommit_put_row` are for foreign keys, and the SQL executor is for `CHECK`.
+* A process must hold exactly one `CatalogService` per engine (the foreign-key and `CHECK` caches live in the instance); the server does.
+
+**NOT REQUIRED**: parent-row locking (the engine has no row locks; ADR D5); a read-set for general serializability (write skew on other constraints remains the documented D10 property).
+
+**Foreign-key enforcement is NOT declared production ready**: transaction races, cascading operations, failure during a cascade and clean-restart recovery are tested, but process kill / power loss during a cascade and large-table behaviour are NOT TESTED, and the repository's mandatory matrix still has FAIL entries that predate this phase (17.5).
+
+### 17.5 Regression (2026-10-15, every cargo run with a private target directory)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | **FAIL, pre-existing**: the same 28 files that fail at `dc5dc44` (a clean `git archive` of it was checked the same way); this phase added none. Every file this phase created, and the files whose formatting was clean at HEAD, are rustfmt-clean; the unformatted hunks in the 28 files belong to earlier phases' code and other sessions' work and were left alone (the tree is shared; `cargo fmt --all` was not run on it) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS, 0 warnings (two lints in this phase's code were fixed, not allowed) |
+| `cargo check --workspace --all-targets --all-features` | PASS |
+| `cargo test --workspace --no-fail-fast` (debug) | 60 test binaries: **2,494 passed, 2 failed, 34 ignored**. The two failures are `repo_hygiene::no_tracked_credentials_json` and `no_tracked_file_contains_a_64_hex_admin_key_literal` (the tracked `frontend/.e2e-crossbrowser-data/default/credentials.json`; protected path, not touched), failing at clean HEAD too |
+| `cargo test --release --workspace --no-fail-fast` | 60 test binaries: **2,495 passed, 3 failed, 32 ignored**. The same two `repo_hygiene` failures, and `group_commit::m1_3_thousand_writers_throughput` (20,949 ops/s against a target of 80,000: an engine-level WAL gate that drives `LsmEngine` directly, which this phase does not touch; it fails at clean HEAD too) |
+
+By package (identical in both profiles): `rubixdb` lib 722 passed (6 ignored, 2 of them this phase's benchmarks), `rubixdb-sql` lib 1,218 passed (22 ignored), `api_sql_integration` 47, `api_sql_phase2a` 9, `api_sql_phase2b3` 10, `api_sql_mission2` 13, `api_sql_phase1` 6, `api_sql_schemas` 8.
+
+Two failures seen in the **first** full debug run of this phase, both resolved and neither a product defect: (1) `persistence_abstraction_complete::no_production_code_outside_persist_touches_the_filesystem_directly` flagged `std::fs` in the two new benchmark files (the scan exempts files named `*tests.rs`); the files were renamed `commit_bench_tests.rs` / `fk_bench_tests.rs`, and the scan passes. (2) `observability::two_concurrent_instances_share_nothing_and_a_restart_in_one_process_starts_empty` failed once under the full run (an auth-failure counter read 0, a sampler-timing assertion in the same family as the known flaky `a_disconnect_mid_statement_...`); it passed 6/6 alone, 5/5 as a whole binary, and in the final full runs. No code in this phase touches authentication or the sampler.
+
+### 17.6 Measured
+
+Machine: the maintainer's Windows 10 workstation (shared with other sessions), SATA disk, engine `GroupCommit` with a 1 ms wait. Both benchmarks are `#[ignore]`d tests (`src/relational/commit_bench_tests.rs`, `fk_bench_tests.rs`), release build, 16 threads x 400 single-row transactions (`begin`, `put_row`, `commit`), a fresh database per run.
+
+| Benchmark | Runs | commits/s min / median / max | latency (per commit) |
+|---|---|---|---|
+| Tables **without** a foreign key, unmodified checkout of `dc5dc44` | 7 | 253 / 272 / 290 | p50 3,173 us, p99 909,673 us |
+| The same, this tree | 7 | 275 / 294 / 306 | p50 3,178 us, p99 644,033 us |
+| Child inserts, no foreign key (this tree, same process) | 5 | 275 / 287 / 305 | not recorded |
+| Child inserts, foreign key to a 16-row parent (this tree, same process) | 5 | 288 / 299 / 305 | not recorded |
+
+Reading: the workload is bound by the disk's fsync (p50 about 3.2 ms, p99 close to a second), so every difference above is inside run-to-run noise, **in both directions**. It shows that the new commit path (foreign-key set read, lock plan, generation check; plus the parent lookup when a key exists) did not make a group-committed write measurably slower on this machine. It does **not** isolate the CPU cost of those additions, and it says nothing about large tables or contended hot parents. No performance PASS is claimed (no workload sweep, no resource measurements, no latency distribution for the foreign-key case).
+
+Correctness stress that ran as tests: 60 barrier-started rounds of a child insert against the delete of its parent (relational), a 3-writer + 1-deleter SQL stress and a 3-task HTTP stress, 15 + 6 rounds of `ADD FOREIGN KEY` racing inserts, 8 threads x 25 commits on one parent, opposite-direction keys from 4 threads, `ALTER TABLE ADD COLUMN` + `SET DEFAULT` racing 3 writers, `ADD CHECK` racing a writer -- no orphan, no lost row, no deadlock in any run.
+
+### 17.7 Protected paths
+
+Zero diff attributable to this phase: the combined diff hash of `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`, `src/error.rs`, `Cargo.toml`, `Cargo.lock`, `tests/repo_hygiene.rs` and the tracked credentials file is `3f5d912f2590c696b94f53019ea245f5b227fc8841cbab6928455e9080e2c86d`, the same value as before Phase 1 (other sessions' uncommitted work in `src/wal/` and `src/manifest/` is part of that value and is unchanged by this phase). `src/relational/` and `src/catalog/` (modifiable per the mission) changed.
+
+### 17.8 Git state
+
+Phase 2b + 3 was started at `dc5dc44`. While it ran, the maintainer committed the working tree twice (`ce9cb59` 08:11 -- Phases 1 and 2a and other sessions' work; `bdb94db` 09:10 -- an intermediate snapshot of this phase). This phase made no commit and no push. At the time of writing `HEAD` is `bdb94db`; this phase's later edits (rustfmt of its own files, the CHECK-error and benchmark-file renames, the REST-drop test, the lint fixes) and this documentation are uncommitted. The protected-path hash in 17.7 is computed against `dc5dc44` (`git diff dc5dc44 -- <protected paths>`), which stays valid after those commits because they contain other sessions' work in `src/wal/` and `src/manifest/` byte-for-byte as it was when this phase began.

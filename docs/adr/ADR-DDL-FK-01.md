@@ -1,6 +1,6 @@
 # ADR-DDL-FK-01: ALTER TABLE and foreign keys
 
-Status: IMPLEMENTED in the working tree, uncommitted (SQL Phase 2b + 3, 2026-10-15).
+Status: IMPLEMENTED (SQL Phase 2b + 3, 2026-10-15).
 Scope: `src/catalog`, `src/relational`, `sql/`; `api/` for additive error mapping and statement dispatch only.
 Not touched: `src/wal/`, `src/manifest/`, `src/sstable/`, `src/compaction/`, `src/error.rs`. **No WAL, MANIFEST or SSTable format changed.**
 Evidence: `docs/SNOWFLAKE_SQL_COMPATIBILITY.md` section 17.

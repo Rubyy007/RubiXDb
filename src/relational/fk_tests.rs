@@ -164,7 +164,7 @@ fn int(n: i32) -> Option<RelationalValue> {
 }
 
 fn row(id: i32, reference: Option<i32>) -> Vec<Option<RelationalValue>> {
-    vec![int(id), reference.and_then(|r| int(r).into()), None]
+    vec![int(id), reference.and_then(int), None]
 }
 
 fn pk(id: i32) -> Vec<RelationalValue> {
@@ -302,7 +302,10 @@ mod versioned_decode {
         let f = Fixture::new("vd_basic");
         let t = f.table("t");
         f.store.put_row(t, &row(1, Some(7))).unwrap();
-        let ord = f.builder.alter_add_column(t, &column("score", Some(5), true)).unwrap();
+        let ord = f
+            .builder
+            .alter_add_column(t, &column("score", Some(5), true))
+            .unwrap();
         assert_eq!(ord, 3);
         // an old row is not rewritten: it reads the backfill
         let mut expected = row(1, Some(7));
@@ -323,7 +326,9 @@ mod versioned_decode {
         let f = Fixture::new("vd_set_default");
         let t = f.table("t");
         f.store.put_row(t, &row(1, None)).unwrap();
-        f.builder.alter_add_column(t, &column("score", Some(5), true)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("score", Some(5), true))
+            .unwrap();
         let ordinal = 3u16;
         let new_default =
             crate::relational::value::encode_row(1, &[Some(RelationalValue::Integer(99))]);
@@ -341,7 +346,9 @@ mod versioned_decode {
         let f = Fixture::new("vd_null");
         let t = f.table("t");
         f.store.put_row(t, &row(1, None)).unwrap();
-        f.builder.alter_add_column(t, &column("score", None, true)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("score", None, true))
+            .unwrap();
         assert_eq!(f.store.get_row(t, &pk(1)).unwrap().unwrap()[3], None);
         f.cleanup();
     }
@@ -351,15 +358,25 @@ mod versioned_decode {
         let f = Fixture::new("vd_generations");
         let t = f.table("t");
         f.store.put_row(t, &row(1, None)).unwrap(); // version 1
-        f.builder.alter_add_column(t, &column("a", Some(10), true)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("a", Some(10), true))
+            .unwrap();
         let mut r2 = row(2, None);
         r2.push(int(20));
         f.store.put_row(t, &r2).unwrap(); // version 2
-        f.builder.alter_add_column(t, &column("b", Some(30), true)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("b", Some(30), true))
+            .unwrap();
         let mut r3 = row(3, None);
         r3.extend([int(40), int(50)]);
         f.store.put_row(t, &r3).unwrap(); // version 3
-        let rows: Vec<_> = f.store.scan_table(t).unwrap().into_iter().map(|(_, r)| r).collect();
+        let rows: Vec<_> = f
+            .store
+            .scan_table(t)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
         assert_eq!(rows[0][3..], [int(10), int(30)]); // v1 row: both from backfill
         assert_eq!(rows[1][3..], [int(20), int(30)]); // v2 row: a stored, b backfilled
         assert_eq!(rows[2][3..], [int(40), int(50)]); // v3 row: both stored
@@ -371,19 +388,32 @@ mod versioned_decode {
         let f = Fixture::new("vd_not_null");
         let t = f.table("t");
         // empty table: allowed without a default
-        f.builder.alter_add_column(t, &column("a", None, false)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("a", None, false))
+            .unwrap();
         let mut r = row(1, None);
         r.push(int(1));
         f.store.put_row(t, &r).unwrap();
         // table with rows: refused, and nothing changes
         let version = f.catalog.get_table(t).unwrap().unwrap().schema_version;
         let columns_before = f.catalog.get_columns(t).unwrap();
-        let err = f.builder.alter_add_column(t, &column("b", None, false)).unwrap_err();
-        assert!(matches!(err, RelationalError::InvalidInput { .. }), "{err:?}");
-        assert_eq!(f.catalog.get_table(t).unwrap().unwrap().schema_version, version);
+        let err = f
+            .builder
+            .alter_add_column(t, &column("b", None, false))
+            .unwrap_err();
+        assert!(
+            matches!(err, RelationalError::InvalidInput { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            f.catalog.get_table(t).unwrap().unwrap().schema_version,
+            version
+        );
         assert_eq!(f.catalog.get_columns(t).unwrap(), columns_before);
         // with a default it is allowed on a non-empty table
-        f.builder.alter_add_column(t, &column("c", Some(0), false)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("c", Some(0), false))
+            .unwrap();
         f.cleanup();
     }
 
@@ -393,24 +423,25 @@ mod versioned_decode {
         let t = f.table("t");
         f.store.put_row(t, &row(1, None)).unwrap();
         f.store.put_row(t, &row(2, None)).unwrap();
-        f.builder.alter_add_column(t, &column("score", Some(5), true)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("score", Some(5), true))
+            .unwrap();
         let idx = f
             .builder
             .create_index_online(t, "score_idx", IndexKind::NonUnique, &[3])
             .unwrap();
         let found = f
             .builder
-            .index_lookup_as_of(
-                idx,
-                &[Some(RelationalValue::Integer(5))],
-                u64::MAX,
-            )
+            .index_lookup_as_of(idx, &[Some(RelationalValue::Integer(5))], u64::MAX)
             .unwrap();
         assert_eq!(found.len(), 2);
         // a unique index over the backfilled column finds the duplicates, and the
         // ALTER-shaped entry point leaves no index row behind
         let err = f.builder.alter_add_unique(t, "score_uq", &[3]).unwrap_err();
-        assert!(matches!(err, RelationalError::InvalidInput { .. }), "{err:?}");
+        assert!(
+            matches!(err, RelationalError::InvalidInput { .. }),
+            "{err:?}"
+        );
         assert!(f
             .catalog
             .list_indexes(t)
@@ -447,7 +478,9 @@ mod versioned_decode {
         let f = Fixture::new("vd_restart");
         let t = f.table("t");
         f.store.put_row(t, &row(1, None)).unwrap();
-        f.builder.alter_add_column(t, &column("score", Some(5), true)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("score", Some(5), true))
+            .unwrap();
         f.builder.alter_rename_column(t, 3, "points").unwrap();
         let f = f.restart();
         let columns = f.catalog.get_columns(t).unwrap();
@@ -462,11 +495,13 @@ mod versioned_decode {
         let t = f.table("t");
         let mut txn = f.txm.begin().unwrap();
         txn.put_row(t, &row(1, None)).unwrap(); // old shape
-        f.builder.alter_add_column(t, &column("score", Some(5), true)).unwrap();
+        f.builder
+            .alter_add_column(t, &column("score", Some(5), true))
+            .unwrap();
         let err = txn.commit().unwrap_err();
         assert!(matches!(err, RelationalError::Conflict { .. }), "{err:?}");
         assert!(ids(&f, t).is_empty()); // nothing was written
-        // a transaction that starts after the ALTER is fine
+                                        // a transaction that starts after the ALTER is fine
         let mut txn = f.txm.begin().unwrap();
         let mut r = row(1, None);
         r.push(int(9));
@@ -636,7 +671,10 @@ mod commit_validation {
             let parents = ids(&f, parent);
             for c in f.store.scan_table(child).unwrap() {
                 if let Some(RelationalValue::Integer(p)) = &c.1[1] {
-                    assert!(parents.contains(p), "round {round}: orphan child references {p}");
+                    assert!(
+                        parents.contains(p),
+                        "round {round}: orphan child references {p}"
+                    );
                 }
             }
             // a failure is a foreign-key violation (never anything else)
@@ -754,7 +792,10 @@ mod commit_validation {
             match added {
                 // The key was added: no orphan may exist, whether the row was written
                 // before (and validated by the scan) or after (and checked at commit).
-                Ok(_) => assert_eq!(orphans, 0, "round {round}: key added but {orphans} orphan(s)"),
+                Ok(_) => assert_eq!(
+                    orphans, 0,
+                    "round {round}: key added but {orphans} orphan(s)"
+                ),
                 // The scan found an orphan already written: refused, nothing recorded.
                 Err(e) => {
                     assert!(is_fk_violation(&e), "round {round}: {e:?}");
@@ -804,7 +845,10 @@ mod enforcement {
         txn.commit().unwrap();
         assert!(ids(&f, parent).is_empty());
         assert!(ids(&f, c_cascade).is_empty());
-        assert_eq!(f.store.get_row(c_null, &pk(20)).unwrap(), Some(row(20, None)));
+        assert_eq!(
+            f.store.get_row(c_null, &pk(20)).unwrap(),
+            Some(row(20, None))
+        );
         f.cleanup();
     }
 
@@ -841,7 +885,10 @@ mod enforcement {
                 }],
             )
             .unwrap_err();
-        assert!(matches!(err, RelationalError::ResourceLimit { .. }), "{err:?}");
+        assert!(
+            matches!(err, RelationalError::ResourceLimit { .. }),
+            "{err:?}"
+        );
         txn.rollback_to(sp);
         txn.commit().unwrap(); // an empty write-set
         assert_eq!(ids(&f, parent), vec![1]);
@@ -893,7 +940,10 @@ mod enforcement {
                 }],
             )
             .unwrap_err();
-        assert!(matches!(err, RelationalError::ResourceLimit { .. }), "{err:?}");
+        assert!(
+            matches!(err, RelationalError::ResourceLimit { .. }),
+            "{err:?}"
+        );
         f.cleanup();
     }
 }
@@ -921,7 +971,12 @@ mod lookup_paths {
             .create_table(
                 f.schema_id,
                 "t",
-                &[col("a", false), col("b", false), col("c", true), col("d", true)],
+                &[
+                    col("a", false),
+                    col("b", false),
+                    col("c", true),
+                    col("d", true),
+                ],
                 &[0, 1],
             )
             .unwrap();
@@ -936,11 +991,21 @@ mod lookup_paths {
             }
         }
         let (table, _) = f.store.resolve_table(t).unwrap();
-        let ints = |v: &[i32]| v.iter().map(|n| RelationalValue::Integer(*n)).collect::<Vec<_>>();
+        let ints = |v: &[i32]| {
+            v.iter()
+                .map(|n| RelationalValue::Integer(*n))
+                .collect::<Vec<_>>()
+        };
 
         // PK point, in either column order
-        assert!(matches!(f.store.plan_access(&table, &[0, 1]).unwrap(), Access::PkPoint));
-        assert!(matches!(f.store.plan_access(&table, &[1, 0]).unwrap(), Access::PkPoint));
+        assert!(matches!(
+            f.store.plan_access(&table, &[0, 1]).unwrap(),
+            Access::PkPoint
+        ));
+        assert!(matches!(
+            f.store.plan_access(&table, &[1, 0]).unwrap(),
+            Access::PkPoint
+        ));
         let point = f
             .store
             .find_rows_with_access(t, &[1, 0], &ints(&[2, 3]), &Access::PkPoint, u64::MAX, 10)

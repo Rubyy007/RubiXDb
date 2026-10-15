@@ -54,9 +54,13 @@ impl TableStore {
         if wanted.len() == pk.len() && wanted == set_of(pk) {
             return Ok(Access::PkPoint);
         }
-        if !ordinals.is_empty() && ordinals.len() < pk.len() && wanted == set_of(&pk[..ordinals.len()])
+        if !ordinals.is_empty()
+            && ordinals.len() < pk.len()
+            && wanted == set_of(&pk[..ordinals.len()])
         {
-            return Ok(Access::PkPrefix { len: ordinals.len() });
+            return Ok(Access::PkPrefix {
+                len: ordinals.len(),
+            });
         }
         for index in self.catalog().list_indexes(table.table_id)? {
             if index.state == IndexState::Ready
@@ -139,17 +143,16 @@ impl TableStore {
                 let (start, end) = index_entry_prefix_range(table_id, index.index_id, &prefix);
                 let pk_types = pk_types(&table, &columns)?;
                 let header_and_prefix = 9 + prefix.len();
-                for entry in self.engine().range_scan(
-                    bound_ref(&start),
-                    bound_ref(&end),
-                    as_of,
-                ) {
+                for entry in self
+                    .engine()
+                    .range_scan(bound_ref(&start), bound_ref(&end), as_of)
+                {
                     let (key, _) = entry?;
                     let pk_bytes = key.get(header_and_prefix..).unwrap_or(&[]);
                     let pk_values = decode_composite_key(&pk_types, pk_bytes)?;
-                    if let Some(row) = self.fetch_row_by_encoded_pk(
-                        &table, &columns, &pk_values, pk_bytes, as_of,
-                    )? {
+                    if let Some(row) =
+                        self.fetch_row_by_encoded_pk(&table, &columns, &pk_values, pk_bytes, as_of)?
+                    {
                         out.push((pk_values, row));
                         if out.len() >= limit {
                             break;

@@ -62,12 +62,7 @@ fn run_once(with_fk: bool, threads: usize, per_thread: usize) -> f64 {
         .create_table(schema, "parent", &[col("id", false), col("v", true)], &[0])
         .unwrap();
     let child = catalog
-        .create_table(
-            schema,
-            "child",
-            &[col("id", false), col("pid", true)],
-            &[0],
-        )
+        .create_table(schema, "child", &[col("id", false), col("pid", true)], &[0])
         .unwrap();
     let store = Arc::new(TableStore::new(Arc::clone(&engine), Arc::clone(&catalog)));
     let builder = IndexBuilder::new(

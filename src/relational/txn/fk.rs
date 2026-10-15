@@ -62,6 +62,10 @@ pub struct RowChange {
 
 type Tuple = Vec<RelationalValue>;
 
+/// What a parent key became: `None` = its row is gone; `Some(values)` = the row's new
+/// values for the referenced columns (any of which may be `NULL`).
+type NewKey = Option<Vec<Option<RelationalValue>>>;
+
 /// The values of `ordinals` in `row`, or `None` if any is `NULL`.
 fn tuple_of(row: &Row, ordinals: &[u16]) -> Option<Tuple> {
     ordinals
@@ -144,7 +148,12 @@ impl Transaction {
     }
 
     /// Does the referenced row for `key` (a child's referencing values) exist?
-    fn referenced_exists(&self, plan: &FkPlan<'_>, key: &[RelationalValue], view: ReadView) -> Result<bool> {
+    fn referenced_exists(
+        &self,
+        plan: &FkPlan<'_>,
+        key: &[RelationalValue],
+        view: ReadView,
+    ) -> Result<bool> {
         Ok(!self
             .find_rows_in_view(
                 plan.fk.parent_table_id,
@@ -194,7 +203,9 @@ impl Transaction {
         self.inner
             .table_store
             .for_each_row_as_of(fk.table_id, self.seq_of(view), |pk, row| {
-                if own.is_some_and(|w| w.contains_key(&encode_composite_key(pk).unwrap_or_default())) {
+                if own
+                    .is_some_and(|w| w.contains_key(&encode_composite_key(pk).unwrap_or_default()))
+                {
                     return Ok(true);
                 }
                 if let Some(t) = tuple_of(row, &fk.child_ordinals) {
@@ -316,7 +327,8 @@ impl Transaction {
                 for (pk_values, op) in parent_writes.values() {
                     // The freshness check passed, so the value at the snapshot is the
                     // value committed now.
-                    let Some(old_row) = self.get_committed_row(fk.parent_table_id, pk_values)? else {
+                    let Some(old_row) = self.get_committed_row(fk.parent_table_id, pk_values)?
+                    else {
                         continue;
                     };
                     let Some(old_key) = tuple_of(&old_row, &fk.parent_ordinals) else {
@@ -337,7 +349,11 @@ impl Transaction {
                         gone.push(key);
                     }
                 }
-                if !gone.is_empty() && !self.children_of(&plan, &gone, ReadView::Latest, 1)?.is_empty() {
+                if !gone.is_empty()
+                    && !self
+                        .children_of(&plan, &gone, ReadView::Latest, 1)?
+                        .is_empty()
+                {
                     return Err(self.parent_violation(fk));
                 }
             }
@@ -347,7 +363,11 @@ impl Transaction {
 
     /// The row at `pk_values` in the engine at this transaction's snapshot, ignoring
     /// the transaction's own writes.
-    fn get_committed_row(&self, table_id: u32, pk_values: &[RelationalValue]) -> Result<Option<Row>> {
+    fn get_committed_row(
+        &self,
+        table_id: u32,
+        pk_values: &[RelationalValue],
+    ) -> Result<Option<Row>> {
         let (table, columns) = self.inner.table_store.resolve_table(table_id)?;
         let encoded = encode_composite_key(pk_values)?;
         self.inner.table_store.fetch_row_by_encoded_pk(
@@ -431,7 +451,7 @@ impl Transaction {
         // columns changed, vacates its old key.
         for fk in fks.iter().filter(|f| f.parent_table_id == table_id) {
             // old key -> the key it became (None = the row is gone)
-            let mut moved: Vec<(Tuple, Option<Vec<Option<RelationalValue>>>)> = Vec::new();
+            let mut moved: Vec<(Tuple, NewKey)> = Vec::new();
             for change in changes {
                 let Some(old) = &change.old else { continue };
                 let Some(old_key) = tuple_of(old, &fk.parent_ordinals) else {
@@ -446,7 +466,7 @@ impl Transaction {
                             .map(|&o| new.get(o as usize).cloned().flatten())
                             .collect();
                         if new_values.iter().all(Option::is_some)
-                            && new_values.iter().cloned().flatten().collect::<Vec<_>>() == old_key
+                            && new_values.iter().flatten().cloned().collect::<Vec<_>>() == old_key
                         {
                             continue;
                         }
@@ -472,7 +492,7 @@ impl Transaction {
                     provided.insert(encode_composite_key(key)?);
                 }
             }
-            let new_for: HashMap<Vec<u8>, (bool, &Option<Vec<Option<RelationalValue>>>)> = moved
+            let new_for: HashMap<Vec<u8>, (bool, &NewKey)> = moved
                 .iter()
                 .map(|(k, n)| Ok((encode_composite_key(k)?, (n.is_none(), n))))
                 .collect::<Result<_>>()?;
@@ -491,11 +511,17 @@ impl Transaction {
                 let Some(&(is_delete, new_values)) = new_for.get(&enc) else {
                     continue;
                 };
-                let action = if is_delete { fk.on_delete } else { fk.on_update };
+                let action = if is_delete {
+                    fk.on_delete
+                } else {
+                    fk.on_update
+                };
                 match action {
                     FkAction::NoAction | FkAction::Restrict => {
                         // An updated key that another row now provides is fine.
-                        if !is_delete && self.referenced_exists(&plan, &child_key, ReadView::Snapshot)? {
+                        if !is_delete
+                            && self.referenced_exists(&plan, &child_key, ReadView::Snapshot)?
+                        {
                             continue;
                         }
                         return Err(self.parent_violation(fk));
@@ -555,7 +581,11 @@ impl Transaction {
         Ok(())
     }
 
-    fn defaults_of(&self, columns: &[ColumnRow], ordinals: &[u16]) -> Result<Vec<Option<RelationalValue>>> {
+    fn defaults_of(
+        &self,
+        columns: &[ColumnRow],
+        ordinals: &[u16],
+    ) -> Result<Vec<Option<RelationalValue>>> {
         ordinals
             .iter()
             .map(|&o| {

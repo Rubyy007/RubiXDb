@@ -155,7 +155,10 @@ mod parser {
         assert!(at.if_exists);
         assert!(matches!(
             at.operation,
-            AlterOperation::AddColumn { if_not_exists: true, .. }
+            AlterOperation::AddColumn {
+                if_not_exists: true,
+                ..
+            }
         ));
     }
 
@@ -194,23 +197,44 @@ mod parser {
         };
         assert_eq!(ct.foreign_keys.len(), 2);
         assert_eq!(ct.foreign_keys[0].columns[0].value, "a"); // inline, folded to one column
-        assert_eq!(ct.foreign_keys[0].on_delete, Some(ReferentialAction::Cascade));
+        assert_eq!(
+            ct.foreign_keys[0].on_delete,
+            Some(ReferentialAction::Cascade)
+        );
         assert_eq!(ct.foreign_keys[1].columns.len(), 2);
-        assert_eq!(ct.foreign_keys[1].on_update, Some(ReferentialAction::Restrict));
+        assert_eq!(
+            ct.foreign_keys[1].on_update,
+            Some(ReferentialAction::Restrict)
+        );
     }
 
     #[test]
     fn the_forms_rubixdb_cannot_do_safely_are_refused_with_the_reason() {
         let cases = [
             ("ALTER TABLE t DROP COLUMN a", "BLOCKED"),
-            ("ALTER TABLE t ALTER COLUMN a TYPE BIGINT", "NOT IMPLEMENTED"),
+            (
+                "ALTER TABLE t ALTER COLUMN a TYPE BIGINT",
+                "NOT IMPLEMENTED",
+            ),
             ("ALTER TABLE t ADD PRIMARY KEY (a)", "primary key"),
             ("ALTER TABLE t ADD COLUMN a INTEGER CHECK (a > 0)", "CHECK"),
-            ("CREATE TABLE c (id INTEGER PRIMARY KEY, CHECK (id > 0) NOT ENFORCED)", "NOT ENFORCED"),
+            (
+                "CREATE TABLE c (id INTEGER PRIMARY KEY, CHECK (id > 0) NOT ENFORCED)",
+                "NOT ENFORCED",
+            ),
             ("ALTER TABLE t RENAME TO u", "RENAME TO"),
-            ("ALTER TABLE t ADD COLUMN a INTEGER, ADD COLUMN b INTEGER", "more than one operation"),
-            ("ALTER TABLE t ADD COLUMN a INTEGER REFERENCES p (id)", "REFERENCES"),
-            ("ALTER TABLE t ADD COLUMN a INTEGER PRIMARY KEY", "PRIMARY KEY"),
+            (
+                "ALTER TABLE t ADD COLUMN a INTEGER, ADD COLUMN b INTEGER",
+                "more than one operation",
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN a INTEGER REFERENCES p (id)",
+                "REFERENCES",
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN a INTEGER PRIMARY KEY",
+                "PRIMARY KEY",
+            ),
             (
                 "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES p (id) NOT VALID",
                 "NOT VALID",
@@ -261,7 +285,10 @@ mod bind_and_plan {
             other => panic!("{other:?}"),
         }
         match alter_op(&db, "ALTER TABLE child ALTER COLUMN note SET DEFAULT 'x'") {
-            BoundAlterOp::SetDefault { ordinal, default_value } => {
+            BoundAlterOp::SetDefault {
+                ordinal,
+                default_value,
+            } => {
                 assert_eq!(ordinal, 2);
                 assert!(!default_value.is_empty());
             }
@@ -278,7 +305,10 @@ mod bind_and_plan {
             &db,
             "ALTER TABLE parent ADD CONSTRAINT p_name_uq UNIQUE (name)",
         ) {
-            BoundAlterOp::AddUnique { name, column_ordinals } => {
+            BoundAlterOp::AddUnique {
+                name,
+                column_ordinals,
+            } => {
                 assert_eq!(name, "p_name_uq");
                 assert_eq!(column_ordinals, vec![1]);
             }
@@ -324,12 +354,17 @@ mod bind_and_plan {
             BoundAlterOp::Noop
         ));
         assert!(matches!(
-            db.try_bind("ALTER TABLE parent DROP CONSTRAINT nope").unwrap_err(),
-            SqlError::UnknownObject { kind: "constraint", .. }
+            db.try_bind("ALTER TABLE parent DROP CONSTRAINT nope")
+                .unwrap_err(),
+            SqlError::UnknownObject {
+                kind: "constraint",
+                ..
+            }
         ));
         // the primary key cannot be dropped
         assert!(matches!(
-            db.try_bind("ALTER TABLE parent DROP CONSTRAINT parent_pkey").unwrap_err(),
+            db.try_bind("ALTER TABLE parent DROP CONSTRAINT parent_pkey")
+                .unwrap_err(),
             SqlError::Unsupported { .. }
         ));
         db.cleanup();
@@ -340,24 +375,29 @@ mod bind_and_plan {
         let db = fk_db("p23_bind_err", "");
         // unknown table / column
         assert!(matches!(
-            db.try_bind("ALTER TABLE nope ADD COLUMN a INTEGER").unwrap_err(),
+            db.try_bind("ALTER TABLE nope ADD COLUMN a INTEGER")
+                .unwrap_err(),
             SqlError::UnknownObject { kind: "table", .. }
         ));
         assert!(matches!(
-            db.try_bind("ALTER TABLE parent RENAME COLUMN nope TO x").unwrap_err(),
+            db.try_bind("ALTER TABLE parent RENAME COLUMN nope TO x")
+                .unwrap_err(),
             SqlError::UnknownObject { kind: "column", .. }
         ));
         assert!(matches!(
-            db.try_bind("ALTER TABLE parent ALTER COLUMN nope SET NOT NULL").unwrap_err(),
+            db.try_bind("ALTER TABLE parent ALTER COLUMN nope SET NOT NULL")
+                .unwrap_err(),
             SqlError::UnknownObject { kind: "column", .. }
         ));
         // duplicates
         assert!(matches!(
-            db.try_bind("ALTER TABLE parent ADD COLUMN name TEXT").unwrap_err(),
+            db.try_bind("ALTER TABLE parent ADD COLUMN name TEXT")
+                .unwrap_err(),
             SqlError::AlreadyExists { .. }
         ));
         assert!(matches!(
-            db.try_bind("ALTER TABLE parent RENAME COLUMN id TO name").unwrap_err(),
+            db.try_bind("ALTER TABLE parent RENAME COLUMN id TO name")
+                .unwrap_err(),
             SqlError::AlreadyExists { .. }
         ));
         // a default must be a literal of the column's type
@@ -365,7 +405,8 @@ mod bind_and_plan {
             .try_bind("ALTER TABLE parent ALTER COLUMN id SET DEFAULT 'text'")
             .is_err());
         assert!(matches!(
-            db.try_bind("ALTER TABLE parent ADD COLUMN c INTEGER DEFAULT 1 + id").unwrap_err(),
+            db.try_bind("ALTER TABLE parent ADD COLUMN c INTEGER DEFAULT 1 + id")
+                .unwrap_err(),
             SqlError::Unsupported { .. } | SqlError::UnknownObject { .. }
         ));
         // an unknown referenced table / column
@@ -411,6 +452,14 @@ mod bind_and_plan {
         let db = fk_db("p23_plan", "");
         let plan = db.plan("ALTER TABLE parent ADD COLUMN c INTEGER");
         assert!(matches!(plan, Plan::Ddl(BoundStatement::AlterTable(_))));
+        // EXPLAIN of a DDL statement is whatever EXPLAIN of CREATE TABLE is: it must not
+        // execute the change
+        let before = db.catalog.get_columns(db.table_id("parent")).unwrap().len();
+        let _ = db.try_plan("EXPLAIN ALTER TABLE parent ADD COLUMN c INTEGER");
+        assert_eq!(
+            db.catalog.get_columns(db.table_id("parent")).unwrap().len(),
+            before
+        );
         db.cleanup();
     }
 
@@ -429,7 +478,10 @@ mod bind_and_plan {
         assert_eq!(ct.foreign_keys.len(), 2);
         assert_eq!(ct.foreign_keys[0].parent_table_id, None); // itself
         assert_eq!(ct.foreign_keys[0].name, "tree_up_fkey");
-        assert_eq!(ct.foreign_keys[1].parent_table_id, Some(db.table_id("parent")));
+        assert_eq!(
+            ct.foreign_keys[1].parent_table_id,
+            Some(db.table_id("parent"))
+        );
         db.cleanup();
     }
 }
@@ -461,7 +513,10 @@ mod alter {
             ]
         );
         // in WHERE, GROUP BY, ORDER BY and an aggregate
-        assert_eq!(db.rows("SELECT COUNT(*) FROM people WHERE country = 'none'"), vec![r(&[big(3)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM people WHERE country = 'none'"),
+            vec![r(&[big(3)])]
+        );
         assert_eq!(
             db.rows("SELECT country, COUNT(*) FROM people GROUP BY country"),
             vec![r(&[text("none"), big(3)])]
@@ -534,14 +589,22 @@ mod alter {
         let err = db
             .try_write("ALTER TABLE people ADD COLUMN must INTEGER NOT NULL")
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         // nothing changed
-        assert_eq!(db.catalog.get_columns(db.table_id("people")).unwrap(), before);
+        assert_eq!(
+            db.catalog.get_columns(db.table_id("people")).unwrap(),
+            before
+        );
         // with a default it works
         db.write("ALTER TABLE people ADD COLUMN must INTEGER NOT NULL DEFAULT 3");
         assert_eq!(db.rows("SELECT SUM(must) FROM people"), vec![r(&[big(9)])]);
         // and the new column is NOT NULL for new rows
-        assert!(db.try_write("INSERT INTO people (id, name, age, must) VALUES (9, 'x', 1, NULL)").is_err());
+        assert!(db
+            .try_write("INSERT INTO people (id, name, age, must) VALUES (9, 'x', 1, NULL)")
+            .is_err());
         // an empty table may take one without a default
         db.write("CREATE TABLE empty_t (id INTEGER PRIMARY KEY)");
         db.write("ALTER TABLE empty_t ADD COLUMN must INTEGER NOT NULL");
@@ -553,7 +616,8 @@ mod alter {
         let db = people("p23_add_dup");
         db.write("ALTER TABLE people ADD COLUMN IF NOT EXISTS name TEXT"); // a no-op
         assert!(matches!(
-            db.try_write("ALTER TABLE people ADD COLUMN name TEXT").unwrap_err(),
+            db.try_write("ALTER TABLE people ADD COLUMN name TEXT")
+                .unwrap_err(),
             SqlError::AlreadyExists { .. }
         ));
         db.write("ALTER TABLE IF EXISTS no_such ADD COLUMN x INTEGER");
@@ -563,12 +627,17 @@ mod alter {
     #[test]
     fn drop_column_is_refused_as_blocked_and_changes_nothing() {
         let db = people("p23_drop_col");
-        let err = db.try_write("ALTER TABLE people DROP COLUMN age").unwrap_err();
+        let err = db
+            .try_write("ALTER TABLE people DROP COLUMN age")
+            .unwrap_err();
         match err {
             SqlError::Unsupported { detail } => assert!(detail.contains("BLOCKED"), "{detail}"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(db.catalog.get_columns(db.table_id("people")).unwrap().len(), 3);
+        assert_eq!(
+            db.catalog.get_columns(db.table_id("people")).unwrap().len(),
+            3
+        );
         db.cleanup();
     }
 
@@ -593,7 +662,10 @@ mod alter {
         );
         // a primary-key column can be renamed too
         db.write("ALTER TABLE people RENAME COLUMN id TO person_id");
-        assert_eq!(db.rows("SELECT COUNT(*) FROM people WHERE person_id >= 1"), vec![r(&[big(4)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM people WHERE person_id >= 1"),
+            vec![r(&[big(4)])]
+        );
         db.cleanup();
     }
 
@@ -607,7 +679,10 @@ mod alter {
         let err = db
             .try_write("ALTER TABLE people ALTER COLUMN age SET NOT NULL")
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         assert_eq!(db.catalog.get_columns(id).unwrap(), before_cols);
         assert_eq!(
             db.catalog.get_table(id).unwrap().unwrap().schema_version,
@@ -617,8 +692,12 @@ mod alter {
         db.write("INSERT INTO people VALUES (4, 'dee', NULL)");
         db.write("DELETE FROM people WHERE age IS NULL");
         db.write("ALTER TABLE people ALTER COLUMN age SET NOT NULL");
-        assert!(db.try_write("INSERT INTO people VALUES (5, 'eve', NULL)").is_err());
-        assert!(db.try_write("UPDATE people SET age = NULL WHERE id = 1").is_err());
+        assert!(db
+            .try_write("INSERT INTO people VALUES (5, 'eve', NULL)")
+            .is_err());
+        assert!(db
+            .try_write("UPDATE people SET age = NULL WHERE id = 1")
+            .is_err());
         // drop it again
         db.write("ALTER TABLE people ALTER COLUMN age DROP NOT NULL");
         db.write("INSERT INTO people VALUES (5, 'eve', NULL)");
@@ -636,7 +715,10 @@ mod alter {
         let err = db
             .try_write("ALTER TABLE people ADD CONSTRAINT people_name_uq UNIQUE (name)")
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         // no index row was left behind, so the name is free to use again
         assert!(db
             .catalog
@@ -647,7 +729,8 @@ mod alter {
         db.write("DELETE FROM people WHERE id = 4");
         db.write("ALTER TABLE people ADD CONSTRAINT people_name_uq UNIQUE (name)");
         assert!(matches!(
-            db.try_write("INSERT INTO people VALUES (5, 'ann', 1)").unwrap_err(),
+            db.try_write("INSERT INTO people VALUES (5, 'ann', 1)")
+                .unwrap_err(),
             SqlError::Conflict { .. }
         ));
         // NULLs never conflict
@@ -669,7 +752,11 @@ mod alter {
         let snapshot = |db: &Db| {
             (
                 db.catalog.get_columns(db.table_id("child")).unwrap(),
-                db.catalog.get_table(db.table_id("child")).unwrap().unwrap().schema_version,
+                db.catalog
+                    .get_table(db.table_id("child"))
+                    .unwrap()
+                    .unwrap()
+                    .schema_version,
                 db.catalog.foreign_keys().unwrap().len(),
                 db.catalog.list_indexes(db.table_id("child")).unwrap().len(),
             )
@@ -731,8 +818,13 @@ mod alter {
         );
         // the default set before the restart is still in force, and so is the unique constraint
         db.write("INSERT INTO people (id, full_name, score) VALUES (5, 'eve', 1)");
-        assert_eq!(db.rows("SELECT age FROM people WHERE id = 5"), vec![r(&[int(18)])]);
-        assert!(db.try_write("INSERT INTO people (id, full_name) VALUES (6, 'eve')").is_err());
+        assert_eq!(
+            db.rows("SELECT age FROM people WHERE id = 5"),
+            vec![r(&[int(18)])]
+        );
+        assert!(db
+            .try_write("INSERT INTO people (id, full_name) VALUES (6, 'eve')")
+            .is_err());
         db.cleanup();
     }
 
@@ -760,7 +852,8 @@ mod alter {
         let committed = Arc::new(AtomicUsize::new(0));
         let writers: Vec<_> = (0..3)
             .map(|w| {
-                let (db, stop, committed) = (Arc::clone(&db), Arc::clone(&stop), Arc::clone(&committed));
+                let (db, stop, committed) =
+                    (Arc::clone(&db), Arc::clone(&stop), Arc::clone(&committed));
                 thread::spawn(move || {
                     let mut i = 0;
                     while !stop.load(Ordering::Relaxed) {
@@ -769,7 +862,9 @@ mod alter {
                         // a statement bound before the ALTER but run after it may fail; one that
                         // succeeds must have been committed whole
                         if db
-                            .try_write(&format!("INSERT INTO people (id, name, age) VALUES ({id}, 'w', 1)"))
+                            .try_write(&format!(
+                                "INSERT INTO people (id, name, age) VALUES ({id}, 'w', 1)"
+                            ))
                             .is_ok()
                         {
                             committed.fetch_add(1, Ordering::Relaxed);
@@ -793,7 +888,10 @@ mod alter {
             vec![r(&[big(3 + committed.load(Ordering::Relaxed) as i64)])]
         );
         let scores = db.rows("SELECT score FROM people WHERE score <> 5");
-        assert!(scores.is_empty(), "every row holds the default or the backfill: {scores:?}");
+        assert!(
+            scores.is_empty(),
+            "every row holds the default or the backfill: {scores:?}"
+        );
         Arc::try_unwrap(db).ok().unwrap().cleanup();
     }
 }
@@ -824,7 +922,10 @@ mod primary_key_update {
             vec![r(&[int(2)]), r(&[int(3)]), r(&[int(10)])]
         );
         // the secondary index follows the row
-        assert_eq!(db.rows("SELECT id FROM kt WHERE name = 'a'"), vec![r(&[int(10)])]);
+        assert_eq!(
+            db.rows("SELECT id FROM kt WHERE name = 'a'"),
+            vec![r(&[int(10)])]
+        );
         db.cleanup();
     }
 
@@ -846,7 +947,9 @@ mod primary_key_update {
     #[test]
     fn a_collision_with_an_untouched_row_fails_and_changes_nothing() {
         let db = t("p23_pk_collide");
-        let err = db.try_write("UPDATE kt SET id = 3 WHERE id = 1").unwrap_err();
+        let err = db
+            .try_write("UPDATE kt SET id = 3 WHERE id = 1")
+            .unwrap_err();
         assert!(matches!(err, SqlError::Conflict { .. }), "{err:?}");
         assert_eq!(
             db.rows("SELECT id, name FROM kt ORDER BY id"),
@@ -857,7 +960,9 @@ mod primary_key_update {
             ]
         );
         // two rows moved onto the same new key
-        let err = db.try_write("UPDATE kt SET id = 50 WHERE id <= 2").unwrap_err();
+        let err = db
+            .try_write("UPDATE kt SET id = 50 WHERE id <= 2")
+            .unwrap_err();
         assert!(matches!(err, SqlError::Conflict { .. }), "{err:?}");
         assert_eq!(db.rows("SELECT COUNT(*) FROM kt"), vec![r(&[big(3)])]);
         db.cleanup();
@@ -866,7 +971,9 @@ mod primary_key_update {
     #[test]
     fn a_null_key_is_refused() {
         let db = t("p23_pk_null");
-        assert!(db.try_write("UPDATE kt SET id = NULL WHERE id = 1").is_err());
+        assert!(db
+            .try_write("UPDATE kt SET id = NULL WHERE id = 1")
+            .is_err());
         assert_eq!(db.rows("SELECT COUNT(*) FROM kt"), vec![r(&[big(3)])]);
         db.cleanup();
     }
@@ -886,11 +993,20 @@ mod primary_key_update {
         let db = t("p23_pk_txn");
         let mut txn = db.txm.begin().unwrap();
         in_txn(&db, "UPDATE kt SET id = 100 WHERE id = 1", &mut txn).unwrap();
-        let inside = db.run_in_txn("SELECT id FROM kt ORDER BY id", &txn).unwrap().rows;
+        let inside = db
+            .run_in_txn("SELECT id FROM kt ORDER BY id", &txn)
+            .unwrap()
+            .rows;
         assert_eq!(inside, vec![r(&[int(2)]), r(&[int(3)]), r(&[int(100)])]);
-        assert_eq!(db.rows("SELECT COUNT(*) FROM kt WHERE id = 1"), vec![r(&[big(1)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM kt WHERE id = 1"),
+            vec![r(&[big(1)])]
+        );
         txn.commit().unwrap();
-        assert_eq!(db.rows("SELECT COUNT(*) FROM kt WHERE id = 1"), vec![r(&[big(0)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM kt WHERE id = 1"),
+            vec![r(&[big(0)])]
+        );
         db.cleanup();
     }
 
@@ -903,7 +1019,10 @@ mod primary_key_update {
         in_txn(&db, "UPDATE kt SET id = 77 WHERE id = 2", &mut b).unwrap();
         a.commit().unwrap();
         assert!(b.commit().is_err());
-        assert_eq!(db.rows("SELECT COUNT(*) FROM kt WHERE id = 77"), vec![r(&[big(1)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM kt WHERE id = 77"),
+            vec![r(&[big(1)])]
+        );
         db.cleanup();
     }
 }
@@ -926,7 +1045,11 @@ mod fk_definition {
         );
         let fks = db.catalog.foreign_keys().unwrap();
         assert_eq!(fks.len(), 2);
-        let by_table = |name: &str| fks.iter().find(|f| f.table_id == db.table_id(name)).unwrap();
+        let by_table = |name: &str| {
+            fks.iter()
+                .find(|f| f.table_id == db.table_id(name))
+                .unwrap()
+        };
         assert_eq!(by_table("inline_c").name, "inline_c_p_fkey");
         use rubixdb::catalog::schema::FkAction;
         assert_eq!(by_table("table_c").on_delete, FkAction::SetNull);
@@ -943,7 +1066,10 @@ mod fk_definition {
         let err = db
             .try_write("ALTER TABLE c ADD FOREIGN KEY (code) REFERENCES p (code)")
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         // a non-unique index does not make it unique
         db.write("CREATE INDEX p_code ON p (code)");
         assert!(db
@@ -955,7 +1081,10 @@ mod fk_definition {
         db.write("ALTER TABLE c ADD FOREIGN KEY (other) REFERENCES p (other)");
         // ... and cannot then be dropped from under the key
         let err = db.try_write("DROP INDEX p_other ON p").unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         db.cleanup();
     }
 
@@ -991,22 +1120,35 @@ mod fk_definition {
                 "CREATE TABLE c (id INTEGER PRIMARY KEY REFERENCES p (id) ON DELETE SET NULL)",
             )
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         let err = db
             .try_write(
                 "CREATE TABLE c (id INTEGER PRIMARY KEY, q INTEGER NOT NULL REFERENCES p (id) ON UPDATE SET NULL)",
             )
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         // SET DEFAULT needs a default or a nullable column
         let err = db
             .try_write(
                 "CREATE TABLE c (id INTEGER PRIMARY KEY, q INTEGER NOT NULL REFERENCES p (id) ON DELETE SET DEFAULT)",
             )
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         // a failed CREATE TABLE leaves no table behind
-        assert!(db.catalog.get_table_by_name(db.f.ctx.default_schema_id, "c").unwrap().is_none());
+        assert!(db
+            .catalog
+            .get_table_by_name(db.f.ctx.default_schema_id, "c")
+            .unwrap()
+            .is_none());
         // once a key sets a column to NULL, that column cannot become NOT NULL
         db.write("CREATE TABLE c2 (id INTEGER PRIMARY KEY, q INTEGER REFERENCES p (id) ON DELETE SET NULL)");
         assert!(db
@@ -1019,7 +1161,10 @@ mod fk_definition {
     fn dropping_a_referenced_table_is_refused_and_dropping_the_child_removes_its_keys() {
         let db = fk_db("p23_def_drop", "");
         let err = db.try_write("DROP TABLE parent").unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         assert_eq!(db.catalog.foreign_keys().unwrap().len(), 1);
         db.write("DROP TABLE child");
         assert!(db.catalog.foreign_keys().unwrap().is_empty());
@@ -1031,7 +1176,9 @@ mod fk_definition {
     fn drop_constraint_removes_the_key_and_orphans_become_possible() {
         let db = fk_db("p23_def_drop_fk", "");
         db.write("INSERT INTO parent VALUES (1, 'a')");
-        assert!(db.try_write("INSERT INTO child VALUES (1, 99, 'x')").is_err());
+        assert!(db
+            .try_write("INSERT INTO child VALUES (1, 99, 'x')")
+            .is_err());
         db.write("ALTER TABLE child DROP CONSTRAINT child_pid_fk");
         db.write("INSERT INTO child VALUES (1, 99, 'x')");
         // and the parent can be dropped now
@@ -1053,11 +1200,16 @@ mod fk_enforcement {
         let db = fk_db("p23_fk_insert", "");
         db.write("INSERT INTO parent VALUES (1, 'one')");
         db.write("INSERT INTO child VALUES (10, 1, 'ok')");
-        let err = db.try_write("INSERT INTO child VALUES (11, 99, 'secret-note')").unwrap_err();
+        let err = db
+            .try_write("INSERT INTO child VALUES (11, 99, 'secret-note')")
+            .unwrap_err();
         assert!(is_fk_violation(&err), "{err:?}");
         let msg = err.to_string();
         // the message names the constraint and tables, never a value
-        assert!(msg.contains("child_pid_fk") && msg.contains("child") && msg.contains("parent"), "{msg}");
+        assert!(
+            msg.contains("child_pid_fk") && msg.contains("child") && msg.contains("parent"),
+            "{msg}"
+        );
         assert!(!msg.contains("99") && !msg.contains("secret-note"), "{msg}");
         assert_eq!(child_ids(&db), vec![r(&[int(10)])]);
         db.cleanup();
@@ -1091,17 +1243,27 @@ mod fk_enforcement {
         let db = fk_db("p23_fk_update", "");
         seed(&db);
         db.write("UPDATE child SET pid = 3 WHERE id = 10");
-        let err = db.try_write("UPDATE child SET pid = 77 WHERE id = 10").unwrap_err();
+        let err = db
+            .try_write("UPDATE child SET pid = 77 WHERE id = 10")
+            .unwrap_err();
         assert!(is_fk_violation(&err), "{err:?}");
-        assert_eq!(db.rows("SELECT pid FROM child WHERE id = 10"), vec![r(&[int(3)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM child WHERE id = 10"),
+            vec![r(&[int(3)])]
+        );
         // an update that does not touch the reference is never checked
         db.write("UPDATE child SET note = 'edited' WHERE id = 10");
         // a multi-row update with one bad row changes none
         let err = db
-            .try_write("UPDATE child SET pid = CASE WHEN id = 11 THEN 88 ELSE 1 END WHERE id IN (10, 11)")
+            .try_write(
+                "UPDATE child SET pid = CASE WHEN id = 11 THEN 88 ELSE 1 END WHERE id IN (10, 11)",
+            )
             .unwrap_err();
         assert!(is_fk_violation(&err), "{err:?}");
-        assert_eq!(db.rows("SELECT pid FROM child WHERE id IN (10, 11) ORDER BY id"), vec![r(&[int(3)]), r(&[int(1)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM child WHERE id IN (10, 11) ORDER BY id"),
+            vec![r(&[int(3)]), r(&[int(1)])]
+        );
         db.cleanup();
     }
 
@@ -1111,7 +1273,8 @@ mod fk_enforcement {
         seed(&db);
         // insert path
         assert!(is_fk_violation(
-            &db.try_write("INSERT INTO child VALUES (40, 55, 'x') ON CONFLICT (id) DO NOTHING").unwrap_err()
+            &db.try_write("INSERT INTO child VALUES (40, 55, 'x') ON CONFLICT (id) DO NOTHING")
+                .unwrap_err()
         ));
         // update path: the row exists, DO UPDATE points it at a missing parent
         assert!(is_fk_violation(
@@ -1120,11 +1283,17 @@ mod fk_enforcement {
             )
             .unwrap_err()
         ));
-        assert_eq!(db.rows("SELECT pid FROM child WHERE id = 10"), vec![r(&[int(1)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM child WHERE id = 10"),
+            vec![r(&[int(1)])]
+        );
         // a valid upsert works on both paths
         db.write("INSERT INTO child VALUES (10, 2, 'x') ON CONFLICT (id) DO UPDATE SET pid = EXCLUDED.pid");
         db.write("INSERT INTO child VALUES (41, 2, 'y') ON CONFLICT (id) DO UPDATE SET pid = EXCLUDED.pid");
-        assert_eq!(db.rows("SELECT pid FROM child WHERE id IN (10, 41) ORDER BY id"), vec![r(&[int(2)]), r(&[int(2)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM child WHERE id IN (10, 41) ORDER BY id"),
+            vec![r(&[int(2)]), r(&[int(2)])]
+        );
         // a row DO NOTHING skips is not checked
         db.write("INSERT INTO child VALUES (10, 999, 'skipped') ON CONFLICT (id) DO NOTHING");
         db.cleanup();
@@ -1137,7 +1306,8 @@ mod fk_enforcement {
         db.write("INSERT INTO child SELECT id + 100, id, name FROM parent");
         assert_eq!(child_ids(&db), vec![r(&[int(101)]), r(&[int(102)])]);
         assert!(is_fk_violation(
-            &db.try_write("INSERT INTO child SELECT id + 200, id + 1000, name FROM parent").unwrap_err()
+            &db.try_write("INSERT INTO child SELECT id + 200, id + 1000, name FROM parent")
+                .unwrap_err()
         ));
         assert_eq!(child_ids(&db).len(), 2);
         db.cleanup();
@@ -1209,11 +1379,17 @@ mod fk_enforcement {
         let err = db.try_write("DELETE FROM parent WHERE id = 1").unwrap_err();
         assert!(is_fk_violation(&err), "{err:?}");
         assert_eq!(parent_ids(&db).len(), 2);
-        assert_eq!(db.rows("SELECT pid FROM child WHERE id = 10"), vec![r(&[int(1)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM child WHERE id = 10"),
+            vec![r(&[int(1)])]
+        );
         // with a parent 0 it works
         db.write("INSERT INTO parent VALUES (0, 'default')");
         db.write("DELETE FROM parent WHERE id = 1");
-        assert_eq!(db.rows("SELECT pid FROM child WHERE id = 10"), vec![r(&[int(0)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM child WHERE id = 10"),
+            vec![r(&[int(0)])]
+        );
         db.cleanup();
     }
 
@@ -1252,7 +1428,9 @@ mod fk_enforcement {
         );
         let db2 = fk_db("p23_fk_upd_restrict", "ON UPDATE NO ACTION");
         seed(&db2);
-        let err = db2.try_write("UPDATE parent SET id = 10 WHERE id = 1").unwrap_err();
+        let err = db2
+            .try_write("UPDATE parent SET id = 10 WHERE id = 1")
+            .unwrap_err();
         assert!(is_fk_violation(&err), "{err:?}");
         assert_eq!(parent_ids(&db2).len(), 3);
         // an unreferenced parent key may change; so may a non-key column of a referenced one
@@ -1273,14 +1451,22 @@ mod fk_enforcement {
         db.write("INSERT INTO p VALUES (1, 1), (1, 2), (2, 1)");
         db.write("INSERT INTO c VALUES (10, 1, 2), (11, 2, 1), (12, 1, NULL), (13, NULL, NULL)");
         // (2, 2) is not a parent even though 2 and 2 each appear in one
-        assert!(is_fk_violation(&db.try_write("INSERT INTO c VALUES (14, 2, 2)").unwrap_err()));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO c VALUES (14, 2, 2)").unwrap_err()
+        ));
         // MATCH SIMPLE: any NULL exempts the row (12 references no row)
         db.write("INSERT INTO c VALUES (15, 99, NULL)");
         // cascade on delete and update
         db.write("UPDATE p SET b = 20 WHERE a = 1 AND b = 2");
-        assert_eq!(db.rows("SELECT y FROM c WHERE id = 10"), vec![r(&[int(20)])]);
+        assert_eq!(
+            db.rows("SELECT y FROM c WHERE id = 10"),
+            vec![r(&[int(20)])]
+        );
         db.write("DELETE FROM p WHERE a = 2 AND b = 1");
-        assert_eq!(db.rows("SELECT COUNT(*) FROM c WHERE id = 11"), vec![r(&[big(0)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM c WHERE id = 11"),
+            vec![r(&[big(0)])]
+        );
         // the surviving rows are untouched
         assert_eq!(db.rows("SELECT COUNT(*) FROM c"), vec![r(&[big(4)])]);
         db.cleanup();
@@ -1296,7 +1482,10 @@ mod fk_enforcement {
         // referenced in the opposite order to the index
         db.write("ALTER TABLE c ADD FOREIGN KEY (q, r) REFERENCES p (b, a)");
         db.write("INSERT INTO c VALUES (1, 'y', 'x')"); // q=b='y', r=a='x'
-        assert!(is_fk_violation(&db.try_write("INSERT INTO c VALUES (2, 'x', 'y')").unwrap_err()));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO c VALUES (2, 'x', 'y')")
+                .unwrap_err()
+        ));
         db.cleanup();
     }
 
@@ -1310,9 +1499,14 @@ mod fk_enforcement {
         );
         db.write("INSERT INTO p VALUES (1, 'AA'), (2, 'BB')");
         db.write("INSERT INTO c VALUES (10, 'AA'), (11, 'BB')");
-        assert!(is_fk_violation(&db.try_write("INSERT INTO c VALUES (12, 'ZZ')").unwrap_err()));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO c VALUES (12, 'ZZ')").unwrap_err()
+        ));
         db.write("UPDATE p SET code = 'AB' WHERE id = 1");
-        assert_eq!(db.rows("SELECT code FROM c WHERE id = 10"), vec![r(&[text("AB")])]);
+        assert_eq!(
+            db.rows("SELECT code FROM c WHERE id = 10"),
+            vec![r(&[text("AB")])]
+        );
         db.write("DELETE FROM p WHERE code = 'BB'");
         assert_eq!(db.rows("SELECT COUNT(*) FROM c"), vec![r(&[big(1)])]);
         db.cleanup();
@@ -1326,7 +1520,9 @@ mod fk_enforcement {
         );
         // parent and children in one statement, in either order
         db.write("INSERT INTO node VALUES (3, 2), (2, 1), (1, NULL)");
-        assert!(is_fk_violation(&db.try_write("INSERT INTO node VALUES (9, 8)").unwrap_err()));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO node VALUES (9, 8)").unwrap_err()
+        ));
         db.write("INSERT INTO node VALUES (4, 3), (5, 1)");
         db.write("DELETE FROM node WHERE id = 2");
         assert_eq!(
@@ -1348,10 +1544,17 @@ mod fk_enforcement {
         db.write("INSERT INTO a VALUES (1)");
         db.write("INSERT INTO b VALUES (1)");
         db.write("INSERT INTO c VALUES (10, 1, 1)");
-        assert!(is_fk_violation(&db.try_write("INSERT INTO c VALUES (11, 1, 5)").unwrap_err()));
-        assert!(is_fk_violation(&db.try_write("INSERT INTO c VALUES (11, 5, 1)").unwrap_err()));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO c VALUES (11, 1, 5)").unwrap_err()
+        ));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO c VALUES (11, 5, 1)").unwrap_err()
+        ));
         db.write("DELETE FROM b WHERE id = 1");
-        assert_eq!(db.rows("SELECT a_id, b_id FROM c"), vec![r(&[int(1), NULL])]);
+        assert_eq!(
+            db.rows("SELECT a_id, b_id FROM c"),
+            vec![r(&[int(1), NULL])]
+        );
         db.write("DELETE FROM a WHERE id = 1");
         assert_eq!(db.rows("SELECT COUNT(*) FROM c"), vec![r(&[big(0)])]);
         db.cleanup();
@@ -1364,8 +1567,13 @@ mod fk_enforcement {
         db.write("CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER)");
         db.write("INSERT INTO parent VALUES (1), (2)");
         db.write("INSERT INTO child VALUES (10, 1), (11, 2), (12, NULL)");
-        db.write("ALTER TABLE child ADD CONSTRAINT child_fk FOREIGN KEY (pid) REFERENCES parent (id)");
-        assert!(is_fk_violation(&db.try_write("INSERT INTO child VALUES (13, 9)").unwrap_err()));
+        db.write(
+            "ALTER TABLE child ADD CONSTRAINT child_fk FOREIGN KEY (pid) REFERENCES parent (id)",
+        );
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO child VALUES (13, 9)")
+                .unwrap_err()
+        ));
 
         let db2 = Db::new("p23_fk_add_bad");
         db2.write("CREATE TABLE parent (id INTEGER PRIMARY KEY)");
@@ -1407,7 +1615,11 @@ mod fk_enforcement {
         db.write("UPDATE p SET id = 10 WHERE id = 1");
         assert_eq!(
             db.rows("SELECT pid, seq FROM c ORDER BY pid, seq"),
-            vec![r(&[int(2), int(1)]), r(&[int(10), int(1)]), r(&[int(10), int(2)])]
+            vec![
+                r(&[int(2), int(1)]),
+                r(&[int(10), int(1)]),
+                r(&[int(10), int(2)])
+            ]
         );
         db.write("DELETE FROM p WHERE id = 10");
         assert_eq!(db.rows("SELECT COUNT(*) FROM c"), vec![r(&[big(1)])]);
@@ -1445,16 +1657,22 @@ mod fk_atomicity {
             .rows;
         assert_eq!(rows, vec![r(&[int(40)])]); // the first statement's row, nothing of the others
         assert_eq!(
-            db.run_in_txn("SELECT COUNT(*) FROM parent", &txn).unwrap().rows,
+            db.run_in_txn("SELECT COUNT(*) FROM parent", &txn)
+                .unwrap()
+                .rows,
             vec![r(&[big(3)])]
         );
         txn.commit().unwrap();
-        assert_eq!(db.rows("SELECT COUNT(*) FROM child WHERE id >= 40"), vec![r(&[big(1)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM child WHERE id >= 40"),
+            vec![r(&[big(1)])]
+        );
         db.cleanup();
     }
 
     #[test]
-    fn a_cascade_that_exceeds_the_write_set_cap_fails_closed_and_leaves_the_transaction_untouched() {
+    fn a_cascade_that_exceeds_the_write_set_cap_fails_closed_and_leaves_the_transaction_untouched()
+    {
         let db = fk_db("p23_atomic_cap", "ON DELETE CASCADE");
         db.write("INSERT INTO parent VALUES (1, 'a'), (2, 'b')");
         for chunk in 0..3 {
@@ -1478,11 +1696,15 @@ mod fk_atomicity {
         assert!(matches!(err, SqlError::ResourceLimit { .. }), "{err:?}");
         // the earlier statement is intact; the failed one left nothing
         assert_eq!(
-            db.run_in_txn("SELECT COUNT(*) FROM parent", &txn).unwrap().rows,
+            db.run_in_txn("SELECT COUNT(*) FROM parent", &txn)
+                .unwrap()
+                .rows,
             vec![r(&[big(2)])]
         );
         assert_eq!(
-            db.run_in_txn("SELECT COUNT(*) FROM child", &txn).unwrap().rows,
+            db.run_in_txn("SELECT COUNT(*) FROM child", &txn)
+                .unwrap()
+                .rows,
             vec![r(&[big(30)])]
         );
         txn.commit().unwrap();
@@ -1540,7 +1762,10 @@ mod fk_atomicity {
         in_txn(&db, "INSERT INTO child VALUES (90, 9, 'c')", &mut txn).unwrap();
         in_txn(&db, "DELETE FROM parent WHERE id = 9", &mut txn).unwrap();
         txn.commit().unwrap();
-        assert_eq!(db.rows("SELECT id, pid FROM child"), vec![r(&[int(70), int(8)])]);
+        assert_eq!(
+            db.rows("SELECT id, pid FROM child"),
+            vec![r(&[int(70), int(8)])]
+        );
         assert_eq!(parent_ids(&db), vec![r(&[int(8)])]);
         db.cleanup();
     }
@@ -1576,7 +1801,10 @@ mod fk_concurrency {
         db.write("DELETE FROM parent WHERE id = 1"); // commits: no child is visible to it
         let err = t1.commit().unwrap_err();
         assert!(
-            matches!(err, rubixdb::relational::RelationalError::ForeignKeyViolation { .. }),
+            matches!(
+                err,
+                rubixdb::relational::RelationalError::ForeignKeyViolation { .. }
+            ),
             "{err:?}"
         );
         assert!(child_ids(&db).is_empty());
@@ -1594,7 +1822,10 @@ mod fk_concurrency {
         db.write("INSERT INTO child VALUES (10, 1, 'x')"); // commits first
         let err = t1.commit().unwrap_err();
         assert!(
-            matches!(err, rubixdb::relational::RelationalError::ForeignKeyViolation { .. }),
+            matches!(
+                err,
+                rubixdb::relational::RelationalError::ForeignKeyViolation { .. }
+            ),
             "{err:?}"
         );
         assert_eq!(child_ids(&db), vec![r(&[int(10)])]);
@@ -1708,7 +1939,8 @@ mod fk_concurrency {
             std::thread::sleep(std::time::Duration::from_millis(10));
             stop.store(true, Ordering::Relaxed);
             writer.join().unwrap();
-            let orphans = db.rows("SELECT COUNT(*) FROM child WHERE pid NOT IN (SELECT id FROM parent)");
+            let orphans =
+                db.rows("SELECT COUNT(*) FROM child WHERE pid NOT IN (SELECT id FROM parent)");
             match added {
                 Ok(_) => assert_eq!(orphans, vec![r(&[big(0)])], "round {round}"),
                 Err(e) => {
@@ -1734,9 +1966,15 @@ mod fk_restart {
         seed(&db);
         let db = reopen(db);
         assert_eq!(db.catalog.foreign_keys().unwrap().len(), 1);
-        assert!(is_fk_violation(&db.try_write("INSERT INTO child VALUES (99, 77, 'x')").unwrap_err()));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO child VALUES (99, 77, 'x')")
+                .unwrap_err()
+        ));
         db.write("UPDATE parent SET id = 10 WHERE id = 2");
-        assert_eq!(db.rows("SELECT pid FROM child WHERE id = 20"), vec![r(&[int(10)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM child WHERE id = 20"),
+            vec![r(&[int(10)])]
+        );
         db.cleanup();
     }
 
@@ -1769,7 +2007,9 @@ mod fk_restart {
             let mut txn = db.txm.begin().unwrap();
             in_txn(&db, "DELETE FROM parent WHERE id = 1", &mut txn).unwrap();
             assert_eq!(
-                db.run_in_txn("SELECT COUNT(*) FROM child", &txn).unwrap().rows,
+                db.run_in_txn("SELECT COUNT(*) FROM child", &txn)
+                    .unwrap()
+                    .rows,
                 vec![r(&[big(2)])]
             );
             // the process ends here: the transaction is never committed (dropping it is
@@ -1811,16 +2051,21 @@ mod authorization {
 
         // no privilege at all: the table does not even appear to exist
         assert!(matches!(
-            db.try_bind_with("ALTER TABLE child ADD COLUMN x INTEGER", &who, &limits).unwrap_err(),
+            db.try_bind_with("ALTER TABLE child ADD COLUMN x INTEGER", &who, &limits)
+                .unwrap_err(),
             SqlError::UnknownObject { .. }
         ));
         // Select is not enough to alter
-        db.catalog.grant("worker", ObjectKind::Table, child, Privilege::Select).unwrap();
+        db.catalog
+            .grant("worker", ObjectKind::Table, child, Privilege::Select)
+            .unwrap();
         assert!(db
             .try_bind_with("ALTER TABLE child ADD COLUMN x INTEGER", &who, &limits)
             .is_err());
         // Ddl on the child allows ALTER ... but a key needs to read the parent
-        db.catalog.grant("worker", ObjectKind::Table, child, Privilege::Ddl).unwrap();
+        db.catalog
+            .grant("worker", ObjectKind::Table, child, Privilege::Ddl)
+            .unwrap();
         assert!(db
             .try_bind_with("ALTER TABLE child ADD COLUMN x INTEGER", &who, &limits)
             .is_ok());
@@ -1832,7 +2077,9 @@ mod authorization {
                 &limits
             )
             .is_err());
-        db.catalog.grant("worker", ObjectKind::Table, parent, Privilege::Select).unwrap();
+        db.catalog
+            .grant("worker", ObjectKind::Table, parent, Privilege::Select)
+            .unwrap();
         assert!(db
             .try_bind_with(
                 "ALTER TABLE child ADD FOREIGN KEY (pid) REFERENCES parent (id)",
@@ -1857,9 +2104,18 @@ mod authorization {
         db.write("INSERT INTO parent VALUES (1, 'secret parent name')");
         let who = crate::auth::AuthContext::none("worker");
         db.catalog
-            .grant("worker", ObjectKind::Table, db.table_id("child"), Privilege::Insert)
+            .grant(
+                "worker",
+                ObjectKind::Table,
+                db.table_id("child"),
+                Privilege::Insert,
+            )
             .unwrap();
-        let bound = db.try_bind_with("INSERT INTO child VALUES (1, 1, 'x')", &who, &SqlLimits::default());
+        let bound = db.try_bind_with(
+            "INSERT INTO child VALUES (1, 1, 'x')",
+            &who,
+            &SqlLimits::default(),
+        );
         assert!(bound.is_ok(), "{bound:?}");
         db.cleanup();
     }
@@ -1873,7 +2129,8 @@ mod fk_paths {
     use super::*;
 
     #[test]
-    fn a_statement_touching_many_parents_finds_their_children_in_one_pass_when_the_child_has_no_index() {
+    fn a_statement_touching_many_parents_finds_their_children_in_one_pass_when_the_child_has_no_index(
+    ) {
         // no index on child.pid and pid is not a prefix of the child key: the multi-parent
         // statement reads the child table once for all the changed keys
         let db = fk_db("p23_paths_batch", "ON DELETE CASCADE ON UPDATE CASCADE");
@@ -1906,7 +2163,10 @@ mod fk_paths {
         }
         db.write("DELETE FROM parent WHERE id = 1");
         assert_eq!(db.rows("SELECT COUNT(*) FROM child"), vec![r(&[big(300)])]);
-        assert_eq!(db.rows("SELECT COUNT(*) FROM child WHERE pid <> 2"), vec![r(&[big(0)])]);
+        assert_eq!(
+            db.rows("SELECT COUNT(*) FROM child WHERE pid <> 2"),
+            vec![r(&[big(0)])]
+        );
         db.cleanup();
     }
 
@@ -1921,8 +2181,14 @@ mod fk_paths {
         );
         db.write("INSERT INTO p VALUES ('AB', 12.50), ('CD', 7.25)");
         db.write("INSERT INTO c VALUES (1, 'AB', 12.50), (2, 'CD', NULL)");
-        assert!(is_fk_violation(&db.try_write("INSERT INTO c VALUES (3, 'ab', NULL)").unwrap_err())); // case matters
-        assert!(is_fk_violation(&db.try_write("INSERT INTO c VALUES (3, NULL, 12.51)").unwrap_err()));
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO c VALUES (3, 'ab', NULL)")
+                .unwrap_err()
+        )); // case matters
+        assert!(is_fk_violation(
+            &db.try_write("INSERT INTO c VALUES (3, NULL, 12.51)")
+                .unwrap_err()
+        ));
         db.write("DELETE FROM p WHERE code = 'CD'");
         assert_eq!(db.rows("SELECT COUNT(*) FROM c"), vec![r(&[big(1)])]);
         db.cleanup();
@@ -1936,7 +2202,9 @@ mod fk_paths {
         db.write("CREATE TABLE c (id INTEGER PRIMARY KEY, code TEXT REFERENCES p (code) ON UPDATE CASCADE)");
         db.write("INSERT INTO p VALUES (1, 'old')");
         db.write("INSERT INTO c VALUES (10, 'old')");
-        db.write("INSERT INTO p VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code");
+        db.write(
+            "INSERT INTO p VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code",
+        );
         assert_eq!(db.rows("SELECT code FROM c"), vec![r(&[text("new")])]);
         db.cleanup();
     }
@@ -1956,8 +2224,15 @@ mod fk_paths {
     fn rows_affected_counts_the_statement_rows_not_the_cascade() {
         let db = fk_db("p23_paths_counts", "ON DELETE CASCADE ON UPDATE CASCADE");
         seed(&db);
-        assert_eq!(db.write("UPDATE parent SET id = 11 WHERE id = 1").rows_affected, 1);
-        assert_eq!(db.write("DELETE FROM parent WHERE id = 11").rows_affected, 1);
+        assert_eq!(
+            db.write("UPDATE parent SET id = 11 WHERE id = 1")
+                .rows_affected,
+            1
+        );
+        assert_eq!(
+            db.write("DELETE FROM parent WHERE id = 11").rows_affected,
+            1
+        );
         db.cleanup();
     }
 
@@ -1969,7 +2244,9 @@ mod fk_paths {
         in_txn(&db, "INSERT INTO child VALUES (10, 1, 'mine')", &mut txn).unwrap();
         in_txn(&db, "DELETE FROM parent WHERE id = 1", &mut txn).unwrap(); // cascades the txn's own row
         assert_eq!(
-            db.run_in_txn("SELECT COUNT(*) FROM child", &txn).unwrap().rows,
+            db.run_in_txn("SELECT COUNT(*) FROM child", &txn)
+                .unwrap()
+                .rows,
             vec![r(&[big(0)])]
         );
         txn.commit().unwrap();
@@ -2037,15 +2314,41 @@ mod catalog_level {
             on_delete: FkAction::NoAction,
             on_update: FkAction::NoAction,
         };
-        assert!(db.catalog.check_foreign_key(&key("k", vec![], vec![])).is_err()); // empty
-        assert!(db.catalog.check_foreign_key(&key("k", vec![1], vec![0, 1])).is_err()); // arity
-        assert!(db.catalog.check_foreign_key(&key("k", vec![1, 1], vec![0, 0])).is_err()); // repeated
-        assert!(db.catalog.check_foreign_key(&key("k", vec![9], vec![0])).is_err()); // no such column
-        assert!(db.catalog.check_foreign_key(&key("k", vec![2], vec![0])).is_err()); // TEXT vs INTEGER
-        assert!(db.catalog.check_foreign_key(&key("k", vec![1], vec![1])).is_err()); // TEXT vs INTEGER, not unique
-        assert!(db.catalog.check_foreign_key(&key("child_pid_fk", vec![1], vec![0])).is_err()); // name taken
-        // pid -> id is a valid definition under a free name, and resolves to the primary key
-        assert_eq!(db.catalog.check_foreign_key(&key("k", vec![1], vec![0])).unwrap(), None);
+        assert!(db
+            .catalog
+            .check_foreign_key(&key("k", vec![], vec![]))
+            .is_err()); // empty
+        assert!(db
+            .catalog
+            .check_foreign_key(&key("k", vec![1], vec![0, 1]))
+            .is_err()); // arity
+        assert!(db
+            .catalog
+            .check_foreign_key(&key("k", vec![1, 1], vec![0, 0]))
+            .is_err()); // repeated
+        assert!(db
+            .catalog
+            .check_foreign_key(&key("k", vec![9], vec![0]))
+            .is_err()); // no such column
+        assert!(db
+            .catalog
+            .check_foreign_key(&key("k", vec![2], vec![0]))
+            .is_err()); // TEXT vs INTEGER
+        assert!(db
+            .catalog
+            .check_foreign_key(&key("k", vec![1], vec![1]))
+            .is_err()); // TEXT vs INTEGER, not unique
+        assert!(db
+            .catalog
+            .check_foreign_key(&key("child_pid_fk", vec![1], vec![0]))
+            .is_err()); // name taken
+                        // pid -> id is a valid definition under a free name, and resolves to the primary key
+        assert_eq!(
+            db.catalog
+                .check_foreign_key(&key("k", vec![1], vec![0]))
+                .unwrap(),
+            None
+        );
         db.cleanup();
     }
 }
@@ -2117,7 +2420,10 @@ mod check_constraints {
     #[test]
     fn declarations_are_recorded_with_names_and_the_columns_they_read() {
         let db = acct("p23_ck_decl");
-        let checks = db.catalog.check_constraints_for(db.table_id("acct")).unwrap();
+        let checks = db
+            .catalog
+            .check_constraints_for(db.table_id("acct"))
+            .unwrap();
         assert_eq!(checks.len(), 2);
         let by_name = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
         assert_eq!(by_name("acct_balance_check").column_ordinals, vec![1]);
@@ -2141,10 +2447,18 @@ mod check_constraints {
             .unwrap_err();
         assert!(is_check_violation(&err), "{err:?}");
         let msg = err.to_string();
-        assert!(msg.contains("acct_balance_check") && msg.contains("acct"), "{msg}");
+        assert!(
+            msg.contains("acct_balance_check") && msg.contains("acct"),
+            "{msg}"
+        );
         assert!(!msg.contains("777"), "{msg}");
-        let err = db.try_write("INSERT INTO acct VALUES (6, 1, 'zzz')").unwrap_err();
-        assert!(is_check_violation(&err) && err.to_string().contains("acct_kind_ck"), "{err:?}");
+        let err = db
+            .try_write("INSERT INTO acct VALUES (6, 1, 'zzz')")
+            .unwrap_err();
+        assert!(
+            is_check_violation(&err) && err.to_string().contains("acct_kind_ck"),
+            "{err:?}"
+        );
         assert_eq!(db.rows("SELECT COUNT(*) FROM acct"), vec![r(&[big(3)])]);
         db.cleanup();
     }
@@ -2154,13 +2468,19 @@ mod check_constraints {
         let db = acct("p23_ck_paths");
         db.write("INSERT INTO acct VALUES (1, 10, 'a'), (2, 20, 'b')");
         // UPDATE: one bad row fails the whole statement
-        let err = db.try_write("UPDATE acct SET balance = balance - 15").unwrap_err();
+        let err = db
+            .try_write("UPDATE acct SET balance = balance - 15")
+            .unwrap_err();
         assert!(is_check_violation(&err), "{err:?}");
-        assert_eq!(db.rows("SELECT balance FROM acct ORDER BY id"), vec![r(&[int(10)]), r(&[int(20)])]);
+        assert_eq!(
+            db.rows("SELECT balance FROM acct ORDER BY id"),
+            vec![r(&[int(10)]), r(&[int(20)])]
+        );
         db.write("UPDATE acct SET balance = balance - 5");
         // UPSERT, both paths
         assert!(is_check_violation(
-            &db.try_write("INSERT INTO acct VALUES (9, -1, 'a') ON CONFLICT (id) DO NOTHING").unwrap_err()
+            &db.try_write("INSERT INTO acct VALUES (9, -1, 'a') ON CONFLICT (id) DO NOTHING")
+                .unwrap_err()
         ));
         assert!(is_check_violation(
             &db.try_write(
@@ -2174,7 +2494,8 @@ mod check_constraints {
         db.write("CREATE TABLE src (id INTEGER PRIMARY KEY, b INTEGER)");
         db.write("INSERT INTO src VALUES (100, 1), (101, -1)");
         assert!(is_check_violation(
-            &db.try_write("INSERT INTO acct (id, balance) SELECT id, b FROM src").unwrap_err()
+            &db.try_write("INSERT INTO acct (id, balance) SELECT id, b FROM src")
+                .unwrap_err()
         ));
         db.write("INSERT INTO acct (id, balance) SELECT id, b FROM src WHERE b > 0");
         assert_eq!(db.rows("SELECT COUNT(*) FROM acct"), vec![r(&[big(3)])]);
@@ -2194,7 +2515,10 @@ mod check_constraints {
         let err = db
             .try_write("ALTER TABLE people ADD CONSTRAINT age_ok CHECK (age >= 0)")
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         assert_eq!(
             (
                 db.catalog.get_table(id).unwrap().unwrap().schema_version,
@@ -2204,7 +2528,10 @@ mod check_constraints {
         );
         db.write("DELETE FROM people WHERE id = 3");
         db.write("ALTER TABLE people ADD CONSTRAINT age_ok CHECK (age >= 0)"); // the NULL row passes
-        assert!(is_check_violation(&db.try_write("INSERT INTO people VALUES (4, -1)").unwrap_err()));
+        assert!(is_check_violation(
+            &db.try_write("INSERT INTO people VALUES (4, -1)")
+                .unwrap_err()
+        ));
         // the same name twice
         assert!(db
             .try_write("ALTER TABLE people ADD CONSTRAINT age_ok CHECK (age < 200)")
@@ -2220,7 +2547,10 @@ mod check_constraints {
         let db = Db::new("p23_ck_forms");
         db.write("CREATE TABLE t2 (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)");
         for (sql, why) in [
-            ("ALTER TABLE t2 ADD CHECK (a IN (SELECT id FROM t2))", "subquery"),
+            (
+                "ALTER TABLE t2 ADD CHECK (a IN (SELECT id FROM t2))",
+                "subquery",
+            ),
             ("ALTER TABLE t2 ADD CHECK (COUNT(*) > 0)", "aggregate"),
             ("ALTER TABLE t2 ADD CHECK (a > $1)", "parameter"),
             ("ALTER TABLE t2 ADD CHECK (a + 1)", "not boolean"),
@@ -2233,7 +2563,11 @@ mod check_constraints {
         assert!(db
             .try_write("CREATE TABLE t3 (id INTEGER PRIMARY KEY, CHECK (zzz > 0))")
             .is_err());
-        assert!(db.catalog.get_table_by_name(db.f.ctx.default_schema_id, "t3").unwrap().is_none());
+        assert!(db
+            .catalog
+            .get_table_by_name(db.f.ctx.default_schema_id, "t3")
+            .unwrap()
+            .is_none());
         // allowed: operators, functions, CASE, BETWEEN, LIKE, IN, IS NULL, several columns
         db.write(
             "ALTER TABLE t2 ADD CONSTRAINT rich CHECK (a BETWEEN 0 AND 100 AND (b LIKE 'x%' OR b IS NULL) \
@@ -2241,7 +2575,9 @@ mod check_constraints {
         );
         db.write("INSERT INTO t2 VALUES (1, 10, NULL), (2, 60, 'xy')");
         assert!(db.try_write("INSERT INTO t2 VALUES (3, 60, NULL)").is_err());
-        assert!(db.try_write("INSERT INTO t2 VALUES (3, 5, 'nope')").is_err());
+        assert!(db
+            .try_write("INSERT INTO t2 VALUES (3, 5, 'nope')")
+            .is_err());
         db.cleanup();
     }
 
@@ -2251,7 +2587,10 @@ mod check_constraints {
         let err = db
             .try_write("ALTER TABLE acct RENAME COLUMN balance TO funds")
             .unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("acct_balance_check"), "{err}");
         db.write("ALTER TABLE acct DROP CONSTRAINT acct_balance_check");
         db.write("ALTER TABLE acct RENAME COLUMN balance TO funds");
@@ -2273,17 +2612,27 @@ mod check_constraints {
         let err = db.try_write("DELETE FROM p WHERE id = 1").unwrap_err();
         assert!(is_check_violation(&err), "{err:?}");
         assert_eq!(db.rows("SELECT COUNT(*) FROM p"), vec![r(&[big(2)])]);
-        assert_eq!(db.rows("SELECT pid FROM c WHERE id = 10"), vec![r(&[int(1)])]);
+        assert_eq!(
+            db.rows("SELECT pid FROM c WHERE id = 10"),
+            vec![r(&[int(1)])]
+        );
         db.cleanup();
     }
 
     #[test]
     fn a_runtime_error_in_a_check_fails_the_statement_and_writes_nothing() {
         let db = Db::new("p23_ck_runtime");
-        db.write("CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER, CHECK (10 / x > 1 OR x IS NULL))");
+        db.write(
+            "CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER, CHECK (10 / x > 1 OR x IS NULL))",
+        );
         db.write("INSERT INTO d VALUES (1, 2)");
-        let err = db.try_write("INSERT INTO d VALUES (2, 3), (3, 0)").unwrap_err();
-        assert!(matches!(err, SqlError::ExecutionParameter { .. }), "{err:?}");
+        let err = db
+            .try_write("INSERT INTO d VALUES (2, 3), (3, 0)")
+            .unwrap_err();
+        assert!(
+            matches!(err, SqlError::ExecutionParameter { .. }),
+            "{err:?}"
+        );
         assert_eq!(db.rows("SELECT COUNT(*) FROM d"), vec![r(&[big(1)])]);
         db.cleanup();
     }
@@ -2295,8 +2644,14 @@ mod check_constraints {
         db.write("ALTER TABLE acct ADD CONSTRAINT id_pos CHECK (id > 0)");
         let db = reopen(db);
         assert_eq!(db.catalog.check_constraints().unwrap().len(), 3);
-        assert!(is_check_violation(&db.try_write("INSERT INTO acct VALUES (2, -5, 'a')").unwrap_err()));
-        assert!(is_check_violation(&db.try_write("INSERT INTO acct VALUES (-2, 5, 'a')").unwrap_err()));
+        assert!(is_check_violation(
+            &db.try_write("INSERT INTO acct VALUES (2, -5, 'a')")
+                .unwrap_err()
+        ));
+        assert!(is_check_violation(
+            &db.try_write("INSERT INTO acct VALUES (-2, 5, 'a')")
+                .unwrap_err()
+        ));
         db.write("DROP TABLE acct");
         assert!(db.catalog.check_constraints().unwrap().is_empty());
         db.cleanup();
@@ -2335,7 +2690,10 @@ mod check_constraints {
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
         if added.is_ok() {
-            assert_eq!(db.rows("SELECT COUNT(*) FROM q WHERE v < 0"), vec![r(&[big(0)])]);
+            assert_eq!(
+                db.rows("SELECT COUNT(*) FROM q WHERE v < 0"),
+                vec![r(&[big(0)])]
+            );
         }
         Arc::try_unwrap(db).ok().unwrap().cleanup();
     }

@@ -44,7 +44,7 @@ mod txn_tests;
 mod fk_tests;
 
 #[cfg(test)]
-mod commit_bench;
+mod commit_bench_tests;
 
 #[cfg(test)]
-mod fk_bench;
+mod fk_bench_tests;

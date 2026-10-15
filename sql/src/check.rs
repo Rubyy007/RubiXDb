@@ -76,8 +76,9 @@ pub fn bind_check(
     };
     if bound.any(&forbidden) {
         return Err(SqlError::Unsupported {
-            detail: "a CHECK expression cannot contain a subquery, an aggregate or a window function"
-                .to_string(),
+            detail:
+                "a CHECK expression cannot contain a subquery, an aggregate or a window function"
+                    .to_string(),
         });
     }
     if bound.ty != Some(RelationalType::Boolean) {
@@ -108,9 +109,9 @@ pub fn parse_check_text(text: &str, limits: &SqlLimits) -> Result<ast::Expr> {
     // front door as any other SQL, so every limit applies.
     let stmt = crate::parse::parse_statement(&format!("SELECT 1 FROM c WHERE {text}"), limits)?;
     match stmt {
-        ast::Statement::Select(select) => select.selection.ok_or_else(|| SqlError::Catalog(
-            "a stored CHECK expression did not parse as a condition".to_string(),
-        )),
+        ast::Statement::Select(select) => select.selection.ok_or_else(|| {
+            SqlError::Catalog("a stored CHECK expression did not parse as a condition".to_string())
+        }),
         _ => Err(SqlError::Catalog(
             "a stored CHECK expression did not parse as a condition".to_string(),
         )),

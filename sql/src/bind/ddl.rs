@@ -8,8 +8,8 @@
 
 use std::collections::HashSet;
 
-use rubixdb::catalog::schema::{ColumnRow, FkAction, Privilege};
 use rubixdb::catalog::schema::IndexKind;
+use rubixdb::catalog::schema::{ColumnRow, FkAction, Privilege};
 use rubixdb::catalog::service::NewForeignKey;
 use rubixdb::catalog::CatalogService;
 use rubixdb::relational::value as rv;
@@ -18,9 +18,9 @@ use rubixdb::relational::RelationalType;
 use crate::ast;
 use crate::auth::AuthContext;
 use crate::bind::expr::ExprBinder;
-use crate::check;
 use crate::bind::scope::{self, BindContext};
 use crate::bound::*;
+use crate::check;
 use crate::error::{Result, SqlError};
 use crate::limits::SqlLimits;
 use crate::metrics::SqlMetrics;
@@ -367,8 +367,7 @@ pub fn bind_create_table(
             });
         }
         // Does the key reference the table being created?
-        let (_, parent_schema) =
-            scope::resolve_schema_scope(catalog, ctx, &fk.foreign_table)?;
+        let (_, parent_schema) = scope::resolve_schema_scope(catalog, ctx, &fk.foreign_table)?;
         let self_reference =
             parent_schema == schema_id && fk.foreign_table.last().value == table_name;
         let (parent_table_id, parent_ordinals) = if self_reference {
@@ -434,7 +433,13 @@ pub fn bind_create_table(
     let mut taken: HashSet<String> = fk_names.clone();
     let mut checks = Vec::with_capacity(stmt.checks.len());
     for def in &stmt.checks {
-        checks.push(bind_check_def(def, &table_name, &stored_columns, limits, &mut taken)?);
+        checks.push(bind_check_def(
+            def,
+            &table_name,
+            &stored_columns,
+            limits,
+            &mut taken,
+        )?);
     }
 
     Ok(BoundCreateTable {
@@ -596,17 +601,17 @@ pub fn bind_alter_table(
     limits: &SqlLimits,
     stmt: &ast::AlterTable,
 ) -> Result<BoundAlterTable> {
-    let resolved = match scope::resolve_table(catalog, ctx, auth, metrics, &stmt.name, Privilege::Ddl)
-    {
-        Ok(r) => r,
-        Err(SqlError::UnknownObject { .. }) if stmt.if_exists => {
-            return Ok(BoundAlterTable {
-                table_id: None,
-                operation: BoundAlterOp::Noop,
-            })
-        }
-        Err(e) => return Err(e),
-    };
+    let resolved =
+        match scope::resolve_table(catalog, ctx, auth, metrics, &stmt.name, Privilege::Ddl) {
+            Ok(r) => r,
+            Err(SqlError::UnknownObject { .. }) if stmt.if_exists => {
+                return Ok(BoundAlterTable {
+                    table_id: None,
+                    operation: BoundAlterOp::Noop,
+                })
+            }
+            Err(e) => return Err(e),
+        };
     let names: Vec<(&str, u16)> = resolved
         .columns
         .iter()
@@ -675,8 +680,7 @@ pub fn bind_alter_table(
                 .iter()
                 .map(|c| column_ordinal(&names, c))
                 .collect::<Result<Vec<_>>>()?;
-            let (_, parent_schema) =
-                scope::resolve_schema_scope(catalog, ctx, &fk.foreign_table)?;
+            let (_, parent_schema) = scope::resolve_schema_scope(catalog, ctx, &fk.foreign_table)?;
             let parent = if parent_schema == resolved.schema_id
                 && fk.foreign_table.last().value == table_name
             {

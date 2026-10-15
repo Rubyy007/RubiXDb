@@ -721,7 +721,10 @@ impl CatalogService {
             });
         }
 
-        let owns_checks = self.check_constraints()?.iter().any(|c| c.table_id == table_id);
+        let owns_checks = self
+            .check_constraints()?
+            .iter()
+            .any(|c| c.table_id == table_id);
         self.engine.write_batch(&ops)?;
         if owns_foreign_keys {
             self.invalidate_foreign_keys();
@@ -1180,7 +1183,8 @@ impl CatalogService {
             type_params: column.type_params.clone(),
             backfill_value,
         };
-        self.engine.write_batch(&[table_op, Self::column_put_op(&row)])?;
+        self.engine
+            .write_batch(&[table_op, Self::column_put_op(&row)])?;
         Ok(ordinal)
     }
 
@@ -1224,7 +1228,8 @@ impl CatalogService {
         }
         column.name = new_name.to_string();
         let (_, table_op) = Self::alter_table_row_op(&table);
-        self.engine.write_batch(&[table_op, Self::column_put_op(&column)])?;
+        self.engine
+            .write_batch(&[table_op, Self::column_put_op(&column)])?;
         Ok(())
     }
 
@@ -1242,7 +1247,8 @@ impl CatalogService {
         let mut column = self.column_for_alter(table_id, ordinal)?;
         column.default_value = default_value;
         let (_, table_op) = Self::alter_table_row_op(&table);
-        self.engine.write_batch(&[table_op, Self::column_put_op(&column)])?;
+        self.engine
+            .write_batch(&[table_op, Self::column_put_op(&column)])?;
         Ok(())
     }
 
@@ -1279,7 +1285,8 @@ impl CatalogService {
         }
         column.nullable = nullable;
         let (_, table_op) = Self::alter_table_row_op(&table);
-        self.engine.write_batch(&[table_op, Self::column_put_op(&column)])?;
+        self.engine
+            .write_batch(&[table_op, Self::column_put_op(&column)])?;
         Ok(())
     }
 
@@ -1733,7 +1740,9 @@ impl CatalogService {
 /// Decodes a `system.columns` row by its own envelope version: a version-1 row
 /// (written before `ALTER TABLE`) has `COLUMNS_V1_FIELDS` fields, a later one all
 /// of `COLUMNS_SCHEMA`.
-fn decode_column_row(bytes: &[u8]) -> Result<(u32, Vec<Option<crate::catalog::encoding::CatalogValue>>)> {
+fn decode_column_row(
+    bytes: &[u8],
+) -> Result<(u32, Vec<Option<crate::catalog::encoding::CatalogValue>>)> {
     let version = bytes
         .get(1..5)
         .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
@@ -1826,7 +1835,11 @@ fn resolve_foreign_key(
 
     // The referenced columns must be unique: the primary key, or a ready UNIQUE
     // index, covering exactly the same set of columns.
-    let as_set = |v: &[u16]| v.iter().copied().collect::<std::collections::BTreeSet<u16>>();
+    let as_set = |v: &[u16]| {
+        v.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<u16>>()
+    };
     let wanted = as_set(def.parent_ordinals);
     let parent_index_id = if as_set(&parent.pk_ordinals) == wanted {
         None

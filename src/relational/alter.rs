@@ -156,7 +156,9 @@ impl IndexBuilder {
         self.catalog.check_foreign_key(new)?;
 
         let (parent, _) = self.table_store.resolve_table(new.parent_table_id)?;
-        let access = self.table_store.plan_access(&parent, &new.parent_ordinals)?;
+        let access = self
+            .table_store
+            .plan_access(&parent, &new.parent_ordinals)?;
         let mut orphan = false;
         self.table_store
             .for_each_row_as_of(new.table_id, u64::MAX, |_, row| {
@@ -195,7 +197,12 @@ impl IndexBuilder {
     /// `ALTER TABLE ... ADD [CONSTRAINT name] UNIQUE (cols)`: a `UNIQUE` index, built
     /// online. Refused -- and leaving no index row behind -- if the existing rows
     /// already hold a value twice.
-    pub fn alter_add_unique(&self, table_id: u32, name: &str, column_ordinals: &[u16]) -> Result<u32> {
+    pub fn alter_add_unique(
+        &self,
+        table_id: u32,
+        name: &str,
+        column_ordinals: &[u16],
+    ) -> Result<u32> {
         match self.create_index_online(table_id, name, IndexKind::Unique, column_ordinals) {
             Ok(index_id) => Ok(index_id),
             Err(e) => {
@@ -254,9 +261,7 @@ impl IndexBuilder {
             })?;
         if violated {
             return Err(RelationalError::InvalidInput {
-                detail: format!(
-                    "cannot add CHECK constraint {name:?}: existing rows violate it"
-                ),
+                detail: format!("cannot add CHECK constraint {name:?}: existing rows violate it"),
             });
         }
         Ok(self

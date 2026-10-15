@@ -144,12 +144,12 @@ impl TableStore {
     /// recognisable (a column newer than the table row) and is simply read again.
     pub(crate) fn resolve_table(&self, table_id: u32) -> Result<(TableRow, Vec<ColumnRow>)> {
         for _ in 0..8 {
-            let table = self
-                .catalog
-                .get_table(table_id)?
-                .ok_or_else(|| RelationalError::NotFound {
-                    object: format!("table {table_id}"),
-                })?;
+            let table =
+                self.catalog
+                    .get_table(table_id)?
+                    .ok_or_else(|| RelationalError::NotFound {
+                        object: format!("table {table_id}"),
+                    })?;
             let columns = self.catalog.get_columns(table_id)?;
             if columns
                 .iter()
