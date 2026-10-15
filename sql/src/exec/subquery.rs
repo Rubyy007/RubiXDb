@@ -47,6 +47,8 @@ pub(super) enum CachedSubquery {
     Scalar(Option<RelationalValue>),
     Exists(bool),
     InSet(InSet),
+    /// The inner column of an `ANY` / `ALL` subquery, in row order.
+    Values(Vec<Option<RelationalValue>>),
 }
 
 /// The materialized value set of an `IN (SELECT ...)`.
@@ -131,6 +133,18 @@ pub(super) fn eval_subquery<'a>(
                 tri_not(t)
             } else {
                 t
+            }
+        }
+        SubqueryKind::Quantified { op, all } => {
+            let lhs = operand.expect("binder always sets an operand on an ANY/ALL subquery");
+            match cached.as_deref() {
+                Some(CachedSubquery::Values(values)) => quantified_tri(&lhs, values, op, all)?,
+                _ => {
+                    let values = run_values(plan, correlated, ctx, ec)?;
+                    let t = quantified_tri(&lhs, &values, op, all)?;
+                    store(sq, correlated, ec, CachedSubquery::Values(values));
+                    t
+                }
             }
         }
     };
@@ -336,6 +350,73 @@ fn run_in_set<'a>(
         has_null,
         empty: rows == 0,
     })
+}
+
+/// Materializes the subquery's single column, in row order, bounded by
+/// `max_materialized_rows` and `max_materialized_bytes` and failing closed.
+fn run_values<'a>(
+    plan: &crate::plan::physical::PhysicalPlan,
+    correlated: bool,
+    ctx: &RowContext,
+    ec: &ExecCtx<'a>,
+) -> Result<Vec<Option<RelationalValue>>> {
+    let mut op = open(plan, correlated, ctx, ec)?;
+    let mut values = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(tuple) = op.next(ec)? {
+        ec.check()?;
+        if values.len() >= ec.limits.max_materialized_rows {
+            return Err(SqlError::ResourceLimit {
+                detail: format!(
+                    "an ANY / ALL subquery produced more than max_materialized_rows ({}) rows",
+                    ec.limits.max_materialized_rows
+                ),
+            });
+        }
+        let v = first_column(tuple);
+        bytes = bytes.saturating_add(crate::exec::setop::row_bytes(std::slice::from_ref(&v)));
+        if bytes > ec.limits.max_materialized_bytes {
+            return Err(SqlError::ResourceLimit {
+                detail: format!(
+                    "an ANY / ALL subquery result exceeded max_materialized_bytes ({})",
+                    ec.limits.max_materialized_bytes
+                ),
+            });
+        }
+        values.push(v);
+    }
+    Ok(values)
+}
+
+/// `lhs <op> ANY (values)` / `lhs <op> ALL (values)` under three-valued logic.
+///
+/// * `ANY`: `TRUE` as soon as one comparison is `TRUE`; otherwise `UNKNOWN`
+///   when some comparison was `UNKNOWN` (a `NULL` operand or member); otherwise
+///   `FALSE`. An empty set is `FALSE` for any operand, `NULL` included.
+/// * `ALL`: `FALSE` as soon as one comparison is `FALSE`; otherwise `UNKNOWN`
+///   when some comparison was `UNKNOWN`; otherwise `TRUE`. An empty set is
+///   `TRUE` for any operand.
+///
+/// So `= ANY` is `IN` and `<> ALL` is `NOT IN`, `NULL` handling included
+/// (tests pin both equivalences).
+fn quantified_tri(
+    lhs: &Option<RelationalValue>,
+    values: &[Option<RelationalValue>],
+    op: crate::ast::BinaryOp,
+    all: bool,
+) -> Result<Tri> {
+    let decisive = if all { Tri::False } else { Tri::True };
+    let mut result = if all { Tri::True } else { Tri::False };
+    for v in values {
+        let t = crate::exec::expr_eval::compare(lhs, v, op)?;
+        if t == decisive {
+            return Ok(decisive);
+        }
+        if t == Tri::Unknown {
+            result = Tri::Unknown;
+        }
+    }
+    Ok(result)
 }
 
 /// Rough per-entry cost of a `HashSet` slot beyond the key's own bytes.

@@ -244,7 +244,7 @@ pub fn stamp_if_fresh(dir: &Path, state: FormatState) -> Result<(), OpsError> {
     if crate::persist::exists(&marker) {
         return Ok(());
     }
-    crate::persist::create_dir_all(dir)?;
+    crate::persist::create_dir_all_durable(dir)?;
     let tmp = dir.join(DATA_FORMAT_TMP);
     {
         use std::io::Write;
@@ -255,6 +255,8 @@ pub fn stamp_if_fresh(dir: &Path, state: FormatState) -> Result<(), OpsError> {
     crate::startup_probe::hit(crate::startup_probe::Point::FormatMarkerTempWritten);
     faults::fire(Fp::FormatStampRename)?;
     crate::persist::rename(&tmp, &marker)?;
+    // ADR-DATA-DIR-DURABILITY-01: the marker's directory entry. A no-op on Windows (assumption W1).
+    crate::persist::sync_dir(dir)?;
     Ok(())
 }
 

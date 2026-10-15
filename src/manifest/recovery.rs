@@ -74,6 +74,52 @@ fn rest_is_zero(reader: &mut impl Read, remaining: u64) -> io::Result<bool> {
     Ok(true)
 }
 
+/// The smallest sector size the model and real devices use; a lost larger sector satisfies the first-sector test a fortiori.
+const LOST_SECTOR_GRANULE: u64 = 512;
+
+/// ADR-TORN-TAIL-LOST-SECTOR-01. `pos` is a frame boundary at which a frame failed validation as something other than the
+/// provable tail. True iff the tail is the remainder of ONE frame whose first sector was lost: (1) the bytes up to the next
+/// sector boundary are all zero, (2) the tail is no longer than one maximum-size frame, (3) no complete valid frame starts
+/// anywhere behind the hole. Anything else keeps the old result (an error), so a hole in front of readable edits is never
+/// truncated away.
+fn lost_first_sector_tail<R: Read + std::io::Seek>(
+    reader: &mut R,
+    pos: u64,
+    file_len: u64,
+) -> io::Result<bool> {
+    let tail_len = file_len.saturating_sub(pos);
+    if tail_len > (FRAME_HEADER_LEN + MAX_EDIT_BODY_LEN) as u64 {
+        return Ok(false);
+    }
+    // The first sector is the bytes from `pos` to the next sector boundary (a header that straddles the boundary is
+    // therefore only partly zero).
+    let zero_end = (pos / LOST_SECTOR_GRANULE + 1) * LOST_SECTOR_GRANULE;
+    if zero_end >= file_len {
+        return Ok(false);
+    }
+    reader.seek(std::io::SeekFrom::Start(pos))?;
+    let mut tail = vec![0u8; tail_len as usize]; // at most 72 bytes, checked above
+    reader.read_exact(&mut tail)?;
+    let hole = (zero_end - pos) as usize;
+    if tail[..hole].iter().any(|b| *b != 0) {
+        return Ok(false);
+    }
+    let mut p = hole;
+    while p + FRAME_HEADER_LEN < tail.len() {
+        let length = u32::from_le_bytes([tail[p], tail[p + 1], tail[p + 2], tail[p + 3]]) as usize;
+        if length > 0 && length <= MAX_EDIT_BODY_LEN && p + FRAME_HEADER_LEN + length <= tail.len()
+        {
+            let stored = u32::from_le_bytes([tail[p + 4], tail[p + 5], tail[p + 6], tail[p + 7]]);
+            let body = &tail[p + FRAME_HEADER_LEN..p + FRAME_HEADER_LEN + length];
+            if crc32c::crc32c(body) == stored && format::decode_body(body).is_ok() {
+                return Ok(false); // a readable edit behind the hole: mid-file damage
+            }
+        }
+        p += 1;
+    }
+    Ok(true)
+}
+
 /// Walks every frame in `file` from byte 0, applying valid edits to a
 /// fresh `ManifestState` as they're found. `file`'s own cursor is left
 /// undefined on return (callers needing to append afterward should
@@ -116,6 +162,10 @@ pub fn replay(file: &mut File) -> Result<ManifestReplayResult> {
         let stored_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
         if length > MAX_EDIT_BODY_LEN {
+            if lost_first_sector_tail(&mut reader, pos, file_len)? {
+                truncated = true;
+                break;
+            }
             return Err(corrupt(format!(
                 "manifest: frame at offset {pos} declares an implausible body length {length} \
                  (max {MAX_EDIT_BODY_LEN})"
@@ -141,18 +191,31 @@ pub fn replay(file: &mut File) -> Result<ManifestReplayResult> {
                 truncated = true;
                 break;
             }
+            if lost_first_sector_tail(&mut reader, pos, file_len)? {
+                truncated = true;
+                break;
+            }
             return Err(corrupt(format!(
                 "manifest: checksum mismatch at offset {pos} (not the trailing frame -- \
                  real corruption, not a torn write)"
             )));
         }
 
-        let edit = format::decode_body(&body).map_err(|e| match e {
-            EngineError::Corruption { detail } => {
-                corrupt(format!("manifest: at offset {pos}: {detail}"))
+        let edit = match format::decode_body(&body) {
+            Ok(edit) => edit,
+            Err(e) => {
+                if lost_first_sector_tail(&mut reader, pos, file_len)? {
+                    truncated = true;
+                    break;
+                }
+                return Err(match e {
+                    EngineError::Corruption { detail } => {
+                        corrupt(format!("manifest: at offset {pos}: {detail}"))
+                    }
+                    other => other,
+                });
             }
-            other => other,
-        })?;
+        };
         state.apply(edit).map_err(|e| match e {
             EngineError::Corruption { detail } => {
                 corrupt(format!("manifest: at offset {pos}: {detail}"))

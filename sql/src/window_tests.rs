@@ -172,8 +172,8 @@ mod parser {
         // `parse_tests::unsupported_grammar_is_a_typed_error_not_a_panic` (left
         // unchanged) stops at its `ROLLUP` case, which Mission 2 supports, and so
         // no longer reaches these; they are Mission 3's (joins) and still refused.
+        // (SQL Phase 1 removed `GROUP BY ALL`, which is implemented now.)
         for sql in [
-            "SELECT id FROM t GROUP BY ALL",
             "SELECT * FROM t, orders",
             "SELECT id FROM t RIGHT JOIN orders o ON t.id = o.id",
             "SELECT id FROM t FULL JOIN orders o ON t.id = o.id",
@@ -186,9 +186,13 @@ mod parser {
 
     #[test]
     fn what_stays_outside_the_grammar_is_a_typed_error() {
+        // SQL Phase 1: `GROUPS` frames and `IGNORE NULLS` are implemented
+        // (`phase1_tests::window_groups`, `::window_ignore_nulls`). What stays refused:
+        // frame exclusion, which `sqlparser` 0.63 does not parse ("TBD: EXCLUDE"),
+        // and `FROM FIRST / LAST`.
         for sql in [
-            "SELECT SUM(x) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
-            "SELECT LAG(x) IGNORE NULLS OVER (ORDER BY id) FROM w",
+            "SELECT SUM(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM w",
+            "SELECT NTH_VALUE(x, 2) FROM LAST OVER (ORDER BY id) FROM w",
         ] {
             let err = parse_statement(sql, &SqlLimits::default()).unwrap_err();
             assert!(

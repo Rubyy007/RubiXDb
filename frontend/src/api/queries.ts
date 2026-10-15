@@ -179,11 +179,14 @@ export function useSchemasQuery() {
   });
 }
 
-export function useTablesQuery() {
+/** Tables of the default schema; with `{ all: true }`, of every schema (each carries its schema name), which the
+ * IDE's completion uses to offer `schema.table`. Same `["sql", ...]` prefix, so it refreshes with the rest. */
+export function useTablesQuery(opts?: { all?: boolean }) {
   const client = useApiClient();
+  const all = opts?.all === true;
   return useQuery({
-    queryKey: ["sql", "tables"],
-    queryFn: () => client!.listTables(),
+    queryKey: all ? ["sql", "tables", "all"] : ["sql", "tables"],
+    queryFn: () => (all ? client!.listAllTables() : client!.listTables()),
     enabled: client !== null,
   });
 }

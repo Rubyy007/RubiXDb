@@ -1031,10 +1031,11 @@ fn min_max_and_sum_and_avg_on_orders_amount_resolve_expected_types() {
 #[test]
 fn group_by_all_and_rollup_remain_explicitly_unsupported() {
     let f = Fixture::new("agg_bind_rollup_unsupported");
-    assert!(matches!(
-        parse_then_bind(&f, "SELECT id FROM t GROUP BY ALL").unwrap_err(),
-        SqlError::Unsupported { .. }
-    ));
+    // SQL Phase 1: `GROUP BY ALL` is implemented -- it binds and groups by the
+    // select list's non-aggregate items (`phase1_tests::group_by_all`).
+    let all = parse_then_bind(&f, "SELECT id FROM t GROUP BY ALL").unwrap();
+    let BoundStatement::Select(all) = all else { panic!("not a SELECT") };
+    assert_eq!(all.group_by.len(), 1, "GROUP BY ALL groups by the one non-aggregate item");
     // Mission 2: OVER / ROLLUP / COUNT(DISTINCT) is implemented; see MISSION2_FEATURE_MATRIX.md §6.2.
     // The ROLLUP case is now a positive assertion; `GROUP BY ALL` above is unchanged.
     let bound = parse_then_bind(&f, "SELECT id, COUNT(*) FROM t GROUP BY ROLLUP(id)")
@@ -1057,8 +1058,19 @@ fn count_distinct_remains_explicitly_unsupported() {
     // The failure mode this test protects -- a form that is not implemented being
     // silently accepted -- stays pinned by the DISTINCT form that is still refused
     // (DISTINCT inside a window aggregate, matrix X3).
-    let err = parse_then_bind(&f, "SELECT COUNT(DISTINCT name) OVER () FROM t").unwrap_err();
-    assert!(matches!(err, SqlError::Unsupported { .. }), "{err:?}");
+    // SQL Phase 1: DISTINCT inside a window aggregate is implemented too
+    // (`phase1_tests::window_distinct`); this pin now binds it and keeps its flag.
+    let windowed = parse_then_bind(&f, "SELECT COUNT(DISTINCT name) OVER () FROM t")
+        .unwrap_or_else(|e| panic!("window DISTINCT binds: {e:?}"));
+    let BoundStatement::Select(w) = windowed else { panic!("not a SELECT") };
+    assert!(
+        w.windows.iter().any(|c| matches!(
+            c.func,
+            crate::bound::BoundWindowFunc::Aggregate { distinct: true, .. }
+        )),
+        "the DISTINCT flag of a window aggregate was dropped: {:?}",
+        w.windows
+    );
     f.cleanup();
 }
 

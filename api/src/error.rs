@@ -53,6 +53,10 @@ pub enum ApiError {
         code: &'static str,
         message: String,
     },
+    /// Any other error plus a specific "what to do next" line (for example a `did you mean` for a
+    /// mistyped keyword) that replaces the generic hint of its code. Status, code and message are the
+    /// inner error's, unchanged.
+    Hinted(Box<ApiError>, String),
 }
 
 impl From<EngineError> for ApiError {
@@ -81,6 +85,10 @@ struct ErrorDetail {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// What to do about it. Always safe text: built from the error's code or from the caller's own
+    /// statement keywords, never from server internals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
 }
 
 impl ApiError {
@@ -90,12 +98,37 @@ impl ApiError {
         self.parts().1
     }
 
+    /// The "what to do next" line of this error: a specific one when a handler attached it, otherwise
+    /// the generic advice for the error's code.
+    pub fn hint(&self) -> Option<String> {
+        if let ApiError::Hinted(_, hint) = self {
+            return Some(hint.clone());
+        }
+        let text = match self.code() {
+            "ALREADY_EXISTS" => "Pick a different name, or add IF NOT EXISTS (for example CREATE SCHEMA IF NOT EXISTS <name>) to make the statement do nothing when the object is already there.",
+            "NOT_FOUND" if matches!(self, ApiError::Sql(_)) => "Check the spelling and the active schema (USE SCHEMA <schema_name> switches it). A read-only key also gets this for objects it cannot create or change.",
+            "AUTHORIZATION_ERROR" | "FORBIDDEN" => "This API key's role does not permit the statement. Use a key with the admin role for DDL and writes.",
+            "UNAUTHORIZED" => "Check the API key and sign in again.",
+            "CONFLICT_ERROR" => "Another transaction changed the same rows first. Roll back and retry the transaction.",
+            "RESOURCE_LIMIT" => "Narrow the statement (WHERE, LIMIT) or split it into smaller statements.",
+            "TIMEOUT" => "Narrow the query (WHERE, LIMIT) or retry when the server is less busy.",
+            "SESSION_NOT_FOUND" => "The transaction session is gone (it ended, expired or belongs to another key). Run BEGIN to start a new one.",
+            "TOO_MANY_SESSIONS" => "Commit or roll back an open transaction first.",
+            "RATE_LIMITED" => "Wait a moment and retry.",
+            "PARSE_ERROR" => "Check the statement's syntax near the position the detail reports.",
+            "STORAGE_EXHAUSTED" => "Free disk space on the data volume, then retry.",
+            _ => return None,
+        };
+        Some(text.to_string())
+    }
+
     /// (status, code, message, detail). `detail` is `None` whenever the
     /// underlying value is server-side-only (a raw OS `io::Error`, a
     /// filesystem path) — logged by the caller, never returned in the
     /// body, per §3's own explicit instruction.
     fn parts(&self) -> (StatusCode, &'static str, String, Option<String>) {
         match self {
+            ApiError::Hinted(inner, _) => inner.parts(),
             ApiError::Validation(msg) => (
                 StatusCode::BAD_REQUEST,
                 "VALIDATION_ERROR",
@@ -251,11 +284,23 @@ fn sql_error_parts(e: &SqlError) -> (StatusCode, &'static str, String, Option<St
             "a SQL resource limit was exceeded".to_string(),
             Some(detail.clone()),
         ),
-        SqlError::Unsupported { detail } | SqlError::UnsupportedExecution { detail } => (
+        SqlError::Unsupported { detail } => (
             StatusCode::BAD_REQUEST,
             "UNSUPPORTED",
             "this SQL feature is not supported".to_string(),
             Some(detail.clone()),
+        ),
+        // The executor's refusals are complete, caller-safe sentences ("CREATE DATABASE is disabled. ..."):
+        // they are the message itself rather than a detail hanging off a generic one.
+        SqlError::UnsupportedExecution { detail } => {
+            (StatusCode::BAD_REQUEST, "UNSUPPORTED", detail.clone(), None)
+        }
+        // A name collision is the caller's request conflicting with current state: 409, not a catalog fault.
+        SqlError::AlreadyExists { detail } => (
+            StatusCode::CONFLICT,
+            "ALREADY_EXISTS",
+            format!("{detail} already exists"),
+            None,
         ),
         SqlError::InvalidIdentifier { detail }
         | SqlError::AmbiguousColumn { detail }
@@ -277,11 +322,12 @@ fn sql_error_parts(e: &SqlError) -> (StatusCode, &'static str, String, Option<St
         // itself already collapsed that distinction one layer down; this
         // mapping must not reintroduce it (e.g. by echoing `kind` in a
         // way that would let a client binary-search object existence).
-        SqlError::UnknownObject { .. } => (
+        SqlError::UnknownObject { kind, detail } => (
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
-            "the referenced object was not found".to_string(),
-            None,
+            format!("the referenced {kind} was not found"),
+            // Only the name the caller itself wrote; present for "missing" and "not allowed" alike.
+            Some(detail.clone()).filter(|d| !d.is_empty()),
         ),
         SqlError::AuthorizationDenied { detail } => (
             StatusCode::FORBIDDEN,
@@ -349,11 +395,13 @@ fn sql_error_parts(e: &SqlError) -> (StatusCode, &'static str, String, Option<St
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message, detail) = self.parts();
+        let hint = self.hint();
         let body = ErrorBody {
             error: ErrorDetail {
                 code,
                 message,
                 detail,
+                hint,
             },
         };
         (status, Json(body)).into_response()

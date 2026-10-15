@@ -62,7 +62,7 @@ use std::collections::HashMap;
 
 use rubixdb::relational::{RelationalType, RelationalValue};
 
-use crate::aggregate::{AggregateArg, AggregateState};
+use crate::aggregate::{AggregateAccumulator, AggregateArg, AggregateState};
 use crate::ast::FrameUnits;
 use crate::bound::{BoundExpr, BoundFrameBound, BoundWindowFunc, BoundWindowSpec};
 use crate::error::{Result, SqlError};
@@ -217,10 +217,15 @@ struct ResolvedFrame {
 fn resolve_bound(b: &BoundFrameBound, units: FrameUnits, ec: &ExecCtx) -> Result<RBound> {
     let offset = |e: &BoundExpr| -> Result<Offset> {
         match units {
-            FrameUnits::Rows => {
-                let n = const_i64(e, "a ROWS frame offset", ec)?;
+            FrameUnits::Rows | FrameUnits::Groups => {
+                let what = if units == FrameUnits::Rows {
+                    "a ROWS frame offset"
+                } else {
+                    "a GROUPS frame offset"
+                };
+                let n = const_i64(e, what, ec)?;
                 if n < 0 {
-                    return Err(runtime("a ROWS frame offset must not be negative"));
+                    return Err(runtime(format!("{what} must not be negative")));
                 }
                 Ok(Offset::Rows(n as u64))
             }
@@ -266,6 +271,11 @@ struct Partition {
     nn_hi: usize,
     /// `ORDER BY` direction of the (single) key.
     ascending: bool,
+    /// `GROUPS` frames: the peer-group number of the row at each position, and
+    /// the first position of each peer group (empty unless the frame is
+    /// `GROUPS`). A group ends where the next begins (or at the partition's end).
+    group_of: Vec<usize>,
+    group_start: Vec<usize>,
 }
 
 impl Partition {
@@ -276,10 +286,13 @@ impl Partition {
     /// The position range `[lo, hi)` of the frame of the row at position `p`.
     fn frame(&self, p: usize, f: &ResolvedFrame) -> (usize, usize) {
         let n = self.len();
+        if f.units == FrameUnits::Groups {
+            return self.groups_frame(p, f);
+        }
         let lo = match f.start {
             RBound::UnboundedPreceding => 0,
             RBound::CurrentRow => match f.units {
-                FrameUnits::Rows => p,
+                FrameUnits::Rows | FrameUnits::Groups => p,
                 FrameUnits::Range => self.peer_start[p],
             },
             RBound::Preceding(off) => self.offset_start(p, off, -1, f.units),
@@ -290,12 +303,80 @@ impl Partition {
         let hi = match f.end {
             RBound::UnboundedFollowing => n,
             RBound::CurrentRow => match f.units {
-                FrameUnits::Rows => p + 1,
+                FrameUnits::Rows | FrameUnits::Groups => p + 1,
                 FrameUnits::Range => self.peer_end[p],
             },
             RBound::Preceding(off) => self.offset_end(p, off, -1, f.units),
             RBound::Following(off) => self.offset_end(p, off, 1, f.units),
             // Refused by the binder as a frame end.
+            RBound::UnboundedPreceding => 0,
+        };
+        (lo.min(n), hi.min(n))
+    }
+
+    /// The frame of the row at position `p` of a `GROUPS` frame: bounds count
+    /// peer groups from the group of the current row. A start that reaches
+    /// before the first group begins at the partition start, one past the last
+    /// group is empty (`n`); an end before the first group is empty (`0`), one
+    /// past the last group runs to the partition end.
+    fn groups_frame(&self, p: usize, f: &ResolvedFrame) -> (usize, usize) {
+        let n = self.len();
+        let groups = self.group_start.len();
+        let g = self.group_of[p] as i128;
+        let group_end = |gi: usize| -> usize {
+            if gi + 1 < groups {
+                self.group_start[gi + 1]
+            } else {
+                n
+            }
+        };
+        let offset = |o: Offset| -> i128 {
+            match o {
+                Offset::Rows(k) => i128::from(k),
+                // Cannot happen: GROUPS offsets are integers.
+                Offset::Range(_) => 0,
+            }
+        };
+        let lo = match f.start {
+            RBound::UnboundedPreceding => 0,
+            RBound::CurrentRow => self.peer_start[p],
+            RBound::Preceding(o) => {
+                let target = g - offset(o);
+                if target <= 0 {
+                    0
+                } else {
+                    self.group_start[target as usize]
+                }
+            }
+            RBound::Following(o) => {
+                let target = g + offset(o);
+                if target >= groups as i128 {
+                    n
+                } else {
+                    self.group_start[target as usize]
+                }
+            }
+            RBound::UnboundedFollowing => n,
+        };
+        let hi = match f.end {
+            RBound::UnboundedFollowing => n,
+            RBound::CurrentRow => self.peer_end[p],
+            RBound::Preceding(o) => {
+                let target = g - offset(o);
+                if target < 0 {
+                    0
+                } else {
+                    group_end(target as usize)
+                }
+            }
+            RBound::Following(o) => {
+                let target = g + offset(o);
+                if target >= groups as i128 {
+                    n
+                } else {
+                    group_end(target as usize)
+                }
+            }
             RBound::UnboundedPreceding => 0,
         };
         (lo.min(n), hi.min(n))
@@ -552,7 +633,12 @@ impl<'a> WindowOp<'a> {
         let mut results: Vec<Vec<Val>> = vec![vec![None; n_rows]; self.functions.len()];
         for rows in partitions {
             ec.check()?;
-            let part = self.order_partition(rows, &order_keys, range_offsets)?;
+            let part = self.order_partition(
+                rows,
+                &order_keys,
+                range_offsets,
+                frame.units == FrameUnits::Groups,
+            )?;
             for (fi, slot) in self.functions.iter().enumerate() {
                 compute_function(
                     &slot.func,
@@ -586,6 +672,7 @@ impl<'a> WindowOp<'a> {
         mut rows: Vec<usize>,
         order_keys: &[Vec<Val>],
         range_offsets: bool,
+        groups: bool,
     ) -> Result<Partition> {
         let items = &self.spec.order_by;
         if !items.is_empty() {
@@ -626,6 +713,17 @@ impl<'a> WindowOp<'a> {
                 .rposition(Option::is_some)
                 .map_or(nn_lo, |i| i + 1);
         }
+        // Peer groups, numbered in order, for `GROUPS` frames.
+        let (mut group_of, mut group_start) = (Vec::new(), Vec::new());
+        if groups {
+            group_of = vec![0usize; n];
+            for p in 0..n {
+                if p == 0 || peer_start[p] == p {
+                    group_start.push(p);
+                }
+                group_of[p] = group_start.len() - 1;
+            }
+        }
         Ok(Partition {
             rows,
             peer_start,
@@ -634,6 +732,8 @@ impl<'a> WindowOp<'a> {
             nn_lo,
             nn_hi,
             ascending: items.first().is_none_or(|i| !i.descending),
+            group_of,
+            group_start,
         })
     }
 }
@@ -650,10 +750,10 @@ fn function_inputs(
                 Some(flt) => eval_predicate(flt, ctx, ec)?.is_true(),
                 None => true,
             };
-            let value = match arg {
-                AggregateArg::Wildcard => None,
-                AggregateArg::Expr(e) if pass => eval(e, ctx, ec)?,
-                AggregateArg::Expr(_) => None,
+            let value = if pass {
+                crate::exec::expr_eval::eval_aggregate_arg(arg, ctx, ec)?
+            } else {
+                None
             };
             (value, None, pass)
         }
@@ -665,9 +765,8 @@ fn function_inputs(
             };
             (eval(expr, ctx, ec)?, d, true)
         }
-        BoundWindowFunc::FirstValue(e) | BoundWindowFunc::LastValue(e) => {
-            (eval(e, ctx, ec)?, None, true)
-        }
+        BoundWindowFunc::FirstValue { expr: e, .. }
+        | BoundWindowFunc::LastValue { expr: e, .. } => (eval(e, ctx, ec)?, None, true),
         BoundWindowFunc::NthValue { expr, .. } => (eval(expr, ctx, ec)?, None, true),
         _ => (None, None, true),
     })
@@ -717,6 +816,31 @@ fn function_constants(f: &BoundWindowFunc, ec: &ExecCtx) -> Result<FnConst> {
 // =======================================================================
 // The functions
 // =======================================================================
+
+/// The positions of a partition whose function argument is not `NULL`, for
+/// `IGNORE NULLS`: `positions` lists them in order, and `before[p]` is how many
+/// of them lie at positions `< p` (so `before[p + 1]` counts those `<= p`), which
+/// turns "the k-th non-NULL row before / after / from here" into an index.
+struct NonNulls {
+    positions: Vec<usize>,
+    before: Vec<usize>,
+}
+
+impl NonNulls {
+    fn of(part: &Partition, input: &FnInput) -> NonNulls {
+        let n = part.len();
+        let mut positions = Vec::new();
+        let mut before = Vec::with_capacity(n + 1);
+        for p in 0..n {
+            before.push(positions.len());
+            if input.value[part.rows[p]].is_some() {
+                positions.push(p);
+            }
+        }
+        before.push(positions.len());
+        NonNulls { positions, before }
+    }
+}
 
 fn bigint(n: usize) -> Val {
     Some(RelationalValue::Bigint(n as i64))
@@ -781,14 +905,35 @@ fn compute_function(
                 out[part.rows[p]] = Some(RelationalValue::Bigint(bucket as i64));
             }
         }
-        BoundWindowFunc::Lag { .. } | BoundWindowFunc::Lead { .. } => {
+        BoundWindowFunc::Lag { ignore_nulls, .. } | BoundWindowFunc::Lead { ignore_nulls, .. } => {
             let backwards = matches!(f, BoundWindowFunc::Lag { .. });
             let off = usize::try_from(c.n).unwrap_or(usize::MAX);
+            let nn = ignore_nulls.then(|| NonNulls::of(part, input));
             for p in 0..n {
-                let target = if backwards {
-                    p.checked_sub(off)
-                } else {
-                    p.checked_add(off).filter(|&t| t < n)
+                let target = match (&nn, off) {
+                    // An offset of 0 is the current row, whatever its value.
+                    (_, 0) => Some(p),
+                    (None, _) => {
+                        if backwards {
+                            p.checked_sub(off)
+                        } else {
+                            p.checked_add(off).filter(|&t| t < n)
+                        }
+                    }
+                    // IGNORE NULLS: the `off`-th row before / after whose value is
+                    // not NULL.
+                    (Some(nn), _) => {
+                        if backwards {
+                            let before = nn.before[p];
+                            before.checked_sub(off).map(|i| nn.positions[i])
+                        } else {
+                            let through = nn.before[p + 1];
+                            through
+                                .checked_add(off - 1)
+                                .filter(|&i| i < nn.positions.len())
+                                .map(|i| nn.positions[i])
+                        }
+                    }
                 };
                 let row = part.rows[p];
                 out[row] = match target {
@@ -797,40 +942,73 @@ fn compute_function(
                 };
             }
         }
-        BoundWindowFunc::FirstValue(_)
-        | BoundWindowFunc::LastValue(_)
-        | BoundWindowFunc::NthValue { .. } => {
+        BoundWindowFunc::FirstValue { ignore_nulls, .. }
+        | BoundWindowFunc::LastValue { ignore_nulls, .. }
+        | BoundWindowFunc::NthValue { ignore_nulls, .. } => {
+            let nn = ignore_nulls.then(|| NonNulls::of(part, input));
             for p in 0..n {
                 ec.check()?;
                 let (lo, hi) = part.frame(p, frame);
+                let k = usize::try_from(c.n).unwrap_or(usize::MAX);
                 let pos = if lo >= hi {
                     None
                 } else {
-                    match f {
-                        BoundWindowFunc::FirstValue(_) => Some(lo),
-                        BoundWindowFunc::LastValue(_) => Some(hi - 1),
-                        _ => {
-                            let k = usize::try_from(c.n).unwrap_or(usize::MAX);
-                            lo.checked_add(k - 1).filter(|&t| t < hi)
+                    match (&nn, f) {
+                        (None, BoundWindowFunc::FirstValue { .. }) => Some(lo),
+                        (None, BoundWindowFunc::LastValue { .. }) => Some(hi - 1),
+                        (None, _) => lo.checked_add(k - 1).filter(|&t| t < hi),
+                        // IGNORE NULLS: only the frame's rows with a value count.
+                        (Some(nn), BoundWindowFunc::FirstValue { .. }) => {
+                            nn.positions.get(nn.before[lo]).copied().filter(|&t| t < hi)
                         }
+                        (Some(nn), BoundWindowFunc::LastValue { .. }) => nn.before[hi]
+                            .checked_sub(1)
+                            .map(|i| nn.positions[i])
+                            .filter(|&t| t >= lo),
+                        (Some(nn), _) => nn.before[lo]
+                            .checked_add(k - 1)
+                            .and_then(|i| nn.positions.get(i).copied())
+                            .filter(|&t| t < hi),
                     }
                 };
                 out[part.rows[p]] = pos.and_then(|q| input.value[part.rows[q]].clone());
             }
         }
-        BoundWindowFunc::Aggregate { func, arg, .. } => {
+        BoundWindowFunc::Aggregate {
+            func,
+            arg,
+            distinct,
+            ..
+        } => {
             let wildcard = matches!(arg, AggregateArg::Wildcard);
             let in_ty: Option<RelationalType> = match arg {
-                AggregateArg::Wildcard => None,
+                AggregateArg::Wildcard | AggregateArg::Multi(_) => None,
                 AggregateArg::Expr(e) => e.ty,
             };
-            let fresh = || AggregateState::initial(*func, wildcard, in_ty);
-            let feed = |state: &mut AggregateState, q: usize| -> Result<()> {
+            let distinct = *distinct;
+            let state_limit = ec.limits.max_aggregate_state_bytes;
+            let fresh = || -> Result<AggregateAccumulator> {
+                Ok(AggregateAccumulator::new(
+                    AggregateState::initial(*func, wildcard, in_ty)?,
+                    distinct,
+                ))
+            };
+            let feed = |state: &mut AggregateAccumulator, q: usize| -> Result<()> {
                 let row = part.rows[q];
                 if !input.pass[row] {
                     return Ok(());
                 }
-                state.update(input.value[row].as_ref())
+                state.update(input.value[row].as_ref())?;
+                // A DISTINCT frame remembers every distinct value it saw.
+                if distinct && state.estimated_bytes() > state_limit {
+                    ec.metrics.record_aggregate_resource_limit_hit();
+                    return Err(SqlError::ResourceLimit {
+                        detail: format!(
+                            "window aggregate state exceeded max_aggregate_state_bytes ({state_limit})"
+                        ),
+                    });
+                }
+                Ok(())
             };
 
             let spans_partition = matches!(frame.start, RBound::UnboundedPreceding)
@@ -863,7 +1041,7 @@ fn compute_function(
                         feed(&mut state, fed)?;
                         fed += 1;
                     }
-                    out[part.rows[p]] = state.clone().finalize();
+                    out[part.rows[p]] = state.current();
                 }
             } else {
                 for p in 0..n {

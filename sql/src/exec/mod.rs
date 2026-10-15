@@ -111,6 +111,18 @@ impl RowContext {
         self
     }
 
+    /// Makes column `ordinal` of `table_ref`'s row read `NULL` (a no-op when the
+    /// context has no such row, e.g. a null-extended `LEFT JOIN` side).
+    /// `AggregateOp` uses it so that a correlated subquery sees a grouping column
+    /// as `NULL` in the rows of a grouping set that leaves the column out.
+    pub fn null_column(&mut self, table_ref: u32, ordinal: u16) {
+        if let Some((_, row)) = self.rows.iter_mut().find(|(tr, _)| *tr == table_ref) {
+            if let Some(v) = row.get_mut(ordinal as usize) {
+                *v = None;
+            }
+        }
+    }
+
     pub fn get_group_key(&self, index: usize) -> Option<&RelationalValue> {
         self.group_keys.get(index).and_then(|v| v.as_ref())
     }
@@ -437,6 +449,15 @@ pub struct ExecLimits {
     /// its own groups, so this multiplies the aggregation state). Default 64:
     /// `CUBE` of six columns, or `ROLLUP` of sixty-three.
     pub max_grouping_sets_per_statement: u32,
+    /// SQL Phase 2a: how many times an autocommit `INSERT ... ON CONFLICT`
+    /// statement is run again when its commit loses a race to a concurrent
+    /// writer of the same key (a write conflict). Each attempt starts from a
+    /// fresh snapshot, so the retry sees the winner's row and arbitrates on it --
+    /// `DO NOTHING` skips, `DO UPDATE` updates -- instead of failing the
+    /// statement with a conflict the caller could not have avoided. Default 32;
+    /// 1 disables the retry. A statement in an explicit transaction is never
+    /// retried (its snapshot belongs to the caller).
+    pub max_upsert_attempts: u32,
 }
 
 impl Default for ExecLimits {
@@ -463,6 +484,7 @@ impl Default for ExecLimits {
             max_window_partition_rows: 1_000_000,
             max_window_functions_per_statement: 64,
             max_grouping_sets_per_statement: 64,
+            max_upsert_attempts: 32,
         }
     }
 }

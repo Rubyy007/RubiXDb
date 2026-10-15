@@ -191,7 +191,7 @@ fn collect_parameters_physical(plan: &PhysicalPlan, out: &mut BTreeSet<u32>) {
                 collect_parameters_expr(g, out);
             }
             for a in aggregates {
-                if let crate::aggregate::AggregateArg::Expr(e) = &a.arg {
+                for e in a.arg.exprs() {
                     collect_parameters_expr(e, out);
                 }
                 collect_parameters_expr_opt(a.filter.as_deref(), out);
@@ -349,7 +349,7 @@ fn collect_parameters_expr(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
             }
         }
         BoundExprKind::Aggregate(agg) => {
-            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+            for e in agg.arg.exprs() {
                 collect_parameters_expr(e, out);
             }
             collect_parameters_expr_opt(agg.filter.as_deref(), out);

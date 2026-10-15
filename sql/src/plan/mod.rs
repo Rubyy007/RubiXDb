@@ -54,7 +54,8 @@ pub enum Plan {
     },
     /// `INSERT` has no access-path or ordering decision to make (every
     /// row's `VALUES` are already fully bound); carried through
-    /// unchanged for a future executor, per item 47.
+    /// unchanged for a future executor, per item 47. An `INSERT ... SELECT`
+    /// carries its source query's physical plan in `select`.
     Insert(BoundInsert),
     /// `UPDATE`'s target row set, planned with the exact same
     /// `PhysicalAccess` decision (`crate::plan::access`) a `SELECT`
@@ -64,12 +65,16 @@ pub enum Plan {
         table: BoundTableRef,
         assignments: Vec<BoundAssignment>,
         access: PhysicalAccess,
+        /// SQL Phase 2a: `RETURNING`, evaluated for every updated row.
+        returning: Option<crate::bound::BoundReturning>,
         max_parameter: u32,
         defined_ctes: u32,
     },
     Delete {
         table: BoundTableRef,
         access: PhysicalAccess,
+        /// SQL Phase 2a: `RETURNING`, evaluated for every deleted row.
+        returning: Option<crate::bound::BoundReturning>,
         max_parameter: u32,
         defined_ctes: u32,
     },
@@ -142,7 +147,17 @@ fn build_plan_cx(bound: &BoundStatement, cx: &Cx<'_>) -> Result<Plan> {
                 defined_ctes: cx.ctes.borrow().len() as u32,
             })
         }
-        BoundStatement::Insert(insert) => Ok(Plan::Insert(insert.clone())),
+        BoundStatement::Insert(insert) => {
+            plan_ctes(&insert.ctes, cx)?;
+            let mut insert = insert.clone();
+            if let Some(source) = &mut insert.select {
+                let physical = plan_select(&source.query, cx)?;
+                validate::validate_subplan(&physical, source.query.max_parameter, catalog)?;
+                source.plan = Some(physical);
+            }
+            insert.defined_ctes = cx.ctes.borrow().len() as u32;
+            Ok(Plan::Insert(insert))
+        }
         BoundStatement::Update(update) => {
             plan_ctes(&update.ctes, cx)?;
             let selection = plan_optional_expr(update.selection.clone(), cx)?;
@@ -161,6 +176,7 @@ fn build_plan_cx(bound: &BoundStatement, cx: &Cx<'_>) -> Result<Plan> {
                 table: update.table.clone(),
                 assignments,
                 access,
+                returning: update.returning.clone(),
                 max_parameter: update.max_parameter,
                 defined_ctes: cx.ctes.borrow().len() as u32,
             })
@@ -178,6 +194,7 @@ fn build_plan_cx(bound: &BoundStatement, cx: &Cx<'_>) -> Result<Plan> {
             Ok(Plan::Delete {
                 table: delete.table.clone(),
                 access,
+                returning: delete.returning.clone(),
                 max_parameter: delete.max_parameter,
                 defined_ctes: cx.ctes.borrow().len() as u32,
             })
@@ -335,7 +352,7 @@ fn plan_select_subqueries(select: &mut BoundSelect, cx: &Cx<'_>) -> Result<()> {
         plan_expr_subqueries(e, cx)?;
     }
     for agg in &mut select.aggregates {
-        if let crate::aggregate::AggregateArg::Expr(e) = &mut agg.arg {
+        for e in agg.arg.exprs_mut() {
             plan_expr_subqueries(e, cx)?;
         }
         if let Some(f) = &mut agg.filter {

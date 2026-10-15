@@ -190,8 +190,9 @@ export interface SqlColumnMeta {
 
 export type SqlResultBody =
   | { kind: "rows"; columns: SqlColumnMeta[]; rows: SqlValue[][]; row_count: number }
-  | { kind: "write"; statement: string; rows_affected: number }
-  | { kind: "ddl" }
+  | { kind: "write"; statement: string; rows_affected: number; message?: string }
+  | { kind: "ddl"; statement?: string; object?: string; changed?: boolean; message?: string }
+  | { kind: "use_schema"; database: string; schema: string; message: string }
   | { kind: "explain"; plan_text: string }
   | { kind: "begin" }
   | { kind: "commit" }
@@ -206,6 +207,8 @@ export interface SqlRequestBody {
   sql: string;
   params?: SqlValue[];
   session_id?: string | null;
+  /** The schema a `USE SCHEMA` selected; the server keeps none, so every request carries it. */
+  schema?: string | null;
 }
 
 export interface DatabaseInfo {
@@ -223,6 +226,7 @@ export interface TableInfo {
   table_id: number;
   schema_id: number;
   name: string;
+  schema_name?: string;
 }
 
 export interface ColumnInfo {
@@ -255,6 +259,8 @@ export interface ApiErrorBody {
     code: string;
     message: string;
     detail?: string;
+    /** What to do about it (the server's guided 4xx text). */
+    hint?: string;
   };
 }
 
@@ -263,12 +269,14 @@ export class ApiRequestError extends Error {
   status: number;
   code: string;
   detail?: string;
+  hint?: string;
 
   constructor(status: number, body: ApiErrorBody) {
     super(body.error.message);
     this.status = status;
     this.code = body.error.code;
     this.detail = body.error.detail;
+    this.hint = body.error.hint;
   }
 }
 

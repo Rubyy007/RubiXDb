@@ -19,6 +19,9 @@ pub struct WriteMetrics {
     write_conflicts: AtomicU64,
     dml_errors: AtomicU64,
     ddl_errors: AtomicU64,
+    upsert_conflict_rows_skipped: AtomicU64,
+    upsert_retries: AtomicU64,
+    rows_returned: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,6 +41,14 @@ pub struct WriteMetricsSnapshot {
     pub write_conflicts: u64,
     pub dml_errors: u64,
     pub ddl_errors: u64,
+    /// SQL Phase 2a: proposed rows `ON CONFLICT DO NOTHING` (or a false
+    /// `DO UPDATE ... WHERE`) left alone.
+    pub upsert_conflict_rows_skipped: u64,
+    /// SQL Phase 2a: autocommit `ON CONFLICT` statements run again after losing a
+    /// commit race.
+    pub upsert_retries: u64,
+    /// SQL Phase 2a: rows handed back by `RETURNING`.
+    pub rows_returned: u64,
 }
 
 impl WriteMetricsSnapshot {
@@ -85,6 +96,16 @@ impl WriteMetrics {
     pub fn record_ddl_error(&self) {
         self.ddl_errors.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_upsert_conflict_rows_skipped(&self, n: u64) {
+        self.upsert_conflict_rows_skipped
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn record_upsert_retry(&self) {
+        self.upsert_retries.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_rows_returned(&self, n: u64) {
+        self.rows_returned.fetch_add(n, Ordering::Relaxed);
+    }
 
     pub fn snapshot(&self) -> WriteMetricsSnapshot {
         WriteMetricsSnapshot {
@@ -98,6 +119,9 @@ impl WriteMetrics {
             write_conflicts: self.write_conflicts.load(Ordering::Relaxed),
             dml_errors: self.dml_errors.load(Ordering::Relaxed),
             ddl_errors: self.ddl_errors.load(Ordering::Relaxed),
+            upsert_conflict_rows_skipped: self.upsert_conflict_rows_skipped.load(Ordering::Relaxed),
+            upsert_retries: self.upsert_retries.load(Ordering::Relaxed),
+            rows_returned: self.rows_returned.load(Ordering::Relaxed),
         }
     }
 }

@@ -325,11 +325,11 @@ mod parser {
     #[test]
     fn what_is_still_not_a_set_operation_is_a_typed_unsupported_error() {
         for sql in [
-            // Another dialect's spelling of EXCEPT.
-            "SELECT v FROM a MINUS SELECT v FROM b",
-            // Column matching by name rather than position.
-            "SELECT v FROM a UNION BY NAME SELECT v FROM b",
-            "SELECT v FROM a UNION ALL BY NAME SELECT v FROM b",
+            // SQL Phase 1: `MINUS` (= EXCEPT) and `UNION [ALL] BY NAME` are
+            // implemented (`phase1_tests::set_ops`); BY NAME stays refused for
+            // the operators that do not have it.
+            "SELECT v FROM a INTERSECT BY NAME SELECT v FROM b",
+            "SELECT v FROM a EXCEPT BY NAME SELECT v FROM b",
             // Not a SELECT operand.
             "VALUES (1) UNION SELECT v FROM b",
             "SELECT v FROM a UNION VALUES (1)",

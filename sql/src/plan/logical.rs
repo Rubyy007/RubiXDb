@@ -144,6 +144,8 @@ pub struct SetOpNode {
     pub right: Box<PhysicalPlan>,
     /// Unified type of each output column; operand values are widened to it.
     pub column_types: Vec<Option<RelationalType>>,
+    /// `UNION BY NAME`: the operands' column alignment (`None`: positional).
+    pub by_name: Option<crate::bound::NameAlignment>,
     /// The output columns (names, unified types): what the operation yields.
     pub items: Vec<BoundSelectItem>,
 }
@@ -301,6 +303,7 @@ fn set_op_node(set: &crate::bound::BoundSetOp, shell: &BoundSelect) -> Result<Se
         left: Box::new(set.left_plan.clone().ok_or_else(|| missing("left"))?),
         right: Box::new(set.right_plan.clone().ok_or_else(|| missing("right"))?),
         column_types: set.column_types.clone(),
+        by_name: set.by_name.clone(),
         items: shell.projection.clone(),
     })
 }

@@ -270,6 +270,9 @@ enum Kind {
 struct Operand<'a> {
     plan: PhysicalPlan,
     op: Option<Box<dyn Operator<'a> + 'a>>,
+    /// `UNION BY NAME`: result column `i` is column `map[i]` of this operand's
+    /// rows, or `NULL` where the operand lacks the column. `None`: positional.
+    map: Option<Vec<Option<usize>>>,
 }
 
 impl<'a> Operand<'a> {
@@ -284,7 +287,18 @@ impl<'a> Operand<'a> {
         }
         match self.op.as_mut().expect("opened above").next(ec)? {
             None => Ok(None),
-            Some(tuple) => widen_row(tuple.projected, types).map(Some),
+            Some(tuple) => {
+                let row = match &self.map {
+                    Some(map) => {
+                        let mut projected = tuple.projected;
+                        map.iter()
+                            .map(|j| j.and_then(|j| projected[j].take()))
+                            .collect()
+                    }
+                    None => tuple.projected,
+                };
+                widen_row(row, types).map(Some)
+            }
         }
     }
 }
@@ -338,10 +352,12 @@ pub(super) fn open_set_op<'a>(
         left: Operand {
             plan: (*node.left).clone(),
             op: None,
+            map: node.by_name.as_ref().map(|a| a.left.clone()),
         },
         right: Operand {
             plan: (*node.right).clone(),
             op: None,
+            map: node.by_name.as_ref().map(|a| a.right.clone()),
         },
         types: node.column_types.clone(),
         set_ref: node.set_ref,

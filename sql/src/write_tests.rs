@@ -182,7 +182,8 @@ fn insert_single_row_is_visible_to_a_later_select() {
         r,
         WriteResult {
             kind: WriteStatementKind::Insert,
-            rows_affected: 1
+            rows_affected: 1,
+            returning: None,
         }
     );
     let s = f.select("SELECT id, name, active FROM t WHERE id = 1");

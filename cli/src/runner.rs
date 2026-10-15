@@ -98,8 +98,30 @@ fn render_sql_result(result: &Value, out: &mut impl Write) {
                 .unwrap_or(0);
             let _ = writeln!(out, "{statement} {n}");
         }
-        "ddl" => {
-            let _ = writeln!(out, "OK");
+        // DDL and USE SCHEMA say what happened ("Schema default.analytics created."), not just "OK". Older
+        // servers send neither a message nor a statement: those still print "OK".
+        "ddl" => match result.get("message").and_then(Value::as_str) {
+            Some(message) => {
+                let _ = writeln!(
+                    out,
+                    "OK (query execution completed): {}",
+                    sanitize_for_terminal(message)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "OK (query execution completed)");
+            }
+        },
+        "use_schema" => {
+            let message = result
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Schema selected.");
+            let _ = writeln!(
+                out,
+                "OK (query execution completed): {}",
+                sanitize_for_terminal(message)
+            );
         }
         "explain" => {
             let text = result

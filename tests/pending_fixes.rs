@@ -534,3 +534,213 @@ fn observe_f_d1a_2_snapshot_seq_can_exceed_the_applied_prefix() {
     let _ = a.join();
     let _ = engine.shutdown();
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// F-D1b-1 - a lost FIRST sector of the last record (later sectors persisted) is a torn tail, in the WAL and the MANIFEST
+// (docs/adr/ADR-TORN-TAIL-LOST-SECTOR-01.md)
+// ---------------------------------------------------------------------------------------------------------------------
+
+const SECTOR: usize = 512;
+
+fn next_boundary(n: usize) -> usize {
+    (n / SECTOR + 1) * SECTOR
+}
+
+fn wal_segment(dir: &Path) -> PathBuf {
+    fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "log"))
+        .unwrap()
+}
+
+/// `n_small` acknowledged small records, then one large record of `big` value bytes. Returns (dir, segment, offset of the
+/// large record, its length).
+fn wal_with_big_tail_record(
+    tag: &str,
+    n_small: usize,
+    big: usize,
+) -> (PathBuf, PathBuf, usize, usize) {
+    let dir = temp_dir(tag);
+    let (mut w, _) = FileWal::open_for_recovery(&dir, WalConfig::default()).unwrap();
+    for i in 0..n_small {
+        w.append_sync(WalOp::Put {
+            key: format!("k{i}").as_bytes(),
+            value: b"value-value-value",
+        })
+        .unwrap();
+    }
+    let seg = wal_segment(&dir);
+    let o = fs::metadata(&seg).unwrap().len() as usize;
+    w.append_sync(WalOp::Put {
+        key: b"big",
+        value: &vec![0xAB; big],
+    })
+    .unwrap();
+    drop(w);
+    let total = fs::metadata(&seg).unwrap().len() as usize;
+    (dir, seg, o, total - o)
+}
+
+/// Zero `[o, next 512-byte boundary)` of the file: the first sector of the record at `o` never reached the disk, the rest did.
+fn lose_first_sector(seg: &Path, o: usize) {
+    let mut b = fs::read(seg).unwrap();
+    let end = next_boundary(o);
+    for x in &mut b[o..end] {
+        *x = 0;
+    }
+    fs::write(seg, b).unwrap();
+}
+
+#[test]
+fn f_d1b_1_lost_first_sector_of_the_last_wal_record_is_a_torn_tail() {
+    let _s = serial();
+    for (n_small, big) in [
+        (1usize, 1500usize),
+        (3, 700),
+        (7, 3000),
+        (2, 600),
+        (5, 1200),
+    ] {
+        let (dir, seg, o, len) =
+            wal_with_big_tail_record(&format!("d1b1_{n_small}_{big}"), n_small, big);
+        assert!(
+            o + len > next_boundary(o),
+            "the tail record must span more than one sector"
+        );
+        lose_first_sector(&seg, o);
+        let r = wal::inspect(&dir, &WalConfig::default()).unwrap();
+        assert!(
+            r.corrupted_segments.is_empty() && r.records.len() == n_small && r.truncated,
+            "F-D1b-1: a last record (at {o}, {len} bytes) whose first sector is all zero and whose remaining sectors \
+             persisted must be a TORN TAIL ({n_small} records trusted, truncated, nothing corrupted); got records={} \
+             truncated={} corrupted={:?}",
+            r.records.len(),
+            r.truncated,
+            r.corrupted_segments
+        );
+    }
+}
+
+/// Guard: a lost first sector followed by a COMPLETE VALID frame is damage in front of data, not a tail: still corruption.
+#[test]
+fn guard_f_d1b_1_lost_first_sector_then_a_valid_frame_is_still_corruption() {
+    let _s = serial();
+    let (dir, seg, o, _len) = wal_with_big_tail_record("d1b1_guard_valid_after", 3, 1500);
+    lose_first_sector(&seg, o);
+    let bytes = fs::read(&seg).unwrap();
+    let frame_len = (o - 24) / 3; // the three small frames are identical in size
+    let valid = bytes[24..24 + frame_len].to_vec(); // a complete, valid frame
+    append_bytes(&seg, &valid);
+    let r = wal::inspect(&dir, &WalConfig::default()).unwrap();
+    assert!(
+        !r.corrupted_segments.is_empty(),
+        "a zeroed first sector followed by a complete valid frame must stay corruption; got records={} truncated={}",
+        r.records.len(),
+        r.truncated
+    );
+}
+
+/// Guard: only the 8-byte header zeroed (the rest of the first sector intact) is damage, not a lost sector: still corruption.
+#[test]
+fn guard_f_d1b_1_only_the_header_zeroed_is_still_corruption() {
+    let _s = serial();
+    let (dir, seg, o, _len) = wal_with_big_tail_record("d1b1_guard_header_only", 3, 1500);
+    let mut b = fs::read(&seg).unwrap();
+    for x in &mut b[o..o + 8] {
+        *x = 0;
+    }
+    fs::write(&seg, b).unwrap();
+    let r = wal::inspect(&dir, &WalConfig::default()).unwrap();
+    assert!(
+        !r.corrupted_segments.is_empty(),
+        "a zeroed header with an intact body must stay corruption; got records={} truncated={}",
+        r.records.len(),
+        r.truncated
+    );
+}
+
+/// Guard: a lost MIDDLE sector of the last record was already a torn tail and must stay one.
+#[test]
+fn guard_f_d1b_1_lost_middle_sector_of_the_last_record_is_still_a_torn_tail() {
+    let _s = serial();
+    let (dir, seg, o, len) = wal_with_big_tail_record("d1b1_guard_middle", 3, 3000);
+    let mut b = fs::read(&seg).unwrap();
+    let mid = next_boundary(o); // the second sector of the record
+    assert!(mid + SECTOR < o + len);
+    for x in &mut b[mid..mid + SECTOR] {
+        *x = 0;
+    }
+    fs::write(&seg, b).unwrap();
+    let r = wal::inspect(&dir, &WalConfig::default()).unwrap();
+    assert!(
+        r.corrupted_segments.is_empty() && r.records.len() == 3 && r.truncated,
+        "got records={} truncated={} corrupted={:?}",
+        r.records.len(),
+        r.truncated,
+        r.corrupted_segments
+    );
+}
+
+/// AddSstable edits appended until the last one straddles the first 512-byte boundary. Returns (dir, offset of that last frame).
+fn manifest_with_straddling_last_frame(tag: &str) -> (PathBuf, usize) {
+    let dir = temp_dir(tag);
+    let (mut m, _) = Manifest::open_after_exclusive_lock(&dir).unwrap();
+    let path = dir.join("MANIFEST");
+    let mut id = 1u64;
+    loop {
+        let before = fs::metadata(&path).unwrap().len() as usize;
+        m.append_sync(ManifestEdit::AddSstable {
+            id,
+            min_seq: id,
+            max_seq: id + 1,
+            file_size: 100,
+        })
+        .unwrap();
+        let after = fs::metadata(&path).unwrap().len() as usize;
+        id += 1;
+        if before < SECTOR && after > SECTOR {
+            return (dir, before);
+        }
+        assert!(id < 64, "no frame straddled the first sector boundary");
+    }
+}
+
+#[test]
+fn f_d1b_1_lost_first_sector_of_the_last_manifest_frame_is_a_torn_tail() {
+    let _s = serial();
+    let (dir, o) = manifest_with_straddling_last_frame("d1b1_manifest");
+    let p = dir.join("MANIFEST");
+    let mut bytes = fs::read(&p).unwrap();
+    assert!(bytes.len() > SECTOR && bytes[SECTOR..].iter().any(|x| *x != 0));
+    for x in &mut bytes[o..SECTOR] {
+        *x = 0;
+    }
+    fs::write(&p, bytes).unwrap();
+    let r = manifest::replay_readonly(&dir).unwrap_or_else(|e| {
+        panic!("F-D1b-1: a MANIFEST whose last frame lost its first sector must be a torn tail, but replay failed: {e}")
+    });
+    assert!(r.truncated && r.valid_length as usize == o, "{r:?}");
+    let (_m, replay) = Manifest::open_after_exclusive_lock(&dir).unwrap();
+    assert_eq!(replay.valid_length as usize, o);
+    assert_eq!(
+        fs::metadata(&p).unwrap().len() as usize,
+        o,
+        "tail must be truncated back"
+    );
+}
+
+/// Guard: a zeroed header with an intact body inside the first sector is damage, not a lost sector.
+#[test]
+fn guard_f_d1b_1_manifest_header_only_zeroed_is_still_an_error() {
+    let _s = serial();
+    let (dir, o) = manifest_with_straddling_last_frame("d1b1_manifest_guard");
+    let p = dir.join("MANIFEST");
+    let mut bytes = fs::read(&p).unwrap();
+    for x in &mut bytes[o..o + 8] {
+        *x = 0;
+    }
+    fs::write(&p, bytes).unwrap();
+    assert!(manifest::replay_readonly(&dir).is_err());
+}

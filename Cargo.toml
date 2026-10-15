@@ -93,6 +93,12 @@ required-features = ["fault-points"]
 name = "pending_fixes"
 required-features = ["fault-points"]
 
+# F-D1b-2 (docs/adr/ADR-DATA-DIR-DURABILITY-01.md): the directory entries the engine creates are synced (POSIX model) and the
+# Windows exposure is observed; the real-kernel test is reported IGNORED on Windows.
+[[test]]
+name = "dir_durability"
+required-features = ["sim-fs"]
+
 # D1b (docs/PERSISTENCE_MODEL.md §6): the four proof tests that gate every class-C claim, plus M7/M8 and an engine-on-SimFs run.
 [[test]]
 name = "sim_proof"

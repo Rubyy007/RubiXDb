@@ -11,7 +11,7 @@
  * Nothing is suggested inside strings or comments, and a suggestion that is exactly what was typed is
  * dropped, so a finished word never keeps a popup open that would swallow Enter. */
 
-import { completionContext, resolveBase, type CatalogLists } from "./completion";
+import { completionContext, resolveBase, tableKey, type CatalogLists } from "./completion";
 import { insideLiteral } from "./autoUpper";
 import { CLAUSE_KEYWORDS, FUNCTIONS, STATEMENT_SNIPPETS } from "./keywords";
 
@@ -48,6 +48,9 @@ export interface SuggestInput {
   columns: (table: string) => ColumnInfo[] | undefined;
   /** Ctrl+Space: also offer a list when nothing has been typed. */
   manual?: boolean;
+  /** The schema unqualified names resolve in (`USE SCHEMA`, else the instance's first schema). When given, tables of
+   * other schemas are offered as `schema.table`; when absent, names are bare and only duplicates are qualified. */
+  activeSchema?: string | null;
 }
 
 const MAX_ITEMS = 12;
@@ -182,21 +185,22 @@ const NOT_ALIAS = new Set([
 
 /** Tables named after FROM / JOIN / UPDATE / INTO (and `CREATE INDEX .. ON t`) in the statement around `caret`,
  * matched against the catalog; with their aliases. */
-export function referencedTables(text: string, caret: number, cat: CatalogLists): TableUse[] {
+export function referencedTables(text: string, caret: number, cat: CatalogLists, active?: string | null): TableUse[] {
   const s0 = statementStart(text, caret);
   const toks = lex(text.slice(s0, statementEnd(text, caret)));
   const first = toks[0]?.t;
   const out: TableUse[] = [];
   const lower = (x: string) => x.toLowerCase();
+  const activeId = active ? cat.schemas.find((s) => lower(s.name) === lower(active))?.id : undefined;
+  // The table a name means: in the named schema if one is written, else in the active schema, else the first match.
   const find = (path: string[]): string | null => {
     const name = path[path.length - 1];
     const schema = path.length >= 2 ? path[path.length - 2] : null;
-    const hit = cat.tables.find((t) => {
-      if (lower(t.name) !== lower(name)) return false;
-      if (!schema) return true;
-      return cat.schemas.some((s) => s.id === t.schemaId && lower(s.name) === lower(schema));
-    });
-    return hit ? hit.name : null;
+    const named = cat.tables.filter((t) => lower(t.name) === lower(name));
+    const hit = schema
+      ? named.find((t) => cat.schemas.some((s) => s.id === t.schemaId && lower(s.name) === lower(schema)))
+      : (named.find((t) => t.schemaId === activeId) ?? named[0]);
+    return hit ? tableKey(cat, hit, active) : null;
   };
   const readName = (i: number): { path: string[]; next: number } | null => {
     if (!toks[i] || toks[i].kind !== "word") return null;
@@ -249,13 +253,13 @@ function cteNames(text: string, caret: number): string[] {
 }
 
 /** Tables whose columns the editor should load before it can suggest columns here. */
-export function neededTables(text: string, caret: number, cat: CatalogLists): string[] {
-  const names = new Set(referencedTables(text, caret, cat).map((u) => u.table));
+export function neededTables(text: string, caret: number, cat: CatalogLists, active?: string | null): string[] {
+  const names = new Set(referencedTables(text, caret, cat, active).map((u) => u.table));
   const ctx = completionContext(text, caret);
   if (ctx) {
-    const r = resolveBase(ctx.base, cat);
+    const r = resolveBase(ctx.base, cat, active);
     if (r?.kind === "columns") names.add(r.table);
-    const alias = ctx.base.length === 1 ? referencedTables(text, caret, cat).find((u) => u.alias && u.alias.toLowerCase() === ctx.base[0].toLowerCase()) : undefined;
+    const alias = ctx.base.length === 1 ? referencedTables(text, caret, cat, active).find((u) => u.alias && u.alias.toLowerCase() === ctx.base[0].toLowerCase()) : undefined;
     if (alias) names.add(alias.table);
   }
   return [...names];
@@ -263,7 +267,7 @@ export function neededTables(text: string, caret: number, cat: CatalogLists): st
 
 // ---- what is expected at the caret -------------------------------------------------------------------------
 
-type Mode = "start" | "table" | "column" | "values" | "after" | "ddl-name";
+type Mode = "start" | "table" | "column" | "values" | "after" | "ddl-name" | "use" | "schema";
 
 const COLUMN_STARTERS = new Set(["SELECT", "WHERE", "AND", "OR", "ON", "HAVING", "BY", "SET", "WHEN", "THEN", "ELSE", "CASE", "NOT", "DISTINCT", "QUALIFY", "USING", "IN", "LIKE", "BETWEEN", "IS", "OVER"]);
 const OPERATORS = new Set(["=", "<", ">", "!", "+", "-", "*", "/", "%", "|", "(", ","]);
@@ -294,6 +298,9 @@ function modeAt(toks: Tok[]): { mode: Mode; clause: string | null } {
   const word = last.kind === "word" ? last.t : "";
   const prev = toks[toks.length - 2]?.t;
 
+  // `USE ` offers SCHEMA; `USE SCHEMA ` offers the schemas. (USE DATABASE is refused by the server, never suggested.)
+  if (first === "USE" && toks.length === 1) return { mode: "use", clause: null };
+  if (first === "USE" && word === "SCHEMA" && toks.length === 2) return { mode: "schema", clause: null };
   if (word === "FROM" || word === "JOIN" || word === "UPDATE" || word === "INTO") return { mode: "table", clause };
   if (word === "TABLE") return { mode: first === "DROP" || first === "ALTER" ? "table" : "ddl-name", clause };
   if (word === "EXISTS" && prev === "IF") return { mode: first === "DROP" ? "table" : "ddl-name", clause };
@@ -362,7 +369,7 @@ function dropExact(items: Suggestion[], partial: string): Suggestion[] {
   return items.filter((i) => !same(i.label, partial) && !same(i.insert.trim(), partial));
 }
 
-export function suggest({ text, caret, catalog, columns, manual = false }: SuggestInput): SuggestResult | null {
+export function suggest({ text, caret, catalog, columns, manual = false, activeSchema = null }: SuggestInput): SuggestResult | null {
   if (caret < 0 || caret > text.length) return null;
   if (insideLiteral(text, caret)) return null;
   // Editing in the middle of a word: no list (it would fight the letters already there).
@@ -380,7 +387,7 @@ export function suggest({ text, caret, catalog, columns, manual = false }: Sugge
     return kept.length ? { items: kept, start, end: caret, partial, auto } : null;
   };
 
-  const uses = referencedTables(text, caret, catalog);
+  const uses = referencedTables(text, caret, catalog, activeSchema);
   const lower = (s: string) => s.toLowerCase();
   const tableByName = (name: string) => catalog.tables.find((t) => lower(t.name) === lower(name));
   const schemaName = (id: number) => catalog.schemas.find((s) => s.id === id)?.name ?? "";
@@ -396,7 +403,7 @@ export function suggest({ text, caret, catalog, columns, manual = false }: Sugge
     const alias = ctx.base.length === 1 ? uses.find((u) => u.alias && lower(u.alias) === lower(ctx.base[0])) : undefined;
     if (alias) list = colsOf(alias.table);
     else {
-      const r = resolveBase(ctx.base, catalog);
+      const r = resolveBase(ctx.base, catalog, activeSchema);
       if (r?.kind === "columns") list = colsOf(r.table);
       else if (r?.kind === "tables") list = r.items.map((name) => ({ label: name, insert: name, kind: "table" as const }));
       else if (r?.kind === "schemas") list = r.items.map((name) => ({ label: name, insert: name, kind: "schema" as const }));
@@ -414,7 +421,9 @@ export function suggest({ text, caret, catalog, columns, manual = false }: Sugge
   // `INSERT INTO t (` / `CREATE INDEX i ON t (`: the columns of that table, minus the ones already listed.
   const open = /\b(?:INSERT\s+INTO|ON)\s+((?:"[^"]+"|[A-Za-z_]\w*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_]\w*))*)\s*\(([^()]*)$/i.exec(text.slice(stmt0, start));
   if (open && (toks[0]?.t === "INSERT" || toks[0]?.t === "CREATE")) {
-    const t = tableByName(open[1].split(".").pop()!.replace(/"/g, "").trim());
+    const path = open[1].split(".").map((p) => p.replace(/"/g, "").trim());
+    const r = resolveBase(path, catalog, activeSchema);
+    const t = r?.kind === "columns" ? { name: r.table } : tableByName(path[path.length - 1]);
     if (t) {
       const used = new Set(open[2].split(",").map((s) => lower(s.trim())).filter(Boolean));
       const items = colsOf(t.name).filter((c) => !used.has(lower(c.label)) && lower(c.label).startsWith(lower(partial)));
@@ -427,21 +436,48 @@ export function suggest({ text, caret, catalog, columns, manual = false }: Sugge
     const dup = new Map<string, number>();
     for (const t of catalog.tables) dup.set(lower(t.name), (dup.get(lower(t.name)) ?? 0) + 1);
     type Cand = Suggestion & { bare?: string };
+    // With an active schema, its tables are bare and every other schema's tables are `schema.table`; without one,
+    // only a name that exists in several schemas is qualified.
     const tables: Cand[] = catalog.tables.map((t) => {
       const sch = schemaName(t.schemaId);
-      const qualify = (dup.get(lower(t.name)) ?? 0) > 1 && sch;
+      const qualify = activeSchema ? !!sch && !same(sch, activeSchema) : (dup.get(lower(t.name)) ?? 0) > 1 && !!sch;
       return { label: qualify ? `${sch}.${t.name}` : t.name, insert: qualify ? `${sch}.${t.name}` : t.name, kind: "table" as const, detail: sch, bare: t.name };
     });
     const schemas = catalog.schemas.map((s) => ({ label: s.name, insert: `${s.name}.`, kind: "schema" as const, detail: "schema" }));
     const p = lower(partial);
     // Tables first, then CTEs, then schemas; alphabetical inside each group.
-    const rank = (x: Suggestion) => (x.kind === "schema" ? 2 : x.detail === "CTE" ? 1 : 0);
+    const foreign = (x: Suggestion) => !!activeSchema && x.kind === "table" && x.detail !== "CTE" && x.label.includes(".");
+    const rank = (x: Suggestion) => (x.kind === "schema" ? 3 : foreign(x) ? 2 : x.detail === "CTE" ? 1 : 0);
     const items: Suggestion[] = ([...tables, ...ctes, ...schemas] as Cand[])
       .filter((x: Cand) => lower(x.label).startsWith(p) || lower(x.bare ?? "").startsWith(p))
       .sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label))
       .map(({ label, insert, kind, detail }) => ({ label, insert, kind, detail }));
     if (!partial && !manual && !items.length) return null;
     return done(items, partial === "");
+  }
+
+  if (mode === "use") {
+    // `USE ` -> SCHEMA. There is no USE DATABASE: the one database is `default`.
+    const items: Suggestion[] = [{ label: "SCHEMA", insert: "SCHEMA ", kind: "keyword", detail: "switch the working schema" }];
+    return done(items.filter((i) => i.label.startsWith(partial.toUpperCase())), partial === "");
+  }
+
+  if (mode === "schema") {
+    // `USE SCHEMA ` -> the schemas that exist (the active one marked), and `default.` for the qualified form.
+    const p = lower(partial);
+    const items: Suggestion[] = [
+      ...catalog.schemas
+        .map((s) => ({ label: s.name, insert: s.name, kind: "schema" as const, detail: activeSchema && same(s.name, activeSchema) ? "active schema" : "schema" }))
+        .sort((a, b) => (a.detail === "active schema" ? -1 : b.detail === "active schema" ? 1 : a.label.localeCompare(b.label))),
+      ...catalog.databases.map((d) => ({ label: `${d.name}.`, insert: `${d.name}.`, kind: "database" as const, detail: "database" })),
+    ].filter((i) => lower(i.label).startsWith(p));
+    return done(items, partial === "");
+  }
+
+  if (mode === "ddl-name" && partial && toks[0]?.t === "CREATE") {
+    // `CREATE SCHEMA i` / `CREATE TABLE i` -> IF NOT EXISTS, the form that does nothing when the name is taken.
+    const item: Suggestion = { label: "IF NOT EXISTS", insert: "IF NOT EXISTS ", kind: "keyword", detail: "do nothing if it already exists" };
+    if (item.label.startsWith(partial.toUpperCase())) return done([item], false);
   }
 
   if (mode === "ddl-name" || mode === "values") {

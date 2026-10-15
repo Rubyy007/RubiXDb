@@ -39,7 +39,7 @@ pub fn open_engine_for_ops(dir: &Path) -> Result<LsmEngine, OpsError> {
     // Refuse a directory written by an incompatible build before anything
     // (including recovery) can touch it.
     let format_state = crate::ops::format::startup_guard(dir)?;
-    crate::persist::create_dir_all(dir)?;
+    crate::persist::create_dir_all_durable(dir)?;
     let engine = LsmEngine::open(
         dir,
         product_wal_config(),

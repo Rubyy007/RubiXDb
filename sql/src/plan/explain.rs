@@ -43,32 +43,52 @@ fn write_plan(plan: &Plan, depth: usize, out: &mut String) {
             write_physical(physical, depth + 1, out);
         }
         Plan::Insert(insert) => {
+            let source = match &insert.select {
+                Some(_) => "source=select".to_string(),
+                None => format!("rows={}", insert.rows.len()),
+            };
             let _ = writeln!(
                 out,
-                "Insert table_id={} rows={}",
+                "Insert table_id={} {source}{}{}",
                 insert.table_id,
-                insert.rows.len()
+                fmt_on_conflict(insert.on_conflict.as_ref()),
+                fmt_returning(insert.returning.as_ref())
             );
+            if let Some(plan) = insert.select.as_ref().and_then(|s| s.plan.as_ref()) {
+                write_physical(plan, depth + 1, out);
+            }
         }
         Plan::Update {
             table,
             assignments,
             access,
+            returning,
             ..
         } => {
             let _ = writeln!(
                 out,
-                "Update table_id={} assignments={}",
+                "Update table_id={} assignments={}{}",
                 table.table_id,
-                assignments.len()
+                assignments.len(),
+                fmt_returning(returning.as_ref())
             );
             indent(out, depth + 1);
             write_access(access, out);
             write_subplans(access_exprs(access), depth + 2, out);
             write_subplans(assignments.iter().map(|a| &a.value), depth + 1, out);
         }
-        Plan::Delete { table, access, .. } => {
-            let _ = writeln!(out, "Delete table_id={}", table.table_id);
+        Plan::Delete {
+            table,
+            access,
+            returning,
+            ..
+        } => {
+            let _ = writeln!(
+                out,
+                "Delete table_id={}{}",
+                table.table_id,
+                fmt_returning(returning.as_ref())
+            );
             indent(out, depth + 1);
             write_access(access, out);
             write_subplans(access_exprs(access), depth + 2, out);
@@ -89,6 +109,51 @@ fn write_plan(plan: &Plan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "Explain");
             write_plan(inner, depth + 1, out);
         }
+    }
+}
+
+/// ` returning=[a, b]` -- the output names of a `RETURNING` list.
+fn fmt_returning(r: Option<&crate::bound::BoundReturning>) -> String {
+    match r {
+        None => String::new(),
+        Some(r) => format!(
+            " returning=[{}]",
+            r.items
+                .iter()
+                .map(|i| i.output_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// ` on_conflict=do_nothing(arbiters=2)` / ` on_conflict=do_update(arbiter=ix3)`.
+fn fmt_on_conflict(oc: Option<&crate::bound::BoundOnConflict>) -> String {
+    use crate::bound::BoundConflictAction;
+    let Some(oc) = oc else {
+        return String::new();
+    };
+    let arbiters: Vec<String> = oc
+        .arbiters
+        .iter()
+        .map(|a| match a.index_id {
+            None => "pk".to_string(),
+            Some(id) => format!("index#{id}"),
+        })
+        .collect();
+    match &oc.action {
+        BoundConflictAction::DoNothing => {
+            format!(" on_conflict=do_nothing(arbiters=[{}])", arbiters.join(", "))
+        }
+        BoundConflictAction::DoUpdate {
+            assignments,
+            selection,
+        } => format!(
+            " on_conflict=do_update(arbiter=[{}], set={}{})",
+            arbiters.join(", "),
+            assignments.len(),
+            if selection.is_some() { ", where" } else { "" }
+        ),
     }
 }
 
@@ -448,11 +513,18 @@ fn fmt_bound(bound: &std::ops::Bound<Vec<BoundExpr>>) -> String {
     }
 }
 
-fn fmt_aggregate(a: &crate::bound::BoundAggregateExpr) -> String {
-    let arg = match &a.arg {
+fn fmt_aggregate_arg(arg: &crate::bound::BoundAggregateArg) -> String {
+    match arg {
         crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
         crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
-    };
+        crate::aggregate::AggregateArg::Multi(es) => {
+            es.iter().map(|e| fmt_expr(e)).collect::<Vec<_>>().join(", ")
+        }
+    }
+}
+
+fn fmt_aggregate(a: &crate::bound::BoundAggregateExpr) -> String {
+    let arg = fmt_aggregate_arg(&a.arg);
     let mut s = format!(
         "{}({}{})",
         a.func.name(),
@@ -493,11 +565,20 @@ fn fmt_frame(f: &BoundFrame) -> String {
         match f.units {
             crate::ast::FrameUnits::Rows => "ROWS",
             crate::ast::FrameUnits::Range => "RANGE",
+            crate::ast::FrameUnits::Groups => "GROUPS",
         },
         fmt_frame_bound(&f.start),
         fmt_frame_bound(&f.end),
         if f.explicit { "" } else { " (default)" }
     )
+}
+
+fn nulls_clause(ignore_nulls: bool) -> &'static str {
+    if ignore_nulls {
+        " IGNORE NULLS"
+    } else {
+        ""
+    }
 }
 
 fn fmt_window_func(f: &BoundWindowFunc) -> String {
@@ -507,12 +588,18 @@ fn fmt_window_func(f: &BoundWindowFunc) -> String {
             .unwrap_or_default()
     };
     match f {
-        BoundWindowFunc::Aggregate { func, arg, filter } => {
-            let arg = match arg {
-                crate::aggregate::AggregateArg::Wildcard => "*".to_string(),
-                crate::aggregate::AggregateArg::Expr(e) => fmt_expr(e),
-            };
-            let mut s = format!("{}({arg})", func.name());
+        BoundWindowFunc::Aggregate {
+            func,
+            arg,
+            distinct,
+            filter,
+        } => {
+            let arg = fmt_aggregate_arg(arg);
+            let mut s = format!(
+                "{}({}{arg})",
+                func.name(),
+                if *distinct { "DISTINCT " } else { "" }
+            );
             if let Some(f) = filter {
                 let _ = write!(s, " FILTER (WHERE {})", fmt_expr(f));
             }
@@ -528,17 +615,36 @@ fn fmt_window_func(f: &BoundWindowFunc) -> String {
             expr,
             offset,
             default,
+            ignore_nulls,
         }
         | BoundWindowFunc::Lead {
             expr,
             offset,
             default,
-        } => format!("{}({}{}{})", f.name(), fmt_expr(expr), opt(offset), opt(default)),
-        BoundWindowFunc::FirstValue(e) | BoundWindowFunc::LastValue(e) => {
-            format!("{}({})", f.name(), fmt_expr(e))
+            ignore_nulls,
+        } => format!(
+            "{}({}{}{}){}",
+            f.name(),
+            fmt_expr(expr),
+            opt(offset),
+            opt(default),
+            nulls_clause(*ignore_nulls)
+        ),
+        BoundWindowFunc::FirstValue { expr, ignore_nulls }
+        | BoundWindowFunc::LastValue { expr, ignore_nulls } => {
+            format!("{}({}){}", f.name(), fmt_expr(expr), nulls_clause(*ignore_nulls))
         }
-        BoundWindowFunc::NthValue { expr, n } => {
-            format!("nth_value({}, {})", fmt_expr(expr), fmt_expr(n))
+        BoundWindowFunc::NthValue {
+            expr,
+            n,
+            ignore_nulls,
+        } => {
+            format!(
+                "nth_value({}, {}){}",
+                fmt_expr(expr),
+                fmt_expr(n),
+                nulls_clause(*ignore_nulls)
+            )
         }
     }
 }
@@ -689,6 +795,24 @@ fn fmt_expr(expr: &BoundExpr) -> String {
                 if negated { "NOT " } else { "" },
                 sq.id
             ),
+            SubqueryKind::Quantified { op, all } => format!(
+                "({} {} {} subquery#{})",
+                sq.operand
+                    .as_ref()
+                    .map(fmt_expr)
+                    .unwrap_or_else(|| "?".to_string()),
+                match op {
+                    BinaryOp::Eq => "=",
+                    BinaryOp::NotEq => "<>",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::LtEq => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::GtEq => ">=",
+                    _ => "?",
+                },
+                if all { "ALL" } else { "ANY" },
+                sq.id
+            ),
         },
     }
 }
@@ -746,7 +870,7 @@ pub(super) fn collect_subqueries<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a Boun
         }
         BoundExprKind::Function { args, .. } => args.iter().for_each(|e| collect_subqueries(e, out)),
         BoundExprKind::Aggregate(agg) => {
-            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+            for e in agg.arg.exprs() {
                 collect_subqueries(e, out);
             }
             if let Some(f) = &agg.filter {

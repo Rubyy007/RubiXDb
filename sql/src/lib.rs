@@ -123,3 +123,16 @@ mod aggregation_tests;
 
 #[cfg(test)]
 mod mission2_corpus_tests;
+
+// SQL Phase 1 (docs/SNOWFLAKE_SQL_COMPATIBILITY.md): ORDER BY aliases / positions, MINUS and
+// UNION BY NAME, COUNT(a, b), DISTINCT window aggregates, GROUP BY ALL, ANY / ALL, GROUPS frames,
+// IGNORE NULLS.
+#[cfg(test)]
+mod phase1_tests;
+
+#[cfg(test)]
+mod phase1_window_tests;
+
+// SQL Phase 2a: RETURNING, INSERT ... SELECT, INSERT ... ON CONFLICT.
+#[cfg(test)]
+mod phase2a_tests;

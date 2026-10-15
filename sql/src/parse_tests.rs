@@ -299,8 +299,9 @@ fn unsupported_grammar_is_a_typed_error_not_a_panic() {
     // assertions; `window_tests::parser::what_is_still_outside_the_grammar_after_mission_2_is_a_typed_error`
     // re-pins the spellings that remain unsupported).
     // Mission 2: OVER / ROLLUP / COUNT(DISTINCT) is implemented; see MISSION2_FEATURE_MATRIX.md §6.2.
+    // SQL Phase 1 (2026-10-14) removed `"SELECT id FROM t GROUP BY ALL"`: GROUP BY ALL
+    // is implemented (`phase1_tests::group_by_all` holds the assertions).
     let cases = [
-        "SELECT id FROM t GROUP BY ALL",
         "SELECT * FROM t, orders",
         "SELECT id FROM t RIGHT JOIN orders o ON t.id = o.id",
         "SELECT id FROM t FULL JOIN orders o ON t.id = o.id",
@@ -343,4 +344,69 @@ fn hex_string_blob_literal_parses() {
         item.expr,
         Expr::Literal(Literal::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]))
     );
+}
+
+// -----------------------------------------------------------------
+// USE SCHEMA / USE DATABASE
+// -----------------------------------------------------------------
+
+#[test]
+fn use_schema_parses_unqualified_and_database_qualified() {
+    let Statement::UseSchema(u) = parse_ok("USE SCHEMA analytics") else {
+        panic!("expected UseSchema")
+    };
+    assert_eq!(u.name.0.len(), 1);
+    assert_eq!(u.name.0[0].value, "analytics");
+    let Statement::UseSchema(u) = parse_ok("use schema default.analytics;") else {
+        panic!("expected UseSchema")
+    };
+    assert_eq!(u.name.0.len(), 2);
+    assert_eq!(u.name.0[1].value, "analytics");
+    // A leading comment or newline does not hide the statement.
+    assert!(matches!(
+        parse_ok(
+            "  
+ USE SCHEMA analytics"
+        ),
+        Statement::UseSchema(_)
+    ));
+}
+
+#[test]
+fn use_schema_rejects_three_part_names() {
+    assert!(matches!(
+        parse_statement("USE SCHEMA a.b.c", &limits()),
+        Err(SqlError::InvalidIdentifier { .. })
+    ));
+}
+
+#[test]
+fn use_database_and_bare_use_are_refused_with_guidance() {
+    for sql in [
+        "USE DATABASE other",
+        "USE DATABASE default",
+        "use database x;",
+    ] {
+        match parse_statement(sql, &limits()) {
+            Err(SqlError::UnsupportedExecution { detail }) => assert_eq!(
+                detail,
+                "USE DATABASE is disabled. Active database is locked to 'default'. Use USE SCHEMA <schema_name> to switch working namespaces.",
+                "{sql}"
+            ),
+            other => panic!("{sql}: expected the USE DATABASE refusal, got {other:?}"),
+        }
+    }
+    for sql in ["USE analytics", "USE"] {
+        assert!(parse_statement(sql, &limits()).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn identifiers_starting_with_use_are_not_mistaken_for_the_use_statement() {
+    // `used_cars` is a table; the statement is an ordinary SELECT parsed by the ordinary dialect.
+    assert!(matches!(
+        parse_ok("SELECT 1 FROM used_cars"),
+        Statement::Select(_)
+    ));
+    assert!(parse_statement("user_table", &limits()).is_err());
 }

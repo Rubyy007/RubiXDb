@@ -16,12 +16,20 @@ use rubixdb::relational::index::IndexBuilder;
 use rubixdb::relational::table_store::TableStore;
 use rubixdb::relational::{RelationalError, RelationalValue, Transaction};
 
-use crate::bound::{BoundAssignment, BoundColumnDef, BoundInsert, BoundStatement};
+use std::collections::HashMap;
+
+use rubixdb::catalog::schema::ColumnRow;
+
+use crate::aggregate::GroupingKey;
+use crate::bound::{
+    BoundArbiter, BoundAssignment, BoundColumnDef, BoundConflictAction, BoundExpr, BoundExprKind,
+    BoundInsert, BoundOnConflict, BoundReturning, BoundStatement, ColumnRef, TableRefId,
+};
 use crate::error::{Result, SqlError};
-use crate::exec::expr_eval::eval;
+use crate::exec::expr_eval::{eval, eval_predicate};
 use crate::exec::operators::build_operator;
 use crate::exec::{
-    CancellationToken, CorrelatedUsage, ExecCtx, ExecLimits, ExecMetrics, RowContext,
+    CancellationToken, CorrelatedUsage, ExecCtx, ExecLimits, ExecMetrics, ResultSchema, RowContext,
 };
 use crate::plan::access::PhysicalAccess;
 use crate::plan::physical::PhysicalPlan;
@@ -30,12 +38,7 @@ use crate::plan::Plan;
 pub mod metrics;
 pub use metrics::WriteMetrics;
 
-/// Item 56/86/123: the smallest result shape the currently-approved
-/// architecture needs — statement kind, success, and a rows-affected
-/// count. No `RETURNING` (item 124: the current grammar/binder has no
-/// representation for it — inspected, not guessed: `sql/src/ast.rs`'s
-/// `Insert`/`Update`/`Delete` carry no returning clause at all), so no
-/// result rows are ever produced for a write statement.
+/// Which kind of statement a `WriteResult` reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteStatementKind {
     Insert,
@@ -44,10 +47,28 @@ pub enum WriteStatementKind {
     Ddl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The rows a `RETURNING` clause handed back, in the order the statement changed
+/// them. Produced by the change itself (the very row values that were written or
+/// deleted), never by a second query. For a statement that commits on its own
+/// (`execute_write_autocommit`) they are returned only after the commit succeeded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnedRows {
+    pub schema: ResultSchema,
+    pub rows: Vec<Vec<Option<RelationalValue>>>,
+}
+
+/// What a write statement reports: its kind, the number of rows it changed and
+/// -- when it has a `RETURNING` clause -- the rows themselves.
+///
+/// `rows_affected` is exactly the number of rows the statement inserted, updated
+/// (a row `ON CONFLICT DO UPDATE` or `UPDATE` matched counts, whether or not its
+/// values changed) or deleted. Rows an `ON CONFLICT` clause skipped are not
+/// counted. With `RETURNING`, `returning.rows.len() == rows_affected` always.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WriteResult {
     pub kind: WriteStatementKind,
     pub rows_affected: u64,
+    pub returning: Option<ReturnedRows>,
 }
 
 /// Executes one write-shaped `Plan` into the caller's own `&mut
@@ -116,8 +137,70 @@ pub fn execute_write(
 /// dropped/rolled-back around it purely so this function has one
 /// uniform signature; that transaction's own snapshot is never used for
 /// anything).
+/// Runs `plan` as its own transaction: begin, execute, commit.
+///
+/// An `INSERT ... ON CONFLICT` whose commit loses a race to a concurrent writer
+/// of the same key (a `Conflict`) is run again, from a fresh snapshot, up to
+/// `ExecLimits::max_upsert_attempts` times: the retry sees the winner's row and
+/// arbitrates on it (`DO NOTHING` skips, `DO UPDATE` updates), which is what
+/// "atomic upsert" means to a caller -- two concurrent upserts of one key end as
+/// one row and no lost update, rather than one of them failing with a conflict it
+/// could not have avoided. Any other statement is run once. Each attempt is the
+/// whole statement against a new snapshot: nothing of a failed attempt survives
+/// (its write-set is dropped with its transaction).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_write_autocommit(
+    plan: &Plan,
+    txm: &rubixdb::relational::TransactionManager,
+    table_store: &TableStore,
+    catalog: &CatalogService,
+    index_builder: &IndexBuilder,
+    params: &[Option<RelationalValue>],
+    limits: &ExecLimits,
+    metrics: &WriteMetrics,
+    cancellation: &CancellationToken,
+) -> Result<WriteResult> {
+    let attempts = match plan {
+        Plan::Insert(insert) if insert.on_conflict.is_some() => limits.max_upsert_attempts.max(1),
+        _ => 1,
+    };
+    let mut attempt = 1u32;
+    loop {
+        let result = execute_write_autocommit_once(
+            plan,
+            txm,
+            table_store,
+            catalog,
+            index_builder,
+            params,
+            limits,
+            metrics,
+            cancellation,
+        );
+        match result {
+            Err(SqlError::Conflict { .. }) if attempt < attempts => {
+                if cancellation.is_cancelled() {
+                    return Err(SqlError::Cancelled);
+                }
+                metrics.record_upsert_retry();
+                // A short, growing, jittered pause so racing writers do not retry in
+                // lock step.
+                let jitter = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| u64::from(d.subsec_nanos()))
+                    .unwrap_or(0)
+                    % 97;
+                let micros = (50u64 << attempt.min(8)) + jitter * 10;
+                std::thread::sleep(std::time::Duration::from_micros(micros));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_write_autocommit_once(
     plan: &Plan,
     txm: &rubixdb::relational::TransactionManager,
     table_store: &TableStore,
@@ -202,24 +285,41 @@ fn execute_write_inner(
     match plan {
         Plan::Insert(insert) => {
             metrics.record_insert_statement();
-            let n = execute_insert(insert, txn, table_store, catalog, index_builder, params, limits, cancellation)?;
-            metrics.record_rows_inserted(n);
+            let out = execute_insert(
+                insert,
+                txn,
+                table_store,
+                catalog,
+                index_builder,
+                params,
+                limits,
+                cancellation,
+            )?;
+            metrics.record_rows_inserted(out.inserted);
+            metrics.record_rows_updated(out.updated);
+            metrics.record_upsert_conflict_rows_skipped(out.skipped);
+            if let Some(r) = &out.returning {
+                metrics.record_rows_returned(r.rows.len() as u64);
+            }
             Ok(WriteResult {
                 kind: WriteStatementKind::Insert,
-                rows_affected: n,
+                rows_affected: out.inserted + out.updated,
+                returning: out.returning,
             })
         }
         Plan::Update {
             table,
             assignments,
             access,
+            returning,
             ..
         } => {
             metrics.record_update_statement();
-            let n = execute_update(
+            let (n, returned) = execute_update(
                 table.table_id,
                 assignments,
                 access,
+                returning.as_ref(),
                 txn,
                 table_store,
                 catalog,
@@ -229,18 +329,42 @@ fn execute_write_inner(
                 cancellation,
             )?;
             metrics.record_rows_updated(n);
+            if let Some(r) = &returned {
+                metrics.record_rows_returned(r.rows.len() as u64);
+            }
             Ok(WriteResult {
                 kind: WriteStatementKind::Update,
                 rows_affected: n,
+                returning: returned,
             })
         }
-        Plan::Delete { table, access, .. } => {
+        Plan::Delete {
+            table,
+            access,
+            returning,
+            ..
+        } => {
             metrics.record_delete_statement();
-            let n = execute_delete(table.table_id, access, txn, table_store, catalog, index_builder, params, limits, cancellation)?;
+            let (n, returned) = execute_delete(
+                table.table_id,
+                access,
+                returning.as_ref(),
+                txn,
+                table_store,
+                catalog,
+                index_builder,
+                params,
+                limits,
+                cancellation,
+            )?;
             metrics.record_rows_deleted(n);
+            if let Some(r) = &returned {
+                metrics.record_rows_returned(r.rows.len() as u64);
+            }
             Ok(WriteResult {
                 kind: WriteStatementKind::Delete,
                 rows_affected: n,
+                returning: returned,
             })
         }
         Plan::Ddl(bound) => {
@@ -275,8 +399,381 @@ fn deadline_at(limits: &ExecLimits) -> Option<std::time::Instant> {
 }
 
 // =======================================================================
-// INSERT (items 6-13)
+// RETURNING (SQL Phase 2a)
 // =======================================================================
+
+type Row = Vec<Option<RelationalValue>>;
+
+/// Collects the rows of a `RETURNING` clause as the statement changes them. Every
+/// row goes in as the very value the statement wrote (or, for `DELETE`, removed);
+/// the clause's expressions are evaluated against it with the engine's own
+/// expression evaluator. The rows are bounded by `max_result_rows` and by
+/// `max_materialized_bytes`, failing closed.
+struct ReturningSink<'a> {
+    spec: &'a BoundReturning,
+    rows: Vec<Row>,
+    bytes: usize,
+}
+
+impl<'a> ReturningSink<'a> {
+    fn new(spec: Option<&'a BoundReturning>) -> Option<Self> {
+        spec.map(|spec| ReturningSink {
+            spec,
+            rows: Vec::new(),
+            bytes: 0,
+        })
+    }
+
+    fn push(
+        &mut self,
+        row: &[Option<RelationalValue>],
+        ec: &ExecCtx<'_>,
+        limits: &ExecLimits,
+    ) -> Result<()> {
+        if self.rows.len() >= limits.max_result_rows {
+            return Err(SqlError::ResourceLimit {
+                detail: format!(
+                    "RETURNING would return more than max_result_rows ({}) rows",
+                    limits.max_result_rows
+                ),
+            });
+        }
+        let ctx = RowContext::single(self.spec.table_ref, row.to_vec());
+        let values = self
+            .spec
+            .items
+            .iter()
+            .map(|item| eval(&item.expr, &ctx, ec))
+            .collect::<Result<Vec<_>>>()?;
+        self.bytes = self
+            .bytes
+            .saturating_add(crate::exec::setop::row_bytes(&values));
+        if self.bytes > limits.max_materialized_bytes {
+            return Err(SqlError::ResourceLimit {
+                detail: format!(
+                    "RETURNING would hold more than max_materialized_bytes ({}) of rows",
+                    limits.max_materialized_bytes
+                ),
+            });
+        }
+        self.rows.push(values);
+        Ok(())
+    }
+
+    fn finish(self) -> ReturnedRows {
+        ReturnedRows {
+            schema: ResultSchema::from_projection(&self.spec.items),
+            rows: self.rows,
+        }
+    }
+}
+
+// =======================================================================
+// INSERT [... SELECT] [ON CONFLICT ...] [RETURNING ...]
+// =======================================================================
+
+struct InsertOutcome {
+    inserted: u64,
+    updated: u64,
+    skipped: u64,
+    returning: Option<ReturnedRows>,
+}
+
+/// A row the statement has decided to write, and whether it differs from what the
+/// transaction already holds.
+struct PendingRow {
+    row: Row,
+    write: bool,
+}
+
+/// What the statement has decided so far, by primary key and -- for each unique
+/// index it arbitrates on -- by the index's value. A later proposed row is checked
+/// against this *and* against the transaction, so a conflict with a row the same
+/// statement inserted or updated earlier is seen exactly like any other.
+struct Pending {
+    rows: Vec<PendingRow>,
+    by_pk: HashMap<GroupingKey, usize>,
+    by_arbiter: Vec<HashMap<GroupingKey, usize>>,
+}
+
+fn pk_key(pk: &[RelationalValue]) -> GroupingKey {
+    GroupingKey::from_values(&pk.iter().cloned().map(Some).collect::<Vec<_>>())
+}
+
+/// The key of a row under a unique index, or `None` when any indexed value is
+/// `NULL` (a `NULL` never equals another, so such a row conflicts with nothing).
+fn arbiter_key(row: &[Option<RelationalValue>], ordinals: &[u16]) -> Option<GroupingKey> {
+    let vals: Vec<Option<RelationalValue>> = ordinals
+        .iter()
+        .map(|&o| row.get(o as usize).cloned().flatten())
+        .collect();
+    if vals.iter().any(Option::is_none) {
+        None
+    } else {
+        Some(GroupingKey::from_values(&vals))
+    }
+}
+
+impl Pending {
+    fn new(arbiters: &[BoundArbiter]) -> Self {
+        Pending {
+            rows: Vec::new(),
+            by_pk: HashMap::new(),
+            by_arbiter: vec![HashMap::new(); arbiters.len()],
+        }
+    }
+
+    fn add(&mut self, pk: Vec<RelationalValue>, row: Row, write: bool, arbiters: &[BoundArbiter]) {
+        let idx = self.rows.len();
+        self.by_pk.insert(pk_key(&pk), idx);
+        for (ai, arb) in arbiters.iter().enumerate() {
+            if arb.index_id.is_some() {
+                if let Some(k) = arbiter_key(&row, &arb.ordinals) {
+                    self.by_arbiter[ai].insert(k, idx);
+                }
+            }
+        }
+        self.rows.push(PendingRow { row, write });
+    }
+}
+
+/// The row a proposed row conflicts with.
+enum Hit {
+    /// One this statement has already inserted or updated.
+    Pending,
+    /// One the transaction can see (its snapshot plus its own earlier writes).
+    Committed { pk: Vec<RelationalValue>, row: Row },
+}
+
+/// Everything conflict detection needs to read the table as the transaction sees it.
+struct Lookup<'a> {
+    txn: &'a Transaction,
+    table_store: &'a TableStore,
+    catalog: &'a CatalogService,
+    index_builder: &'a IndexBuilder,
+    params: &'a [Option<RelationalValue>],
+    limits: &'a ExecLimits,
+    cancellation: &'a CancellationToken,
+    table_id: u32,
+    pk_ordinals: &'a [u16],
+    columns: &'a [ColumnRow],
+}
+
+impl Lookup<'_> {
+    /// The primary keys of the rows the transaction sees with `ordinals = vals`,
+    /// found by the same access machinery `UPDATE` / `DELETE` use (an equality
+    /// lookup on the unique index when one is ready, a scan otherwise), so the
+    /// transaction's own earlier writes are part of what is seen.
+    fn pks_by_columns(
+        &self,
+        ordinals: &[u16],
+        vals: &[Option<RelationalValue>],
+    ) -> Result<Vec<Vec<RelationalValue>>> {
+        let mut predicate: Option<BoundExpr> = None;
+        for (&ordinal, value) in ordinals.iter().zip(vals) {
+            let column = self
+                .columns
+                .iter()
+                .find(|c| c.ordinal == ordinal)
+                .ok_or_else(|| {
+                    SqlError::Storage("an ON CONFLICT column no longer resolves".to_string())
+                })?;
+            let ty = crate::bind::ddl::relational_type_of(column)?;
+            let eq = BoundExpr {
+                kind: BoundExprKind::BinaryOp {
+                    left: Box::new(BoundExpr {
+                        kind: BoundExprKind::Column(ColumnRef {
+                            table_ref: TableRefId(0),
+                            table_id: self.table_id,
+                            ordinal,
+                        }),
+                        ty: Some(ty),
+                        nullable: column.nullable,
+                    }),
+                    op: crate::ast::BinaryOp::Eq,
+                    right: Box::new(BoundExpr {
+                        kind: BoundExprKind::Literal(value.clone()),
+                        ty: Some(ty),
+                        nullable: false,
+                    }),
+                },
+                ty: Some(rubixdb::relational::RelationalType::Boolean),
+                nullable: false,
+            };
+            predicate = Some(match predicate {
+                Some(p) => crate::plan::expr_util::and_all(p, eq),
+                None => eq,
+            });
+        }
+        let access = crate::plan::access::plan_table_access(
+            self.table_id,
+            0,
+            predicate.as_ref(),
+            self.catalog,
+            &crate::plan::metrics::PlannerMetrics::default(),
+        )?;
+        let (pks, _) = find_target_pks(
+            &access,
+            self.pk_ordinals,
+            self.txn,
+            self.table_store,
+            self.index_builder,
+            self.params,
+            self.limits,
+            self.cancellation,
+        )?;
+        Ok(pks)
+    }
+
+    /// The first conflict of `proposed` with a row of the statement or of the
+    /// transaction, checking the arbiters in order.
+    fn find_hit(
+        &self,
+        pending: &Pending,
+        arbiters: &[BoundArbiter],
+        proposed: &[Option<RelationalValue>],
+    ) -> Result<Option<Hit>> {
+        for (ai, arbiter) in arbiters.iter().enumerate() {
+            match arbiter.index_id {
+                None => {
+                    let pk = pk_values_of(proposed, self.pk_ordinals)?;
+                    if pending.by_pk.contains_key(&pk_key(&pk)) {
+                        return Ok(Some(Hit::Pending));
+                    }
+                    if let Some(row) = self.txn.get_row(self.table_id, &pk)? {
+                        return Ok(Some(Hit::Committed { pk, row }));
+                    }
+                }
+                Some(_) => {
+                    let Some(key) = arbiter_key(proposed, &arbiter.ordinals) else {
+                        continue;
+                    };
+                    if pending.by_arbiter[ai].contains_key(&key) {
+                        return Ok(Some(Hit::Pending));
+                    }
+                    let vals: Vec<Option<RelationalValue>> = arbiter
+                        .ordinals
+                        .iter()
+                        .map(|&o| proposed[o as usize].clone())
+                        .collect();
+                    for pk in self.pks_by_columns(&arbiter.ordinals, &vals)? {
+                        if let Some(&i) = pending.by_pk.get(&pk_key(&pk)) {
+                            // The statement already changed this row: it conflicts
+                            // only if it still holds these values (a `Pending` hit
+                            // through `by_arbiter` was handled above).
+                            let still = arbiter_key(&pending.rows[i].row, &arbiter.ordinals);
+                            if still.as_ref() == Some(&key) {
+                                return Ok(Some(Hit::Pending));
+                            }
+                            continue;
+                        }
+                        if let Some(row) = self.txn.get_row(self.table_id, &pk)? {
+                            return Ok(Some(Hit::Committed { pk, row }));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A value that must be present was `NULL`: the statement is refused before it
+/// writes anything.
+fn check_not_null(columns: &[ColumnRow], row: &[Option<RelationalValue>]) -> Result<()> {
+    for column in columns {
+        if !column.nullable && row.get(column.ordinal as usize).is_none_or(Option::is_none) {
+            return Err(SqlError::ExecutionParameter {
+                detail: format!("column {:?} is NOT NULL", column.name),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Store assignment of one value of an `INSERT ... SELECT`: a lossless widening
+/// (`exec::setop::widen_value`), or `BIGINT` into `INTEGER` when the value fits.
+fn convert_for_insert(
+    value: RelationalValue,
+    to: rubixdb::relational::RelationalType,
+) -> Result<RelationalValue> {
+    use rubixdb::relational::RelationalType;
+    match (&value, to) {
+        (RelationalValue::Bigint(n), RelationalType::Integer) => i32::try_from(*n)
+            .map(RelationalValue::Integer)
+            .map_err(|_| SqlError::ExecutionParameter {
+                detail: format!("the value {n} is out of range for an INTEGER column"),
+            }),
+        _ => crate::exec::setop::widen_value(value, to),
+    }
+}
+
+/// The rows an `INSERT` proposes: its `VALUES` tuples evaluated, or the rows of its
+/// source query (read in full, against the transaction's view, *before* any row is
+/// written, so a statement that reads the table it inserts into sees the table as
+/// it was). Bounded by `max_dml_target_rows`.
+fn proposed_rows(
+    insert: &BoundInsert,
+    columns: &[ColumnRow],
+    ec: &ExecCtx<'_>,
+    limits: &ExecLimits,
+    cancellation: &CancellationToken,
+    at: Option<std::time::Instant>,
+) -> Result<Vec<Row>> {
+    let mut out: Vec<Row> = Vec::new();
+    match &insert.select {
+        None => {
+            // `INSERT`'s `VALUES` never bind a column reference or a correlated
+            // access, so an empty `RowContext` is always sufficient.
+            let ctx = RowContext::new();
+            for row in &insert.rows {
+                check_point(cancellation, at)?;
+                let values: Row = row
+                    .iter()
+                    .map(|expr| eval(expr, &ctx, ec))
+                    .collect::<Result<_>>()?;
+                out.push(values);
+            }
+        }
+        Some(source) => {
+            let plan = source.plan.as_ref().ok_or_else(|| SqlError::UnsupportedExecution {
+                detail: "an INSERT ... SELECT reached execution without a physical plan (internal planner invariant violation)"
+                    .to_string(),
+            })?;
+            let mut operator = build_operator(plan, &RowContext::new(), ec)?;
+            loop {
+                ec.check()?;
+                check_point(cancellation, at)?;
+                let Some(tuple) = operator.next(ec)? else {
+                    break;
+                };
+                if out.len() >= limits.max_dml_target_rows {
+                    return Err(SqlError::ResourceLimit {
+                        detail: format!(
+                            "INSERT ... SELECT produces more than max_dml_target_rows ({}) rows",
+                            limits.max_dml_target_rows
+                        ),
+                    });
+                }
+                let mut row: Row = vec![None; columns.len()];
+                for (target, value) in source.targets.iter().zip(tuple.projected) {
+                    row[target.ordinal as usize] = match (value, target.convert_to) {
+                        (Some(v), Some(to)) => Some(convert_for_insert(v, to)?),
+                        (v, _) => v,
+                    };
+                }
+                for (ordinal, default) in &source.defaults {
+                    row[*ordinal as usize] = default.clone();
+                }
+                out.push(row);
+            }
+        }
+    }
+    for row in &out {
+        check_not_null(columns, row)?;
+    }
+    Ok(out)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn execute_insert(
@@ -288,51 +785,42 @@ fn execute_insert(
     params: &[Option<RelationalValue>],
     limits: &ExecLimits,
     cancellation: &CancellationToken,
-) -> Result<u64> {
-    // `Transaction::put_row` is a generic upsert-at-key primitive
-    // shared with `UPDATE` (see `execute_update`'s own doc comment) --
-    // by itself it has no notion of "this key must not already exist",
-    // and its commit-time freshness/`UNIQUE` validation only catches a
-    // *concurrently racing* insert of the same `PRIMARY KEY` (the two
-    // committed snapshots genuinely differ), never a plain, later,
-    // non-overlapping `INSERT` of a `PRIMARY KEY` some earlier,
-    // already-committed transaction used (both snapshots agree, so
-    // nothing there looks like a conflict) -- confirmed by reading
-    // `Transaction::commit`/`validate_and_build_ops` (src/relational/
-    // txn.rs): `unique_checks` only ever iterates `IndexKind::Unique`
-    // *secondary* indexes, never the table's own `PRIMARY KEY`, and a
-    // differential test against an independent reference model (`sql/
-    // src/write_tests.rs::differential`) caught the resulting silent-
-    // overwrite gap directly. `INSERT`, unlike `UPDATE`, is the one
-    // caller that actually needs "must be a new row" semantics, so this
-    // existence check belongs here, not in the shared primitive. It is
-    // not a second, independent conflict detector (item 11's own
-    // concern): it reuses `Transaction::get_row` (the same snapshot-
-    // and write-set-overlay-correct read every other statement kind
-    // uses) entirely *within* this one transaction, and the commit-time
-    // freshness check remains the sole authority for the concurrent
-    // case (two transactions racing to insert the same key are still
-    // resolved there, unchanged -- this check only closes the
-    // sequential gap freshness cannot see). Reported as `SqlError::
-    // Conflict`, the exact class `RelationalError::Conflict` already
-    // maps to, so a `PRIMARY KEY` violation and a concurrent write
-    // conflict are indistinguishable to a caller in the same way a
-    // `UNIQUE` violation already is -- consistent, not a new error
-    // class.
+) -> Result<InsertOutcome> {
+    // `Transaction::put_row` is a generic upsert-at-key primitive shared with
+    // `UPDATE`: by itself it has no notion of "this key must not already exist",
+    // and its commit-time validation only catches a *concurrently racing* write of
+    // the same key, never a later, non-overlapping insert of a key some earlier
+    // transaction used. `INSERT` is the one caller that needs "must be a new row",
+    // so the existence check belongs here, against the transaction's own view
+    // (`Transaction::get_row`: snapshot plus its earlier writes). The commit-time
+    // freshness check stays the sole authority for the concurrent case.
+    //
+    // The statement is decided in two phases. Phase 1 reads: it evaluates the
+    // proposed rows, finds each one's conflict (if any) and computes the row to
+    // write and the `RETURNING` values -- against the transaction and against what
+    // the statement itself has already decided -- and writes **nothing**. Phase 2
+    // buffers the decided rows into the transaction's write-set. So a statement that
+    // is going to fail on a duplicate key, a NOT NULL violation, a failing
+    // `DO UPDATE` expression, an arithmetic overflow or a second hit on one row has
+    // changed nothing even inside an explicit transaction; only a failure of the
+    // buffering itself (a write-set limit, a row-shape error) can leave earlier rows
+    // of the statement buffered there, and an autocommit statement drops its whole
+    // transaction in every case.
     let table = catalog.get_table(insert.table_id)?.ok_or_else(|| {
         SqlError::Storage("a target table no longer resolves in the catalog".to_string())
     })?;
+    let columns = catalog.get_columns(insert.table_id)?;
     let at = deadline_at(limits);
-    // Phase 1 (read-only): evaluate every row's `VALUES` expressions
-    // up front, one shared `ExecCtx` borrowing `txn` immutably for
-    // parameter resolution only (`INSERT`'s own grammar never binds a
-    // `Column` reference or a correlated access, `crate::bind::dml::
-    // bind_insert`, so an empty `RowContext` is always correct/
-    // sufficient here). Bounded by `SqlLimits::max_values_rows`,
-    // already enforced at bind time -- no new resource risk from
-    // evaluating every row before writing any of them.
-    let evaluated: Vec<Vec<Option<RelationalValue>>> = {
-        let metrics = ExecMetrics::default();
+    let metrics = ExecMetrics::default();
+    let arbiters: Vec<BoundArbiter> = match &insert.on_conflict {
+        Some(oc) => oc.arbiters.clone(),
+        None => vec![BoundArbiter {
+            index_id: None,
+            ordinals: table.pk_ordinals.clone(),
+        }],
+    };
+
+    let (writes, outcome) = {
         let ec = ExecCtx::new(
             txn,
             table_store,
@@ -342,41 +830,132 @@ fn execute_insert(
             &metrics,
             cancellation,
         );
-        let ctx = RowContext::new();
-        let mut out = Vec::with_capacity(insert.rows.len());
-        for row in &insert.rows {
-            check_point(cancellation, at)?;
-            let values: Vec<Option<RelationalValue>> = row
-                .iter()
-                .map(|expr| eval(expr, &ctx, &ec))
-                .collect::<Result<_>>()?;
-            out.push(values);
-        }
-        out
+        let proposed = proposed_rows(insert, &columns, &ec, limits, cancellation, at)?;
+        let lookup = Lookup {
+            txn,
+            table_store,
+            catalog,
+            index_builder,
+            params,
+            limits,
+            cancellation,
+            table_id: insert.table_id,
+            pk_ordinals: &table.pk_ordinals,
+            columns: &columns,
+        };
+        decide_insert(
+            insert.on_conflict.as_ref(),
+            insert.returning.as_ref(),
+            &lookup,
+            &ec,
+            proposed,
+            &arbiters,
+            &columns,
+            limits,
+            at,
+        )?
     };
 
-    // Phase 2 (write): the borrow above has ended -- `txn` is free to
-    // mutate. Item 7: every row of this statement is buffered into the
-    // *same* transaction's write-set, never committed per row
-    // (`execute_write`'s own caller decides the commit boundary) -- a
-    // validation failure on row N leaves rows before it buffered but
-    // nothing durable anywhere until that one, later commit.
-    // `PHASE_RELATIONAL_WRITE_EXECUTOR_ARCHITECTURE.md` §4 has the full
-    // atomicity argument, including the one honestly-documented
-    // residual gap for an explicit multi-statement transaction.
-    let mut inserted = 0u64;
-    for values in evaluated {
+    for row in &writes {
         check_point(cancellation, at)?;
-        let pk = pk_values_of(&values, &table.pk_ordinals)?;
-        if txn.get_row(insert.table_id, &pk)?.is_some() {
+        txn.put_row(insert.table_id, row)?;
+    }
+    Ok(outcome)
+}
+
+/// Phase 1 of an `INSERT` (see `execute_insert`).
+#[allow(clippy::too_many_arguments)]
+fn decide_insert(
+    on_conflict: Option<&BoundOnConflict>,
+    returning: Option<&BoundReturning>,
+    lookup: &Lookup<'_>,
+    ec: &ExecCtx<'_>,
+    proposed: Vec<Row>,
+    arbiters: &[BoundArbiter],
+    columns: &[ColumnRow],
+    limits: &ExecLimits,
+    at: Option<std::time::Instant>,
+) -> Result<(Vec<Row>, InsertOutcome)> {
+    let mut pending = Pending::new(arbiters);
+    let mut sink = ReturningSink::new(returning);
+    let (mut inserted, mut updated, mut skipped) = (0u64, 0u64, 0u64);
+
+    for proposed_row in proposed {
+        check_point(lookup.cancellation, at)?;
+        let hit = lookup.find_hit(&pending, arbiters, &proposed_row)?;
+        let Some(hit) = hit else {
+            // No conflict: a new row.
+            let pk = pk_values_of(&proposed_row, lookup.pk_ordinals)?;
+            if let Some(sink) = sink.as_mut() {
+                sink.push(&proposed_row, ec, limits)?;
+            }
+            pending.add(pk, proposed_row, true, arbiters);
+            inserted += 1;
+            continue;
+        };
+        let Some(oc) = on_conflict else {
             return Err(SqlError::Conflict {
                 detail: "duplicate key value violates primary key constraint".to_string(),
             });
+        };
+        match &oc.action {
+            BoundConflictAction::DoNothing => skipped += 1,
+            BoundConflictAction::DoUpdate {
+                assignments,
+                selection,
+            } => {
+                let (pk, existing) = match hit {
+                    Hit::Pending => {
+                        // PostgreSQL's cardinality violation: the command may not
+                        // change one row twice, or the result would depend on the
+                        // order the rows were proposed in.
+                        return Err(SqlError::ExecutionParameter {
+                            detail: "ON CONFLICT DO UPDATE command cannot affect a row a second time: the statement proposes more than one row for the same key"
+                                .to_string(),
+                        });
+                    }
+                    Hit::Committed { pk, row } => (pk, row),
+                };
+                // `existing` is the table row under its own name, `EXCLUDED` the
+                // proposed row; every SET expression sees the same pre-update pair.
+                let ctx = RowContext::single(oc.existing_ref, existing.clone())
+                    .with_row(oc.excluded_ref, proposed_row);
+                if let Some(selection) = selection {
+                    if !eval_predicate(selection, &ctx, ec)?.is_true() {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                let mut new_row = existing.clone();
+                for assignment in assignments {
+                    new_row[assignment.ordinal as usize] = eval(&assignment.value, &ctx, ec)?;
+                }
+                check_not_null(columns, &new_row)?;
+                if let Some(sink) = sink.as_mut() {
+                    sink.push(&new_row, ec, limits)?;
+                }
+                let changed = new_row != existing;
+                pending.add(pk, new_row, changed, arbiters);
+                updated += 1;
+            }
         }
-        txn.put_row(insert.table_id, &values)?;
-        inserted += 1;
     }
-    Ok(inserted)
+
+    let writes = pending
+        .rows
+        .into_iter()
+        .filter(|p| p.write)
+        .map(|p| p.row)
+        .collect();
+    Ok((
+        writes,
+        InsertOutcome {
+            inserted,
+            updated,
+            skipped,
+            returning: sink.map(ReturningSink::finish),
+        },
+    ))
 }
 
 /// Shared by `execute_insert`'s own existence check and `find_target_pks`:
@@ -411,6 +990,7 @@ fn execute_update(
     table_id: u32,
     assignments: &[BoundAssignment],
     access: &PhysicalAccess,
+    returning: Option<&BoundReturning>,
     txn: &mut Transaction,
     table_store: &TableStore,
     catalog: &CatalogService,
@@ -418,11 +998,12 @@ fn execute_update(
     params: &[Option<RelationalValue>],
     limits: &ExecLimits,
     cancellation: &CancellationToken,
-) -> Result<u64> {
+) -> Result<(u64, Option<ReturnedRows>)> {
     let table = catalog.get_table(table_id)?.ok_or_else(|| {
         SqlError::Storage("a target table no longer resolves in the catalog".to_string())
     })?;
     let table_ref = access_table_ref(access);
+    let mut sink = ReturningSink::new(returning);
     let (target_pks, usage) = find_target_pks(
         access,
         &table.pk_ordinals,
@@ -451,6 +1032,7 @@ fn execute_update(
             assignments,
             &target_pks,
             usage,
+            sink,
             txn,
             table_store,
             index_builder,
@@ -503,6 +1085,10 @@ fn execute_update(
                 let value = eval(&assignment.value, &row_ctx, &ec)?;
                 new_row[assignment.ordinal as usize] = value;
             }
+            // RETURNING reports the row as this statement leaves it.
+            if let Some(sink) = sink.as_mut() {
+                sink.push(&new_row, &ec, limits)?;
+            }
         }
         // `PRIMARY KEY` updates are already rejected at bind time
         // (`crate::bind::dml::bind_update`, D6 — verified, not assumed:
@@ -529,7 +1115,7 @@ fn execute_update(
         txn.put_row(table_id, &new_row)?;
         updated += 1;
     }
-    Ok(updated)
+    Ok((updated, sink.map(ReturningSink::finish)))
 }
 
 // =======================================================================
@@ -540,6 +1126,7 @@ fn execute_update(
 fn execute_delete(
     table_id: u32,
     access: &PhysicalAccess,
+    returning: Option<&BoundReturning>,
     txn: &mut Transaction,
     table_store: &TableStore,
     catalog: &CatalogService,
@@ -547,7 +1134,7 @@ fn execute_delete(
     params: &[Option<RelationalValue>],
     limits: &ExecLimits,
     cancellation: &CancellationToken,
-) -> Result<u64> {
+) -> Result<(u64, Option<ReturnedRows>)> {
     let table = catalog.get_table(table_id)?.ok_or_else(|| {
         SqlError::Storage("a target table no longer resolves in the catalog".to_string())
     })?;
@@ -563,17 +1150,42 @@ fn execute_delete(
     )?;
     let at = deadline_at(limits);
 
+    // RETURNING reports the rows as they were when this statement deleted them:
+    // read (and evaluated) first, in one pass over the transaction's own view,
+    // so nothing is written if a RETURNING expression fails.
+    let mut sink = ReturningSink::new(returning);
+    if let Some(sink) = sink.as_mut() {
+        let metrics = ExecMetrics::default();
+        let ec = ExecCtx::new(
+            txn,
+            table_store,
+            index_builder,
+            params,
+            limits,
+            &metrics,
+            cancellation,
+        );
+        for pk in &target_pks {
+            check_point(cancellation, at)?;
+            let row = txn.get_row(table_id, pk)?.ok_or_else(|| {
+                SqlError::Storage(
+                    "a target row disappeared between being matched and being deleted".to_string(),
+                )
+            })?;
+            sink.push(&row, &ec, limits)?;
+        }
+    }
+
     let mut deleted = 0u64;
     for pk in target_pks {
         check_point(cancellation, at)?;
         // Item 14: the row's own current existence is authoritative
-        // through `delete_row` itself (D10-certified); no re-fetch is
-        // needed here since a `DELETE` needs only the already-collected
-        // primary key, never the row's other column values.
+        // through `delete_row` itself (D10-certified); the already-collected
+        // primary key is all a `DELETE` needs.
         txn.delete_row(table_id, &pk)?;
         deleted += 1;
     }
-    Ok(deleted)
+    Ok((deleted, sink.map(ReturningSink::finish)))
 }
 
 /// Shared by `UPDATE`/`DELETE` (item 14/15/47/48): drives the *exact
@@ -667,13 +1279,14 @@ fn execute_update_with_subqueries(
     assignments: &[BoundAssignment],
     target_pks: &[Vec<RelationalValue>],
     usage: CorrelatedUsage,
+    mut sink: Option<ReturningSink<'_>>,
     txn: &mut Transaction,
     table_store: &TableStore,
     index_builder: &IndexBuilder,
     params: &[Option<RelationalValue>],
     limits: &ExecLimits,
     cancellation: &CancellationToken,
-) -> Result<u64> {
+) -> Result<(u64, Option<ReturnedRows>)> {
     let at = deadline_at(limits);
     let metrics = ExecMetrics::default();
     let mut pending: Vec<Vec<Option<RelationalValue>>> = Vec::new();
@@ -702,6 +1315,9 @@ fn execute_update_with_subqueries(
             for assignment in assignments {
                 new_row[assignment.ordinal as usize] = eval(&assignment.value, &row_ctx, &ec)?;
             }
+            if let Some(sink) = sink.as_mut() {
+                sink.push(&new_row, &ec, limits)?;
+            }
             updated += 1;
             if row_ctx.row_for(table_ref) == Some(&new_row) {
                 continue;
@@ -724,7 +1340,7 @@ fn execute_update_with_subqueries(
         check_point(cancellation, at)?;
         txn.put_row(table_id, &new_row)?;
     }
-    Ok(updated)
+    Ok((updated, sink.map(ReturningSink::finish)))
 }
 
 fn access_table_ref(access: &PhysicalAccess) -> u32 {
@@ -797,21 +1413,13 @@ fn execute_ddl(
                 1
             }
         },
-        // No `CatalogService::create_database` primitive exists
-        // (inspected, not guessed: `grep -n "pub fn create_database"
-        // src/catalog/service.rs` has zero matches) -- `bootstrap()` is
-        // the only current way a database row is ever created. Adding
-        // one is a materially larger catalog-layer primitive than this
-        // increment's own scope justifies without evidence a real
-        // multi-database workload needs it; refused with a controlled
-        // error rather than faked (item 35: "ONLY execute the DDL forms
-        // that the current architecture and catalog/index
-        // implementations can safely support").
+        // v1 is one database per instance (D1: bootstrap creates "default" and nothing else does), and
+        // there is deliberately no `CatalogService::create_database` primitive. `CREATE DATABASE` is
+        // therefore refused for every name, with the way forward spelled out, rather than faked.
         BoundStatement::CreateDatabase(_) => {
             return Err(SqlError::UnsupportedExecution {
-                detail:
-                    "CREATE DATABASE has no catalog execution primitive in the current architecture"
-                        .to_string(),
+                detail: "CREATE DATABASE is disabled. rubiXDb v1 runs on a single database ('default'). Use CREATE SCHEMA <schema_name> to organize your tables."
+                    .to_string(),
             })
         }
         // Structurally unreachable in practice (`execute_write_inner`
@@ -834,6 +1442,7 @@ fn execute_ddl(
     Ok(WriteResult {
         kind: WriteStatementKind::Ddl,
         rows_affected: n,
+        returning: None,
     })
 }
 

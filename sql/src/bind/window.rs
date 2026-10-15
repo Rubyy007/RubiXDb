@@ -260,13 +260,11 @@ fn bind_window_call(
             distinct,
             filter,
         } => {
-            if *distinct {
-                return Err(SqlError::Unsupported {
-                    detail: format!(
-                        "{}(DISTINCT ...) as a window function",
-                        func.name().to_ascii_uppercase()
-                    ),
-                });
+            if call.ignore_nulls {
+                return Err(err(format!(
+                    "IGNORE NULLS is not accepted by {}; it applies to LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE",
+                    func.name().to_ascii_uppercase()
+                )));
             }
             let (bound_arg, in_ty) = match arg {
                 AggregateArg::Wildcard => (AggregateArg::Wildcard, None),
@@ -274,6 +272,19 @@ fn bind_window_call(
                     let bound = bind_window_arg(b, e)?;
                     let ty = bound.ty;
                     (AggregateArg::Expr(Box::new(bound)), ty)
+                }
+                AggregateArg::Multi(es) => {
+                    if *func != crate::aggregate::AggregateFunc::Count {
+                        return Err(err(format!(
+                            "aggregate function {} takes exactly one argument",
+                            func.name()
+                        )));
+                    }
+                    let bound = es
+                        .iter()
+                        .map(|e| bind_window_arg(b, e).map(Box::new))
+                        .collect::<Result<Vec<_>>>()?;
+                    (AggregateArg::Multi(bound), None)
                 }
             };
             let wildcard = matches!(bound_arg, AggregateArg::Wildcard);
@@ -301,6 +312,7 @@ fn bind_window_call(
                 BoundWindowFunc::Aggregate {
                     func: *func,
                     arg: bound_arg,
+                    distinct: *distinct,
                     filter,
                 },
                 Some(ty),
@@ -309,7 +321,9 @@ fn bind_window_call(
                 false,
             )
         }
-        ast::WindowFunction::Named { name, args } => bind_named_function(b, name, args)?,
+        ast::WindowFunction::Named { name, args } => {
+            bind_named_function(b, name, args, call.ignore_nulls)?
+        }
     };
 
     if explicit_frame && !frame_allowed {
@@ -380,7 +394,19 @@ fn bind_named_function(
     b: &mut ExprBinder<'_>,
     name: &str,
     args: &[ast::Expr],
+    ignore_nulls: bool,
 ) -> Result<NamedBound> {
+    if ignore_nulls
+        && !matches!(
+            name,
+            "lag" | "lead" | "first_value" | "last_value" | "nth_value"
+        )
+    {
+        return Err(err(format!(
+            "IGNORE NULLS is not accepted by {}; it applies to LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE",
+            name.to_ascii_uppercase()
+        )));
+    }
     let arity = |lo: usize, hi: usize| -> Result<()> {
         if args.len() < lo || args.len() > hi {
             let want = if lo == hi {
@@ -492,12 +518,14 @@ fn bind_named_function(
                     expr,
                     offset,
                     default,
+                    ignore_nulls,
                 }
             } else {
                 BoundWindowFunc::Lead {
                     expr,
                     offset,
                     default,
+                    ignore_nulls,
                 }
             };
             (f, ty, true, false, true)
@@ -507,9 +535,9 @@ fn bind_named_function(
             let expr = Box::new(bind_window_arg(b, &args[0])?);
             let ty = expr.ty;
             let f = if name == "first_value" {
-                BoundWindowFunc::FirstValue(expr)
+                BoundWindowFunc::FirstValue { expr, ignore_nulls }
             } else {
-                BoundWindowFunc::LastValue(expr)
+                BoundWindowFunc::LastValue { expr, ignore_nulls }
             };
             (f, ty, true, true, false)
         }
@@ -524,7 +552,17 @@ fn bind_named_function(
                     return Err(err("the position of NTH_VALUE must be at least 1"));
                 }
             }
-            (BoundWindowFunc::NthValue { expr, n }, ty, true, true, false)
+            (
+                BoundWindowFunc::NthValue {
+                    expr,
+                    n,
+                    ignore_nulls,
+                },
+                ty,
+                true,
+                true,
+                false,
+            )
         }
         other => {
             return Err(err(format!("{other} is not a window function")));
@@ -579,6 +617,11 @@ fn bind_frame(
         _ => {}
     }
     let has_offset = |x: &F| matches!(x, F::Preceding(_) | F::Following(_));
+    if f.units == FrameUnits::Groups && order_by.is_empty() {
+        return Err(err(
+            "a GROUPS frame requires the window to have an ORDER BY (peer groups are defined by it)",
+        ));
+    }
     let mut key_ty = None;
     if f.units == FrameUnits::Range && (has_offset(&f.start) || has_offset(&f.end)) {
         if order_by.len() != 1 {
@@ -604,6 +647,7 @@ fn bind_frame(
         let mut offset = |e: &ast::Expr| -> Result<Box<BoundExpr>> {
             match f.units {
                 FrameUnits::Rows => bind_constant_integer(b, e, "a ROWS frame offset"),
+                FrameUnits::Groups => bind_constant_integer(b, e, "a GROUPS frame offset"),
                 FrameUnits::Range => {
                     let bound = b.bind(e, key_ty)?;
                     if !is_constant(&bound) {

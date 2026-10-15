@@ -70,6 +70,26 @@ function initialState(): IdeState {
   });
 }
 
+const SCHEMA_KEY = "rubixdb-ide-schema";
+
+/** The schema chosen last time (a per-browser convenience; the server validates it on every request). */
+function loadSchema(): string | null {
+  try {
+    return window.localStorage.getItem(SCHEMA_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSchema(schema: string | null): void {
+  try {
+    if (schema) window.localStorage.setItem(SCHEMA_KEY, schema);
+    else window.localStorage.removeItem(SCHEMA_KEY);
+  } catch {
+    /* private window or blocked storage: the choice just lasts for this visit */
+  }
+}
+
 export function IdePage() {
   const client = useApiClient();
   const clientRef = useRef(client);
@@ -78,7 +98,7 @@ export function IdePage() {
   const { session } = useSession();
   const databases = useDatabasesQuery();
   const schemas = useSchemasQuery();
-  const tables = useTablesQuery();
+  const tables = useTablesQuery({ all: true });
   const instance = useInstanceQuery();
 
   const [state, setState] = useState<IdeState>(initialState);
@@ -114,6 +134,8 @@ export function IdePage() {
   const runnerRef = useRef<Runner | null>(null);
   if (runnerRef.current === null) {
     runnerRef.current = new Runner({
+      initialSchema: loadSchema(),
+      onSchemaChange: saveSchema,
       send: (req, signal) => {
         const c = clientRef.current;
         return c ? c.sql(req, signal) : Promise.reject(new Error("Not connected"));
@@ -178,6 +200,12 @@ export function IdePage() {
     }),
     [databases.data, schemas.data, tables.data],
   );
+  const schemaChosen = runs.schema !== null;
+  const activeSchema = runs.schema ?? schemas.data?.[0]?.name ?? null;
+  // Column lookups name a schema only when one was chosen (or the table is qualified); otherwise the server's
+  // default applies, exactly as before schemas could be chosen.
+  const chosenSchemaRef = useRef(runs.schema);
+  chosenSchemaRef.current = runs.schema;
   const catalogStatus: "loading" | "ready" | "error" =
     databases.isError || schemas.isError || tables.isError ? "error" : databases.isLoading || schemas.isLoading || tables.isLoading ? "loading" : "ready";
 
@@ -190,8 +218,12 @@ export function IdePage() {
     async (table: string): Promise<ColumnInfo[]> => {
       const c = clientRef.current;
       if (!c) return [];
+      // `schema.table` names a table outside the active schema; a bare name is in the active one.
+      const dot = table.indexOf(".");
+      const schema = dot > 0 ? table.slice(0, dot) : chosenSchemaRef.current;
+      const name = dot > 0 ? table.slice(dot + 1) : table;
       try {
-        const d = await queryClient.fetchQuery({ queryKey: ["sql", "table", table], queryFn: () => c.describeTable(table), staleTime: 30_000 });
+        const d = await queryClient.fetchQuery({ queryKey: ["sql", "table", schema ?? "", name], queryFn: () => (schema ? c.describeTable(name, schema) : c.describeTable(name)), staleTime: 30_000 });
         return d.columns.map((x) => ({ name: x.name, type: x.data_type }));
       } catch {
         return [];
@@ -379,7 +411,7 @@ export function IdePage() {
     const body = stmts[stmts.length - 1].text;
     const stmt = /^explain\b/i.test(body) ? body : `EXPLAIN ${body}`;
     setPlans((p) => ({ ...p, [cellId]: { sql: text, status: "loading" } }));
-    c.sql({ sql: stmt })
+    c.sql(runs.schema ? { sql: stmt, schema: runs.schema } : { sql: stmt })
       .then((res) => {
         const r = res.result;
         setPlans((p) =>
@@ -567,6 +599,8 @@ export function IdePage() {
     setFocused: setFocusedId,
     history,
     catalog,
+    activeSchema,
+    schemaChosen,
     catalogStatus,
     refreshCatalog,
     catalogRefreshing,
@@ -796,6 +830,15 @@ export function IdePage() {
                 <input type="checkbox" checked={state.autocommit} onChange={(e) => setState((st) => ({ ...st, autocommit: e.target.checked }))} />
                 <span>Autocommit</span>
               </label>
+              {activeSchema && (
+                <span
+                  className="ide-schema text-mono"
+                  data-chosen={schemaChosen}
+                  title={schemaChosen ? "Set by USE SCHEMA. Unqualified names resolve here." : "The default schema. Run USE SCHEMA <name> to switch."}
+                >
+                  default.{activeSchema}
+                </span>
+              )}
               <button type="button" className="ide-iconbtn" aria-label="Toggle dark mode" title="Toggle dark mode" onClick={() => void toggleTheme()}>
                 <Icon name="moon" />
               </button>

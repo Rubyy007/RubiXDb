@@ -113,6 +113,10 @@ pub enum SqlError {
     /// get_row` never conflict-checks; only `commit()` does, and nothing
     /// here calls it with a non-empty write-set).
     Conflict { detail: String },
+    /// A `CREATE`-shaped statement named an object that already exists in its namespace (a schema, table or
+    /// index with that name). The caller's own mistake, so it maps to a client error -- never the generic
+    /// catalog failure it used to be folded into. `detail` is the catalog's own safe text (`schema "x"`).
+    AlreadyExists { detail: String },
 }
 
 impl fmt::Display for SqlError {
@@ -143,6 +147,7 @@ impl fmt::Display for SqlError {
             SqlError::Cancelled => write!(f, "execution cancelled"),
             SqlError::DeadlineExceeded => write!(f, "execution deadline exceeded"),
             SqlError::Conflict { detail } => write!(f, "transaction conflict: {detail}"),
+            SqlError::AlreadyExists { detail } => write!(f, "already exists: {detail}"),
         }
     }
 }
@@ -151,7 +156,16 @@ impl std::error::Error for SqlError {}
 
 impl From<rubixdb::catalog::CatalogError> for SqlError {
     fn from(e: rubixdb::catalog::CatalogError) -> Self {
-        SqlError::Catalog(e.to_string())
+        use rubixdb::catalog::CatalogError as CE;
+        match e {
+            // A name collision or a missing target is the caller's doing, not a server fault.
+            CE::AlreadyExists { object } => SqlError::AlreadyExists { detail: object },
+            CE::NotFound { object } => SqlError::UnknownObject {
+                kind: "object",
+                detail: object,
+            },
+            other => SqlError::Catalog(other.to_string()),
+        }
     }
 }
 
@@ -167,10 +181,11 @@ impl From<rubixdb::relational::RelationalError> for SqlError {
             RE::ResourceLimit { detail } => SqlError::ResourceLimit { detail },
             RE::Conflict { detail } => SqlError::Conflict { detail },
             RE::InvalidInput { detail } => SqlError::ExecutionParameter { detail },
-            RE::NotFound { .. }
-            | RE::Engine(_)
-            | RE::Catalog(_)
-            | RE::InvalidTransactionState { .. } => SqlError::Storage(e.to_string()),
+            // e.g. `CREATE INDEX` on a name already taken: classified exactly like a direct catalog error.
+            RE::Catalog(ce) => SqlError::from(ce),
+            RE::NotFound { .. } | RE::Engine(_) | RE::InvalidTransactionState { .. } => {
+                SqlError::Storage(e.to_string())
+            }
         }
     }
 }

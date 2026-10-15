@@ -161,7 +161,7 @@ export function SqlConsolePage() {
         message = "Cancelled.";
       } else if (err instanceof ApiRequestError) {
         // Only the API's own sanitized code/message/detail -- never the raw error object.
-        message = `${err.code}: ${err.message}${err.detail ? ` (${err.detail})` : ""}`;
+        message = `${err.code}: ${err.message}${err.detail ? ` (${err.detail})` : ""}${err.hint ? ` — ${err.hint}` : ""}`;
         if (err.code === "SESSION_NOT_FOUND") {
           // The server no longer knows this session (expired or the transaction already ended
           // some other way) -- forget it client-side too rather than keep retrying a dead id.
@@ -418,7 +418,19 @@ function ResultsView({
     case "ddl":
       return (
         <div className="sqlc-message">
-          <p>OK.</p>
+          <p>
+            <strong>Query execution completed.</strong>
+          </p>
+          <p>{r.message ?? "OK."}</p>
+        </div>
+      );
+    case "use_schema":
+      return (
+        <div className="sqlc-message">
+          <p>
+            <strong>Query execution completed.</strong>
+          </p>
+          <p>{r.message}</p>
         </div>
       );
     case "explain":

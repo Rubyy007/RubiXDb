@@ -194,6 +194,14 @@ pub enum Expr {
         subquery: Box<QueryExpr>,
         negated: bool,
     },
+    /// `expr <op> ANY|SOME|ALL (SELECT ...)`: `op` is one of the six
+    /// comparisons; `all` distinguishes `ALL` from `ANY` / `SOME`.
+    Quantified {
+        expr: Box<Expr>,
+        op: BinaryOp,
+        all: bool,
+        subquery: Box<QueryExpr>,
+    },
 }
 
 /// SQL-mission-1: a query used as a value or a relation (a subquery, a CTE
@@ -226,6 +234,9 @@ pub enum WindowFunction {
 pub struct WindowCall {
     pub function: WindowFunction,
     pub over: WindowOver,
+    /// `IGNORE NULLS` written after the call (`LAG(x) IGNORE NULLS OVER (...)`).
+    /// `RESPECT NULLS`, the default, is `false`.
+    pub ignore_nulls: bool,
 }
 
 /// The `OVER` clause: a name defined by `WINDOW`, or an inline specification.
@@ -249,6 +260,9 @@ pub struct WindowSpec {
 pub enum FrameUnits {
     Rows,
     Range,
+    /// `GROUPS`: offsets count peer groups (rows equal under the window's
+    /// `ORDER BY`), PostgreSQL 11+.
+    Groups,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -383,6 +397,10 @@ pub struct SetOperation {
     /// `ALL`: multiset semantics, no duplicate removal. `false` is the
     /// default (and `DISTINCT`) quantifier.
     pub all: bool,
+    /// `UNION [ALL] BY NAME`: the operands' columns are matched by **name**, not
+    /// by position (a column one operand lacks is `NULL` there). Snowflake and
+    /// DuckDB spelling; only `UNION` has it.
+    pub by_name: bool,
     pub left: Box<Select>,
     pub right: Box<Select>,
 }
@@ -403,6 +421,9 @@ pub struct Select {
     pub from: Option<FromClause>,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,
+    /// `GROUP BY ALL` (Snowflake): group by every select-list item that is not an
+    /// aggregate or window function call. `group_by` and `grouping` are then empty.
+    pub group_by_all: bool,
     /// SQL-mission-2: `Some` when the `GROUP BY` uses `ROLLUP`, `CUBE` or
     /// `GROUPING SETS`; it then holds *every* element of the clause in written
     /// order (plain expressions included) and `group_by` is empty.
@@ -421,11 +442,23 @@ impl Select {
     /// `left <op> [ALL] right` as a query of its own: no clauses besides the
     /// operation (the caller attaches `WITH` / `ORDER BY` / `LIMIT`).
     pub fn set_operation(op: SetOperator, all: bool, left: Select, right: Select) -> Select {
+        Self::set_operation_with(op, all, false, left, right)
+    }
+
+    /// `set_operation` with the `BY NAME` flag.
+    pub fn set_operation_with(
+        op: SetOperator,
+        all: bool,
+        by_name: bool,
+        left: Select,
+        right: Select,
+    ) -> Select {
         Select {
             ctes: Vec::new(),
             set_op: Some(SetOperation {
                 op,
                 all,
+                by_name,
                 left: Box::new(left),
                 right: Box::new(right),
             }),
@@ -434,6 +467,7 @@ impl Select {
             from: None,
             selection: None,
             group_by: Vec::new(),
+            group_by_all: false,
             grouping: None,
             having: None,
             qualify: None,
@@ -450,10 +484,46 @@ pub struct Insert {
     /// A `WITH` list written before the statement (SQL-mission-1 Slice C).
     pub ctes: Vec<Cte>,
     pub table: ObjectName,
+    /// `INSERT INTO t AS alias`: the name the existing row goes by in
+    /// `ON CONFLICT DO UPDATE` and `RETURNING`.
+    pub table_alias: Option<Ident>,
     /// `None` = every column, in catalog ordinal order (`INSERT INTO t
     /// VALUES (...)`); `Some` = the explicit `(col, ...)` list.
     pub columns: Option<Vec<Ident>>,
+    /// The `VALUES` tuples (empty when the rows come from `query`).
     pub rows: Vec<Vec<Expr>>,
+    /// SQL Phase 2a: `INSERT ... SELECT` -- the query whose rows are inserted.
+    pub query: Option<Box<Select>>,
+    /// SQL Phase 2a: `ON CONFLICT [target] DO NOTHING | DO UPDATE ...`.
+    pub on_conflict: Option<OnConflict>,
+    /// SQL Phase 2a: `RETURNING <select list>`.
+    pub returning: Option<Vec<SelectItem>>,
+}
+
+/// What an `ON CONFLICT` clause names as the unique constraint it arbitrates on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictTarget {
+    /// `(col, ...)`: the unique constraint or unique index over exactly these columns.
+    Columns(Vec<Ident>),
+    /// `ON CONSTRAINT name`: a primary key (`<table>_pkey`) or unique index by name.
+    Constraint(Ident),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictAction {
+    DoNothing,
+    /// `DO UPDATE SET ... [WHERE ...]`: the existing row is `table` (or its alias),
+    /// the proposed row is `EXCLUDED`.
+    DoUpdate {
+        assignments: Vec<Assignment>,
+        selection: Option<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    pub target: Option<ConflictTarget>,
+    pub action: ConflictAction,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -469,6 +539,8 @@ pub struct Update {
     pub table: ObjectName,
     pub assignments: Vec<Assignment>,
     pub selection: Option<Expr>,
+    /// SQL Phase 2a: `RETURNING <select list>` (the updated rows' new values).
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -477,6 +549,8 @@ pub struct Delete {
     pub ctes: Vec<Cte>,
     pub table: ObjectName,
     pub selection: Option<Expr>,
+    /// SQL Phase 2a: `RETURNING <select list>` (the deleted rows' values).
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 /// RubiXDB's own closed SQL type-name set — D4's type system, named at
@@ -532,6 +606,14 @@ pub struct DropTable {
 pub struct CreateDatabase {
     pub name: Ident,
     pub if_not_exists: bool,
+}
+
+/// `USE SCHEMA [db.]schema` -- a session command: it changes which schema unqualified names resolve
+/// against, nothing else. The API/CLI/IDE carry the chosen schema from request to request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseSchema {
+    /// `schema` or `db.schema`.
+    pub name: ObjectName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -590,6 +672,9 @@ pub enum Statement {
     CreateDatabase(CreateDatabase),
     /// `CREATE SCHEMA` — PARSED, BOUND. NOT EXECUTABLE YET.
     CreateSchema(CreateSchema),
+    /// `USE SCHEMA` -- PARSED. Resolved by the caller before binding (`bind::scope::resolve_use_schema`);
+    /// binding it is a controlled refusal, never a statement the planner or executor sees.
+    UseSchema(UseSchema),
     /// `CREATE TABLE` — PARSED, BOUND. NOT EXECUTABLE YET (the bound
     /// form is shaped to call `CatalogService::create_table` directly,
     /// item 25 — but this crate never calls it).

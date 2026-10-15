@@ -88,7 +88,7 @@ impl Manifest {
     /// something this function can observe) — documented, not silently
     /// assumed.
     pub fn open_after_exclusive_lock(dir: &Path) -> Result<(Manifest, ManifestReplayResult)> {
-        crate::persist::create_dir_all(dir)?;
+        crate::persist::create_dir_all_durable(dir)?;
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         let mut file = OpenOptions::new()
             .create(true)
@@ -96,6 +96,9 @@ impl Manifest {
             .read(true)
             .write(true)
             .open(&manifest_path)?;
+        // ADR-DATA-DIR-DURABILITY-01: the MANIFEST entry itself. Synced on every open (not only when the file was created) so
+        // that an earlier attempt that created it but failed before syncing is repaired. A no-op on Windows (assumption W1).
+        crate::persist::sync_dir(dir)?;
 
         let replay_result = recovery::replay(&mut file)?;
         if replay_result.truncated {

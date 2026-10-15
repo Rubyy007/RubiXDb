@@ -664,6 +664,47 @@
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
+.ide-schema {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.ide-schema[data-chosen="true"] {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+.ide-error-hint {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.ide-error-hint code {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg-card);
+}
+.ide-done {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px var(--space-3);
+  border-left: 3px solid var(--color-healthy);
+  background: var(--bg-card);
+}
+.ide-done.is-noop {
+  border-left-color: var(--text-secondary);
+}
+.ide-done-title {
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--color-healthy);
+}
+.ide-done.is-noop .ide-done-title {
+  color: var(--text-secondary);
+}
 .ide-error-meta {
   margin-top: 4px;
   font-size: 12px;

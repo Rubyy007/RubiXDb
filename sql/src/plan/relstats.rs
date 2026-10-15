@@ -41,7 +41,8 @@ pub fn defined_ctes(plan: &Plan) -> u32 {
         | Plan::Update { defined_ctes, .. }
         | Plan::Delete { defined_ctes, .. } => *defined_ctes,
         Plan::Explain(inner) => defined_ctes(inner),
-        Plan::Insert(_) | Plan::Ddl(_) | Plan::Begin | Plan::Commit | Plan::Rollback => 0,
+        Plan::Insert(insert) => insert.defined_ctes,
+        Plan::Ddl(_) | Plan::Begin | Plan::Commit | Plan::Rollback => 0,
     }
 }
 
@@ -59,7 +60,12 @@ pub fn plan_stats(plan: &Plan) -> RelationStats {
         }
         Plan::Delete { access, .. } => walk_exprs(access_exprs(access), 0, &mut stats),
         Plan::Explain(inner) => return plan_stats(inner),
-        Plan::Insert(_) | Plan::Ddl(_) | Plan::Begin | Plan::Commit | Plan::Rollback => {}
+        Plan::Insert(insert) => {
+            if let Some(plan) = insert.select.as_ref().and_then(|s| s.plan.as_ref()) {
+                walk(plan, 0, &mut stats);
+            }
+        }
+        Plan::Ddl(_) | Plan::Begin | Plan::Commit | Plan::Rollback => {}
     }
     stats
 }
@@ -135,11 +141,11 @@ fn walk(plan: &PhysicalPlan, depth: usize, stats: &mut RelationStats) {
             walk_exprs(group_by.iter(), depth, stats);
             walk_exprs(
                 aggregates.iter().flat_map(|a| {
-                    let arg = match &a.arg {
-                        crate::aggregate::AggregateArg::Expr(e) => Some(e.as_ref()),
-                        crate::aggregate::AggregateArg::Wildcard => None,
-                    };
-                    arg.into_iter().chain(a.filter.as_deref())
+                    a.arg
+                        .exprs()
+                        .iter()
+                        .map(|e| e.as_ref())
+                        .chain(a.filter.as_deref())
                 }),
                 depth,
                 stats,

@@ -70,6 +70,29 @@ pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Sta
                 if_not_exists: *if_not_exists,
             }))
         }
+        sp::Statement::Use(u) => match u {
+            sp::Use::Schema(name) => {
+                let name = convert_object_name(name, limits)?;
+                if name.0.len() > 2 {
+                    return Err(SqlError::InvalidIdentifier {
+                        detail: format!(
+                            "USE SCHEMA name has {} parts; use schema or default.schema",
+                            name.0.len()
+                        ),
+                    });
+                }
+                Ok(Statement::UseSchema(UseSchema { name }))
+            }
+            sp::Use::Database(_) | sp::Use::Catalog(_) => Err(SqlError::UnsupportedExecution {
+                detail: "USE DATABASE is disabled. Active database is locked to 'default'. Use USE SCHEMA <schema_name> to switch working namespaces."
+                    .to_string(),
+            }),
+            sp::Use::Object(_) | sp::Use::Default => Err(SqlError::UnsupportedExecution {
+                detail: "USE needs a target. Use USE SCHEMA <schema_name> to switch working namespaces."
+                    .to_string(),
+            }),
+            _ => Err(unsupported("this USE form")),
+        },
         sp::Statement::CreateDatabase {
             db_name,
             if_not_exists,
@@ -244,7 +267,9 @@ fn convert_query_statement(q: &sp::Query, dg: &DepthGuard) -> Result<Statement> 
         || !q.locks.is_empty()
         || q.for_clause.is_some()
     {
-        return Err(unsupported("ORDER BY/LIMIT/FETCH/FOR on a data-modification statement"));
+        return Err(unsupported(
+            "ORDER BY/LIMIT/FETCH/FOR on a data-modification statement",
+        ));
     }
     let ctes = convert_with(q.with.as_ref(), dg, 0)?;
     match inner {
@@ -263,7 +288,9 @@ fn convert_query_statement(q: &sp::Query, dg: &DepthGuard) -> Result<Statement> 
             i.ctes = ctes;
             Ok(Statement::Insert(i))
         }
-        _ => Err(unsupported("statement kind not in the approved grammar subset")),
+        _ => Err(unsupported(
+            "statement kind not in the approved grammar subset",
+        )),
     }
 }
 
@@ -377,15 +404,22 @@ fn convert_set_operation(body: &sp::SetExpr, dg: &DepthGuard, depth: usize) -> R
             sp::SetOperator::Union => SetOperator::Union,
             sp::SetOperator::Intersect => SetOperator::Intersect,
             sp::SetOperator::Except => SetOperator::Except,
-            sp::SetOperator::Minus => return Err(unsupported("MINUS (use EXCEPT)")),
+            // Snowflake's name for EXCEPT; the two are interchangeable.
+            sp::SetOperator::Minus => SetOperator::Except,
         };
-        let all = match quantifier {
-            sp::SetQuantifier::None | sp::SetQuantifier::Distinct => false,
-            sp::SetQuantifier::All => true,
-            _ => return Err(unsupported("BY NAME set operations")),
+        let (all, by_name) = match quantifier {
+            sp::SetQuantifier::None | sp::SetQuantifier::Distinct => (false, false),
+            sp::SetQuantifier::All => (true, false),
+            sp::SetQuantifier::ByName | sp::SetQuantifier::DistinctByName => (false, true),
+            sp::SetQuantifier::AllByName => (true, true),
         };
+        if by_name && op != SetOperator::Union {
+            return Err(unsupported(
+                "BY NAME with INTERSECT / EXCEPT / MINUS (only UNION has it)",
+            ));
+        }
         let right = convert_set_operand(right, dg, depth + 1)?;
-        acc = Select::set_operation(op, all, acc, right);
+        acc = Select::set_operation_with(op, all, by_name, acc, right);
     }
     Ok(acc)
 }
@@ -465,8 +499,17 @@ fn convert_select_core(
             "SELECT with TOP/INTO/LATERAL/PREWHERE/CONNECT BY/CLUSTER BY/DISTRIBUTE BY/SORT BY/value-table-mode/EXCLUDE",
         ));
     }
+    let mut group_by_all = false;
     let (group_by, grouping) = match &select.group_by {
-        sp::GroupByExpr::All(_) => return Err(unsupported("GROUP BY ALL")),
+        sp::GroupByExpr::All(modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(unsupported(
+                    "GROUP BY ALL with WITH ROLLUP / WITH CUBE / WITH TOTALS modifiers",
+                ));
+            }
+            group_by_all = true;
+            (Vec::new(), None)
+        }
         sp::GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
                 return Err(unsupported(
@@ -562,6 +605,7 @@ fn convert_select_core(
         from,
         selection,
         group_by,
+        group_by_all,
         grouping,
         having,
         qualify,
@@ -650,7 +694,7 @@ fn convert_frame(f: &sp::WindowFrame, dg: &DepthGuard, depth: usize) -> Result<F
     let units = match f.units {
         sp::WindowFrameUnits::Rows => FrameUnits::Rows,
         sp::WindowFrameUnits::Range => FrameUnits::Range,
-        sp::WindowFrameUnits::Groups => return Err(unsupported("GROUPS window frames")),
+        sp::WindowFrameUnits::Groups => FrameUnits::Groups,
     };
     let bound = |b: &sp::WindowFrameBound| -> Result<FrameBound> {
         Ok(match b {
@@ -698,9 +742,7 @@ fn convert_window_function(
     dg: &DepthGuard,
     depth: usize,
 ) -> Result<Expr> {
-    if f.null_treatment.is_some() {
-        return Err(unsupported("IGNORE NULLS / RESPECT NULLS on a window function"));
-    }
+    let ignore_nulls = matches!(f.null_treatment, Some(sp::NullTreatment::IgnoreNulls));
     let over = match over {
         sp::WindowType::NamedWindow(n) => WindowOver::Named(convert_ident(n, dg.limits)?),
         sp::WindowType::WindowSpec(spec) => {
@@ -722,7 +764,9 @@ fn convert_window_function(
             }
         } else if WINDOW_ONLY_FUNCTIONS.contains(&lower.as_str()) {
             if f.filter.is_some() {
-                return Err(unsupported("FILTER on a window function that is not an aggregate"));
+                return Err(unsupported(
+                    "FILTER on a window function that is not an aggregate",
+                ));
             }
             let args = match &f.args {
                 sp::FunctionArguments::None => Vec::new(),
@@ -758,7 +802,11 @@ fn convert_window_function(
     } else {
         return Err(not_a_window_function());
     };
-    Ok(Expr::Window(Box::new(WindowCall { function, over })))
+    Ok(Expr::Window(Box::new(WindowCall {
+        function,
+        over,
+        ignore_nulls,
+    })))
 }
 
 /// The argument, `DISTINCT` flag and `FILTER` clause of an aggregate call
@@ -781,7 +829,10 @@ fn convert_aggregate_call(
         .transpose()?;
     match &f.args {
         sp::FunctionArguments::None => Err(SqlError::TypeMismatch {
-            detail: format!("aggregate function {} requires an argument", agg_func.name()),
+            detail: format!(
+                "aggregate function {} requires an argument",
+                agg_func.name()
+            ),
         }),
         sp::FunctionArguments::Subquery(_) => {
             Err(unsupported("function call with a bare subquery argument"))
@@ -798,17 +849,53 @@ fn convert_aggregate_call(
             );
             if list.args.is_empty() {
                 return Err(SqlError::TypeMismatch {
-                    detail: format!("aggregate function {} requires an argument", agg_func.name()),
+                    detail: format!(
+                        "aggregate function {} requires an argument",
+                        agg_func.name()
+                    ),
                 });
             }
             if list.args.len() > 1 {
-                return Err(SqlError::TypeMismatch {
-                    detail: format!(
-                        "aggregate function {} requires exactly 1 argument, found {}",
-                        agg_func.name(),
-                        list.args.len()
-                    ),
-                });
+                // `COUNT(a, b, ...)` / `COUNT(DISTINCT a, b, ...)`: the only
+                // aggregate that takes several expressions (Snowflake).
+                if agg_func != crate::aggregate::AggregateFunc::Count {
+                    return Err(SqlError::TypeMismatch {
+                        detail: format!(
+                            "aggregate function {} requires exactly 1 argument, found {}",
+                            agg_func.name(),
+                            list.args.len()
+                        ),
+                    });
+                }
+                if list.args.len() > dg.limits.max_columns {
+                    return Err(SqlError::ResourceLimit {
+                        detail: "COUNT has too many arguments".to_string(),
+                    });
+                }
+                let exprs = list
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                            convert_expr(e, dg, depth + 1).map(Box::new)
+                        }
+                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
+                            Err(SqlError::TypeMismatch {
+                                detail:
+                                    "COUNT(*) takes no other argument; name the columns to count"
+                                        .to_string(),
+                            })
+                        }
+                        _ => Err(unsupported(
+                            "named or qualified wildcard function arguments",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok((
+                    crate::aggregate::AggregateArg::Multi(exprs),
+                    distinct,
+                    filter,
+                ));
             }
             match &list.args[0] {
                 sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
@@ -836,7 +923,9 @@ fn convert_aggregate_call(
                         filter,
                     ))
                 }
-                _ => Err(unsupported("named or qualified wildcard function arguments")),
+                _ => Err(unsupported(
+                    "named or qualified wildcard function arguments",
+                )),
             }
         }
     }
@@ -1006,10 +1095,7 @@ impl IntoKindOnly for SqlError {
     }
 }
 
-fn convert_table_alias(
-    alias: &sp::TableAlias,
-    limits: &SqlLimits,
-) -> Result<(Ident, Vec<Ident>)> {
+fn convert_table_alias(alias: &sp::TableAlias, limits: &SqlLimits) -> Result<(Ident, Vec<Ident>)> {
     let columns = alias
         .columns
         .iter()
@@ -1081,16 +1167,17 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
         || !insert.assignments.is_empty()
         || insert.partitioned.is_some()
         || !insert.after_columns.is_empty()
-        || insert.on.is_some()
-        || insert.returning.is_some()
         || insert.replace_into
         || insert.priority.is_some()
         || insert.settings.is_some()
         || insert.format_clause.is_some()
     {
         return Err(unsupported(
-            "INSERT with dialect-specific modifiers (OR/IGNORE/ON CONFLICT/RETURNING/...)",
+            "INSERT with dialect-specific modifiers (OR/IGNORE/REPLACE/SET/PARTITION/...)",
         ));
+    }
+    if insert.output.is_some() {
+        return Err(unsupported("INSERT ... OUTPUT"));
     }
     let sp::TableObject::TableName(table_name) = &insert.table else {
         return Err(unsupported("INSERT target must be a plain table name"));
@@ -1131,13 +1218,40 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
         .source
         .as_ref()
         .ok_or_else(|| unsupported("INSERT ... DEFAULT VALUES / SET form"))?;
+    let table_alias = insert
+        .table_alias
+        .as_ref()
+        .map(|a| convert_ident(&a.alias, dg.limits))
+        .transpose()?;
+    let on_conflict = insert
+        .on
+        .as_ref()
+        .map(|on| convert_on_insert(on, dg))
+        .transpose()?;
+    let returning = insert
+        .returning
+        .as_ref()
+        .map(|items| convert_returning(items, dg))
+        .transpose()?;
+    // `INSERT ... SELECT`: any query body but a bare `VALUES` list.
+    if !matches!(source.body.as_ref(), sp::SetExpr::Values(_)) {
+        let query = convert_query(source, dg, 1)?;
+        return Ok(Insert {
+            ctes: Vec::new(),
+            table,
+            table_alias,
+            columns,
+            rows: Vec::new(),
+            query: Some(Box::new(query)),
+            on_conflict,
+            returning,
+        });
+    }
     if source.with.is_some() || source.order_by.is_some() || source.limit_clause.is_some() {
-        return Err(unsupported("INSERT ... SELECT with WITH/ORDER BY/LIMIT"));
+        return Err(unsupported("INSERT ... VALUES with WITH/ORDER BY/LIMIT"));
     }
     let sp::SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(unsupported(
-            "INSERT source must be a VALUES list (no INSERT ... SELECT)",
-        ));
+        unreachable!("checked above: the body is a VALUES list");
     };
     if values.rows.len() > dg.limits.max_values_rows {
         return Err(SqlError::ResourceLimit {
@@ -1169,14 +1283,90 @@ fn convert_insert(insert: &sp::Insert, dg: &DepthGuard) -> Result<Insert> {
     Ok(Insert {
         ctes: Vec::new(),
         table,
+        table_alias,
         columns,
         rows,
+        query: None,
+        on_conflict,
+        returning,
     })
 }
 
+/// `RETURNING <select list>` of an `INSERT` / `UPDATE` / `DELETE`.
+fn convert_returning(
+    items: &[sp::SelectItem],
+    dg: &DepthGuard,
+) -> Result<Vec<SelectItem>> {
+    if items.len() > dg.limits.max_columns {
+        return Err(SqlError::ResourceLimit {
+            detail: format!(
+                "RETURNING list exceeds max_columns ({})",
+                dg.limits.max_columns
+            ),
+        });
+    }
+    items
+        .iter()
+        .map(|item| convert_select_item(item, dg, 1))
+        .collect()
+}
+
+/// `ON CONFLICT [target] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (PostgreSQL 18).
+/// MySQL's `ON DUPLICATE KEY UPDATE` is a different statement and stays refused.
+fn convert_on_insert(on: &sp::OnInsert, dg: &DepthGuard) -> Result<OnConflict> {
+    let sp::OnInsert::OnConflict(oc) = on else {
+        return Err(unsupported(
+            "ON DUPLICATE KEY UPDATE (use ON CONFLICT ... DO UPDATE)",
+        ));
+    };
+    let target = match &oc.conflict_target {
+        None => None,
+        Some(sp::ConflictTarget::Columns(cols)) => {
+            if cols.is_empty() || cols.len() > dg.limits.max_columns {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: "an ON CONFLICT target names between 1 and max_columns columns"
+                        .to_string(),
+                });
+            }
+            Some(ConflictTarget::Columns(
+                cols.iter()
+                    .map(|c| convert_ident(c, dg.limits))
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        }
+        Some(sp::ConflictTarget::OnConstraint(name)) => {
+            let converted = convert_object_name(name, dg.limits)?;
+            if converted.0.len() != 1 {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: "an ON CONFLICT ON CONSTRAINT name must not be qualified".to_string(),
+                });
+            }
+            Some(ConflictTarget::Constraint(
+                converted.0.into_iter().next().expect("checked len 1"),
+            ))
+        }
+    };
+    let action = match &oc.action {
+        sp::OnConflictAction::DoNothing => ConflictAction::DoNothing,
+        sp::OnConflictAction::DoUpdate(du) => ConflictAction::DoUpdate {
+            assignments: du
+                .assignments
+                .iter()
+                .map(|a| convert_assignment(a, dg))
+                .collect::<Result<Vec<_>>>()?,
+            selection: du
+                .selection
+                .as_ref()
+                .map(|e| convert_expr(e, dg, 1))
+                .transpose()?,
+        },
+    };
+    Ok(OnConflict { target, action })
+}
+
 fn convert_update(update: &sp::Update, dg: &DepthGuard) -> Result<Update> {
-    if update.from.is_some() || update.returning.is_some() {
-        return Err(unsupported("UPDATE ... FROM / RETURNING"));
+    if update.from.is_some() {
+        return Err(unsupported("UPDATE ... FROM"));
     }
     let table = convert_table_factor(&update.table.relation, dg, 1)?;
     if table.derived.is_some() {
@@ -1195,11 +1385,17 @@ fn convert_update(update: &sp::Update, dg: &DepthGuard) -> Result<Update> {
         .as_ref()
         .map(|e| convert_expr(e, dg, 1))
         .transpose()?;
+    let returning = update
+        .returning
+        .as_ref()
+        .map(|items| convert_returning(items, dg))
+        .transpose()?;
     Ok(Update {
         ctes: Vec::new(),
         table: table.name,
         assignments,
         selection,
+        returning,
     })
 }
 
@@ -1222,12 +1418,11 @@ fn convert_assignment(a: &sp::Assignment, dg: &DepthGuard) -> Result<Assignment>
 fn convert_delete(delete: &sp::Delete, dg: &DepthGuard) -> Result<Delete> {
     if !delete.tables.is_empty()
         || delete.using.is_some()
-        || delete.returning.is_some()
         || !delete.order_by.is_empty()
         || delete.limit.is_some()
     {
         return Err(unsupported(
-            "DELETE with USING/RETURNING/ORDER BY/LIMIT/multi-table form",
+            "DELETE with USING/ORDER BY/LIMIT/multi-table form",
         ));
     }
     let sp::FromTable::WithFromKeyword(from) = &delete.from else {
@@ -1247,10 +1442,16 @@ fn convert_delete(delete: &sp::Delete, dg: &DepthGuard) -> Result<Delete> {
         .as_ref()
         .map(|e| convert_expr(e, dg, 1))
         .transpose()?;
+    let returning = delete
+        .returning
+        .as_ref()
+        .map(|items| convert_returning(items, dg))
+        .transpose()?;
     Ok(Delete {
         ctes: Vec::new(),
         table: table.name,
         selection,
+        returning,
     })
 }
 
@@ -1407,6 +1608,17 @@ fn convert_expr(e: &sp::Expr, dg: &DepthGuard, depth: usize) -> Result<Expr> {
             subquery: Box::new(convert_subquery(subquery, dg, depth + 1)?),
             negated: *negated,
         }),
+        sp::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => convert_quantified(left, compare_op, right, false, dg, depth),
+        sp::Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => convert_quantified(left, compare_op, right, true, dg, depth),
         sp::Expr::InSubquery {
             expr,
             subquery,
@@ -1463,6 +1675,38 @@ fn convert_unary_op(
         sp::UnaryOperator::Plus => convert_expr(inner, dg, depth + 1),
         other => Err(unsupported(format!("unary operator: {other:?}"))),
     }
+}
+
+/// `left <op> ANY|SOME|ALL (subquery)`. Only the six comparison operators and
+/// only a subquery on the right (not an array) are accepted.
+fn convert_quantified(
+    left: &sp::Expr,
+    op: &sp::BinaryOperator,
+    right: &sp::Expr,
+    all: bool,
+    dg: &DepthGuard,
+    depth: usize,
+) -> Result<Expr> {
+    let op = match convert_binary_op(op)? {
+        o @ (BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Lt
+        | BinaryOp::LtEq
+        | BinaryOp::Gt
+        | BinaryOp::GtEq) => o,
+        _ => return Err(unsupported("ANY / ALL with a non-comparison operator")),
+    };
+    let sp::Expr::Subquery(q) = right else {
+        return Err(unsupported(
+            "ANY / ALL over something other than a subquery (arrays)",
+        ));
+    };
+    Ok(Expr::Quantified {
+        expr: Box::new(convert_expr(left, dg, depth + 1)?),
+        op,
+        all,
+        subquery: Box::new(convert_subquery(q, dg, depth + 1)?),
+    })
 }
 
 fn convert_binary_op(op: &sp::BinaryOperator) -> Result<BinaryOp> {
@@ -1565,7 +1809,12 @@ fn convert_typed_string(ts: &sp::TypedString) -> Result<Expr> {
 }
 
 fn convert_function(f: &sp::Function, dg: &DepthGuard, depth: usize) -> Result<Expr> {
-    if f.uses_odbc_syntax || !f.within_group.is_empty() || f.null_treatment.is_some() {
+    // `IGNORE NULLS` / `RESPECT NULLS` belong to window functions only
+    // (`LAG(x) IGNORE NULLS OVER (...)`); on any other call they are refused.
+    if f.uses_odbc_syntax
+        || !f.within_group.is_empty()
+        || (f.null_treatment.is_some() && f.over.is_none())
+    {
         return Err(unsupported(
             "function call with ODBC/WITHIN GROUP/null-treatment modifiers",
         ));

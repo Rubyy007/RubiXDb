@@ -2217,8 +2217,9 @@ async fn set_operation_errors_and_limits_over_http() {
 
     // Spellings outside the grammar fail closed.
     for sql in [
-        "SELECT v FROM sa MINUS SELECT v FROM sc",
-        "SELECT v FROM sa UNION BY NAME SELECT v FROM sc",
+        // SQL Phase 1 implemented `MINUS` and `UNION BY NAME` (`api_sql_phase1.rs`); BY NAME
+        // stays refused for the operators that do not have it.
+        "SELECT v FROM sa INTERSECT BY NAME SELECT v FROM sc",
         "VALUES (1) UNION SELECT v FROM sc",
     ] {
         let (status, body) = err(sql.to_string()).await;

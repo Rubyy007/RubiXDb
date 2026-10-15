@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { SqlColumnMeta } from "../api/types";
 import { ResultsGrid } from "../components/console/ResultsGrid";
 import { toCsv } from "../utils/csv";
@@ -291,23 +291,58 @@ function ResultBody({
     }
     case "write":
       return (
-        <p className="ide-write">
-          <strong>{result.statement}</strong> — {result.rows_affected.toLocaleString()} row{result.rows_affected === 1 ? "" : "s"} affected.
-        </p>
+        <Done>
+          <p className="ide-write">
+            <strong>{result.statement}</strong> — {result.rows_affected.toLocaleString()} row{result.rows_affected === 1 ? "" : "s"} affected.
+          </p>
+        </Done>
       );
     case "ddl":
-      return <p className="ide-write">OK.</p>;
+      // `changed: false` is an IF [NOT] EXISTS no-op: it succeeded and did nothing, which the line says.
+      return (
+        <Done noop={result.changed === false}>
+          <p className="ide-write">{result.message ?? "OK."}</p>
+        </Done>
+      );
+    case "use_schema":
+      return (
+        <Done>
+          <p className="ide-write">{result.message}</p>
+        </Done>
+      );
     case "explain":
       return <PlanTree text={result.plan_text} />;
     case "begin":
-      return <p className="ide-write">Transaction started.</p>;
+      return (
+        <Done>
+          <p className="ide-write">Transaction started.</p>
+        </Done>
+      );
     case "commit":
-      return <p className="ide-write">Transaction committed.</p>;
+      return (
+        <Done>
+          <p className="ide-write">Transaction committed.</p>
+        </Done>
+      );
     case "rollback":
-      return <p className="ide-write">Transaction rolled back.</p>;
+      return (
+        <Done>
+          <p className="ide-write">Transaction rolled back.</p>
+        </Done>
+      );
     default:
       return null;
   }
+}
+
+/** The success banner of a statement that returns no rows: says what completed, never a bare "OK". */
+function Done({ children, noop = false }: { children: ReactNode; noop?: boolean }) {
+  return (
+    <div className={`ide-done${noop ? " is-noop" : ""}`} role="status">
+      <strong className="ide-done-title">{noop ? "Query execution completed — nothing changed" : "Query execution completed"}</strong>
+      {children}
+    </div>
+  );
 }
 
 function EmptyGrid({ columns, ms }: { columns: SqlColumnMeta[]; ms: number | undefined }) {

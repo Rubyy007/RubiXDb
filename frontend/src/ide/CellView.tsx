@@ -9,6 +9,8 @@ import { editorId, useIde } from "./ideContext";
 import { formatAge, formatMs } from "./format";
 import { isTxn, type IdeCell, type TxnBlock } from "./model";
 import { OutputPanel } from "./OutputPanel";
+import type { CatalogLists } from "./completion";
+import { missingKind, suggestNames } from "./didYouMean";
 import type { CellRun, RunError } from "./runner";
 
 const STATUS_LABEL: Record<CellRun["status"], string> = {
@@ -75,8 +77,19 @@ function jumpTarget(detail: string | undefined): { line: number; col: number } |
   return m ? { line: Number(m[1]), col: m[2] ? Number(m[2]) : 1 } : null;
 }
 
+/** Names from the loaded catalog that look like the one a NOT_FOUND error could not find. */
+function nearNames(error: RunError, catalog: CatalogLists): string[] {
+  if (error.code !== "NOT_FOUND" || !error.detail) return [];
+  const kind = missingKind(error.message);
+  const typed = error.detail.split(".").pop() ?? error.detail;
+  if (kind === "schema") return suggestNames(typed, catalog.schemas.map((s) => s.name));
+  if (kind === "table") return suggestNames(typed, catalog.tables.map((t) => t.name));
+  return [];
+}
+
 function ErrorPane({ cellId, error, ms }: { cellId: string; error: RunError; ms?: number }) {
   const ide = useIde();
+  const near = nearNames(error, ide.catalog);
   const rel = jumpTarget(error.detail);
   // The server reports the position inside the one statement it received; map it back to the cell.
   const target = rel ? (error.statement ? cellPosition(error.statement, rel.line, rel.col) : rel) : null;
@@ -95,6 +108,23 @@ function ErrorPane({ cellId, error, ms }: { cellId: string; error: RunError; ms?
         </div>
       )}
       {error.detail && <div className="ide-error-detail">{error.detail}</div>}
+      {near.length > 0 && (
+        <div className="ide-error-hint">
+          Did you mean{" "}
+          {near.map((n, i) => (
+            <span key={n}>
+              {i > 0 ? ", " : ""}
+              <code className="text-mono">{n}</code>
+            </span>
+          ))}
+          ?
+        </div>
+      )}
+      {error.hint && (
+        <div className="ide-error-hint" data-testid="error-hint">
+          <strong>What to do:</strong> {error.hint}
+        </div>
+      )}
       <div className="ide-error-meta text-mono">
         {error.http !== undefined ? `HTTP ${error.http}` : "no HTTP response"}
         {ms !== undefined ? ` · ${formatMs(ms)}` : ""}
@@ -130,17 +160,17 @@ function SqlCell({ cell, txnId }: { cell: IdeCell; txnId: string | null }) {
   const canRun = hasSql(cell.text) && !active && !needsSession;
   const runTitle = needsSession ? "Begin the transaction first" : "Run the statement at the cursor (Ctrl+Enter). Run all: Ctrl+Shift+Enter";
 
-  const { catalog, fetchColumnInfo, setCursor, autoUpper, catalogUpdatedAt } = ide;
+  const { catalog, fetchColumnInfo, setCursor, autoUpper, catalogUpdatedAt, activeSchema } = ide;
   const cellId = cell.id;
   const catalogSig = catalog.tables.map((t) => `${t.id}:${t.name}`).join(",");
   useEffect(() => {
     colsRef.current = {};
-  }, [catalogSig, catalogUpdatedAt]);
+  }, [catalogSig, catalogUpdatedAt, activeSchema]);
 
   /** Work out the suggestions for the caret; if some table's columns are still unknown, load them and look again. */
   const runSuggest = useCallback(
     (offset: number, value: string, manual = false) => {
-      const compute = () => suggest({ text: value, caret: offset, catalog, columns: (t) => colsRef.current[t], manual });
+      const compute = () => suggest({ text: value, caret: offset, catalog, columns: (t) => colsRef.current[t], manual, activeSchema });
       const show = (res: SuggestResult | null) =>
         setComp((cur) => {
           if (!res) return null;
@@ -151,7 +181,7 @@ function SqlCell({ cell, txnId }: { cell: IdeCell; txnId: string | null }) {
           return { res, index: res.auto ? -1 : 0 };
         });
       show(compute());
-      const missing = neededTables(value, offset, catalog).filter((t) => !colsRef.current[t]);
+      const missing = neededTables(value, offset, catalog, activeSchema).filter((t) => !colsRef.current[t]);
       const my = ++seq.current;
       if (missing.length) {
         void Promise.all(
@@ -163,7 +193,7 @@ function SqlCell({ cell, txnId }: { cell: IdeCell; txnId: string | null }) {
         });
       }
     },
-    [catalog, fetchColumnInfo],
+    [catalog, fetchColumnInfo, activeSchema],
   );
 
   const onCursor = useCallback(

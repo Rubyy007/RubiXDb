@@ -197,7 +197,7 @@ mod parser {
     #[test]
     fn what_stays_outside_the_grammar_is_a_typed_error() {
         for sql in [
-            "SELECT a FROM ag GROUP BY ALL",
+            // SQL Phase 1: `GROUP BY ALL` is implemented (`phase1_tests::group_by_all`).
             "SELECT a FROM ag GROUP BY a WITH ROLLUP",
             "SELECT COUNT(DISTINCT *) FROM ag",
             "SELECT abs(x) FILTER (WHERE x > 0) FROM ag",
@@ -642,16 +642,20 @@ mod exec_2e {
     }
 
     #[test]
-    fn a_correlated_subquery_over_a_grouped_column_is_refused_with_grouping_sets() {
+    fn a_correlated_subquery_over_a_grouped_column_works_with_grouping_sets() {
+        // SQL Phase 1 implemented what this test used to pin as refused (matrix F-5);
+        // `phase1_tests::grouping_sets::correlated_subqueries_see_omitted_columns_as_null`
+        // holds the semantics. What stays an error: a column that is not a grouping column.
         let db = grouped("agg_correlated_refused");
+        db.try_bind(
+            "SELECT (SELECT COUNT(*) FROM ag z WHERE z.a = ag.a) FROM ag GROUP BY ROLLUP (a)",
+        )
+        .unwrap();
         let err = bind_err(
             &db,
-            "SELECT (SELECT COUNT(*) FROM ag z WHERE z.a = ag.a) FROM ag GROUP BY ROLLUP (a)",
+            "SELECT (SELECT COUNT(*) FROM ag z WHERE z.a = ag.x) FROM ag GROUP BY ROLLUP (a)",
         );
-        assert!(
-            matches!(&err, SqlError::Unsupported { detail } if detail.contains("correlated subquery")),
-            "{err:?}"
-        );
+        assert!(matches!(err, SqlError::TypeMismatch { .. }), "{err:?}");
         db.cleanup();
     }
 
@@ -1106,10 +1110,15 @@ mod exec_2f {
         let err =
             parse_statement("SELECT COUNT(DISTINCT *) FROM ag", &SqlLimits::default()).unwrap_err();
         assert!(matches!(err, SqlError::TypeMismatch { .. }), "{err:?}");
-        let err = db
-            .try_bind("SELECT COUNT(DISTINCT x) OVER () FROM ag")
+        // SQL Phase 1: `COUNT(DISTINCT x) OVER (...)` is implemented (see
+        // `phase1_tests::window_distinct`); the refusal this assertion pinned is
+        // replaced by the still-refused forms next to it: a second argument on any
+        // aggregate but COUNT, and DISTINCT over a wildcard.
+        db.try_bind("SELECT COUNT(DISTINCT x) OVER () FROM ag")
+            .unwrap_or_else(|e| panic!("window DISTINCT binds now: {e:?}"));
+        let err = parse_statement("SELECT SUM(DISTINCT x, y) FROM ag", &SqlLimits::default())
             .unwrap_err();
-        assert!(matches!(err, SqlError::Unsupported { .. }), "{err:?}");
+        assert!(matches!(err, SqlError::TypeMismatch { .. }), "{err:?}");
         db.cleanup();
     }
 

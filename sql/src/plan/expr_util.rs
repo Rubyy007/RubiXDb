@@ -122,7 +122,7 @@ fn collect_table_refs(expr: &BoundExpr, out: &mut BTreeSet<u32>) {
             }
         }
         BoundExprKind::Aggregate(agg) => {
-            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+            for e in agg.arg.exprs() {
                 collect_table_refs(e, out);
             }
             if let Some(f) = &agg.filter {
@@ -218,7 +218,7 @@ fn collect_ordinals(expr: &BoundExpr, table_ref: u32, out: &mut BTreeSet<u16>) {
             }
         }
         BoundExprKind::Aggregate(agg) => {
-            if let crate::aggregate::AggregateArg::Expr(e) = &agg.arg {
+            for e in agg.arg.exprs() {
                 collect_ordinals(e, table_ref, out);
             }
             if let Some(f) = &agg.filter {
@@ -316,7 +316,7 @@ where
             Ok(())
         }
         BoundExprKind::Aggregate(agg) => {
-            if let crate::aggregate::AggregateArg::Expr(e) = &mut agg.arg {
+            for e in agg.arg.exprs_mut() {
                 for_each_subquery_mut(e, f)?;
             }
             if let Some(filter) = &mut agg.filter {
@@ -375,10 +375,8 @@ pub fn contains_subquery(expr: &BoundExpr) -> bool {
         }
         BoundExprKind::Function { args, .. } => args.iter().any(contains_subquery),
         BoundExprKind::Aggregate(agg) => {
-            (match &agg.arg {
-                crate::aggregate::AggregateArg::Expr(e) => contains_subquery(e),
-                crate::aggregate::AggregateArg::Wildcard => false,
-            }) || agg.filter.as_deref().is_some_and(contains_subquery)
+            agg.arg.exprs().iter().any(|e| contains_subquery(e))
+                || agg.filter.as_deref().is_some_and(contains_subquery)
         }
     }
 }

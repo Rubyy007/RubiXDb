@@ -15,7 +15,7 @@
 //! ANSI-standard behavior, not a Postgres-only extension, so
 //! `GenericDialect` already provides it.
 
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{Dialect, GenericDialect, SnowflakeDialect};
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, Tokenizer};
@@ -56,13 +56,14 @@ pub fn parse_script(sql: &str, limits: &SqlLimits) -> Result<Vec<Statement>> {
     }
     reject_pathological_operator_chains(sql, limits)?;
 
-    let dialect = GenericDialect {};
-    let raw_statements = Parser::new(&dialect)
-        .with_recursion_limit(limits.max_expression_depth)
-        .try_with_sql(sql)
-        .map_err(map_parser_error)?
-        .parse_statements()
-        .map_err(map_parser_error)?;
+    // `GenericDialect` reads `USE SCHEMA x` as `USE` + an object named "SCHEMA" and fails on `x`. A script that
+    // begins with `USE` is therefore parsed with the one dialect whose `USE` grammar knows SCHEMA/DATABASE; the
+    // conversion below still admits only `USE SCHEMA` (everything else, `USE DATABASE` included, is refused).
+    let raw_statements = if begins_with_use(sql) {
+        parse_raw(&SnowflakeDialect {}, sql, limits)?
+    } else {
+        parse_raw(&GenericDialect {}, sql, limits)?
+    };
 
     if raw_statements.len() > limits.max_statements_per_script {
         return Err(SqlError::ResourceLimit {
@@ -78,6 +79,29 @@ pub fn parse_script(sql: &str, limits: &SqlLimits) -> Result<Vec<Statement>> {
         .iter()
         .map(|s| crate::convert::convert_statement(s, limits))
         .collect()
+}
+
+fn parse_raw(
+    dialect: &dyn Dialect,
+    sql: &str,
+    limits: &SqlLimits,
+) -> Result<Vec<sqlparser::ast::Statement>> {
+    Parser::new(dialect)
+        .with_recursion_limit(limits.max_expression_depth)
+        .try_with_sql(sql)
+        .map_err(map_parser_error)?
+        .parse_statements()
+        .map_err(map_parser_error)
+}
+
+/// Whether the first word of the text is `USE` (case-insensitive, whole word).
+fn begins_with_use(sql: &str) -> bool {
+    let t = sql.trim_start();
+    t.get(..3).is_some_and(|w| w.eq_ignore_ascii_case("use"))
+        && t[3..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
 }
 
 /// A pre-tokenizer, pre-parser defense against a real, measured hazard:

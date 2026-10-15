@@ -266,6 +266,12 @@ impl<'a> ExprBinder<'a> {
                 subquery,
                 negated,
             } => self.bind_in_subquery(expr, subquery, *negated),
+            Expr::Quantified {
+                expr,
+                op,
+                all,
+                subquery,
+            } => self.bind_quantified(expr, *op, *all, subquery),
         }
     }
 
@@ -412,6 +418,52 @@ impl<'a> ExprBinder<'a> {
         })
     }
 
+    /// `lhs <op> ANY|SOME|ALL (subquery)`: bound exactly like `IN` (the operand
+    /// conforms to the subquery column's type; no implicit coercion).
+    fn bind_quantified(
+        &mut self,
+        lhs: &Expr,
+        op: ast::BinaryOp,
+        all: bool,
+        q: &ast::QueryExpr,
+    ) -> Result<BoundExpr> {
+        let NestedQuery {
+            id,
+            query,
+            outer_refs,
+            outer_labels,
+        } = self.bind_nested_query(q)?;
+        let what = if all { "ALL" } else { "ANY" };
+        if query.projection.len() != 1 {
+            return Err(type_mismatch(format!(
+                "a {what} subquery must return exactly one column, found {}",
+                query.projection.len()
+            )));
+        }
+        let inner_ty = query.projection[0].expr.ty;
+        let operand = self.bind(lhs, inner_ty)?;
+        if let (Some(l), Some(r)) = (operand.ty, inner_ty) {
+            if l != r {
+                return Err(type_mismatch(format!(
+                    "{what} subquery compares {l:?} with {r:?}"
+                )));
+            }
+        }
+        Ok(BoundExpr {
+            kind: BoundExprKind::Subquery(Box::new(BoundSubqueryExpr {
+                id,
+                kind: SubqueryKind::Quantified { op, all },
+                operand: Some(operand),
+                query,
+                outer_refs,
+                outer_labels,
+                plan: None,
+            })),
+            ty: Some(RelationalType::Boolean),
+            nullable: true,
+        })
+    }
+
     /// Binds the `FILTER (WHERE cond)` of an aggregate: a boolean condition over
     /// the rows being aggregated, which may not itself contain an aggregate or
     /// a window function.
@@ -462,35 +514,38 @@ impl<'a> ExprBinder<'a> {
                     nullable,
                 })
             }
-            crate::aggregate::AggregateArg::Expr(inner) => {
-                let prev_allow = self.allow_aggregate;
-                let (local_before, outer_before) =
-                    (self.local_column_refs, self.outer_column_refs);
-                self.allow_aggregate = false;
-                let bound_inner = self.bind(inner, None);
-                self.allow_aggregate = prev_allow;
-                if bound_inner.is_ok()
-                    && self.outer_column_refs > outer_before
-                    && self.local_column_refs == local_before
-                {
-                    // SQL assigns such an aggregate to the *enclosing* query
-                    // (it aggregates over the outer rows). Evaluating it
-                    // there is not implemented; evaluating it over the inner
-                    // rows would silently compute something else, so refuse.
-                    return Err(SqlError::Unsupported {
-                        detail: "an aggregate whose arguments reference only columns of an enclosing query is not supported".to_string(),
-                    });
+            crate::aggregate::AggregateArg::Multi(inners) => {
+                // `COUNT(a, b, ...)`: any types; a row counts when no
+                // argument is NULL.
+                if func != crate::aggregate::AggregateFunc::Count {
+                    return Err(type_mismatch(format!(
+                        "aggregate function {} takes exactly one argument",
+                        func.name()
+                    )));
                 }
-                let bound_inner = match bound_inner {
-                    Err(SqlError::TypeMismatch { detail })
-                        if detail == "aggregate functions are not allowed in this context" =>
-                    {
-                        return Err(SqlError::TypeMismatch {
-                            detail: "aggregate function calls cannot be nested".to_string(),
-                        });
-                    }
-                    other => other?,
-                };
+                let bound = self.bind_aggregate_args(inners)?;
+                let (ty, nullable) = crate::aggregate::AggregateContract::derive_return_type(
+                    func, false, None,
+                )?;
+                check_assignable(Some(ty), expected.unwrap_or(ty))?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Aggregate(BoundAggregateExpr {
+                        func,
+                        arg: crate::aggregate::AggregateArg::Multi(
+                            bound.into_iter().map(Box::new).collect(),
+                        ),
+                        distinct,
+                        filter,
+                    }),
+                    ty: Some(ty),
+                    nullable,
+                })
+            }
+            crate::aggregate::AggregateArg::Expr(inner) => {
+                let bound_inner = self
+                    .bind_aggregate_args(std::slice::from_ref(inner))?
+                    .pop()
+                    .expect("one argument bound");
 
                 crate::aggregate::AggregateContract::check_argument_type(
                     func,
@@ -514,6 +569,40 @@ impl<'a> ExprBinder<'a> {
                     nullable,
                 })
             }
+        }
+    }
+
+    /// Binds the argument expressions of one aggregate call: no aggregate may
+    /// appear inside (they cannot nest), and at least one argument must read a
+    /// column of this query (an aggregate over only an enclosing query's columns
+    /// belongs to that query, which is not implemented).
+    fn bind_aggregate_args(&mut self, args: &[Box<Expr>]) -> Result<Vec<BoundExpr>> {
+        let prev_allow = self.allow_aggregate;
+        let (local_before, outer_before) = (self.local_column_refs, self.outer_column_refs);
+        self.allow_aggregate = false;
+        let bound: Result<Vec<BoundExpr>> = args.iter().map(|a| self.bind(a, None)).collect();
+        self.allow_aggregate = prev_allow;
+        if bound.is_ok()
+            && self.outer_column_refs > outer_before
+            && self.local_column_refs == local_before
+        {
+            // SQL assigns such an aggregate to the *enclosing* query
+            // (it aggregates over the outer rows). Evaluating it
+            // there is not implemented; evaluating it over the inner
+            // rows would silently compute something else, so refuse.
+            return Err(SqlError::Unsupported {
+                detail: "an aggregate whose arguments reference only columns of an enclosing query is not supported".to_string(),
+            });
+        }
+        match bound {
+            Err(SqlError::TypeMismatch { detail })
+                if detail == "aggregate functions are not allowed in this context" =>
+            {
+                Err(SqlError::TypeMismatch {
+                    detail: "aggregate function calls cannot be nested".to_string(),
+                })
+            }
+            other => other,
         }
     }
 

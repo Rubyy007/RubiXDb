@@ -27,6 +27,7 @@ pub enum CliError {
         code: String,
         message: String,
         detail: Option<String>,
+        hint: Option<String>,
     },
     /// The server responded with a non-2xx status but the body did not
     /// decode as the expected error shape (should not happen against a
@@ -45,10 +46,23 @@ impl std::fmt::Display for CliError {
                 code,
                 message,
                 detail,
-            } => match detail {
-                Some(d) => write!(f, "{code}: {message} ({d}) [HTTP {status}]"),
-                None => write!(f, "{code}: {message} [HTTP {status}]"),
-            },
+                hint,
+            } => {
+                match detail {
+                    Some(d) => write!(f, "{code}: {message} ({d}) [HTTP {status}]")?,
+                    None => write!(f, "{code}: {message} [HTTP {status}]")?,
+                }
+                // Terminal safety: the hint is server text, so it is escaped like every other server string.
+                match hint {
+                    Some(h) => write!(
+                        f,
+                        "
+  hint: {}",
+                        crate::render::sanitize_for_terminal(h)
+                    ),
+                    None => Ok(()),
+                }
+            }
             CliError::MalformedErrorBody { status, raw } => {
                 write!(f, "unexpected error response (HTTP {status}): {raw}")
             }
@@ -67,6 +81,8 @@ pub struct Connection {
     /// item 35: the active session, if any -- `None` means every
     /// following statement runs autocommit (the stateless default).
     session_id: Option<String>,
+    /// The schema chosen with `USE SCHEMA`, sent with every statement. `None`: the server's default.
+    schema: Option<String>,
     /// How many more times a lost server may be re-resolved (see `try_reattach`). Zero for
     /// connections that did not attach to another process's instance.
     reattach_budget: u8,
@@ -91,6 +107,7 @@ impl Connection {
             base_url,
             api_key,
             session_id: None,
+            schema: None,
             reattach_budget: 0,
             owned: None,
         }
@@ -150,6 +167,7 @@ impl Connection {
             sql: sql.to_string(),
             params: Vec::new(),
             session_id: self.session_id.clone(),
+            schema: self.schema.clone(),
         };
         let send = |c: &Connection| {
             c.http
@@ -182,6 +200,13 @@ impl Connection {
             // `put_back` semantics already guarantee: still open, still
             // valid, under the same id this client already holds.
             self.session_id = parsed.session_id.clone();
+            if parsed.result.get("kind").and_then(Value::as_str) == Some("use_schema") {
+                self.schema = parsed
+                    .result
+                    .get("schema")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             Ok(parsed)
         } else {
             match serde_json::from_str::<ApiErrorBody>(&text) {
@@ -191,12 +216,14 @@ impl Connection {
                             code,
                             message,
                             detail,
+                            hint,
                         },
                 }) => Err(CliError::Api {
                     status: status.as_u16(),
                     code,
                     message,
                     detail,
+                    hint,
                 }),
                 Err(_) => Err(CliError::MalformedErrorBody {
                     status: status.as_u16(),
@@ -209,6 +236,11 @@ impl Connection {
     /// Forces the client to forget its own session id (used when the
     /// server tells us the session is gone -- `SESSION_NOT_FOUND` -- so
     /// this connection does not keep retrying a dead id forever).
+    /// The schema `USE SCHEMA` selected on this connection (shown by `\conninfo`).
+    pub fn current_schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
     pub fn forget_session(&mut self) {
         self.session_id = None;
     }
@@ -234,12 +266,14 @@ impl Connection {
                             code,
                             message,
                             detail,
+                            hint,
                         },
                 }) => Err(CliError::Api {
                     status: status.as_u16(),
                     code,
                     message,
                     detail,
+                    hint,
                 }),
                 Err(_) => Err(CliError::MalformedErrorBody {
                     status: status.as_u16(),
@@ -281,12 +315,14 @@ impl Connection {
                             code,
                             message,
                             detail,
+                            hint,
                         },
                 }) => Err(CliError::Api {
                     status: status.as_u16(),
                     code,
                     message,
                     detail,
+                    hint,
                 }),
                 Err(_) => Err(CliError::MalformedErrorBody {
                     status: status.as_u16(),
@@ -308,12 +344,24 @@ impl Connection {
         self.get_json("/v1/catalog/schemas")
     }
 
+    /// `?schema=` for catalog reads, so `\lt` and `\d` look where `USE SCHEMA` pointed.
+    fn schema_query(&self) -> String {
+        match &self.schema {
+            Some(s) => format!("?schema={}", urlencode(s)),
+            None => String::new(),
+        }
+    }
+
     pub fn list_tables(&self) -> Result<Value, CliError> {
-        self.get_json("/v1/catalog/tables")
+        self.get_json(&format!("/v1/catalog/tables{}", self.schema_query()))
     }
 
     pub fn describe_table(&self, name: &str) -> Result<Value, CliError> {
-        self.get_json(&format!("/v1/catalog/tables/{}", urlencode(name)))
+        self.get_json(&format!(
+            "/v1/catalog/tables/{}{}",
+            urlencode(name),
+            self.schema_query()
+        ))
     }
 
     pub fn list_indexes(&self) -> Result<Value, CliError> {

@@ -130,19 +130,15 @@ fn expr_mentions(e: &ast::Expr, name: &str) -> bool {
         }
         Function { args, .. } => args.iter().any(|x| expr_mentions(x, name)),
         Aggregate { arg, filter, .. } => {
-            (match arg {
-                crate::aggregate::AggregateArg::Expr(x) => expr_mentions(x, name),
-                crate::aggregate::AggregateArg::Wildcard => false,
-            }) || filter.as_deref().is_some_and(|x| expr_mentions(x, name))
+            arg.exprs().iter().any(|x| expr_mentions(x, name))
+                || filter.as_deref().is_some_and(|x| expr_mentions(x, name))
         }
         Grouping(args) => args.iter().any(|x| expr_mentions(x, name)),
         Window(call) => {
             (match &call.function {
                 ast::WindowFunction::Aggregate { arg, filter, .. } => {
-                    (match arg {
-                        crate::aggregate::AggregateArg::Expr(x) => expr_mentions(x, name),
-                        crate::aggregate::AggregateArg::Wildcard => false,
-                    }) || filter.as_deref().is_some_and(|x| expr_mentions(x, name))
+                    arg.exprs().iter().any(|x| expr_mentions(x, name))
+                        || filter.as_deref().is_some_and(|x| expr_mentions(x, name))
                 }
                 ast::WindowFunction::Named { args, .. } => {
                     args.iter().any(|x| expr_mentions(x, name))
@@ -160,7 +156,7 @@ fn expr_mentions(e: &ast::Expr, name: &str) -> bool {
             let ast::QueryExpr::Select(s) = subquery.as_ref();
             mentions_table(s, name)
         }
-        InSubquery { expr, subquery, .. } => {
+        InSubquery { expr, subquery, .. } | Quantified { expr, subquery, .. } => {
             let ast::QueryExpr::Select(s) = subquery.as_ref();
             expr_mentions(expr, name) || mentions_table(s, name)
         }
@@ -265,6 +261,11 @@ pub(super) fn bind_recursive_body(
             set.op.name()
         )));
     }
+    if set.by_name {
+        return Err(SqlError::Unsupported {
+            detail: format!("UNION BY NAME in the body of recursive CTE '{name}'"),
+        });
+    }
     if !body.ctes.is_empty() {
         return Err(SqlError::Unsupported {
             detail: format!("a WITH list inside the body of recursive CTE '{name}'"),
@@ -346,7 +347,7 @@ fn bind_parts(
     if refs == 0 {
         // The right operand never read the working table: an ordinary UNION
         // of two queries (types unify as for any set operation).
-        let shell = super::setop::combine(env, set.op, set.all, seed, term)?;
+        let shell = super::setop::combine(env, set.op, set.all, seed, term, None)?;
         return Ok((shell, None));
     }
 
@@ -368,7 +369,7 @@ fn bind_parts(
             }
         }
     }
-    let shell = super::setop::combine(env, set.op, set.all, seed, term)?;
+    let shell = super::setop::combine(env, set.op, set.all, seed, term, None)?;
     Ok((
         shell,
         Some(BoundRecursion {

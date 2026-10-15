@@ -31,6 +31,10 @@ export interface IdeApi {
   setFocused: (cellId: string) => void;
   history: HistoryEntry[];
   catalog: CatalogLists;
+  /** The schema unqualified names resolve in: the one `USE SCHEMA` chose, else the instance's first schema. */
+  activeSchema: string | null;
+  /** True once a `USE SCHEMA` chose it (false: it is only the server's default). */
+  schemaChosen: boolean;
   catalogStatus: "loading" | "ready" | "error";
   /** Re-read databases, schemas, tables (and drop cached column lists) from the server. */
   refreshCatalog: () => void;
@@ -38,6 +42,7 @@ export interface IdeApi {
   catalogRefreshing: boolean;
   /** When the catalog was last read successfully (ms since epoch), or null. */
   catalogUpdatedAt: number | null;
+  /** `table` is bare for a table of the active schema, `schema.table` for any other. */
   fetchColumns: (table: string) => Promise<string[]>;
   /** Columns with their types (cached); an empty list when the table cannot be described. */
   fetchColumnInfo: (table: string) => Promise<ColumnInfo[]>;

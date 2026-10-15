@@ -75,6 +75,13 @@ fn bind_statement_inner(
         ast::Statement::CreateSchema(s) => {
             BoundStatement::CreateSchema(ddl::bind_create_schema(catalog, ctx, auth, metrics, s)?)
         }
+        ast::Statement::UseSchema(_) => {
+            return Err(crate::SqlError::UnsupportedExecution {
+                detail:
+                    "USE SCHEMA is a session command and cannot appear inside another statement"
+                        .to_string(),
+            })
+        }
         ast::Statement::CreateTable(s) => BoundStatement::CreateTable(ddl::bind_create_table(
             catalog, ctx, auth, metrics, limits, s,
         )?),

@@ -259,7 +259,15 @@ fn next_segment_id(id: u64) -> Result<u64> {
 /// into existence. See `canonicalize_existing_dir` for `inspect`'s
 /// read-only counterpart (Group 4.1).
 fn canonicalize_data_dir(dir: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(dir)?;
+    // ADR-DATA-DIR-DURABILITY-01: the `wal/` entry (and any directory created above it) must be durable before a segment is
+    // written into it. The parent is synced on every open, not only when this call created `wal/`, so that an earlier attempt
+    // that created it but failed before syncing is repaired. A no-op on Windows (assumption W1).
+    fs::create_dir_all_durable(dir)?;
+    let parent = match dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fsync_dir(parent)?;
     let canonical = fs::canonicalize(dir)?;
     Ok(canonical)
 }

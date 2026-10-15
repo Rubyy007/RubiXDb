@@ -8,7 +8,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Extension, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Extension, FromRequest, Request, State};
+use axum::http::StatusCode;
 use axum::Json;
 use rubixdb::relational::{RelationalType, RelationalValue};
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,66 @@ pub struct SqlRequest {
     pub params: Vec<SqlParam>,
     #[serde(default)]
     pub session_id: Option<Uuid>,
+    /// The schema a prior `USE SCHEMA` selected. The server keeps no per-client schema (a request stays
+    /// self-contained): the client sends the name back with each statement, and unqualified names resolve
+    /// in it. Absent means the instance's first schema (`public`).
+    #[serde(default)]
+    pub schema: Option<String>,
+}
+
+/// `Json<T>` whose failures use this API's own error body (code, message, hint) instead of axum's
+/// plain-text rejection, so a malformed or mistyped request is a clean 4xx a client can read.
+pub struct ApiJson<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(ApiJson(v)),
+            Err(rejection) => Err(json_rejection(rejection)),
+        }
+    }
+}
+
+fn json_rejection(rejection: JsonRejection) -> ApiError {
+    let (status, code, message) = match rejection {
+        JsonRejection::MissingJsonContentType(_) => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "UNSUPPORTED_MEDIA_TYPE",
+            "send the request with the header Content-Type: application/json",
+        ),
+        JsonRejection::JsonSyntaxError(_) => (
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "the request body is not valid JSON",
+        ),
+        JsonRejection::JsonDataError(_) => (
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "the request body is JSON but not a SQL request: expected {\"sql\": \"...\"} with optional \"params\", \"session_id\" and \"schema\"",
+        ),
+        other if other.status() == StatusCode::PAYLOAD_TOO_LARGE => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PAYLOAD_TOO_LARGE",
+            "the request body is larger than the server accepts",
+        ),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_ERROR",
+            "the request body could not be read",
+        ),
+    };
+    ApiError::Admin {
+        status,
+        code,
+        message: message.to_string(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -64,12 +126,31 @@ pub enum SqlResultBody {
     Write {
         statement: &'static str,
         rows_affected: u64,
+        /// A sentence for people: "INSERT completed: 3 rows affected."
+        message: String,
     },
     /// DDL — item 49: `CatalogService`'s own DDL methods are already
     /// atomic/durable the instant they return `Ok` (`PHASE_RELATIONAL_
     /// WRITE_EXECUTOR_ARCHITECTURE.md`), so "success" here already means
     /// durable, exactly like `Write`.
-    Ddl,
+    Ddl {
+        /// "CREATE SCHEMA", "DROP TABLE", ...
+        statement: &'static str,
+        /// The object the statement named, fully qualified where that is known (`default.analytics.users`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        object: Option<String>,
+        /// False when the statement was a no-op (`IF NOT EXISTS` on an existing object, `IF EXISTS` on a
+        /// missing one): it succeeded and changed nothing.
+        changed: bool,
+        message: String,
+    },
+    /// `USE SCHEMA`: the schema unqualified names resolve in from now on. Nothing is stored server-side;
+    /// the client sends `schema` with each following request.
+    UseSchema {
+        database: String,
+        schema: String,
+        message: String,
+    },
     /// item 135: the actual structured plan, rendered by `rubixdb_sql::
     /// plan::explain`. Never fabricated text, and (a deliberate choice
     /// this crate's own architecture doc documents) never executes the
@@ -154,16 +235,145 @@ fn write_statement_name(kind: WriteStatementKind) -> &'static str {
     }
 }
 
+/// What a DDL statement is about, captured before it runs (a dropped object cannot be looked up
+/// afterwards).
+struct DdlSummary {
+    statement: &'static str,
+    object: Option<String>,
+}
+
+impl DdlSummary {
+    fn noun(&self) -> &'static str {
+        match self.statement {
+            "CREATE SCHEMA" => "Schema",
+            "CREATE TABLE" | "DROP TABLE" => "Table",
+            "CREATE INDEX" | "DROP INDEX" => "Index",
+            _ => "Object",
+        }
+    }
+
+    fn message(&self, changed: bool) -> String {
+        let noun = self.noun();
+        let name = self
+            .object
+            .as_deref()
+            .map(|o| format!(" {o}"))
+            .unwrap_or_default();
+        match (self.statement.starts_with("CREATE"), changed) {
+            (true, true) => format!("{noun}{name} created."),
+            (true, false) => format!("{noun}{name} already exists; nothing changed."),
+            (false, true) => format!("{noun}{name} dropped."),
+            (false, false) => format!("{noun}{name} does not exist; nothing dropped."),
+        }
+    }
+}
+
+/// `database.schema` for a schema id, when the catalog can say; names only, never ids.
+fn qualified_schema(state: &AppState, schema_id: u32) -> Option<String> {
+    let catalog = &state.sql.catalog;
+    let schema = catalog.get_schema(schema_id).ok().flatten()?;
+    let database = catalog.get_database(schema.database_id).ok().flatten()?;
+    Some(format!("{}.{}", database.name, schema.name))
+}
+
+fn ddl_summary(state: &AppState, bound: &BoundStatement) -> Option<DdlSummary> {
+    let catalog = &state.sql.catalog;
+    let database_name = |id: u32| catalog.get_database(id).ok().flatten().map(|d| d.name);
+    Some(match bound {
+        BoundStatement::CreateDatabase(_) => DdlSummary {
+            statement: "CREATE DATABASE",
+            object: None,
+        },
+        BoundStatement::CreateSchema(cs) => DdlSummary {
+            statement: "CREATE SCHEMA",
+            object: Some(match database_name(cs.database_id) {
+                Some(db) => format!("{db}.{}", cs.name),
+                None => cs.name.clone(),
+            }),
+        },
+        BoundStatement::CreateTable(ct) => DdlSummary {
+            statement: "CREATE TABLE",
+            object: Some(match qualified_schema(state, ct.schema_id) {
+                Some(s) => format!("{s}.{}", ct.name),
+                None => ct.name.clone(),
+            }),
+        },
+        BoundStatement::DropTable(dt) => DdlSummary {
+            statement: "DROP TABLE",
+            object: dt.table_id.and_then(|id| {
+                let t = catalog.get_table(id).ok().flatten()?;
+                Some(match qualified_schema(state, t.schema_id) {
+                    Some(s) => format!("{s}.{}", t.name),
+                    None => t.name,
+                })
+            }),
+        },
+        BoundStatement::CreateIndex(ci) => DdlSummary {
+            statement: "CREATE INDEX",
+            object: Some(ci.name.clone()),
+        },
+        BoundStatement::DropIndex(di) => DdlSummary {
+            statement: "DROP INDEX",
+            object: di
+                .index_id
+                .and_then(|id| catalog.get_index(id).ok().flatten())
+                .map(|i| i.name),
+        },
+        _ => return None,
+    })
+}
+
 fn write_result_to_json(
     result: rubixdb_sql::exec::write::WriteResult,
-    is_ddl: bool,
+    ddl: Option<DdlSummary>,
 ) -> SqlResultBody {
-    if is_ddl {
-        SqlResultBody::Ddl
-    } else {
-        SqlResultBody::Write {
-            statement: write_statement_name(result.kind),
-            rows_affected: result.rows_affected,
+    // `INSERT` / `UPDATE` / `DELETE ... RETURNING`: the rows the statement changed
+    // are the result, shaped exactly like a `SELECT`'s (`row_count` is the number of
+    // rows changed). The statement's write is already durable when this is built --
+    // the returned rows come out of `execute_write_autocommit` only after its
+    // commit, and out of a session statement only after it was buffered.
+    if let Some(returned) = result.returning {
+        let columns: Vec<ColumnMeta> = returned
+            .schema
+            .fields
+            .iter()
+            .map(|f| ColumnMeta {
+                name: f.name.clone(),
+                ty: f.ty.map(relational_type_name),
+                nullable: f.nullable,
+            })
+            .collect();
+        let row_count = returned.rows.len();
+        let rows: Vec<Vec<SqlValueJson>> = returned
+            .rows
+            .iter()
+            .map(|row| row.iter().map(value_to_json).collect())
+            .collect();
+        return SqlResultBody::Rows {
+            columns,
+            rows,
+            row_count,
+        };
+    }
+    let changed = result.rows_affected > 0;
+    match ddl {
+        Some(summary) => SqlResultBody::Ddl {
+            statement: summary.statement,
+            message: summary.message(changed),
+            object: summary.object,
+            changed,
+        },
+        None => {
+            let statement = write_statement_name(result.kind);
+            let n = result.rows_affected;
+            SqlResultBody::Write {
+                statement,
+                rows_affected: n,
+                message: format!(
+                    "{statement} completed: {n} row{} affected.",
+                    if n == 1 { "" } else { "s" }
+                ),
+            }
         }
     }
 }
@@ -249,6 +459,7 @@ fn statement_class(stmt: &Statement) -> &'static str {
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_) => class::DDL,
         Statement::Begin | Statement::Commit | Statement::Rollback => class::TRANSACTION,
+        Statement::UseSchema(_) => class::OTHER,
         Statement::Explain(_) => class::EXPLAIN,
     }
 }
@@ -257,7 +468,7 @@ pub async fn sql(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
     request_id: Option<Extension<crate::observability::RequestId>>,
-    Json(req): Json<SqlRequest>,
+    ApiJson(req): ApiJson<SqlRequest>,
 ) -> Result<Json<SqlResponse>, ApiError> {
     use crate::observability::events::{kind, severity, Event};
     state.sql.api_metrics.record_request();
@@ -380,11 +591,73 @@ async fn handle(
     query: &crate::observability::queries::QueryGuard<'_>,
 ) -> Result<SqlResponse, ApiError> {
     let sql_limits = SqlLimits::default();
-    let stmt = parse_statement(&req.sql, &sql_limits)?;
+    let stmt = match parse_statement(&req.sql, &sql_limits) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            // A mistyped keyword gets a "did you mean"; any other error keeps its code's generic hint.
+            let hint = match &e {
+                SqlError::Parse { .. } | SqlError::Unsupported { .. } => {
+                    crate::sql_hints::statement_hint(&req.sql)
+                }
+                _ => None,
+            };
+            return Err(match hint {
+                Some(h) => ApiError::Hinted(Box::new(ApiError::from(e)), h),
+                None => e.into(),
+            });
+        }
+    };
     query.set_class(statement_class(&stmt));
     *ddl = ddl_audit(&stmt);
 
-    let bind_context = state.sql.bind_context()?;
+    let mut bind_context = state.sql.bind_context()?;
+    // `USE SCHEMA` is how a client leaves a schema that no longer exists, so it never resolves the old one.
+    let selected = req
+        .schema
+        .as_deref()
+        .filter(|n| !n.is_empty() && !matches!(stmt, Statement::UseSchema(_)));
+    if let Some(name) = selected {
+        if name.len() > sql_limits.max_identifier_len {
+            return Err(ApiError::Validation("schema name is too long".to_string()));
+        }
+        bind_context.default_schema_id = rubixdb_sql::bind::scope::resolve_schema_in_database(
+            &state.sql.catalog,
+            bind_context.database_id,
+            name,
+        )
+        .map_err(|e| {
+            ApiError::Hinted(
+                Box::new(ApiError::from(e)),
+                "The selected schema does not exist (it may have been removed). Run USE SCHEMA <schema_name> to pick one that does."
+                    .to_string(),
+            )
+        })?;
+    }
+
+    if let Statement::UseSchema(u) = &stmt {
+        let (_, schema) = rubixdb_sql::bind::scope::resolve_use_schema(
+            &state.sql.catalog,
+            &bind_context,
+            &u.name,
+        )?;
+        let database = state
+            .sql
+            .catalog
+            .get_database(bind_context.database_id)
+            .ok()
+            .flatten()
+            .map(|d| d.name)
+            .unwrap_or_else(|| "default".to_string());
+        return Ok(SqlResponse {
+            session_id: req.session_id,
+            result: SqlResultBody::UseSchema {
+                message: format!("Now using schema {database}.{schema}."),
+                database,
+                schema,
+            },
+        });
+    }
+
     let auth_ctx: AuthContext = to_sql_auth_context(principal);
     let bound = bind_statement(
         &state.sql.catalog,
@@ -419,6 +692,7 @@ async fn handle(
         .map(SqlParam::into_relational_value)
         .collect::<Result<_, _>>()?;
 
+    let summary = ddl_summary(state, &bound);
     match &bound {
         BoundStatement::Begin => handle_begin(state, principal, req.session_id).await,
         BoundStatement::Commit => handle_commit(state, principal, req.session_id).await,
@@ -435,7 +709,7 @@ async fn handle(
         | BoundStatement::DropTable(_)
         | BoundStatement::CreateIndex(_)
         | BoundStatement::DropIndex(_) => {
-            handle_write(state, principal, req.session_id, plan, params).await
+            handle_write(state, principal, req.session_id, plan, params, summary).await
         }
         BoundStatement::Explain(_) => {
             unreachable!(
@@ -702,10 +976,10 @@ async fn handle_write(
     session_id: Option<Uuid>,
     plan: Plan,
     params: Vec<Option<RelationalValue>>,
+    ddl: Option<DdlSummary>,
 ) -> Result<SqlResponse, ApiError> {
     let limits = exec_limits(state);
     let deadline = Duration::from_secs(state.config.sql_statement_deadline_secs);
-    let is_ddl = matches!(plan, Plan::Ddl(_));
 
     match session_id {
         None => {
@@ -730,7 +1004,7 @@ async fn handle_write(
                 .record_rows_affected(result.rows_affected);
             Ok(SqlResponse {
                 session_id: None,
-                result: write_result_to_json(result, is_ddl),
+                result: write_result_to_json(result, ddl),
             })
         }
         Some(id) => {
@@ -770,7 +1044,7 @@ async fn handle_write(
                         .record_rows_affected(result.rows_affected);
                     Ok(SqlResponse {
                         session_id: Some(id),
-                        result: write_result_to_json(result, is_ddl),
+                        result: write_result_to_json(result, ddl),
                     })
                 }
                 Ok((Err(e), txn)) => {

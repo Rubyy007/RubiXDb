@@ -360,6 +360,7 @@ fn judge_wal(dir: &Path, ledger: &Path) -> (&'static str, String) {
 fn run_smoke() -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let mut integrity: Vec<String> = Vec::new();
+    let (mut inert, mut exercised) = (0usize, 0usize);
     for (i, c) in cycles().iter().enumerate() {
         let ran = run_cycle(c, i);
         if !ran.crashed_ok {
@@ -387,12 +388,23 @@ fn run_smoke() -> Vec<Row> {
             ));
             rows.push(judge(c, &ran, &sim, img, &surv, n));
         }
-        // the model must actually do something: the images of one dump are not all the same
+        // The model must actually do something: when the dump holds anything unsynced (a write, a truncation, a namespace
+        // operation awaiting a directory sync) the images of that one dump are not all the same. A dump with NOTHING
+        // unsynced (a crash right after the last sync, or after the F-D1b-2 fix made the directory entries durable) has
+        // exactly one possible image; that cycle is recorded as inert, not as a harness failure. Before the F-D1b-2 fix the
+        // dropped-namespace image always differed, so this case could not arise (D1c STEP 1 note, docs/PERSISTENCE_MODEL.md).
+        let (ns_pending, files_pending) = sim.unsynced_summary();
         if distinct.len() < 2 {
-            integrity.push(format!(
-                "cycle {i}: all {} images are identical - the model changed nothing",
-                images().len()
-            ));
+            if ns_pending == 0 && files_pending == 0 {
+                inert += 1;
+            } else {
+                integrity.push(format!(
+                    "cycle {i}: all {} images are identical although {ns_pending} namespace operation(s) and                      {files_pending} file(s) were unsynced - the model changed nothing",
+                    images().len()
+                ));
+            }
+        } else {
+            exercised += 1;
         }
         if rows
             .iter()
@@ -404,6 +416,11 @@ fn run_smoke() -> Vec<Row> {
         }
     }
     write_rows(&rows);
+    println!("smoke liveness: {exercised} cycle(s) where the model changed the image, {inert} inert (nothing unsynced at the crash point)");
+    assert!(
+        exercised >= 3,
+        "the model changed the image in only {exercised} cycle(s): it is not being exercised"
+    );
     assert!(
         integrity.is_empty(),
         "harness integrity failures: {integrity:#?}"

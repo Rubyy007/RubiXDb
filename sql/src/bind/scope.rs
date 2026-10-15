@@ -75,6 +75,39 @@ fn resolve_schema_by_name(catalog: &CatalogService, database_id: u32, name: &str
         .ok_or_else(|| unknown_schema(name))
 }
 
+/// A schema of `database_id` by exact name (the schema a client selected earlier with `USE SCHEMA`).
+pub fn resolve_schema_in_database(
+    catalog: &CatalogService,
+    database_id: u32,
+    name: &str,
+) -> Result<u32> {
+    resolve_schema_by_name(catalog, database_id, name)
+}
+
+/// `USE SCHEMA [db.]schema`: the schema id and its stored name. Unqualified names resolve in the
+/// context's database; a database qualifier must name an existing database. A missing schema is the
+/// ordinary `UnknownObject` (HTTP 404).
+pub fn resolve_use_schema(
+    catalog: &CatalogService,
+    ctx: &BindContext,
+    name: &ast::ObjectName,
+) -> Result<(u32, String)> {
+    let (database_id, schema_name) = match name.0.len() {
+        1 => (ctx.database_id, &name.0[0].value),
+        2 => (
+            resolve_database_by_name(catalog, &name.0[0].value)?,
+            &name.0[1].value,
+        ),
+        n => {
+            return Err(SqlError::InvalidIdentifier {
+                detail: format!("USE SCHEMA name has {n} parts; use schema or default.schema"),
+            })
+        }
+    };
+    let schema_id = resolve_schema_by_name(catalog, database_id, schema_name)?;
+    Ok((schema_id, schema_name.clone()))
+}
+
 fn resolve_database_by_name(catalog: &CatalogService, name: &str) -> Result<u32> {
     catalog
         .list_databases()?

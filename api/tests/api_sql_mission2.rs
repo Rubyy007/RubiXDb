@@ -335,10 +335,11 @@ async fn illegal_frames_are_bind_errors_and_groups_frames_are_unsupported() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}: {body}");
         assert_eq!(body["error"]["code"], "BIND_ERROR", "{sql}: {body}");
     }
+    // SQL Phase 1 implemented GROUPS frames, DISTINCT window aggregates and IGNORE NULLS
+    // (`api_sql_phase1.rs`); a FILTER on a window function that is not an aggregate is
+    // still refused, as is anything the parser cannot read (frame EXCLUDE).
     for sql in [
-        "SELECT SUM(x) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
-        "SELECT SUM(DISTINCT x) OVER () FROM w",
-        "SELECT LAG(x) IGNORE NULLS OVER (ORDER BY id) FROM w",
+        "SELECT ROW_NUMBER() FILTER (WHERE x > 1) OVER (ORDER BY id) FROM w",
     ] {
         let (status, body) = sql_req(&router, ADMIN_KEY, json!({ "sql": sql })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}: {body}");

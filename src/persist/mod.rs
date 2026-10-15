@@ -542,6 +542,35 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// `create_dir_all`, then makes every directory entry this call created durable by syncing the PARENT of each
+/// (ADR-DATA-DIR-DURABILITY-01). On Windows `sync_dir` is a no-op (assumption A5/W1), so there this is exactly
+/// `create_dir_all`; a directory the call did not create is not touched.
+pub fn create_dir_all_durable(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    let mut created: Vec<PathBuf> = Vec::new();
+    for a in path.ancestors() {
+        if a.as_os_str().is_empty() || exists(a) {
+            break;
+        }
+        created.push(a.to_path_buf());
+    }
+    create_dir_all(path)?;
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for d in &created {
+        let parent = match d.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        if !parents.contains(&parent) {
+            parents.push(parent);
+        }
+    }
+    for parent in parents {
+        sync_dir(&parent)?;
+    }
+    Ok(())
+}
+
 pub fn hard_link(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     #[cfg(feature = "sim-fs")]
     if let Some(s) = sim_active() {

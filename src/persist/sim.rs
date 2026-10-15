@@ -682,6 +682,16 @@ impl SimFs {
             .collect()
     }
 
+    /// `(namespace operations awaiting a sync_dir, files holding writes or truncations not yet synced)`. `(0, 0)` means every
+    /// crash image of this record is the same: the model has nothing to take away.
+    pub fn unsynced_summary(&self) -> (usize, usize) {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            st.nslog.iter().filter(|o| !o.durable()).count(),
+            st.files.values().filter(|f| !f.pending.is_empty()).count(),
+        )
+    }
+
     pub fn list_paths(&self) -> Vec<String> {
         self.state
             .lock()

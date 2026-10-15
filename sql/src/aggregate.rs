@@ -52,6 +52,30 @@ pub enum AggregateArg<T> {
     Wildcard,
     /// `COUNT(expr)`, `SUM(expr)`, etc.
     Expr(T),
+    /// `COUNT(a, b, ...)` / `COUNT(DISTINCT a, b, ...)` (two or more
+    /// expressions; `COUNT` only). A row counts when **none** of the
+    /// expressions is `NULL`; under `DISTINCT` it counts once per distinct
+    /// combination (canonical grouping equality: `-0.0 = +0.0`, `NaN = NaN`).
+    Multi(Vec<T>),
+}
+
+impl<T> AggregateArg<T> {
+    /// The argument expressions (none for `COUNT(*)`).
+    pub fn exprs(&self) -> &[T] {
+        match self {
+            AggregateArg::Wildcard => &[],
+            AggregateArg::Expr(e) => std::slice::from_ref(e),
+            AggregateArg::Multi(v) => v,
+        }
+    }
+
+    pub fn exprs_mut(&mut self) -> &mut [T] {
+        match self {
+            AggregateArg::Wildcard => &mut [],
+            AggregateArg::Expr(e) => std::slice::from_mut(e),
+            AggregateArg::Multi(v) => v,
+        }
+    }
 }
 
 /// One aggregate function's contract and type rules.
@@ -295,6 +319,77 @@ impl GroupingValue {
             GroupingValue::Timestamp(_) => 9,
         }
     }
+}
+
+impl GroupingValue {
+    /// An injective byte encoding of the canonical value (a type tag, then the
+    /// payload; variable-length payloads carry their length), used to fold the
+    /// arguments of `COUNT(a, b, ...)` into one comparable value.
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        match self {
+            GroupingValue::Null => out.push(0),
+            GroupingValue::Boolean(b) => out.extend([1, u8::from(*b)]),
+            GroupingValue::Integer(i) => {
+                out.push(2);
+                out.extend(i.to_be_bytes());
+            }
+            GroupingValue::Bigint(i) => {
+                out.push(3);
+                out.extend(i.to_be_bytes());
+            }
+            GroupingValue::Real(bits) => {
+                out.push(4);
+                out.extend(bits.to_be_bytes());
+            }
+            GroupingValue::Double(bits) => {
+                out.push(5);
+                out.extend(bits.to_be_bytes());
+            }
+            GroupingValue::Decimal(v, s) => {
+                out.push(6);
+                out.extend(v.to_be_bytes());
+                out.push(*s);
+            }
+            GroupingValue::Text(s) => {
+                out.push(7);
+                out.extend((s.len() as u64).to_be_bytes());
+                out.extend(s.as_bytes());
+            }
+            GroupingValue::Blob(b) => {
+                out.push(8);
+                out.extend((b.len() as u64).to_be_bytes());
+                out.extend(b);
+            }
+            GroupingValue::Date(d) => {
+                out.push(9);
+                out.extend(d.to_be_bytes());
+            }
+            GroupingValue::Time(t) => {
+                out.push(10);
+                out.extend(t.to_be_bytes());
+            }
+            GroupingValue::Timestamp(t) => {
+                out.push(11);
+                out.extend(t.to_be_bytes());
+            }
+        }
+    }
+}
+
+/// The single value `COUNT(a, b, ...)` accumulates for one row
+/// ([`AggregateArg::Multi`]): `None` when any argument is `NULL` (the row does
+/// not count), otherwise a `BLOB` that is equal for two rows exactly when every
+/// argument pair is equal under the grouping equality. It is never shown to a
+/// user; `COUNT` only counts it and, under `DISTINCT`, remembers it.
+pub fn composite_count_value(values: &[Option<RelationalValue>]) -> Option<RelationalValue> {
+    if values.iter().any(Option::is_none) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for v in values {
+        GroupingValue::from_optional_value(v.as_ref()).encode_into(&mut out);
+    }
+    Some(RelationalValue::Blob(out))
 }
 
 /// A composite grouping key containing canonical values for each GROUP BY expression.
@@ -893,6 +988,13 @@ impl AggregateAccumulator {
 
     pub fn finalize(self) -> Option<RelationalValue> {
         self.state.finalize()
+    }
+
+    /// The value the aggregate has right now, without consuming it (a running
+    /// window frame reads it after every row). Copies only the small state,
+    /// never the `DISTINCT` seen-set.
+    pub fn current(&self) -> Option<RelationalValue> {
+        self.state.clone().finalize()
     }
 }
 

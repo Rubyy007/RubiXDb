@@ -262,6 +262,11 @@ fn conninfo(conn: &Connection, out: &mut impl Write) -> bool {
         }
         Err(e) => print_error(out, &e),
     };
+    let _ = writeln!(
+        out,
+        "schema: {}",
+        conn.current_schema().unwrap_or("(default: first schema)")
+    );
     match conn.session_id() {
         Some(id) => {
             let _ = writeln!(out, "session: {id} (transaction open)");

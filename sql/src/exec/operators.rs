@@ -381,7 +381,7 @@ impl<'a> AggregateOp<'a> {
             .map(|agg| {
                 let is_wildcard = matches!(agg.arg, AggregateArg::Wildcard);
                 let input_ty = match &agg.arg {
-                    AggregateArg::Wildcard => None,
+                    AggregateArg::Wildcard | AggregateArg::Multi(_) => None,
                     AggregateArg::Expr(e) => e.ty,
                 };
                 Ok(AggregateAccumulator::new(
@@ -442,10 +442,9 @@ impl<'a> AggregateOp<'a> {
                         continue;
                     }
                 }
-                inputs.push(Some(match &agg.arg {
-                    AggregateArg::Wildcard => None,
-                    AggregateArg::Expr(e) => eval(e, &tuple.ctx, ec)?,
-                }));
+                inputs.push(Some(crate::exec::expr_eval::eval_aggregate_arg(
+                    &agg.arg, &tuple.ctx, ec,
+                )?));
             }
             if skipped > 0 {
                 ec.metrics.record_aggregate_filter_rows_skipped(skipped);
@@ -477,6 +476,7 @@ impl<'a> AggregateOp<'a> {
                         if grouping_mode {
                             let (keys, mask) = grouping_keys(&key_values, set);
                             ctx = ctx.with_grouping(keys, mask);
+                            null_omitted_columns(&mut ctx, &self.group_by, set);
                         }
                         groups.push(Group {
                             ctx,
@@ -523,6 +523,7 @@ impl<'a> AggregateOp<'a> {
                 if grouping_mode {
                     let (keys, mask) = grouping_keys(&vec![None; self.group_by.len()], set);
                     ctx = ctx.with_grouping(keys, mask);
+                    null_omitted_columns(&mut ctx, &self.group_by, set);
                 }
                 groups.push(Group {
                     ctx,
@@ -554,6 +555,21 @@ impl<'a> AggregateOp<'a> {
             .collect();
         self.output = Some(out.into_iter());
         Ok(())
+    }
+}
+
+/// In the representative row of an output row of grouping set `set`, the
+/// grouping columns the set leaves out read `NULL` -- what a correlated
+/// subquery that names such a column must see (`GroupKeyRef` covers every other
+/// reader). Grouping expressions that are not bare columns have nothing to null:
+/// a subquery cannot read them (`validate_group_compat`).
+fn null_omitted_columns(ctx: &mut RowContext, group_by: &[BoundExpr], set: &[usize]) {
+    for (i, key) in group_by.iter().enumerate() {
+        if !set.contains(&i) {
+            if let crate::bound::BoundExprKind::Column(c) = &key.kind {
+                ctx.null_column(c.table_ref.0, c.ordinal);
+            }
+        }
     }
 }
 

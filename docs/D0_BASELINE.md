@@ -545,3 +545,22 @@ Slice D1b, preceded by STEP 1 of the gate (fixes approved 2026-10-13). Platform:
 ## H. Not tested / limits (D1b)
 
 Real power loss, a real fsync lie, real sector tearing or reordering — **NOT TESTED**; every class C row is simulated under `docs/PERSISTENCE_MODEL.md` with A1–A5/W1 untested. Linux/macOS — not run. 4 KiB sectors — configurable, not run. Class C with concurrent writers, compaction on, the relational workload, and every fault point other than the six sampled — not run (D1c). Power-loss behaviour of `credentials.json`, `security.log`, instance bookkeeping, the frontend cache, directory creation by the host — NOT TESTED (outside the abstraction). Release binaries before/after the threading were not byte-compared.
+
+## I. D1c STEP 1 evidence (2026-10-14): F-D1b-1 and F-D1b-2 decisions landed
+
+All on Windows 10 / NTFS, debug builds, `CARGO_TARGET_DIR` on D:. Class C rows are SIMULATED (docs/PERSISTENCE_MODEL.md; A1-A5/W1); real power loss NOT TESTED.
+
+| # | Command | Result |
+|---|---|---|
+| 1 | `cargo test --features fault-points --test pending_fixes -- --test-threads=1` | 17 passed, 0 failed, 1 ignored (`observe_f_d1a_2_*`); the two `f_d1b_1_*` tests failed before the change (WAL: `records=0 truncated=false corrupted=[1]`; MANIFEST: `empty body (missing edit_type)`) and the four `guard_f_d1b_1_*` passed before and after |
+| 2 | `cargo test --features sim-fs --test sim_proof -- --nocapture` | 8 passed; P4 over 400 seeds: 4 exact 7, lost-no-stub 103, torn tail truncated 290, **rejected as corrupt 0** (was 108) |
+| 3 | `cargo test --features sim-fs --test dir_durability` | 5 passed, 1 ignored (SKIPPED: real POSIX kernel); the 3 `posix_model_*` tests FAILED with the five call-site edits reverted and pass with them |
+| 4 | `cargo build --features fault-points --example fault_child`; `cargo test --features fault-points --test fault_points -- --test-threads=1` | 24 passed, 0 failed, 5 ignored (122.6 s). Matrix verdict column: class A 34/34, class B single 164/164, concurrent 31/31, relational 31/31 |
+| 5 | `cargo build --features fault-points,sim-fs --example fault_child`; `cargo test --features fault-points,sim-fs --test sim_power_loss` x4 | 1 passed each; rows 153; class B 17/17; class C PASS 109 / 109 / 107 / 109, FAIL 27 / 27 / 29 / 27 = F-D1b-2 (Windows model) 24 + "WAL corrupt" 3 / 3 / 5 / 3 (F-D1b-3, G15); UNCLASSIFIED 0 |
+| 6 | experiment, NOT landed: M3 conformed to A2, smoke x3 + P4 | class C PASS 112 / 112 / 112, FAIL 24 (= F-D1b-2 Windows model only); P4 rejected 0; the change was reverted (`src/persist/sim.rs` restored) |
+| 7 | `cargo test --features fault-points,sim-fs --test persistence_abstraction_complete --test fault_points_absent_from_product` | 2 + 7 passed |
+| 8 | `cargo test --features fault-points,sim-fs --lib` | **697 passed**, 0 failed, 4 ignored (693 + the 4 new `wal::recovery` tests) -- 226 s |
+| 9 | `cargo clippy -p rubixdb --all-targets --all-features -- -D warnings`; `cargo fmt -p rubixdb -- --check` | clean; clean |
+| 10 | `cargo test --workspace --no-fail-fast` | **2,185 passed, 2 failed, 32 ignored** (~28 min; the 2 failures are the pre-existing `repo_hygiene` `no_tracked_credentials_json` and `no_tracked_file_contains_a_64_hex_admin_key_literal`). Diff against D1b final 2,181 / 2 / 32: **+4 passed** = the 4 new unit tests in `wal::recovery` (default build); the feature-gated tests (`pending_fixes`, `dir_durability`) are not in the default workspace count. Diff against D0 baseline 2,168 / 2 / 32 and D1a final 2,178 / 2 / 32: see rows above. |
+
+Not tested: real power loss; a real Unix kernel (the POSIX directory-sync evidence is the simulator with `dir_sync_effective = true`); the Windows directory-entry exposure (accepted, verbatim limitation in DURABILITY_CONTRACT C-SYNC-2 / A5); 4 KiB sectors; class C with concurrent writers, compaction on, relational (D1c).

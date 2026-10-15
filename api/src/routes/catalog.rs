@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use rubixdb::catalog::schema::{ObjectKind, Privilege};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,33 @@ pub struct TableInfo {
     pub table_id: u32,
     pub schema_id: u32,
     pub name: String,
+    /// The schema the table lives in, so a client can offer `schema.table` without a second lookup.
+    pub schema_name: String,
+}
+
+/// Which schema a catalog read looks at. Neither field: the instance's first schema, as before.
+#[derive(Debug, Default, Deserialize)]
+pub struct SchemaScope {
+    /// Exact schema name (what `USE SCHEMA` selected).
+    pub schema: Option<String>,
+    /// `all`: every schema of the database (for tables only).
+    pub scope: Option<String>,
+}
+
+/// The schema id a `?schema=` selects; `NotFound` when no such schema exists.
+fn scoped_schema_id(
+    state: &AppState,
+    bind_context: &rubixdb_sql::BindContext,
+    schema: Option<&str>,
+) -> Result<u32, ApiError> {
+    match schema.filter(|s| !s.is_empty()) {
+        None => Ok(bind_context.default_schema_id),
+        Some(name) => Ok(rubixdb_sql::bind::scope::resolve_schema_in_database(
+            &state.sql.catalog,
+            bind_context.database_id,
+            name,
+        )?),
+    }
 }
 
 /// `\lt` — every table in the current schema this principal is
@@ -112,16 +139,34 @@ pub struct TableInfo {
 pub async fn tables(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
+    Query(scope): Query<SchemaScope>,
 ) -> Result<Json<Vec<TableInfo>>, ApiError> {
     let auth_ctx = to_sql_auth_context(&principal);
     let bind_context = state.sql.bind_context()?;
-    let rows = state
+    let schemas = state
         .sql
         .catalog
-        .list_tables(bind_context.default_schema_id)
+        .list_schemas(bind_context.database_id)
         .map_err(rubixdb_sql::SqlError::from)?;
+    let wanted: Vec<_> = if scope.scope.as_deref() == Some("all") {
+        schemas
+    } else {
+        let id = scoped_schema_id(&state, &bind_context, scope.schema.as_deref())?;
+        schemas.into_iter().filter(|s| s.schema_id == id).collect()
+    };
+    let mut rows = Vec::new();
+    for s in &wanted {
+        for t in state
+            .sql
+            .catalog
+            .list_tables(s.schema_id)
+            .map_err(rubixdb_sql::SqlError::from)?
+        {
+            rows.push((s.name.clone(), t));
+        }
+    }
     let mut out = Vec::with_capacity(rows.len());
-    for t in rows {
+    for (schema_name, t) in rows {
         let authorized = rubixdb_sql::auth::is_authorized(
             &state.sql.catalog,
             &auth_ctx,
@@ -137,6 +182,7 @@ pub async fn tables(
                 table_id: t.table_id,
                 schema_id: t.schema_id,
                 name: t.name,
+                schema_name,
             });
         }
     }
@@ -185,12 +231,14 @@ pub async fn describe_table(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
     Path(name): Path<String>,
+    Query(scope): Query<SchemaScope>,
 ) -> Result<Json<TableDescription>, ApiError> {
     let bind_context = state.sql.bind_context()?;
+    let schema_id = scoped_schema_id(&state, &bind_context, scope.schema.as_deref())?;
     let table = state
         .sql
         .catalog
-        .get_table_by_name(bind_context.default_schema_id, &name)
+        .get_table_by_name(schema_id, &name)
         .map_err(rubixdb_sql::SqlError::from)?
         .ok_or_else(not_found)?;
 

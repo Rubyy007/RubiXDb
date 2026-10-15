@@ -2767,7 +2767,16 @@ fn reconcile_sstables_with_manifest(
     manifest: &mut Manifest,
     state: &mut ManifestState,
 ) -> Result<(Vec<Arc<SsTable>>, u64)> {
-    crate::persist::create_dir_all(sstables_dir)?;
+    // ADR-DATA-DIR-DURABILITY-01: the `sstables/` entry must be durable before any table is written into it. The parent is
+    // synced on every open (see `canonicalize_data_dir`). A no-op on Windows (assumption W1).
+    crate::persist::create_dir_all_durable(sstables_dir)?;
+    if let Some(parent) = sstables_dir.parent() {
+        crate::persist::sync_dir(if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        })?;
+    }
 
     let mut seen_ids: HashSet<u64> = HashSet::new();
     let mut max_id_seen: u64 = 0;

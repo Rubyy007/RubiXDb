@@ -47,7 +47,8 @@ export const STATEMENT_SNIPPETS: readonly Snippet[] = [
   { label: "CREATE TABLE", insert: "CREATE TABLE ", detail: "new table" },
   { label: "CREATE INDEX", insert: "CREATE INDEX ", detail: "new index" },
   { label: "CREATE UNIQUE INDEX", insert: "CREATE UNIQUE INDEX ", detail: "new unique index" },
-  { label: "CREATE SCHEMA", insert: "CREATE SCHEMA ", detail: "new schema" },
+  { label: "CREATE SCHEMA", insert: "CREATE SCHEMA ", detail: "new schema in default" },
+  { label: "USE SCHEMA", insert: "USE SCHEMA ", detail: "switch the working schema" },
   { label: "ALTER TABLE", insert: "ALTER TABLE ", detail: "change a table" },
   { label: "DROP TABLE", insert: "DROP TABLE ", detail: "remove a table" },
   { label: "DROP INDEX", insert: "DROP INDEX ", detail: "remove an index" },
@@ -57,6 +58,10 @@ export const STATEMENT_SNIPPETS: readonly Snippet[] = [
   { label: "COMMIT", insert: "COMMIT", detail: "keep the transaction" },
   { label: "ROLLBACK", insert: "ROLLBACK", detail: "discard the transaction" },
 ];
+
+/** Statements the server refuses (rubiXDb v1 has one database, `default`). They are never suggested; typing one
+ * is answered by the server with a 400 and the way forward (CREATE SCHEMA / USE SCHEMA). */
+export const UNSUPPORTED_STATEMENTS: readonly string[] = ["CREATE DATABASE", "USE DATABASE"];
 
 /** Keywords and phrases offered inside a statement, in the order they are usually wanted. */
 export const CLAUSE_KEYWORDS: readonly string[] = [

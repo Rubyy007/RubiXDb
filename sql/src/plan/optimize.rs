@@ -280,7 +280,7 @@ fn collect_required_columns(plan: &LogicalPlan, acc: &mut HashMap<u32, BTreeSet<
                 note(g, acc);
             }
             for a in aggregates {
-                if let crate::aggregate::AggregateArg::Expr(e) = &a.arg {
+                for e in a.arg.exprs() {
                     note(e, acc);
                 }
                 if let Some(f) = &a.filter {

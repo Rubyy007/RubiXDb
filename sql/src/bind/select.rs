@@ -178,6 +178,13 @@ pub(super) fn bind_select_in_with(
         &group_by,
         &mut max_parameter,
     )?;
+    // `GROUP BY ALL`: group by every select-list item that is not an aggregate
+    // or window function call (Snowflake).
+    let group_by = if stmt.group_by_all {
+        derive_group_by_all(&projection)
+    } else {
+        group_by
+    };
     // The table references this query's own FROM defines: a column of any
     // other table is an outer-query column, constant within one evaluation
     // of this query (SQL-mission-1).
@@ -269,15 +276,26 @@ pub(super) fn bind_select_in_with(
         .order_by
         .iter()
         .map(|item| -> Result<BoundOrderByItem> {
-            let mut eb = ExprBinder::new(Some(&scope), limits)
-                .with_aggregate(is_aggregated)
-                .with_window(true)
-                .with_env(env)
-                .with_outer(outer)
-                .with_named_windows(&named_windows)
-                .with_group_exprs(&group_by);
-            let bound = eb.bind(&item.expr, None)?;
-            max_parameter = max_parameter.max(eb.max_parameter);
+            // A select-list position (`ORDER BY 2`) or an output alias
+            // (`ORDER BY total`) names an item of the select list itself.
+            let bound = match resolve_output_reference(&item.expr, &projection, &projection_aliases)? {
+                Some(expr) => expr,
+                None => {
+                    // Any other expression sees the FROM columns first and
+                    // falls back to the select list's aliases (`ORDER BY a + 1`).
+                    let mut eb = ExprBinder::new(Some(&scope), limits)
+                        .with_aggregate(is_aggregated)
+                        .with_window(true)
+                        .with_env(env)
+                        .with_outer(outer)
+                        .with_named_windows(&named_windows)
+                        .with_group_exprs(&group_by)
+                        .with_aliases(&alias_exprs);
+                    let bound = eb.bind(&item.expr, None)?;
+                    max_parameter = max_parameter.max(eb.max_parameter);
+                    bound
+                }
+            };
             if is_aggregated {
                 validate_group_compat(&bound, &group_by, &own_refs)?;
             }
@@ -322,20 +340,12 @@ pub(super) fn bind_select_in_with(
     // NULL in the rows of a set that leaves it out, so its occurrences are
     // rewritten to read the group's key (`GroupKeyRef`) instead of the
     // representative input row -- which would still hold the column's value.
+    //
+    // A correlated subquery reads the group's representative row, not these
+    // rewritten trees: `validate_group_compat` already limits it to columns that
+    // are bare grouping expressions, and `AggregateOp` makes such a column `NULL`
+    // in the representative row of every set that leaves it out.
     let (projection, having, qualify, order_by) = if grouping.is_some() {
-        let reads_grouped_row = |e: &BoundExpr| {
-            matches!(&e.kind, BoundExprKind::Subquery(sq)
-                if sq.outer_refs.iter().any(|c| own_refs.contains(&c.table_ref.0)))
-        };
-        let offending = projection.iter().any(|i| i.expr.any(&reads_grouped_row))
-            || having.as_ref().is_some_and(|e| e.any(&reads_grouped_row))
-            || qualify.as_ref().is_some_and(|e| e.any(&reads_grouped_row))
-            || order_by.iter().any(|i| i.expr.any(&reads_grouped_row));
-        if offending {
-            return Err(SqlError::Unsupported {
-                detail: "a correlated subquery that reads a column of the grouped query is not supported together with ROLLUP, CUBE or GROUPING SETS".to_string(),
-            });
-        }
         (
             projection
                 .into_iter()
@@ -986,7 +996,7 @@ fn bind_projection(
     Ok((out, aliases))
 }
 
-fn expand_wildcard(
+pub(super) fn expand_wildcard(
     entry: &ScopeEntry,
     out: &mut Vec<BoundSelectItem>,
     limits: &SqlLimits,
@@ -1020,7 +1030,7 @@ fn expand_wildcard(
     Ok(())
 }
 
-fn derive_output_name(expr: &ast::Expr) -> String {
+pub(super) fn derive_output_name(expr: &ast::Expr) -> String {
     match expr {
         ast::Expr::Column(col) => col.parts.last().expect("non-empty").value.clone(),
         ast::Expr::Function { name, .. } => name.last().value.clone(),
@@ -1312,4 +1322,82 @@ fn extract_windows(expr: BoundExpr, out: &mut Vec<BoundWindowCall>) -> BoundExpr
         };
     }
     expr.map_children(&mut |c| extract_windows(c, out))
+}
+
+/// `ORDER BY` items that name an item of the select list rather than an
+/// expression over the `FROM` columns (SQL standard; PostgreSQL; Snowflake's
+/// `ORDER BY` documents "a column alias appearing in the query block's SELECT
+/// list" and "the position of an expression in the SELECT list"):
+///
+/// * an **unsigned integer literal** is a 1-based position in the select list
+///   (after `*` expansion); one outside `1..=n` is a bind error, never a
+///   constant sort key. A parameter (`$1`) and any other constant stay
+///   ordinary expressions.
+/// * a **bare identifier equal to an explicit select-list alias** is that
+///   item, *even when a `FROM` column has the same name* (the standard's and
+///   PostgreSQL's rule: output names win in a bare `ORDER BY` name). An alias
+///   given to two items is ambiguous and refused.
+///
+/// `None` means "bind as an ordinary expression". Qualified names
+/// (`t.total`) never name an alias.
+fn resolve_output_reference(
+    expr: &ast::Expr,
+    projection: &[BoundSelectItem],
+    aliases: &[(String, usize)],
+) -> Result<Option<BoundExpr>> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Number { text, is_integer: true }) => {
+            let position = text.parse::<i64>().ok();
+            match position {
+                Some(n) if n >= 1 && (n as u64) <= projection.len() as u64 => {
+                    Ok(Some(projection[(n - 1) as usize].expr.clone()))
+                }
+                _ => Err(SqlError::InvalidIdentifier {
+                    detail: format!(
+                        "ORDER BY position {text} is not in the select list (it has {} item(s))",
+                        projection.len()
+                    ),
+                }),
+            }
+        }
+        ast::Expr::Column(c) if c.parts.len() == 1 => {
+            let name = &c.parts[0].value;
+            let mut hits = aliases.iter().filter(|(alias, _)| alias == name);
+            let Some((_, idx)) = hits.next() else {
+                return Ok(None);
+            };
+            if hits.next().is_some() {
+                return Err(SqlError::InvalidIdentifier {
+                    detail: format!("ORDER BY '{name}' is ambiguous: two select-list items have that alias"),
+                });
+            }
+            Ok(Some(projection[*idx].expr.clone()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The grouping expressions of `GROUP BY ALL`: the select-list items (in order,
+/// each distinct expression once) that contain no aggregate call and no window
+/// function call. (`GROUPING(...)` in the select list never gets here: it names
+/// expressions of a written `GROUP BY` list, and the select list is bound while
+/// there is none, which refuses it.)
+fn derive_group_by_all(projection: &[BoundSelectItem]) -> Vec<BoundExpr> {
+    let is_window = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Window(_));
+    let mut out: Vec<BoundExpr> = Vec::new();
+    for item in projection {
+        // A constant is no grouping key (grouping by one would turn the global
+        // aggregate of an empty input -- one row -- into zero groups).
+        let constant = matches!(
+            item.expr.kind,
+            BoundExprKind::Literal(_) | BoundExprKind::Parameter { .. }
+        );
+        if constant || contains_aggregate(&item.expr) || item.expr.any(&is_window) {
+            continue;
+        }
+        if !out.contains(&item.expr) {
+            out.push(item.expr.clone());
+        }
+    }
+    out
 }

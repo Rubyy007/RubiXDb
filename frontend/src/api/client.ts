@@ -195,8 +195,14 @@ export class ApiClient {
     return this.request<TableInfo[]>("GET", "/v1/catalog/tables");
   }
 
-  describeTable(name: string) {
-    return this.request<TableDescription>("GET", `/v1/catalog/tables/${encodeURIComponent(name)}`);
+  /** Tables of every schema, each with its schema name (for `schema.table` completion). */
+  listAllTables() {
+    return this.request<TableInfo[]>("GET", "/v1/catalog/tables?scope=all");
+  }
+
+  describeTable(name: string, schema?: string | null) {
+    const q = schema ? `?schema=${encodeURIComponent(schema)}` : "";
+    return this.request<TableDescription>("GET", `/v1/catalog/tables/${encodeURIComponent(name)}${q}`);
   }
 
   listIndexes() {

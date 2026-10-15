@@ -22,6 +22,9 @@ pub struct SqlRequestBody {
     pub params: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The schema a `USE SCHEMA` selected; sent back with every statement (the server keeps none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,4 +44,7 @@ pub struct ApiErrorDetail {
     pub message: String,
     #[serde(default)]
     pub detail: Option<String>,
+    /// What to do about the error; absent from older servers.
+    #[serde(default)]
+    pub hint: Option<String>,
 }

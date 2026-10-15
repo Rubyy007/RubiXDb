@@ -281,7 +281,34 @@ pub(super) fn values_eq(a: &Option<RelationalValue>, b: &Option<RelationalValue>
     compare(a, b, BinaryOp::Eq).unwrap_or(Tri::Unknown)
 }
 
-fn compare(a: &Option<RelationalValue>, b: &Option<RelationalValue>, op: BinaryOp) -> Result<Tri> {
+/// The value one input row contributes to an aggregate (`None`: the argument
+/// is `NULL`, or `COUNT(*)` which has no argument). For `COUNT(a, b, ...)`
+/// (`AggregateArg::Multi`) it is the row's composite value, `None` when any of
+/// the arguments is `NULL`.
+pub(crate) fn eval_aggregate_arg(
+    arg: &crate::aggregate::AggregateArg<Box<BoundExpr>>,
+    ctx: &RowContext,
+    ec: &ExecCtx,
+) -> Result<Option<RelationalValue>> {
+    use crate::aggregate::AggregateArg;
+    match arg {
+        AggregateArg::Wildcard => Ok(None),
+        AggregateArg::Expr(e) => eval(e, ctx, ec),
+        AggregateArg::Multi(es) => {
+            let values = es
+                .iter()
+                .map(|e| eval(e, ctx, ec))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(crate::aggregate::composite_count_value(&values))
+        }
+    }
+}
+
+pub(super) fn compare(
+    a: &Option<RelationalValue>,
+    b: &Option<RelationalValue>,
+    op: BinaryOp,
+) -> Result<Tri> {
     let (a, b) = match (a, b) {
         (Some(a), Some(b)) => (a, b),
         _ => return Ok(Tri::Unknown),

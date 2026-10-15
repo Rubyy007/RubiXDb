@@ -133,6 +133,11 @@ pub enum SubqueryKind {
     Exists { negated: bool },
     /// `operand [NOT] IN (SELECT x ...)`: SQL three-valued logic.
     In { negated: bool },
+    /// `operand <op> ANY|SOME|ALL (SELECT x ...)`: `ANY` is the three-valued
+    /// disjunction of `operand <op> x` over the rows, `ALL` the conjunction
+    /// (an empty set gives `FALSE` for `ANY`, `TRUE` for `ALL`, whatever the
+    /// operand is).
+    Quantified { op: crate::ast::BinaryOp, all: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +244,9 @@ pub enum BoundWindowFunc {
     Aggregate {
         func: crate::aggregate::AggregateFunc,
         arg: BoundAggregateArg,
+        /// `AGG(DISTINCT x) OVER (...)`: each distinct value of the frame
+        /// counts once (the frame's own rows, not the partition's).
+        distinct: bool,
         filter: Option<Box<BoundExpr>>,
     },
     RowNumber,
@@ -247,19 +255,27 @@ pub enum BoundWindowFunc {
     PercentRank,
     CumeDist,
     Ntile(Box<BoundExpr>),
+    /// `ignore_nulls`: `IGNORE NULLS` -- rows whose value is `NULL` are skipped
+    /// when counting `offset` rows back (`LAG`) or forward (`LEAD`).
     Lag {
         expr: Box<BoundExpr>,
         offset: Option<Box<BoundExpr>>,
         default: Option<Box<BoundExpr>>,
+        ignore_nulls: bool,
     },
     Lead {
         expr: Box<BoundExpr>,
         offset: Option<Box<BoundExpr>>,
         default: Option<Box<BoundExpr>>,
+        ignore_nulls: bool,
     },
     /// `FIRST_VALUE(expr)`: `expr` at the first row of the **frame** (`NULL` for
-    /// an empty frame).
-    FirstValue(Box<BoundExpr>),
+    /// an empty frame). With `ignore_nulls`, the first row of the frame whose
+    /// value is not `NULL`.
+    FirstValue {
+        expr: Box<BoundExpr>,
+        ignore_nulls: bool,
+    },
     /// `LAST_VALUE(expr)`: `expr` at the last row of the **frame**.
     ///
     /// **Not the partition's last row** unless the frame says so. With the
@@ -272,12 +288,17 @@ pub enum BoundWindowFunc {
     /// `ORDER BY` the default frame is the whole partition.) This is the
     /// standard's behaviour, not a quirk of this engine; tests pin all three
     /// cases (`window_tests::exec_2c::last_value_*`).
-    LastValue(Box<BoundExpr>),
+    LastValue {
+        expr: Box<BoundExpr>,
+        ignore_nulls: bool,
+    },
     /// `NTH_VALUE(expr, n)`: `expr` at the n-th row (1-based) of the **frame**;
-    /// `NULL` when the frame has fewer than `n` rows.
+    /// `NULL` when the frame has fewer than `n` rows. With `ignore_nulls` the
+    /// n-th row whose value is not `NULL`.
     NthValue {
         expr: Box<BoundExpr>,
         n: Box<BoundExpr>,
+        ignore_nulls: bool,
     },
 }
 
@@ -293,8 +314,8 @@ impl BoundWindowFunc {
             BoundWindowFunc::Ntile(_) => "ntile",
             BoundWindowFunc::Lag { .. } => "lag",
             BoundWindowFunc::Lead { .. } => "lead",
-            BoundWindowFunc::FirstValue(_) => "first_value",
-            BoundWindowFunc::LastValue(_) => "last_value",
+            BoundWindowFunc::FirstValue { .. } => "first_value",
+            BoundWindowFunc::LastValue { .. } => "last_value",
             BoundWindowFunc::NthValue { .. } => "nth_value",
         }
     }
@@ -331,18 +352,21 @@ impl BoundWindowCall {
                 expr,
                 offset,
                 default,
+                ..
             }
             | BoundWindowFunc::Lead {
                 expr,
                 offset,
                 default,
+                ..
             } => {
                 out.push(expr);
                 out.extend(offset.iter().map(|b| b.as_ref()));
                 out.extend(default.iter().map(|b| b.as_ref()));
             }
-            BoundWindowFunc::FirstValue(e) | BoundWindowFunc::LastValue(e) => out.push(e),
-            BoundWindowFunc::NthValue { expr, n } => {
+            BoundWindowFunc::FirstValue { expr: e, .. }
+            | BoundWindowFunc::LastValue { expr: e, .. } => out.push(e),
+            BoundWindowFunc::NthValue { expr, n, .. } => {
                 out.push(expr);
                 out.push(n);
             }
@@ -361,11 +385,20 @@ impl BoundWindowCall {
     pub fn map_exprs(self, f: &mut dyn FnMut(BoundExpr) -> BoundExpr) -> BoundWindowCall {
         let mut m = |e: Box<BoundExpr>| Box::new(f(*e));
         let func = match self.func {
-            BoundWindowFunc::Aggregate { func, arg, filter } => BoundWindowFunc::Aggregate {
+            BoundWindowFunc::Aggregate {
                 func,
+                arg,
+                distinct,
+                filter,
+            } => BoundWindowFunc::Aggregate {
+                func,
+                distinct,
                 arg: match arg {
                     BoundAggregateArg::Wildcard => BoundAggregateArg::Wildcard,
                     BoundAggregateArg::Expr(e) => BoundAggregateArg::Expr(m(e)),
+                    BoundAggregateArg::Multi(v) => {
+                        BoundAggregateArg::Multi(v.into_iter().map(&mut m).collect())
+                    }
                 },
                 filter: filter.map(&mut m),
             },
@@ -374,25 +407,40 @@ impl BoundWindowCall {
                 expr,
                 offset,
                 default,
+                ignore_nulls,
             } => BoundWindowFunc::Lag {
                 expr: m(expr),
                 offset: offset.map(&mut m),
                 default: default.map(&mut m),
+                ignore_nulls,
             },
             BoundWindowFunc::Lead {
                 expr,
                 offset,
                 default,
+                ignore_nulls,
             } => BoundWindowFunc::Lead {
                 expr: m(expr),
                 offset: offset.map(&mut m),
                 default: default.map(&mut m),
+                ignore_nulls,
             },
-            BoundWindowFunc::FirstValue(e) => BoundWindowFunc::FirstValue(m(e)),
-            BoundWindowFunc::LastValue(e) => BoundWindowFunc::LastValue(m(e)),
-            BoundWindowFunc::NthValue { expr, n } => BoundWindowFunc::NthValue {
+            BoundWindowFunc::FirstValue { expr, ignore_nulls } => BoundWindowFunc::FirstValue {
+                expr: m(expr),
+                ignore_nulls,
+            },
+            BoundWindowFunc::LastValue { expr, ignore_nulls } => BoundWindowFunc::LastValue {
+                expr: m(expr),
+                ignore_nulls,
+            },
+            BoundWindowFunc::NthValue {
+                expr,
+                n,
+                ignore_nulls,
+            } => BoundWindowFunc::NthValue {
                 expr: m(expr),
                 n: m(n),
+                ignore_nulls,
             },
             other => other,
         };
@@ -473,7 +521,7 @@ impl BoundExpr {
             BoundExprKind::Function { args, .. } => args.iter().collect(),
             BoundExprKind::Aggregate(agg) => {
                 let mut v: Vec<&BoundExpr> = Vec::new();
-                if let BoundAggregateArg::Expr(e) = &agg.arg {
+                for e in agg.arg.exprs() {
                     v.push(e);
                 }
                 v.extend(agg.filter.iter().map(|b| b.as_ref()));
@@ -560,6 +608,9 @@ impl BoundExpr {
                 arg: match agg.arg {
                     BoundAggregateArg::Wildcard => BoundAggregateArg::Wildcard,
                     BoundAggregateArg::Expr(e) => BoundAggregateArg::Expr(b(e)),
+                    BoundAggregateArg::Multi(v) => {
+                        BoundAggregateArg::Multi(v.into_iter().map(&mut b).collect())
+                    }
                 },
                 distinct: agg.distinct,
                 filter: agg.filter.map(&mut b),
@@ -819,9 +870,21 @@ pub struct BoundSetOp {
     /// operands are an untyped `NULL`). Each operand's value is widened to it
     /// (`exec::setop`) before rows are compared.
     pub column_types: Vec<Option<RelationalType>>,
+    /// `UNION [ALL] BY NAME`: which column of each operand is result column
+    /// `i` (`None`: the operand lacks it, so it is `NULL` there). `None` for a
+    /// positional operation.
+    pub by_name: Option<NameAlignment>,
     /// The operands' physical plans, attached by the planner.
     pub left_plan: Option<crate::plan::physical::PhysicalPlan>,
     pub right_plan: Option<crate::plan::physical::PhysicalPlan>,
+}
+
+/// How the columns of a `UNION [ALL] BY NAME` line up: result column `i` is
+/// column `left[i]` of the left operand and column `right[i]` of the right one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NameAlignment {
+    pub left: Vec<Option<usize>>,
+    pub right: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -870,11 +933,82 @@ pub struct BoundSelect {
     pub max_parameter: u32,
 }
 
+/// `RETURNING <select list>` of an `INSERT` / `UPDATE` / `DELETE` (SQL Phase 2a):
+/// the items are evaluated, for every row the statement actually changed, against
+/// that row's values as they are after the change (for `DELETE`: as they were).
+/// `table_ref` is the relation id the items' columns are bound to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundReturning {
+    pub table_ref: u32,
+    pub items: Vec<BoundSelectItem>,
+}
+
+/// One unique constraint an `ON CONFLICT` clause arbitrates on: the primary key
+/// (`index_id` `None`) or a unique index, with the columns it covers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundArbiter {
+    pub index_id: Option<u32>,
+    pub ordinals: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundConflictAction {
+    DoNothing,
+    /// `DO UPDATE SET ... [WHERE ...]`, bound against two relations: the existing
+    /// row (`BoundOnConflict::existing_ref`) and the proposed row (`excluded_ref`).
+    DoUpdate {
+        assignments: Vec<BoundAssignment>,
+        selection: Option<BoundExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundOnConflict {
+    /// The constraints a proposed row is checked against, in order. `DO UPDATE`
+    /// always has exactly one (its conflict target); `DO NOTHING` without a
+    /// target has the primary key and every ready unique index.
+    pub arbiters: Vec<BoundArbiter>,
+    pub existing_ref: u32,
+    pub excluded_ref: u32,
+    pub action: BoundConflictAction,
+}
+
+/// How the rows of an `INSERT ... SELECT` map onto the target table's columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundInsertSelect {
+    pub query: BoundSelect,
+    /// The query's physical plan, attached by the planner.
+    pub plan: Option<crate::plan::physical::PhysicalPlan>,
+    /// For each output column of the query: the target column it fills and the
+    /// type its values are widened to (`None`: already that type).
+    pub targets: Vec<InsertSelectTarget>,
+    /// Target columns the statement does not name, with their `DEFAULT` (or `NULL`).
+    pub defaults: Vec<(u16, Option<rubixdb::relational::RelationalValue>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertSelectTarget {
+    pub ordinal: u16,
+    /// The column's type when the query's differs: a lossless widening
+    /// (`INTEGER` to `BIGINT`, ...) or -- the one narrowing -- `BIGINT` to
+    /// `INTEGER`, checked per value (`SUM` / `COUNT` give `BIGINT`).
+    pub convert_to: Option<RelationalType>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundInsert {
+    /// The statement's `WITH` list (visible to an `INSERT ... SELECT`).
+    pub ctes: Vec<BoundCte>,
     pub database_id: u32,
     pub schema_id: u32,
     pub table_id: u32,
+    /// `INSERT ... SELECT`: the rows come from here and `rows` is empty.
+    pub select: Option<Box<BoundInsertSelect>>,
+    pub on_conflict: Option<BoundOnConflict>,
+    pub returning: Option<BoundReturning>,
+    /// Every `WITH` definition the planner planned for the statement (the
+    /// statement's own list and those inside the source query); 0 until planned.
+    pub defined_ctes: u32,
     /// One row per `VALUES (...)` tuple; each row has exactly one entry
     /// per catalog column, in ordinal order (a column omitted from an
     /// explicit column list binds as an untyped `NULL` `BoundExpr` here
@@ -897,6 +1031,7 @@ pub struct BoundUpdate {
     pub table: BoundTableRef,
     pub assignments: Vec<BoundAssignment>,
     pub selection: Option<BoundExpr>,
+    pub returning: Option<BoundReturning>,
     pub max_parameter: u32,
 }
 
@@ -905,6 +1040,7 @@ pub struct BoundDelete {
     pub ctes: Vec<BoundCte>,
     pub table: BoundTableRef,
     pub selection: Option<BoundExpr>,
+    pub returning: Option<BoundReturning>,
     pub max_parameter: u32,
 }
 

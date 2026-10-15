@@ -19,6 +19,8 @@ export interface RunError {
   code: string;
   message: string;
   detail?: string;
+  /** The server's "what to do next" line for this error, when it sent one. */
+  hint?: string;
   /** HTTP status when the API answered; absent for a client-side failure. */
   http?: number;
   /** Which statement of a multi-statement cell failed (set by the runner). */
@@ -100,6 +102,8 @@ export interface RunnerState {
   sessions: Record<string, SessionInfo>;
   /** Short messages about a session or container (begin/commit failures, adoption). */
   notices: Record<string, string>;
+  /** The schema a `USE SCHEMA` selected (sent with every statement); null: the server's default schema. */
+  schema: string | null;
   inFlight: InFlight[];
   queued: number;
 }
@@ -112,6 +116,10 @@ export interface RunnerOptions {
   now?: () => number;
   perf?: () => number;
   onHistory?: (e: HistoryEntry) => void;
+  /** The schema to start in (remembered by the page between visits). */
+  initialSchema?: string | null;
+  /** Called whenever `USE SCHEMA` (or a reset) changes the schema. */
+  onSchemaChange?: (schema: string | null) => void;
 }
 
 interface Job {
@@ -129,7 +137,7 @@ export function implicitSessionKey(sheetId: string): string {
 
 export function toRunError(err: unknown): RunError {
   if (err instanceof ApiRequestError) {
-    return { code: err.code, message: err.message, detail: err.detail, http: err.status };
+    return { code: err.code, message: err.message, detail: err.detail, hint: err.hint, http: err.status };
   }
   if (err && typeof err === "object" && (err as { name?: string }).name === "AbortError") {
     return { code: "CANCELLED", message: "the request was cancelled" };
@@ -137,7 +145,7 @@ export function toRunError(err: unknown): RunError {
   return { code: "NETWORK_ERROR", message: err instanceof Error ? err.message : "the request failed" };
 }
 
-const EMPTY: RunnerState = { runs: {}, sessions: {}, notices: {}, inFlight: [], queued: 0 };
+const EMPTY: RunnerState = { runs: {}, sessions: {}, notices: {}, schema: null, inFlight: [], queued: 0 };
 
 export class Runner {
   private st: RunnerState = EMPTY;
@@ -151,8 +159,11 @@ export class Runner {
   private readonly now: () => number;
   private readonly perf: () => number;
   private readonly onHistory?: (e: HistoryEntry) => void;
+  private readonly onSchemaChange?: (schema: string | null) => void;
 
   constructor(opts: RunnerOptions) {
+    if (opts.initialSchema) this.st = { ...EMPTY, schema: opts.initialSchema };
+    this.onSchemaChange = opts.onSchemaChange;
     this.send = opts.send;
     this.max = Math.max(1, opts.maxConcurrent ?? DEFAULT_MAX_CONCURRENT);
     this.now = opts.now ?? (() => Date.now());
@@ -174,6 +185,20 @@ export class Runner {
 
   private setRun(cellId: string, run: CellRun): void {
     this.set({ runs: { ...this.st.runs, [cellId]: run } });
+  }
+
+  /** Choose the schema unqualified names resolve in (`null`: back to the server's default). */
+  setSchema(schema: string | null): void {
+    if (this.st.schema === schema) return;
+    this.set({ schema });
+    this.onSchemaChange?.(schema);
+  }
+
+  /** A request body: the schema is part of it only when one was chosen, so requests stay as small as before. */
+  private request(sql: string, sessionId: string | null): SqlRequestBody {
+    const req: SqlRequestBody = sessionId ? { sql, session_id: sessionId } : { sql };
+    if (this.st.schema) req.schema = this.st.schema;
+    return req;
   }
 
   private setNotice(key: string, text: string | null): void {
@@ -261,14 +286,14 @@ export class Runner {
     const controller = new AbortController();
     const t0 = this.perf();
     try {
-      const res = await this.send(sessionId ? { sql, session_id: sessionId } : { sql }, controller.signal);
+      const res = await this.send(this.request(sql, sessionId), controller.signal);
       this.history(sheetId, key, sql, true, null, this.perf() - t0, null, 1, 1);
       return res;
     } catch (err) {
       const e = toRunError(err);
       this.history(sheetId, key, sql, false, e.code, this.perf() - t0, null, 1, 1);
       if (e.code === "SESSION_NOT_FOUND") this.setSession(key, null);
-      this.setNotice(key, `${e.code}: ${e.message}${e.detail ? ` (${e.detail})` : ""}`);
+      this.setNotice(key, `${e.code}: ${e.message}${e.detail ? ` (${e.detail})` : ""}${e.hint ? ` — ${e.hint}` : ""}`);
       return null;
     }
   }
@@ -336,10 +361,10 @@ export class Runner {
       this.markCurrent(job, sessionKey, stmt, i, statements.length, startedAt, sessionId, parts);
       const t1 = this.perf();
       try {
-        const req: SqlRequestBody = sid ? { sql: stmt.text, session_id: sid } : { sql: stmt.text };
-        const response = await this.send(req, controller.signal);
+        const response = await this.send(this.request(stmt.text, sid), controller.signal);
         const ms = this.perf() - t1;
         sid = response.session_id;
+        if (response.result.kind === "use_schema") this.setSchema(response.result.schema);
         parts.push({ index: i, text: stmt.text, startLine: stmt.startLine, startCol: stmt.startCol, status: "success", response, ms });
         const r = response.result;
         const rows = r.kind === "rows" ? r.row_count : r.kind === "write" ? r.rows_affected : null;
