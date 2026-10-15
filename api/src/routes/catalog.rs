@@ -570,7 +570,7 @@ pub async fn delete_table(
         .sql
         .catalog
         .drop_table(table_id)
-        .map_err(rubixdb_sql::SqlError::from)?;
+        .map_err(rubixdb_sql::error::ddl_catalog_error)?;
     Ok(Json(DeleteResult { deleted: true }))
 }
 
@@ -634,7 +634,7 @@ pub async fn delete_index(
         .sql
         .index_builder
         .drop_index_online(index_id)
-        .map_err(rubixdb_sql::SqlError::from)?;
+        .map_err(rubixdb_sql::error::ddl_relational_error)?;
     Ok(Json(DeleteResult { deleted: true }))
 }
 

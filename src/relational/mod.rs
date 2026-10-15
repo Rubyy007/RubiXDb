@@ -11,10 +11,12 @@
 //! authorization enforcement (deferred to D15's binder, per the existing
 //! architecture).
 
+pub mod alter;
 pub mod error;
 pub mod index;
 pub mod index_key;
 pub mod key;
+pub mod lookup;
 pub mod stats;
 pub mod table_store;
 pub mod txn;
@@ -24,8 +26,8 @@ pub use error::{RelationalError, Result};
 pub use index::{IndexBuilder, IndexStatsSnapshot};
 pub use table_store::{Row, TableStore, MAX_ROW_VALUE_BYTES};
 pub use txn::{
-    OverlayEntry, TableOverlay, Transaction, TransactionManager, TxnLimits, TxnMetricsSnapshot,
-    TxnState,
+    CascadedWrite, OverlayEntry, ReadView, RowChange, Savepoint, TableOverlay, Transaction,
+    TransactionManager, TxnLimits, TxnMetricsSnapshot, TxnState,
 };
 pub use value::{validate_decimal, RelationalType, RelationalValue, MAX_DECIMAL_PRECISION};
 
@@ -37,3 +39,12 @@ mod index_tests;
 
 #[cfg(test)]
 mod txn_tests;
+
+#[cfg(test)]
+mod fk_tests;
+
+#[cfg(test)]
+mod commit_bench;
+
+#[cfg(test)]
+mod fk_bench;

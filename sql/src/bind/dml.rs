@@ -598,7 +598,6 @@ pub fn bind_update(
     let env = BindEnv::new(catalog, ctx, auth, metrics);
     let resolved =
         scope::resolve_table(catalog, ctx, auth, metrics, &stmt.table, Privilege::Update)?;
-    let pk_ordinals: HashSet<u16> = resolved.table.pk_ordinals.iter().copied().collect();
     let mut scope = env.new_scope();
     let mut max_parameter = 0u32;
     let ctes = crate::bind::select::bind_with_list(
@@ -632,12 +631,8 @@ pub fn bind_update(
                     kind: "column",
                     detail: a.column.value.clone(),
                 })?;
-            if pk_ordinals.contains(&column.ordinal) {
-                return Err(SqlError::Unsupported {
-                    detail: "UPDATE of a primary-key column is not supported in v1 (use DELETE + INSERT, D6)"
-                        .to_string(),
-                });
-            }
+            // A `SET` of a primary-key column is allowed (it changes the row's key; see
+            // `exec::write::execute_update` and `Transaction::apply_row_updates`).
             let ty = relational_type_of(column)?;
             // A `SET` expression may contain a subquery (SQL-mission-1 Slice
             // B); it is evaluated against the row's pre-update values and the

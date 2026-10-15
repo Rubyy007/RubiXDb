@@ -88,6 +88,9 @@ fn bind_statement_inner(
         ast::Statement::DropTable(s) => {
             BoundStatement::DropTable(ddl::bind_drop_table(catalog, ctx, auth, metrics, s)?)
         }
+        ast::Statement::AlterTable(s) => BoundStatement::AlterTable(ddl::bind_alter_table(
+            catalog, ctx, auth, metrics, limits, s,
+        )?),
         ast::Statement::CreateIndex(s) => BoundStatement::CreateIndex(ddl::bind_create_index(
             catalog, ctx, auth, metrics, limits, s,
         )?),

@@ -59,6 +59,7 @@ pub mod code {
     pub const ADMIN_ACTION: &str = "admin.action";
     pub const CATALOG_CREATE: &str = "catalog.create";
     pub const CATALOG_DROP: &str = "catalog.drop";
+    pub const CATALOG_ALTER: &str = "catalog.alter";
     pub const INSTANCE_START: &str = "instance.start";
     pub const INSTANCE_STOP: &str = "instance.stop";
     pub const INSTANCE_DROP: &str = "instance.drop";

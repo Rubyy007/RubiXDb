@@ -127,15 +127,40 @@ impl TableStore {
             .collect())
     }
 
+    /// The shared engine and catalog, for the sibling modules (`txn::fk`,
+    /// `alter`) that read and write the same physical keys `TableStore` does.
+    pub(crate) fn engine(&self) -> &Arc<LsmEngine> {
+        &self.engine
+    }
+
+    pub(crate) fn catalog(&self) -> &Arc<CatalogService> {
+        &self.catalog
+    }
+
+    /// A table's row and its columns. They are two catalog reads; `ALTER TABLE
+    /// ... ADD COLUMN` changes both in one atomic batch, so a pair read across that
+    /// batch could pair the old table row with a column the old rows do not have.
+    /// Every column records the `schema_version` that added it, so such a pair is
+    /// recognisable (a column newer than the table row) and is simply read again.
     pub(crate) fn resolve_table(&self, table_id: u32) -> Result<(TableRow, Vec<ColumnRow>)> {
-        let table = self
-            .catalog
-            .get_table(table_id)?
-            .ok_or_else(|| RelationalError::NotFound {
-                object: format!("table {table_id}"),
-            })?;
-        let columns = self.catalog.get_columns(table_id)?;
-        Ok((table, columns))
+        for _ in 0..8 {
+            let table = self
+                .catalog
+                .get_table(table_id)?
+                .ok_or_else(|| RelationalError::NotFound {
+                    object: format!("table {table_id}"),
+                })?;
+            let columns = self.catalog.get_columns(table_id)?;
+            if columns
+                .iter()
+                .all(|c| c.added_in_schema_version <= table.schema_version)
+            {
+                return Ok((table, columns));
+            }
+        }
+        Err(RelationalError::Conflict {
+            detail: format!("table {table_id}'s schema is changing; retry the statement"),
+        })
     }
 
     fn pk_ordinal_set(table: &TableRow) -> HashSet<u16> {
@@ -150,10 +175,12 @@ impl TableStore {
     /// §5/§6). Returns the durable sequence the row (and its index
     /// entries) committed at.
     pub fn put_row(&self, table_id: u32, values: &[Option<RelationalValue>]) -> Result<u64> {
-        let (table, columns) = self.resolve_table(table_id)?;
-        validate_row_shape(&table, &columns, values)?;
+        // The epoch lock first: `ALTER TABLE` holds its write side while it changes the
+        // schema, so the shape resolved below is the shape this write is applied under.
         let epoch = self.epoch_lock(table_id);
         let _epoch_guard = epoch.read().unwrap_or_else(|p| p.into_inner());
+        let (table, columns) = self.resolve_table(table_id)?;
+        validate_row_shape(&table, &columns, values)?;
 
         let indexes = self.maintained_indexes(table_id)?;
         let pk_values = extract_pk_values(&table, values);
@@ -190,12 +217,12 @@ impl TableStore {
                 detail: "put_rows requires at least one row".to_string(),
             });
         }
+        let epoch = self.epoch_lock(table_id);
+        let _epoch_guard = epoch.read().unwrap_or_else(|p| p.into_inner());
         let (table, columns) = self.resolve_table(table_id)?;
         for values in rows {
             validate_row_shape(&table, &columns, values)?;
         }
-        let epoch = self.epoch_lock(table_id);
-        let _epoch_guard = epoch.read().unwrap_or_else(|p| p.into_inner());
         let indexes = self.maintained_indexes(table_id)?;
 
         let mut ops = Vec::with_capacity(rows.len() * (1 + indexes.len() * 2));
@@ -861,17 +888,28 @@ pub(crate) fn decode_full_row(
     value_bytes: &[u8],
 ) -> Result<Row> {
     let pk_set = TableStore::pk_ordinal_set(table);
-    let non_pk_types: Vec<RelationalType> = columns
+    // `ADR-DDL-FK-01`: a row is decoded against the columns that existed when it
+    // was written -- those added at or before its own `schema_version`. A column
+    // added later (`ALTER TABLE ... ADD COLUMN`) is not in the row's bytes at all;
+    // it reads as the column's `backfill_value`. Columns are only ever appended, so
+    // the columns a row holds are a prefix of the (ordinal-ordered) non-key columns.
+    let row_version = peek_row_schema_version(value_bytes)?;
+    let stored: Vec<&ColumnRow> = columns
         .iter()
-        .filter(|c| !pk_set.contains(&c.ordinal))
-        .map(relational_type_from_column)
+        .filter(|c| !pk_set.contains(&c.ordinal) && c.added_in_schema_version <= row_version)
+        .collect();
+    let stored_types: Vec<RelationalType> = stored
+        .iter()
+        .map(|c| relational_type_from_column(c))
         .collect::<Result<_>>()?;
-    let (_, non_pk_fields) = decode_row(value_bytes, &non_pk_types)?;
+    let (_, non_pk_fields) = decode_row(value_bytes, &stored_types)?;
 
     let mut non_pk_iter = non_pk_fields.into_iter();
     let mut result = Vec::with_capacity(columns.len());
     for column in columns {
-        if pk_set.contains(&column.ordinal) {
+        if !pk_set.contains(&column.ordinal) && column.added_in_schema_version > row_version {
+            result.push(decode_backfill(column)?);
+        } else if pk_set.contains(&column.ordinal) {
             let idx = table
                 .pk_ordinals
                 .iter()
@@ -894,6 +932,33 @@ pub(crate) fn decode_full_row(
         }
     }
     Ok(result)
+}
+
+/// The `schema_version` stamped in a `RowValue` envelope (`format_version:u8 ||
+/// schema_version:u32 LE || ...`, D3).
+fn peek_row_schema_version(value_bytes: &[u8]) -> Result<u32> {
+    let raw = value_bytes
+        .get(1..5)
+        .ok_or_else(|| RelationalError::InvalidInput {
+            detail: "a stored row is shorter than its envelope header".to_string(),
+        })?;
+    Ok(u32::from_le_bytes(raw.try_into().expect("4 bytes")))
+}
+
+/// What a row written before `column` was added reads as for it.
+fn decode_backfill(column: &ColumnRow) -> Result<Option<RelationalValue>> {
+    match &column.backfill_value {
+        None => Ok(None),
+        Some(bytes) => decode_literal(column, bytes),
+    }
+}
+
+/// Decodes a literal the catalog stores for `column` (a `DEFAULT`, a backfill
+/// value): a one-field `RowValue` of the column's type.
+pub(crate) fn decode_literal(column: &ColumnRow, bytes: &[u8]) -> Result<Option<RelationalValue>> {
+    let ty = relational_type_from_column(column)?;
+    let (_, mut fields) = decode_row(bytes, &[ty])?;
+    Ok(fields.pop().flatten())
 }
 
 fn as_bound_ref(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {

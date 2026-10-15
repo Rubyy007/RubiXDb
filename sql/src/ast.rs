@@ -594,6 +594,90 @@ pub struct CreateTable {
     /// A table-level `PRIMARY KEY(a, b, ...)` constraint, if present
     /// (composite keys, D6).
     pub table_primary_key: Option<Vec<Ident>>,
+    /// Foreign keys: table-level `FOREIGN KEY (...) REFERENCES ...` and inline
+    /// `col TYPE REFERENCES ...` (folded to a one-column key), in source order.
+    pub foreign_keys: Vec<ForeignKeyDef>,
+    /// `CHECK (...)`: table-level and column-level, in source order.
+    pub checks: Vec<CheckDef>,
+}
+
+/// `[CONSTRAINT name] CHECK (expression)`. `text` is the expression as SQL text, the
+/// form the catalog stores; it is parsed and bound again whenever a row is written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckDef {
+    pub name: Option<Ident>,
+    pub expr: Expr,
+    pub text: String,
+}
+
+/// `ON DELETE` / `ON UPDATE` action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferentialAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+/// A foreign key as written: `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES
+/// table [(cols)] [ON DELETE action] [ON UPDATE action]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeyDef {
+    pub name: Option<Ident>,
+    pub columns: Vec<Ident>,
+    pub foreign_table: ObjectName,
+    /// Empty = the referenced table's primary key.
+    pub referred_columns: Vec<Ident>,
+    pub on_delete: Option<ReferentialAction>,
+    pub on_update: Option<ReferentialAction>,
+}
+
+/// The one change an `ALTER TABLE` statement makes. A statement carries exactly
+/// one: the catalog applies a change atomically, and several in a row would not be
+/// (`ADR-DDL-FK-01`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterOperation {
+    AddColumn {
+        column: ColumnDef,
+        if_not_exists: bool,
+    },
+    RenameColumn {
+        from: Ident,
+        to: Ident,
+    },
+    SetDefault {
+        column: Ident,
+        value: Expr,
+    },
+    DropDefault {
+        column: Ident,
+    },
+    SetNotNull {
+        column: Ident,
+    },
+    DropNotNull {
+        column: Ident,
+    },
+    AddForeignKey(ForeignKeyDef),
+    AddCheck(CheckDef),
+    /// `ADD [CONSTRAINT name] UNIQUE (cols)` -- a unique index.
+    AddUnique {
+        name: Option<Ident>,
+        columns: Vec<Ident>,
+    },
+    /// `DROP CONSTRAINT name` -- a foreign key, a `CHECK`, or a unique constraint (index).
+    DropConstraint {
+        name: Ident,
+        if_exists: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTable {
+    pub name: ObjectName,
+    pub if_exists: bool,
+    pub operation: AlterOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +765,8 @@ pub enum Statement {
     CreateTable(CreateTable),
     /// `DROP TABLE` — PARSED, BOUND. NOT EXECUTABLE YET.
     DropTable(DropTable),
+    /// `ALTER TABLE` -- one operation per statement (`AlterOperation`).
+    AlterTable(AlterTable),
     /// `CREATE INDEX` — PARSED, BOUND. NOT EXECUTABLE YET (the bound
     /// form is shaped to call `IndexBuilder::create_index_online`
     /// directly — but this crate never calls it).

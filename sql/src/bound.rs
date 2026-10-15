@@ -4,7 +4,8 @@
 //! every object reference has already passed authorization (item 15).
 //! No variant here is executed by this crate.
 
-use rubixdb::catalog::schema::IndexKind;
+use rubixdb::catalog::schema::{FkAction, IndexKind};
+use rubixdb::catalog::service::NewForeignKey;
 use rubixdb::relational::{RelationalType, RelationalValue};
 
 use crate::ast::{BinaryOp, JoinKind, UnaryOp};
@@ -1060,6 +1061,29 @@ pub struct BoundColumnDef {
     pub default_value: Option<Vec<u8>>,
 }
 
+/// A `CHECK` constraint, validated at bind time (the expression binds, is boolean,
+/// and uses none of the forbidden forms) and carried as the text the catalog stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundCheckDef {
+    pub name: String,
+    pub text: String,
+    /// The columns the expression reads.
+    pub columns: Vec<u16>,
+}
+
+/// A foreign key declared in `CREATE TABLE`, resolved: the referencing columns are
+/// ordinals of the table being created; the referenced table is an existing one
+/// (`parent_table_id: Some`) or the table being created itself (`None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundCreateTableForeignKey {
+    pub name: String,
+    pub child_ordinals: Vec<u16>,
+    pub parent_table_id: Option<u32>,
+    pub parent_ordinals: Vec<u16>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundCreateTable {
     pub database_id: u32,
@@ -1068,6 +1092,56 @@ pub struct BoundCreateTable {
     pub columns: Vec<BoundColumnDef>,
     pub pk_ordinals: Vec<u16>,
     pub if_not_exists: bool,
+    pub foreign_keys: Vec<BoundCreateTableForeignKey>,
+    pub checks: Vec<BoundCheckDef>,
+}
+
+/// The change an `ALTER TABLE` makes, with every name resolved to catalog ids and
+/// ordinals.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundAlterOp {
+    /// `IF EXISTS` and the table (or `IF NOT EXISTS` and the column) is as asked.
+    Noop,
+    AddColumn(BoundColumnDef),
+    RenameColumn {
+        ordinal: u16,
+        new_name: String,
+    },
+    SetDefault {
+        ordinal: u16,
+        /// Encoded literal, as `BoundColumnDef::default_value`.
+        default_value: Vec<u8>,
+    },
+    DropDefault {
+        ordinal: u16,
+    },
+    SetNotNull {
+        ordinal: u16,
+    },
+    DropNotNull {
+        ordinal: u16,
+    },
+    AddForeignKey(NewForeignKey),
+    AddCheck(BoundCheckDef),
+    DropCheck {
+        constraint_id: u32,
+    },
+    AddUnique {
+        name: String,
+        column_ordinals: Vec<u16>,
+    },
+    DropForeignKey {
+        fk_id: u32,
+    },
+    DropUnique {
+        index_id: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundAlterTable {
+    pub table_id: Option<u32>,
+    pub operation: BoundAlterOp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1125,6 +1199,7 @@ pub enum BoundStatement {
     DropTable(BoundDropTable),
     CreateIndex(BoundCreateIndex),
     DropIndex(BoundDropIndex),
+    AlterTable(BoundAlterTable),
     Explain(Box<BoundStatement>),
     Begin,
     Commit,

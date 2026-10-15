@@ -11,6 +11,7 @@ pub mod auth;
 pub mod bind;
 pub mod bound;
 pub mod convert;
+pub mod check;
 pub mod error;
 pub mod exec;
 pub mod functions;
@@ -136,3 +137,7 @@ mod phase1_window_tests;
 // SQL Phase 2a: RETURNING, INSERT ... SELECT, INSERT ... ON CONFLICT.
 #[cfg(test)]
 mod phase2a_tests;
+
+// SQL Phase 2b + 3: ALTER TABLE and foreign keys.
+#[cfg(test)]
+mod phase2b3_tests;

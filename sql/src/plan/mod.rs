@@ -204,6 +204,7 @@ fn build_plan_cx(bound: &BoundStatement, cx: &Cx<'_>) -> Result<Plan> {
         | BoundStatement::CreateTable(_)
         | BoundStatement::DropTable(_)
         | BoundStatement::CreateIndex(_)
+        | BoundStatement::AlterTable(_)
         | BoundStatement::DropIndex(_) => Ok(Plan::Ddl(bound.clone())),
         BoundStatement::Begin => Ok(Plan::Begin),
         BoundStatement::Commit => Ok(Plan::Commit),

@@ -151,8 +151,8 @@ fn acquire_build_slot(counter: &AtomicUsize) -> Result<BuildSlot<'_>> {
 
 pub struct IndexBuilder {
     engine: Arc<LsmEngine>,
-    catalog: Arc<CatalogService>,
-    table_store: Arc<TableStore>,
+    pub(crate) catalog: Arc<CatalogService>,
+    pub(crate) table_store: Arc<TableStore>,
     stats: IndexStats,
     active_builds: AtomicUsize,
     /// Test-only seam (compiled out of every non-test build): called after each
@@ -295,8 +295,62 @@ impl IndexBuilder {
         if self.backfill(table_id, &index_row, cancel)?.is_none() {
             return Ok(false);
         }
+        if index_row.kind == IndexKind::Unique {
+            self.verify_unique_entries(table_id, &index_row)?;
+        }
         self.catalog.mark_index_ready(index_id)?;
         Ok(true)
+    }
+
+    /// A `UNIQUE` index may only become `Ready` if the rows it was built over hold
+    /// no value twice. (Writes made while it is `Building` are already checked at
+    /// commit against the entries; this covers the rows that existed before it.)
+    /// One bounded-memory pass over the index in key order: entries of equal indexed
+    /// value are adjacent, so a duplicate is two neighbours with the same indexed
+    /// bytes. A tuple whose columns are all `NULL` equals nothing (standard SQL), as
+    /// at commit.
+    fn verify_unique_entries(&self, table_id: u32, index: &IndexRow) -> Result<()> {
+        let (_, columns) = self.table_store.resolve_table(table_id)?;
+        let types = index
+            .column_ordinals
+            .iter()
+            .map(|&o| {
+                columns
+                    .iter()
+                    .find(|c| c.ordinal == o)
+                    .ok_or_else(|| RelationalError::InvalidInput {
+                        detail: format!("index {} column {o} no longer exists", index.index_id),
+                    })
+                    .and_then(crate::relational::table_store::relational_type_from_column)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let snapshot = self.engine.snapshot();
+        let (start, end) = index_entry_range(table_id, index.index_id);
+        let mut previous: Option<Vec<u8>> = None;
+        for entry in self.engine.range_scan(
+            as_bound_ref(&start),
+            as_bound_ref(&end),
+            snapshot.seq(),
+        ) {
+            let (key, _) = entry?;
+            let body = key.get(9..).unwrap_or(&[]);
+            let (values, consumed) = decode_indexed_columns(&types, body)?;
+            if values.iter().all(Option::is_none) {
+                previous = None;
+                continue;
+            }
+            let prefix = &body[..consumed];
+            if previous.as_deref() == Some(prefix) {
+                return Err(RelationalError::InvalidInput {
+                    detail: format!(
+                        "cannot create UNIQUE index {:?}: the existing rows hold a value more than once",
+                        index.name
+                    ),
+                });
+            }
+            previous = Some(prefix.to_vec());
+        }
+        Ok(())
     }
 
     /// The backfill pass itself (T1–T4). Enumerates every primary key

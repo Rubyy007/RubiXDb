@@ -121,7 +121,7 @@ fn resolve_database_by_name(catalog: &CatalogService, name: &str) -> Result<u32>
 /// resolving each qualifying part against the catalog by name (never
 /// assuming an ID from position — item 33: physical/catalog IDs are
 /// never derived from anything but an authoritative catalog lookup).
-fn resolve_schema_scope(
+pub(crate) fn resolve_schema_scope(
     catalog: &CatalogService,
     ctx: &BindContext,
     name: &ast::ObjectName,
@@ -709,6 +709,7 @@ pub fn relation_columns(
                 default_value: None,
                 added_in_schema_version: 0,
                 type_params,
+                backfill_value: None,
             })
         })
         .collect()

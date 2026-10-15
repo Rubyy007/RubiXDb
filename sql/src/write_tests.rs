@@ -411,21 +411,19 @@ fn update_unique_column_to_an_existing_value_conflicts() {
     f.cleanup();
 }
 
+/// Superseded by SQL Phase 2b+3 (`docs/adr/ADR-DDL-FK-01.md`, matrix row G-8): this
+/// test used to pin the refusal of `UPDATE` on a primary-key column (D6). The statement
+/// is now supported -- the row moves to its new key -- because `ON UPDATE CASCADE`
+/// needs it; the full behaviour is covered by `phase2b3_tests::primary_key_update`.
 #[test]
-fn update_primary_key_column_is_rejected_end_to_end() {
-    let f = WriteFixture::new("update_pk_rejected");
+fn update_primary_key_column_moves_the_row_end_to_end() {
+    let f = WriteFixture::new("update_pk_moves");
     f.write("INSERT INTO t (id, name, active) VALUES (1, 'a', TRUE)");
-    // Rejected at bind time (D6) -- `f.plan` itself panics via
-    // `unwrap_or_else`, so call the pipeline manually to assert the
-    // error kind instead of a hard panic.
-    let limits = SqlLimits::default();
-    let stmt = parse_statement("UPDATE t SET id = 2 WHERE id = 1", &limits).unwrap();
-    let metrics = SqlMetrics::default();
-    let auth = AuthContext::admin("t");
-    let err = bind_statement(&f.f.catalog, &f.f.ctx, &auth, &metrics, &limits, &stmt).unwrap_err();
-    assert!(
-        matches!(err, crate::SqlError::Unsupported { .. })
-            || matches!(err, crate::SqlError::TypeMismatch { .. })
+    let r = f.write("UPDATE t SET id = 2 WHERE id = 1");
+    assert_eq!(r.rows_affected, 1);
+    assert_eq!(
+        f.select("SELECT id, name FROM t").rows,
+        vec![vec![int(2), text("a")]]
     );
     f.cleanup();
 }

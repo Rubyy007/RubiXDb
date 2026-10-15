@@ -51,6 +51,11 @@ pub enum RelationalError {
     InvalidTransactionState {
         detail: String,
     },
+    /// A change would leave a foreign key without its referenced row (a child row
+    /// with no parent, or a parent row still referenced). `ADR-DDL-FK-01`.
+    ForeignKeyViolation {
+        detail: String,
+    },
 }
 
 impl fmt::Display for RelationalError {
@@ -66,6 +71,9 @@ impl fmt::Display for RelationalError {
             }
             RelationalError::InvalidTransactionState { detail } => {
                 write!(f, "invalid transaction state: {detail}")
+            }
+            RelationalError::ForeignKeyViolation { detail } => {
+                write!(f, "foreign key violation: {detail}")
             }
         }
     }

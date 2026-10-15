@@ -312,6 +312,16 @@ fn ddl_summary(state: &AppState, bound: &BoundStatement) -> Option<DdlSummary> {
             statement: "CREATE INDEX",
             object: Some(ci.name.clone()),
         },
+        BoundStatement::AlterTable(at) => DdlSummary {
+            statement: "ALTER TABLE",
+            object: at.table_id.and_then(|id| {
+                let t = catalog.get_table(id).ok().flatten()?;
+                Some(match qualified_schema(state, t.schema_id) {
+                    Some(s) => format!("{s}.{}", t.name),
+                    None => t.name,
+                })
+            }),
+        },
         BoundStatement::DropIndex(di) => DdlSummary {
             statement: "DROP INDEX",
             object: di
@@ -457,6 +467,7 @@ fn statement_class(stmt: &Statement) -> &'static str {
         | Statement::CreateTable(_)
         | Statement::DropTable(_)
         | Statement::CreateIndex(_)
+        | Statement::AlterTable(_)
         | Statement::DropIndex(_) => class::DDL,
         Statement::Begin | Statement::Commit | Statement::Rollback => class::TRANSACTION,
         Statement::UseSchema(_) => class::OTHER,
@@ -566,7 +577,7 @@ struct DdlAudit {
 /// DDL create/drop statements only; everything else is `None`. The object is
 /// the statement's most specific identifier (bounded and escaped by the log).
 fn ddl_audit(stmt: &Statement) -> Option<DdlAudit> {
-    use crate::security_log::code::{CATALOG_CREATE, CATALOG_DROP};
+    use crate::security_log::code::{CATALOG_ALTER, CATALOG_CREATE, CATALOG_DROP};
     let (code, kind, object) = match stmt {
         Statement::CreateDatabase(s) => (CATALOG_CREATE, "database", s.name.value.clone()),
         Statement::CreateSchema(s) => (CATALOG_CREATE, "schema", s.name.last().value.clone()),
@@ -578,6 +589,7 @@ fn ddl_audit(stmt: &Statement) -> Option<DdlAudit> {
             s.name.as_ref().map(|n| n.value.clone()).unwrap_or_default(),
         ),
         Statement::DropIndex(s) => (CATALOG_DROP, "index", s.name.value.clone()),
+        Statement::AlterTable(s) => (CATALOG_ALTER, "table", s.name.last().value.clone()),
         _ => return None,
     };
     Some(DdlAudit { code, kind, object })
@@ -708,6 +720,7 @@ async fn handle(
         | BoundStatement::CreateTable(_)
         | BoundStatement::DropTable(_)
         | BoundStatement::CreateIndex(_)
+        | BoundStatement::AlterTable(_)
         | BoundStatement::DropIndex(_) => {
             handle_write(state, principal, req.session_id, plan, params, summary).await
         }

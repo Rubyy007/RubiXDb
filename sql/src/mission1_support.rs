@@ -122,8 +122,11 @@ impl Db {
         limits: &SqlLimits,
     ) -> crate::Result<BoundStatement> {
         let stmt = parse_statement(sql, limits)?;
+        // This harness's own catalog handle, not the fixture's: the foreign-key and CHECK
+        // caches live in the `CatalogService` instance, and the executor (which writes the
+        // constraints) uses this one -- exactly one instance per engine, as in the server.
         bind_statement(
-            &self.f.catalog,
+            &self.catalog,
             &self.f.ctx,
             auth,
             &SqlMetrics::default(),
@@ -140,7 +143,7 @@ impl Db {
         let bound = self.try_bind_with(sql, &AuthContext::admin("test-principal"), limits)?;
         build_plan(
             &bound,
-            &self.f.catalog,
+            &self.catalog,
             &PlannerLimits::default(),
             &PlannerMetrics::default(),
         )

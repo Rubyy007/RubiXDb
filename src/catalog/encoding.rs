@@ -24,6 +24,11 @@ pub const SYSTEM_TABLE_COLUMNS: u32 = 4;
 pub const SYSTEM_TABLE_INDEXES: u32 = 5;
 pub const SYSTEM_TABLE_CONSTRAINTS: u32 = 6;
 pub const SYSTEM_TABLE_GRANTS: u32 = 7;
+/// `docs/adr/ADR-DDL-FK-01.md`: foreign-key definitions. A new system table,
+/// not a new field of `system.constraints` -- existing `system.constraints`
+/// rows keep their exact encoding, and a catalog written before this table
+/// existed simply has no rows in it.
+pub const SYSTEM_TABLE_FOREIGN_KEYS: u32 = 8;
 
 /// D3's `RowValue` format version this module reads and writes.
 pub const ROW_FORMAT_VERSION: u8 = 1;

@@ -10,20 +10,23 @@
 //! `CREATE`/`DROP INDEX` — the already-certified online `IndexBuilder`
 //! (item 39/40: never a second index implementation).
 
-use rubixdb::catalog::service::ColumnDef;
+use rubixdb::catalog::service::{ColumnDef, NewTableCheck, NewTableForeignKey};
 use rubixdb::catalog::{CatalogError, CatalogService};
 use rubixdb::relational::index::IndexBuilder;
 use rubixdb::relational::table_store::TableStore;
-use rubixdb::relational::{RelationalError, RelationalValue, Transaction};
+use rubixdb::relational::{RelationalError, RelationalValue, RowChange, Transaction};
 
 use std::collections::HashMap;
 
 use rubixdb::catalog::schema::ColumnRow;
 
 use crate::aggregate::GroupingKey;
+use crate::check::{self, CompiledCheck};
+use crate::limits::SqlLimits;
 use crate::bound::{
-    BoundArbiter, BoundAssignment, BoundColumnDef, BoundConflictAction, BoundExpr, BoundExprKind,
-    BoundInsert, BoundOnConflict, BoundReturning, BoundStatement, ColumnRef, TableRefId,
+    BoundAlterOp, BoundArbiter, BoundAssignment, BoundColumnDef, BoundConflictAction, BoundExpr,
+    BoundExprKind, BoundInsert, BoundOnConflict, BoundReturning, BoundStatement, ColumnRef,
+    TableRefId,
 };
 use crate::error::{Result, SqlError};
 use crate::exec::expr_eval::{eval, eval_predicate};
@@ -285,16 +288,18 @@ fn execute_write_inner(
     match plan {
         Plan::Insert(insert) => {
             metrics.record_insert_statement();
-            let out = execute_insert(
-                insert,
-                txn,
-                table_store,
-                catalog,
-                index_builder,
-                params,
-                limits,
-                cancellation,
-            )?;
+            let out = within_savepoint(txn, |txn| {
+                execute_insert(
+                    insert,
+                    txn,
+                    table_store,
+                    catalog,
+                    index_builder,
+                    params,
+                    limits,
+                    cancellation,
+                )
+            })?;
             metrics.record_rows_inserted(out.inserted);
             metrics.record_rows_updated(out.updated);
             metrics.record_upsert_conflict_rows_skipped(out.skipped);
@@ -315,19 +320,21 @@ fn execute_write_inner(
             ..
         } => {
             metrics.record_update_statement();
-            let (n, returned) = execute_update(
-                table.table_id,
-                assignments,
-                access,
-                returning.as_ref(),
-                txn,
-                table_store,
-                catalog,
-                index_builder,
-                params,
-                limits,
-                cancellation,
-            )?;
+            let (n, returned) = within_savepoint(txn, |txn| {
+                execute_update(
+                    table.table_id,
+                    assignments,
+                    access,
+                    returning.as_ref(),
+                    txn,
+                    table_store,
+                    catalog,
+                    index_builder,
+                    params,
+                    limits,
+                    cancellation,
+                )
+            })?;
             metrics.record_rows_updated(n);
             if let Some(r) = &returned {
                 metrics.record_rows_returned(r.rows.len() as u64);
@@ -345,18 +352,20 @@ fn execute_write_inner(
             ..
         } => {
             metrics.record_delete_statement();
-            let (n, returned) = execute_delete(
-                table.table_id,
-                access,
-                returning.as_ref(),
-                txn,
-                table_store,
-                catalog,
-                index_builder,
-                params,
-                limits,
-                cancellation,
-            )?;
+            let (n, returned) = within_savepoint(txn, |txn| {
+                execute_delete(
+                    table.table_id,
+                    access,
+                    returning.as_ref(),
+                    txn,
+                    table_store,
+                    catalog,
+                    index_builder,
+                    params,
+                    limits,
+                    cancellation,
+                )
+            })?;
             metrics.record_rows_deleted(n);
             if let Some(r) = &returned {
                 metrics.record_rows_returned(r.rows.len() as u64);
@@ -369,12 +378,144 @@ fn execute_write_inner(
         }
         Plan::Ddl(bound) => {
             metrics.record_ddl_statement();
-            execute_ddl(bound, catalog, index_builder)
+            execute_ddl(
+                bound,
+                txn,
+                table_store,
+                catalog,
+                index_builder,
+                params,
+                limits,
+                cancellation,
+            )
         }
         Plan::Begin | Plan::Commit | Plan::Rollback | Plan::Query { .. } | Plan::Explain(_) => {
             Err(SqlError::UnsupportedExecution {
                 detail: "this statement kind is not executed by crate::exec::write (transaction-control statements are the caller's own TransactionManager/Transaction lifecycle, item 5/92/93; SELECT uses crate::exec::execute)".to_string(),
             })
+        }
+    }
+}
+
+/// Checks `rows` (rows a statement is about to write, or has cascaded into) against
+/// the `CHECK` constraints of `table_id`. The error names the table and the
+/// constraint, never a value.
+#[allow(clippy::too_many_arguments)]
+fn check_rows<'a>(
+    txn: &Transaction,
+    table_store: &TableStore,
+    catalog: &CatalogService,
+    index_builder: &IndexBuilder,
+    params: &[Option<RelationalValue>],
+    limits: &ExecLimits,
+    cancellation: &CancellationToken,
+    table_id: u32,
+    rows: impl IntoIterator<Item = &'a Row>,
+) -> Result<()> {
+    let checks = check::compile_table_checks(catalog, table_id, &SqlLimits::default())?;
+    check_rows_against(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        table_id,
+        &checks,
+        rows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_rows_against<'a>(
+    txn: &Transaction,
+    table_store: &TableStore,
+    catalog: &CatalogService,
+    index_builder: &IndexBuilder,
+    params: &[Option<RelationalValue>],
+    limits: &ExecLimits,
+    cancellation: &CancellationToken,
+    table_id: u32,
+    checks: &[CompiledCheck],
+    rows: impl IntoIterator<Item = &'a Row>,
+) -> Result<()> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let metrics = ExecMetrics::default();
+    let ec = ExecCtx::new(
+        txn,
+        table_store,
+        index_builder,
+        params,
+        limits,
+        &metrics,
+        cancellation,
+    );
+    for row in rows {
+        if let Some(failed) = check::first_violation(checks, row, &ec)? {
+            let table = catalog
+                .get_table(table_id)?
+                .map(|t| t.name)
+                .unwrap_or_else(|| format!("#{table_id}"));
+            return Err(check::violation(&table, failed));
+        }
+    }
+    Ok(())
+}
+
+/// Checks the child rows a cascade wrote against their own tables' constraints.
+#[allow(clippy::too_many_arguments)]
+fn check_cascaded(
+    txn: &Transaction,
+    table_store: &TableStore,
+    catalog: &CatalogService,
+    index_builder: &IndexBuilder,
+    params: &[Option<RelationalValue>],
+    limits: &ExecLimits,
+    cancellation: &CancellationToken,
+    cascaded: &[rubixdb::relational::CascadedWrite],
+) -> Result<()> {
+    let mut by_table: Vec<u32> = cascaded.iter().map(|c| c.table_id).collect();
+    by_table.sort_unstable();
+    by_table.dedup();
+    for table_id in by_table {
+        check_rows(
+            txn,
+            table_store,
+            catalog,
+            index_builder,
+            params,
+            limits,
+            cancellation,
+            table_id,
+            cascaded
+                .iter()
+                .filter(|c| c.table_id == table_id)
+                .map(|c| &c.row),
+        )?;
+    }
+    Ok(())
+}
+
+/// Runs one DML statement so that it either buffers all of its writes into the
+/// transaction or none: on failure -- a violated constraint, a cascade that hits a
+/// limit, a failing expression half way through -- everything the statement
+/// buffered is discarded and the transaction's earlier statements are untouched.
+fn within_savepoint<T>(
+    txn: &mut Transaction,
+    run: impl FnOnce(&mut Transaction) -> Result<T>,
+) -> Result<T> {
+    let savepoint = txn.savepoint();
+    match run(txn) {
+        Ok(v) => {
+            txn.release_savepoint(savepoint);
+            Ok(v)
+        }
+        Err(e) => {
+            txn.rollback_to(savepoint);
+            Err(e)
         }
     }
 }
@@ -483,6 +624,8 @@ struct InsertOutcome {
 /// transaction already holds.
 struct PendingRow {
     row: Row,
+    /// The row this one replaces (an `ON CONFLICT DO UPDATE`), `None` for a new row.
+    old: Option<Row>,
     write: bool,
 }
 
@@ -523,7 +666,14 @@ impl Pending {
         }
     }
 
-    fn add(&mut self, pk: Vec<RelationalValue>, row: Row, write: bool, arbiters: &[BoundArbiter]) {
+    fn add(
+        &mut self,
+        pk: Vec<RelationalValue>,
+        row: Row,
+        old: Option<Row>,
+        write: bool,
+        arbiters: &[BoundArbiter],
+    ) {
         let idx = self.rows.len();
         self.by_pk.insert(pk_key(&pk), idx);
         for (ai, arb) in arbiters.iter().enumerate() {
@@ -533,7 +683,7 @@ impl Pending {
                 }
             }
         }
-        self.rows.push(PendingRow { row, write });
+        self.rows.push(PendingRow { row, old, write });
     }
 }
 
@@ -856,10 +1006,38 @@ fn execute_insert(
         )?
     };
 
-    for row in &writes {
+    // CHECK constraints: every row about to be written, before any is.
+    check_rows(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        insert.table_id,
+        writes.iter().filter_map(|c| c.new.as_ref()),
+    )?;
+    for change in &writes {
         check_point(cancellation, at)?;
-        txn.put_row(insert.table_id, row)?;
+        txn.put_row(
+            insert.table_id,
+            change.new.as_ref().expect("an insert writes a row"),
+        )?;
     }
+    // Foreign keys: every written row's parent must exist, and an upserted row
+    // whose referenced columns changed is a change to a parent.
+    let cascaded = txn.enforce_foreign_keys(insert.table_id, &writes)?;
+    check_cascaded(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        &cascaded,
+    )?;
     Ok(outcome)
 }
 
@@ -875,7 +1053,7 @@ fn decide_insert(
     columns: &[ColumnRow],
     limits: &ExecLimits,
     at: Option<std::time::Instant>,
-) -> Result<(Vec<Row>, InsertOutcome)> {
+) -> Result<(Vec<RowChange>, InsertOutcome)> {
     let mut pending = Pending::new(arbiters);
     let mut sink = ReturningSink::new(returning);
     let (mut inserted, mut updated, mut skipped) = (0u64, 0u64, 0u64);
@@ -889,7 +1067,7 @@ fn decide_insert(
             if let Some(sink) = sink.as_mut() {
                 sink.push(&proposed_row, ec, limits)?;
             }
-            pending.add(pk, proposed_row, true, arbiters);
+            pending.add(pk, proposed_row, None, true, arbiters);
             inserted += 1;
             continue;
         };
@@ -935,7 +1113,7 @@ fn decide_insert(
                     sink.push(&new_row, ec, limits)?;
                 }
                 let changed = new_row != existing;
-                pending.add(pk, new_row, changed, arbiters);
+                pending.add(pk, new_row, Some(existing), changed, arbiters);
                 updated += 1;
             }
         }
@@ -945,7 +1123,10 @@ fn decide_insert(
         .rows
         .into_iter()
         .filter(|p| p.write)
-        .map(|p| p.row)
+        .map(|p| RowChange {
+            old: p.old,
+            new: Some(p.row),
+        })
         .collect();
     Ok((
         writes,
@@ -1035,6 +1216,7 @@ fn execute_update(
             sink,
             txn,
             table_store,
+            catalog,
             index_builder,
             params,
             limits,
@@ -1043,6 +1225,7 @@ fn execute_update(
     }
 
     let mut updated = 0u64;
+    let mut changes: Vec<(Row, Row)> = Vec::new();
     for pk in target_pks {
         check_point(cancellation, at)?;
         // Re-fetched fresh, through the same certified, snapshot- and
@@ -1090,17 +1273,12 @@ fn execute_update(
                 sink.push(&new_row, &ec, limits)?;
             }
         }
-        // `PRIMARY KEY` updates are already rejected at bind time
-        // (`crate::bind::dml::bind_update`, D6 — verified, not assumed:
-        // `bind_tests::update_of_primary_key_column_is_rejected`), so
-        // `new_row`'s own primary-key columns are always identical to
-        // `old_row`'s -- `Transaction::put_row` upserting at the same
-        // key is always the correct, complete operation (old/new
-        // secondary-index-entry delete+insert included atomically,
-        // D11, already certified); the delete-old-physical-row-plus-
-        // insert-new-physical-row path item 19 describes as the
-        // fallback for a PK-changing UPDATE is structurally unreachable
-        // here and is not implemented.
+        // A `SET` of a primary-key column changes the row's key. The writes are
+        // applied after every new row is computed (`Transaction::apply_row_updates`):
+        // a key-preserving row is an upsert at its own key (old/new secondary-index
+        // entries delete+insert atomically, D11), a key-changing row a delete of the
+        // old key and an insert of the new one, with all old keys removed first so a
+        // statement may shift keys among its own rows.
         if row_ctx.row_for(table_ref) == Some(&new_row) {
             // Item 22: nothing actually changed -- `put_row` would
             // still perform a real (if no-op-shaped) write; skipping it
@@ -1112,10 +1290,79 @@ fn execute_update(
             updated += 1;
             continue;
         }
-        txn.put_row(table_id, &new_row)?;
+        changes.push((old_row_for_write(&row_ctx, table_ref), new_row));
         updated += 1;
     }
+    check_rows(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        table_id,
+        changes.iter().map(|(_, new)| new),
+    )?;
+    write_updates(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        table_id,
+        changes,
+    )?;
     Ok((updated, sink.map(ReturningSink::finish)))
+}
+
+/// The row an `UPDATE` started from, as the row context holds it.
+fn old_row_for_write(row_ctx: &RowContext, table_ref: u32) -> Row {
+    row_ctx
+        .row_for(table_ref)
+        .cloned()
+        .expect("the statement's own row context holds its target row")
+}
+
+/// Buffers an `UPDATE`'s `(old, new)` rows and enforces the foreign keys they touch
+/// (a changed referencing column needs its parent; a changed referenced column
+/// applies `ON UPDATE` to the rows that reference it).
+#[allow(clippy::too_many_arguments)]
+fn write_updates(
+    txn: &mut Transaction,
+    table_store: &TableStore,
+    catalog: &CatalogService,
+    index_builder: &IndexBuilder,
+    params: &[Option<RelationalValue>],
+    limits: &ExecLimits,
+    cancellation: &CancellationToken,
+    table_id: u32,
+    changes: Vec<(Row, Row)>,
+) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    txn.apply_row_updates(table_id, &changes)?;
+    let row_changes: Vec<RowChange> = changes
+        .into_iter()
+        .map(|(old, new)| RowChange {
+            old: Some(old),
+            new: Some(new),
+        })
+        .collect();
+    let cascaded = txn.enforce_foreign_keys(table_id, &row_changes)?;
+    check_cascaded(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        &cascaded,
+    )
 }
 
 // =======================================================================
@@ -1176,14 +1423,39 @@ fn execute_delete(
         }
     }
 
+    // A table another table references needs the deleted rows' values to apply
+    // `ON DELETE` (read before the deletes, from the transaction's own view).
+    let needs_rows = txn.table_is_referenced(table_id)?;
+    let mut deleted_rows: Vec<RowChange> = Vec::new();
     let mut deleted = 0u64;
     for pk in target_pks {
         check_point(cancellation, at)?;
+        if needs_rows {
+            if let Some(row) = txn.get_row(table_id, &pk)? {
+                deleted_rows.push(RowChange {
+                    old: Some(row),
+                    new: None,
+                });
+            }
+        }
         // Item 14: the row's own current existence is authoritative
         // through `delete_row` itself (D10-certified); the already-collected
         // primary key is all a `DELETE` needs.
         txn.delete_row(table_id, &pk)?;
         deleted += 1;
+    }
+    if needs_rows {
+        let cascaded = txn.enforce_foreign_keys(table_id, &deleted_rows)?;
+        check_cascaded(
+            txn,
+            table_store,
+            catalog,
+            index_builder,
+            params,
+            limits,
+            cancellation,
+            &cascaded,
+        )?;
     }
     Ok((deleted, sink.map(ReturningSink::finish)))
 }
@@ -1282,6 +1554,7 @@ fn execute_update_with_subqueries(
     mut sink: Option<ReturningSink<'_>>,
     txn: &mut Transaction,
     table_store: &TableStore,
+    catalog: &CatalogService,
     index_builder: &IndexBuilder,
     params: &[Option<RelationalValue>],
     limits: &ExecLimits,
@@ -1289,7 +1562,7 @@ fn execute_update_with_subqueries(
 ) -> Result<(u64, Option<ReturnedRows>)> {
     let at = deadline_at(limits);
     let metrics = ExecMetrics::default();
-    let mut pending: Vec<Vec<Option<RelationalValue>>> = Vec::new();
+    let mut pending: Vec<(Row, Row)> = Vec::new();
     let mut pending_bytes = 0usize;
     let mut updated = 0u64;
     {
@@ -1311,7 +1584,7 @@ fn execute_update_with_subqueries(
                 )
             })?;
             let row_ctx = RowContext::single(table_ref, old_row.clone());
-            let mut new_row = old_row;
+            let mut new_row = old_row.clone();
             for assignment in assignments {
                 new_row[assignment.ordinal as usize] = eval(&assignment.value, &row_ctx, &ec)?;
             }
@@ -1333,13 +1606,32 @@ fn execute_update_with_subqueries(
                     ),
                 });
             }
-            pending.push(new_row);
+            pending.push((old_row, new_row));
         }
     }
-    for new_row in pending {
-        check_point(cancellation, at)?;
-        txn.put_row(table_id, &new_row)?;
-    }
+    check_point(cancellation, at)?;
+    check_rows(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        table_id,
+        pending.iter().map(|(_, new)| new),
+    )?;
+    write_updates(
+        txn,
+        table_store,
+        catalog,
+        index_builder,
+        params,
+        limits,
+        cancellation,
+        table_id,
+        pending,
+    )?;
     Ok((updated, sink.map(ReturningSink::finish)))
 }
 
@@ -1356,10 +1648,16 @@ fn access_table_ref(access: &PhysicalAccess) -> u32 {
 // DDL (items 35-45, 96)
 // =======================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn execute_ddl(
     bound: &BoundStatement,
+    txn: &Transaction,
+    table_store: &TableStore,
     catalog: &CatalogService,
     index_builder: &IndexBuilder,
+    params: &[Option<RelationalValue>],
+    limits: &ExecLimits,
+    cancellation: &CancellationToken,
 ) -> Result<WriteResult> {
     let n = match bound {
         BoundStatement::CreateSchema(cs) => match catalog.create_schema(cs.database_id, &cs.name) {
@@ -1369,10 +1667,38 @@ fn execute_ddl(
         },
         BoundStatement::CreateTable(ct) => {
             let columns: Vec<ColumnDef> = ct.columns.iter().map(bound_column_to_catalog).collect();
-            match catalog.create_table(ct.schema_id, &ct.name, &columns, &ct.pk_ordinals) {
+            let foreign_keys: Vec<NewTableForeignKey> = ct
+                .foreign_keys
+                .iter()
+                .map(|fk| NewTableForeignKey {
+                    name: fk.name.clone(),
+                    child_ordinals: fk.child_ordinals.clone(),
+                    parent_table_id: fk.parent_table_id,
+                    parent_ordinals: fk.parent_ordinals.clone(),
+                    on_delete: fk.on_delete,
+                    on_update: fk.on_update,
+                })
+                .collect();
+            let checks: Vec<NewTableCheck> = ct
+                .checks
+                .iter()
+                .map(|c| NewTableCheck {
+                    name: c.name.clone(),
+                    column_ordinals: c.columns.clone(),
+                    expression: c.text.clone(),
+                })
+                .collect();
+            match catalog.create_table_with_foreign_keys(
+                ct.schema_id,
+                &ct.name,
+                &columns,
+                &ct.pk_ordinals,
+                &foreign_keys,
+                &checks,
+            ) {
                 Ok(_) => 1,
                 Err(CatalogError::AlreadyExists { .. }) if ct.if_not_exists => 0,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(ddl_catalog_error(e)),
             }
         }
         BoundStatement::DropTable(dt) => match dt.table_id {
@@ -1382,7 +1708,7 @@ fn execute_ddl(
             // real no-op, not an error.
             None => 0,
             Some(table_id) => {
-                catalog.drop_table(table_id)?;
+                catalog.drop_table(table_id).map_err(ddl_catalog_error)?;
                 1
             }
         },
@@ -1409,7 +1735,104 @@ fn execute_ddl(
         BoundStatement::DropIndex(di) => match di.index_id {
             None => 0,
             Some(index_id) => {
-                index_builder.drop_index_online(index_id)?;
+                index_builder
+                    .drop_index_online(index_id)
+                    .map_err(ddl_relational_error)?;
+                1
+            }
+        },
+        BoundStatement::AlterTable(at) => match (at.table_id, &at.operation) {
+            (None, _) | (_, BoundAlterOp::Noop) => 0,
+            (Some(table_id), op) => {
+                match op {
+                    BoundAlterOp::Noop => {}
+                    BoundAlterOp::AddColumn(column) => {
+                        index_builder
+                            .alter_add_column(table_id, &bound_column_to_catalog(column))
+                            .map_err(ddl_relational_error)?;
+                    }
+                    BoundAlterOp::RenameColumn { ordinal, new_name } => index_builder
+                        .alter_rename_column(table_id, *ordinal, new_name)
+                        .map_err(ddl_relational_error)?,
+                    BoundAlterOp::SetDefault {
+                        ordinal,
+                        default_value,
+                    } => index_builder
+                        .alter_set_default(table_id, *ordinal, Some(default_value.clone()))
+                        .map_err(ddl_relational_error)?,
+                    BoundAlterOp::DropDefault { ordinal } => index_builder
+                        .alter_set_default(table_id, *ordinal, None)
+                        .map_err(ddl_relational_error)?,
+                    BoundAlterOp::SetNotNull { ordinal } => index_builder
+                        .alter_set_not_null(table_id, *ordinal)
+                        .map_err(ddl_relational_error)?,
+                    BoundAlterOp::DropNotNull { ordinal } => index_builder
+                        .alter_drop_not_null(table_id, *ordinal)
+                        .map_err(ddl_relational_error)?,
+                    BoundAlterOp::AddForeignKey(fk) => {
+                        index_builder
+                            .alter_add_foreign_key(fk)
+                            .map_err(ddl_relational_error)?;
+                    }
+                    BoundAlterOp::AddUnique {
+                        name,
+                        column_ordinals,
+                    } => {
+                        index_builder
+                            .alter_add_unique(table_id, name, column_ordinals)
+                            .map_err(ddl_relational_error)?;
+                    }
+                    BoundAlterOp::AddCheck(def) => {
+                        // Bind the stored text against the table as it is now, then
+                        // evaluate it for every existing row under the table's lock.
+                        let table = catalog.get_table(table_id)?.ok_or_else(|| {
+                            SqlError::Storage("a target table no longer resolves in the catalog".to_string())
+                        })?;
+                        let columns = catalog.get_columns(table_id)?;
+                        let sql_limits = SqlLimits::default();
+                        let expr = check::parse_check_text(&def.text, &sql_limits)?;
+                        let bound = check::bind_check(&table.name, &columns, &expr, &sql_limits)?;
+                        let compiled = [CompiledCheck {
+                            name: def.name.clone(),
+                            expr: bound.expr,
+                            table_ref: bound.table_ref,
+                        }];
+                        let metrics = ExecMetrics::default();
+                        let ec = ExecCtx::new(
+                            txn,
+                            table_store,
+                            index_builder,
+                            params,
+                            limits,
+                            &metrics,
+                            cancellation,
+                        );
+                        index_builder
+                            .alter_add_check(
+                                table_id,
+                                &def.name,
+                                &def.columns,
+                                &def.text,
+                                &mut |row| {
+                                    check::first_violation(&compiled, row, &ec)
+                                        .map(|v| v.is_none())
+                                        .map_err(|e| RelationalError::InvalidInput {
+                                            detail: format!("the constraint could not be evaluated: {e}"),
+                                        })
+                                },
+                            )
+                            .map_err(ddl_relational_error)?;
+                    }
+                    BoundAlterOp::DropCheck { constraint_id } => index_builder
+                        .alter_drop_check(*constraint_id)
+                        .map_err(ddl_relational_error)?,
+                    BoundAlterOp::DropForeignKey { fk_id } => index_builder
+                        .alter_drop_foreign_key(*fk_id)
+                        .map_err(ddl_relational_error)?,
+                    BoundAlterOp::DropUnique { index_id } => index_builder
+                        .drop_index_online(*index_id)
+                        .map_err(ddl_relational_error)?,
+                }
                 1
             }
         },
@@ -1462,12 +1885,15 @@ fn bound_statement_kind_name(s: &BoundStatement) -> &'static str {
         BoundStatement::DropTable(_) => "DROP TABLE",
         BoundStatement::CreateIndex(_) => "CREATE INDEX",
         BoundStatement::DropIndex(_) => "DROP INDEX",
+        BoundStatement::AlterTable(_) => "ALTER TABLE",
         BoundStatement::Explain(_) => "EXPLAIN",
         BoundStatement::Begin => "BEGIN",
         BoundStatement::Commit => "COMMIT",
         BoundStatement::Rollback => "ROLLBACK",
     }
 }
+
+use crate::error::{ddl_catalog_error, ddl_relational_error};
 
 fn bound_column_to_catalog(c: &BoundColumnDef) -> ColumnDef {
     ColumnDef {

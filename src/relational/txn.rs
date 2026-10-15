@@ -20,10 +20,13 @@
 //! `RelationalValue`s, never SQL text or names, so a future executor can
 //! use it directly without reparsing or re-binding (item 43).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLockWriteGuard};
+use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
+
+mod fk;
+pub use fk::{CascadedWrite, ReadView, RowChange, MAX_CASCADE_DEPTH};
 
 use crate::catalog::schema::{IndexKind, IndexRow};
 use crate::lsm::{LsmEngine, Snapshot, WriteOp};
@@ -119,9 +122,32 @@ pub enum TxnState {
     Aborted,
 }
 
+#[derive(Clone)]
 enum RowOp {
     Put(Row),
     Delete,
+}
+
+/// What `rollback_to` needs to undo one buffered write: the entry the key held
+/// before it (`None` = the key was not in the write-set).
+struct JournalEntry {
+    table_id: u32,
+    encoded_pk: Vec<u8>,
+    previous: Option<(Vec<RelationalValue>, RowOp)>,
+}
+
+/// A point in a transaction's write-set that `Transaction::rollback_to` can return
+/// to, discarding every write buffered since. Statement atomicity inside an
+/// explicit transaction: a statement that fails part-way (a cascade that hits a
+/// violation, a write-set limit) is undone without losing the transaction's
+/// earlier statements.
+#[derive(Debug)]
+pub struct Savepoint {
+    journal_len: usize,
+    op_count: usize,
+    byte_count: usize,
+    /// Did taking this savepoint start the journal (so releasing it stops it)?
+    owns_journal: bool,
 }
 
 /// `table_id -> encoded_pk -> (pk_values, latest op)` — see
@@ -195,6 +221,12 @@ fn as_bound_ref(bound: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<&[u8]> {
     }
 }
 
+/// One epoch lock held by a committing transaction.
+enum CommitGuard<'a> {
+    Write(#[allow(dead_code)] RwLockWriteGuard<'a, ()>),
+    Read(#[allow(dead_code)] RwLockReadGuard<'a, ()>),
+}
+
 struct Inner {
     engine: Arc<LsmEngine>,
     table_store: Arc<TableStore>,
@@ -265,6 +297,8 @@ impl TransactionManager {
             finished: false,
             write_version: 0,
             overlay_cache: std::sync::Mutex::new(HashMap::new()),
+            table_versions: HashMap::new(),
+            journal: None,
         })
     }
 
@@ -340,6 +374,13 @@ pub struct Transaction {
     write_version: u64,
     /// `table_id -> (write_version it was built at, overlay)`.
     overlay_cache: std::sync::Mutex<HashMap<u32, (u64, Arc<TableOverlay>)>>,
+    /// `table_id -> schema_version` this transaction first buffered a row write
+    /// under. Commit refuses (a `Conflict`) if the table was altered since: the
+    /// buffered row may not fit the new shape, or may violate a constraint added
+    /// meanwhile (`ADR-DDL-FK-01`).
+    table_versions: HashMap<u32, u32>,
+    /// Undo log for `rollback_to`; `Some` only while a `Savepoint` is open.
+    journal: Option<Vec<JournalEntry>>,
 }
 
 impl Transaction {
@@ -458,6 +499,9 @@ impl Transaction {
         let pk_values = table_store::extract_pk_values(&table, values);
         let encoded_pk = encode_composite_key(&pk_values)?;
         let bytes = approx_row_bytes(values);
+        self.table_versions
+            .entry(table_id)
+            .or_insert(table.schema_version);
         self.record_op(
             table_id,
             encoded_pk,
@@ -509,13 +553,71 @@ impl Transaction {
                 ),
             });
         }
-        table_writes.insert(encoded_pk, (pk_values, op));
+        let previous = table_writes.insert(encoded_pk.clone(), (pk_values, op));
+        if let Some(journal) = self.journal.as_mut() {
+            journal.push(JournalEntry {
+                table_id,
+                encoded_pk,
+                previous,
+            });
+        }
         if is_new_key {
             self.op_count += 1;
         }
         self.byte_count += approx_bytes;
         self.write_version += 1;
         Ok(())
+    }
+
+    // -------------------------------------------------------------
+    // Savepoints -- statement atomicity (ADR-DDL-FK-01)
+    // -------------------------------------------------------------
+
+    /// Marks the write-set so that `rollback_to` can undo everything buffered
+    /// after this point. Savepoints nest; each is released (`release_savepoint`) or
+    /// rolled back to, innermost first.
+    pub fn savepoint(&mut self) -> Savepoint {
+        let owns_journal = self.journal.is_none();
+        let journal = self.journal.get_or_insert_with(Vec::new);
+        Savepoint {
+            journal_len: journal.len(),
+            op_count: self.op_count,
+            byte_count: self.byte_count,
+            owns_journal,
+        }
+    }
+
+    /// Keeps everything buffered since `sp`.
+    pub fn release_savepoint(&mut self, sp: Savepoint) {
+        if sp.owns_journal {
+            self.journal = None;
+        }
+    }
+
+    /// Discards every write buffered since `sp`, restoring the write-set (and its
+    /// size accounting) exactly as it was.
+    pub fn rollback_to(&mut self, sp: Savepoint) {
+        if let Some(mut journal) = self.journal.take() {
+            while journal.len() > sp.journal_len {
+                let entry = journal.pop().expect("length checked");
+                let table_writes = self.writes.entry(entry.table_id).or_default();
+                match entry.previous {
+                    Some(previous) => {
+                        table_writes.insert(entry.encoded_pk, previous);
+                    }
+                    None => {
+                        table_writes.remove(&entry.encoded_pk);
+                    }
+                }
+            }
+            self.writes.retain(|_, w| !w.is_empty());
+            self.op_count = sp.op_count;
+            self.byte_count = sp.byte_count;
+            self.write_version += 1;
+            if !sp.owns_journal {
+                self.journal = Some(journal);
+            }
+        }
     }
 
     // -------------------------------------------------------------
@@ -556,38 +658,73 @@ impl Transaction {
             return Ok(seq);
         }
 
-        let mut table_ids: Vec<u32> = self.writes.keys().copied().collect();
-        table_ids.sort_unstable();
-
-        // The commit critical section: one epoch *write* lock per
-        // touched table, acquired in a fixed (sorted) order across every
-        // concurrently committing transaction — the deadlock-avoidance
-        // discipline that makes acquiring more than one lock safe.
-        // `PHASE_RELATIONAL_TRANSACTION_ARCHITECTURE.md` §6 has the full
-        // proof this closes both the ordinary write-write TOCTOU race
-        // and the `UNIQUE`-existence-check race, reusing the *same*
-        // lock `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §6/§7 already
-        // certified for online index builds — never a second, new
-        // synchronization primitive.
-        let locks: Vec<_> = table_ids
-            .iter()
-            .map(|&id| self.inner.table_store.epoch_lock(id))
-            .collect();
-        let _guards: Vec<RwLockWriteGuard<'_, ()>> = locks
-            .iter()
-            .map(|l| l.write().unwrap_or_else(|p| p.into_inner()))
-            .collect();
-
-        match self.validate_and_build_ops(&table_ids) {
-            Ok(physical_ops) => {
-                let seq = self.inner.engine.write_batch(&physical_ops)?;
-                for (&table_id, table_writes) in &self.writes {
-                    self.inner
-                        .table_store
-                        .runtime_stats()
-                        .note_mutations(table_id, table_writes.len() as u64);
+        // The commit critical section: one epoch lock per touched table, acquired
+        // in a fixed (sorted) order across every concurrently committing
+        // transaction -- the deadlock-avoidance discipline that makes acquiring
+        // more than one lock safe. A table the transaction **writes** is locked
+        // exclusively. A table it only has to **look at** because of a foreign key
+        // (the parents of rows it writes to a child, the children of rows it
+        // changes in a parent) is locked shared: that already excludes every
+        // writer of it (they hold the exclusive side), and lets transactions that
+        // only reference one parent run side by side.
+        // `PHASE_RELATIONAL_TRANSACTION_ARCHITECTURE.md` §6 has the full proof this
+        // closes both the ordinary write-write TOCTOU race and the `UNIQUE`-existence-
+        // check race, reusing the *same* lock `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md`
+        // §6/§7 already certified for online index builds -- never a second, new
+        // synchronization primitive; `ADR-DDL-FK-01` extends the same argument to
+        // foreign keys.
+        //
+        // Which tables to lock depends on the foreign keys in force, and those can
+        // change (`ALTER TABLE ... ADD FOREIGN KEY`) between reading them and holding
+        // the locks. A change takes both tables' exclusive locks and bumps the
+        // generation, so: read the generation, take the locks, and if the generation
+        // moved, release and start again.
+        let catalog = Arc::clone(self.inner.table_store.catalog());
+        let mut attempts = 0u32;
+        let result: Result<u64> = loop {
+            let generation = catalog.foreign_key_generation();
+            let lock_plan = self.commit_lock_plan()?;
+            let locks: Vec<_> = lock_plan
+                .iter()
+                .map(|(&id, &exclusive)| (self.inner.table_store.epoch_lock(id), exclusive))
+                .collect();
+            let _guards: Vec<CommitGuard<'_>> = locks
+                .iter()
+                .map(|(l, exclusive)| {
+                    if *exclusive {
+                        CommitGuard::Write(l.write().unwrap_or_else(|p| p.into_inner()))
+                    } else {
+                        CommitGuard::Read(l.read().unwrap_or_else(|p| p.into_inner()))
+                    }
+                })
+                .collect();
+            if catalog.foreign_key_generation() != generation {
+                attempts += 1;
+                if attempts >= 8 {
+                    break Err(RelationalError::Conflict {
+                        detail: "foreign keys are being changed; retry the transaction".to_string(),
+                    });
                 }
-                drop(_guards);
+                continue;
+            }
+            let mut table_ids: Vec<u32> = self.writes.keys().copied().collect();
+            table_ids.sort_unstable();
+            break self
+                .validate_and_build_ops(&table_ids)
+                .and_then(|physical_ops| {
+                    let seq = self.inner.engine.write_batch(&physical_ops)?;
+                    for (&table_id, table_writes) in &self.writes {
+                        self.inner
+                            .table_store
+                            .runtime_stats()
+                            .note_mutations(table_id, table_writes.len() as u64);
+                    }
+                    Ok(seq)
+                });
+        };
+
+        match result {
+            Ok(seq) => {
                 self.finish(TxnState::Committed);
                 self.inner
                     .metrics
@@ -608,7 +745,6 @@ impl Transaction {
                 Ok(seq)
             }
             Err(e) => {
-                drop(_guards);
                 let is_conflict = matches!(e, RelationalError::Conflict { .. });
                 self.finish(TxnState::Aborted);
                 if is_conflict {
@@ -624,6 +760,22 @@ impl Transaction {
                 Err(e)
             }
         }
+    }
+
+    /// The tables a commit must lock, mapped to whether the lock is exclusive:
+    /// the tables it writes (exclusive), plus -- for each foreign key -- the other
+    /// table whose rows the validation reads (shared, unless it is also written).
+    fn commit_lock_plan(&self) -> Result<BTreeMap<u32, bool>> {
+        let mut plan: BTreeMap<u32, bool> = self.writes.keys().map(|&id| (id, true)).collect();
+        for fk in self.inner.table_store.catalog().foreign_keys()?.iter() {
+            if self.writes.contains_key(&fk.table_id) {
+                plan.entry(fk.parent_table_id).or_insert(false);
+            }
+            if self.writes.contains_key(&fk.parent_table_id) {
+                plan.entry(fk.table_id).or_insert(false);
+            }
+        }
+        Ok(plan)
     }
 
     /// Runs entirely under the caller's held epoch write-locks. Computes
@@ -647,6 +799,14 @@ impl Transaction {
 
         for &table_id in table_ids {
             let (table, columns) = self.inner.table_store.resolve_table(table_id)?;
+            if let Some(&seen) = self.table_versions.get(&table_id) {
+                if seen != table.schema_version {
+                    return Err(RelationalError::Conflict {
+                        detail: "the table was altered after this transaction first wrote to it"
+                            .to_string(),
+                    });
+                }
+            }
             let indexes = self.inner.table_store.maintained_indexes(table_id)?;
             let table_writes = &self.writes[&table_id];
 
@@ -732,6 +892,13 @@ impl Transaction {
                 });
             }
         }
+
+        // 1b. Foreign keys, against the state the commit is about to extend (the
+        // exclusive/shared locks above keep it from changing underneath): every
+        // written child row's parent exists, and no written parent row that went
+        // away is still referenced. Runs after the freshness check, which is what
+        // makes a written parent row's snapshot value equal its current value.
+        self.validate_foreign_keys()?;
 
         // 2a. Intra-transaction UNIQUE collision: two different rows in
         // *this same* write-set independently claiming one value. The

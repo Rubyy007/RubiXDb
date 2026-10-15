@@ -9,20 +9,22 @@
 //! read-only catalog query.
 
 use std::ops::Bound;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::catalog::encoding::{
     catalog_key, decode_row, encode_row, system_table_prefix_range, system_table_range,
     SYSTEM_TABLE_COLUMNS, SYSTEM_TABLE_CONSTRAINTS, SYSTEM_TABLE_COUNTERS, SYSTEM_TABLE_DATABASES,
-    SYSTEM_TABLE_GRANTS, SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_SCHEMAS, SYSTEM_TABLE_TABLES,
+    SYSTEM_TABLE_FOREIGN_KEYS, SYSTEM_TABLE_GRANTS, SYSTEM_TABLE_INDEXES, SYSTEM_TABLE_SCHEMAS,
+    SYSTEM_TABLE_TABLES,
 };
 use crate::catalog::error::{CatalogError, Result};
 use crate::catalog::schema::{
-    ColumnRow, ConstraintKind, ConstraintRow, DatabaseRow, GrantRow, IndexKind, IndexRow,
-    IndexState, ObjectKind, Privilege, SchemaRow, TableRow, TableState, COLUMNS_SCHEMA,
-    CONSTRAINTS_SCHEMA, DATABASES_SCHEMA, GRANTS_SCHEMA, INDEXES_SCHEMA, SCHEMAS_SCHEMA,
-    TABLES_SCHEMA,
+    ColumnRow, ConstraintKind, ConstraintRow, DatabaseRow, FkAction, ForeignKeyRow, GrantRow,
+    IndexKind, IndexRow, IndexState, ObjectKind, Privilege, SchemaRow, TableRow, TableState,
+    COLUMNS_SCHEMA, COLUMNS_V1_FIELDS, COLUMN_ROW_VERSION, CONSTRAINTS_SCHEMA, DATABASES_SCHEMA,
+    FOREIGN_KEYS_SCHEMA, GRANTS_SCHEMA, INDEXES_SCHEMA, SCHEMAS_SCHEMA, TABLES_SCHEMA,
 };
 use crate::lsm::{LsmEngine, WriteOp};
 
@@ -39,6 +41,44 @@ pub struct ColumnDef {
     /// for `DECIMAL`/`NUMERIC`, `None` otherwise.
     pub type_params: Option<Vec<u8>>,
 }
+
+/// A foreign key to define (`CatalogService::create_foreign_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewForeignKey {
+    /// The referencing ("child") table.
+    pub table_id: u32,
+    pub name: String,
+    pub child_ordinals: Vec<u16>,
+    pub parent_table_id: u32,
+    pub parent_ordinals: Vec<u16>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+/// A foreign key declared in `CREATE TABLE` (`create_table_with_foreign_keys`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTableForeignKey {
+    pub name: String,
+    pub child_ordinals: Vec<u16>,
+    /// The referenced table; `None` = the table being created (a self-reference).
+    pub parent_table_id: Option<u32>,
+    pub parent_ordinals: Vec<u16>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+/// A `CHECK` constraint declared in `CREATE TABLE` (`create_table_with_foreign_keys`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTableCheck {
+    pub name: String,
+    /// The columns the expression reads (so a rename of one can be refused).
+    pub column_ordinals: Vec<u16>,
+    /// The expression's SQL text, as `ConstraintRow::check_expression` stores it.
+    pub expression: String,
+}
+
+/// Longest `CHECK` expression text accepted.
+pub const MAX_CHECK_EXPRESSION_BYTES: usize = 4096;
 
 /// `PHASE_RELATIONAL_INDEX_BACKFILL_ADR.md` §14 (Resource limits) — bounds
 /// on `CREATE INDEX` itself, enforced before any allocation/write, so an
@@ -69,6 +109,16 @@ fn now_micros() -> i64 {
 pub struct CatalogService {
     engine: Arc<LsmEngine>,
     ddl_lock: Mutex<()>,
+    /// All foreign keys, rebuilt on demand after any change (`foreign_keys`). The
+    /// foreign-key and `CHECK` caches are why a process must hold **exactly one**
+    /// `CatalogService` per engine (the server builds one and shares it): a second
+    /// instance writing constraints would leave this one's cache stale.
+    fk_cache: RwLock<Option<Arc<Vec<ForeignKeyRow>>>>,
+    /// Bumped, after the write is visible, by every foreign-key change.
+    fk_generation: AtomicU64,
+    /// Every `CHECK` constraint, rebuilt on demand after any change (`check_constraints`).
+    check_cache: RwLock<Option<Arc<Vec<ConstraintRow>>>>,
+    check_generation: AtomicU64,
 }
 
 impl CatalogService {
@@ -76,6 +126,10 @@ impl CatalogService {
         CatalogService {
             engine,
             ddl_lock: Mutex::new(()),
+            fk_cache: RwLock::new(None),
+            fk_generation: AtomicU64::new(0),
+            check_cache: RwLock::new(None),
+            check_generation: AtomicU64::new(0),
         }
     }
 
@@ -309,6 +363,21 @@ impl CatalogService {
         columns: &[ColumnDef],
         pk_ordinals: &[u16],
     ) -> Result<u32> {
+        self.create_table_with_foreign_keys(schema_id, name, columns, pk_ordinals, &[], &[])
+    }
+
+    /// `create_table`, declaring foreign keys and `CHECK` constraints in the same
+    /// atomic batch: the table, its columns, its primary-key index and its
+    /// constraints all become visible together or not at all.
+    pub fn create_table_with_foreign_keys(
+        &self,
+        schema_id: u32,
+        name: &str,
+        columns: &[ColumnDef],
+        pk_ordinals: &[u16],
+        foreign_keys: &[NewTableForeignKey],
+        checks: &[NewTableCheck],
+    ) -> Result<u32> {
         let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
         validate_name(name, "table")?;
         if columns.is_empty() {
@@ -412,14 +481,127 @@ impl CatalogService {
                 default_value: column.default_value.clone(),
                 added_in_schema_version: 1,
                 type_params: column.type_params.clone(),
+                backfill_value: None,
             };
+            ops.push(Self::column_put_op(&row));
+        }
+
+        // Foreign keys and CHECK constraints: checked against the shape the new table
+        // will have, ids taken from one counter advance.
+        if !foreign_keys.is_empty() || !checks.is_empty() {
+            let child_shape = FkShape {
+                table_id,
+                name: name.to_string(),
+                pk_ordinals: pk_ordinals.to_vec(),
+                columns: columns
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, c)| ColumnRow {
+                        table_id,
+                        ordinal: ordinal as u16,
+                        name: c.name.clone(),
+                        data_type: c.data_type,
+                        nullable: c.nullable,
+                        default_value: c.default_value.clone(),
+                        added_in_schema_version: 1,
+                        type_params: c.type_params.clone(),
+                        backfill_value: None,
+                    })
+                    .collect(),
+                unique_indexes: Vec::new(),
+            };
+            let (first_id, _) = self.allocate_id(CounterKind::Constraint)?;
+            let last_id = first_id
+                .checked_add((foreign_keys.len() + checks.len()) as u32 - 1)
+                .ok_or_else(|| CatalogError::InvalidInput {
+                    detail: "Constraint ID space exhausted (u32::MAX reached)".to_string(),
+                })?;
+            let mut seen_names = std::collections::HashSet::new();
+            for (i, check) in checks.iter().enumerate() {
+                validate_name(&check.name, "constraint")?;
+                validate_check_expression(&check.expression)?;
+                if !seen_names.insert(check.name.as_str()) {
+                    return Err(CatalogError::AlreadyExists {
+                        object: format!("constraint {:?}", check.name),
+                    });
+                }
+                if check
+                    .column_ordinals
+                    .iter()
+                    .any(|&o| o as usize >= columns.len())
+                {
+                    return Err(CatalogError::InvalidInput {
+                        detail: "a CHECK constraint names a column that does not exist".to_string(),
+                    });
+                }
+                let row = ConstraintRow {
+                    constraint_id: first_id + (foreign_keys.len() + i) as u32,
+                    table_id,
+                    name: check.name.clone(),
+                    kind: ConstraintKind::Check,
+                    column_ordinals: check.column_ordinals.clone(),
+                    check_expression: Some(check.expression.clone()),
+                    added_in_schema_version: 1,
+                };
+                ops.push(WriteOp::Put {
+                    key: catalog_key(SYSTEM_TABLE_CONSTRAINTS, &row.constraint_id.to_be_bytes()),
+                    value: encode_row(1, &row.to_fields()),
+                });
+            }
+            for (i, fk) in foreign_keys.iter().enumerate() {
+                validate_name(&fk.name, "constraint")?;
+                if !seen_names.insert(fk.name.as_str()) {
+                    return Err(CatalogError::AlreadyExists {
+                        object: format!("constraint {:?}", fk.name),
+                    });
+                }
+                let parent_shape = match fk.parent_table_id {
+                    None => child_shape.clone(),
+                    Some(id) => {
+                        let parent = self.require_active_table(id)?;
+                        self.fk_shape(&parent)?
+                    }
+                };
+                let parent_index_id = resolve_foreign_key(
+                    &FkDefinition {
+                        child_ordinals: &fk.child_ordinals,
+                        parent_ordinals: &fk.parent_ordinals,
+                        on_delete: fk.on_delete,
+                        on_update: fk.on_update,
+                    },
+                    &child_shape,
+                    &parent_shape,
+                )?;
+                let row = ForeignKeyRow {
+                    fk_id: first_id + i as u32,
+                    table_id,
+                    name: fk.name.clone(),
+                    child_ordinals: fk.child_ordinals.clone(),
+                    parent_table_id: fk.parent_table_id.unwrap_or(table_id),
+                    parent_ordinals: fk.parent_ordinals.clone(),
+                    parent_index_id,
+                    on_delete: fk.on_delete,
+                    on_update: fk.on_update,
+                    created_at,
+                };
+                ops.push(WriteOp::Put {
+                    key: catalog_key(SYSTEM_TABLE_FOREIGN_KEYS, &row.fk_id.to_be_bytes()),
+                    value: encode_row(1, &row.to_fields()),
+                });
+            }
             ops.push(WriteOp::Put {
-                key: catalog_key(SYSTEM_TABLE_COLUMNS, &column_pk(table_id, ordinal)),
-                value: encode_row(1, &row.to_fields()),
+                key: Self::counter_key(CounterKind::Constraint),
+                value: last_id.to_le_bytes().to_vec(),
             });
         }
 
         self.engine.write_batch(&ops)?;
+        if !foreign_keys.is_empty() {
+            self.invalidate_foreign_keys();
+        }
+        if !checks.is_empty() {
+            self.invalidate_checks();
+        }
         Ok(table_id)
     }
 
@@ -477,7 +659,7 @@ impl CatalogService {
         {
             let (key, value) = row?;
             let ordinal = column_pk_ordinal(&key)?;
-            let (_, fields) = decode_row(&value, &COLUMNS_SCHEMA)?;
+            let (_, fields) = decode_column_row(&value)?;
             out.push(ColumnRow::from_fields(table_id, ordinal, fields)?);
         }
         out.sort_by_key(|c| c.ordinal);
@@ -497,9 +679,29 @@ impl CatalogService {
             });
         }
 
+        // A table another table's foreign key references cannot be dropped out from
+        // under it; the table's own foreign keys go with it.
+        let foreign_keys = self.foreign_keys()?;
+        if let Some(fk) = foreign_keys
+            .iter()
+            .find(|fk| fk.parent_table_id == table_id && fk.table_id != table_id)
+        {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "table {table_id} is referenced by foreign key {:?} of table {}; drop that constraint first",
+                    fk.name, fk.table_id
+                ),
+            });
+        }
         let mut ops = vec![WriteOp::Delete {
             key: catalog_key(SYSTEM_TABLE_TABLES, &table_id.to_be_bytes()),
         }];
+        let owns_foreign_keys = foreign_keys.iter().any(|fk| fk.table_id == table_id);
+        for fk in foreign_keys.iter().filter(|fk| fk.table_id == table_id) {
+            ops.push(WriteOp::Delete {
+                key: catalog_key(SYSTEM_TABLE_FOREIGN_KEYS, &fk.fk_id.to_be_bytes()),
+            });
+        }
         for column in self.get_columns(table_id)? {
             ops.push(WriteOp::Delete {
                 key: catalog_key(SYSTEM_TABLE_COLUMNS, &column_pk(table_id, column.ordinal)),
@@ -519,7 +721,14 @@ impl CatalogService {
             });
         }
 
+        let owns_checks = self.check_constraints()?.iter().any(|c| c.table_id == table_id);
         self.engine.write_batch(&ops)?;
+        if owns_foreign_keys {
+            self.invalidate_foreign_keys();
+        }
+        if owns_checks {
+            self.invalidate_checks();
+        }
         Ok(())
     }
 
@@ -674,6 +883,7 @@ impl CatalogService {
                     .to_string(),
             });
         }
+        self.refuse_if_foreign_key_uses_index(index_id)?;
         let ops = vec![WriteOp::Delete {
             key: catalog_key(SYSTEM_TABLE_INDEXES, &index_id.to_be_bytes()),
         }];
@@ -765,6 +975,7 @@ impl CatalogService {
                     .to_string(),
             });
         }
+        self.refuse_if_foreign_key_uses_index(index_id)?;
         self.transition_index_state(
             index_id,
             &[IndexState::Building, IndexState::Ready, IndexState::Failed],
@@ -891,6 +1102,526 @@ impl CatalogService {
     }
 
     // -------------------------------------------------------------
+    // ALTER TABLE primitives (ADR-DDL-FK-01). Each is one `write_batch`
+    // under `ddl_lock` that rewrites the affected `system.columns` row
+    // **and** the `system.tables` row with its `schema_version` bumped, so
+    // the change and the new version become visible together or not at all.
+    // Callers that must also coordinate with in-flight row writes (every one
+    // that validates existing rows) hold the table's epoch write-lock around
+    // the call -- see `relational::alter`.
+    // -------------------------------------------------------------
+
+    fn alter_table_row_op(table: &TableRow) -> (TableRow, WriteOp) {
+        let mut next = table.clone();
+        next.schema_version = table.schema_version.saturating_add(1);
+        let op = WriteOp::Put {
+            key: catalog_key(SYSTEM_TABLE_TABLES, &next.table_id.to_be_bytes()),
+            value: encode_row(1, &next.to_fields()),
+        };
+        (next, op)
+    }
+
+    fn column_put_op(row: &ColumnRow) -> WriteOp {
+        WriteOp::Put {
+            key: catalog_key(SYSTEM_TABLE_COLUMNS, &column_pk(row.table_id, row.ordinal)),
+            value: encode_row(COLUMN_ROW_VERSION, &row.to_fields()),
+        }
+    }
+
+    fn require_active_table(&self, table_id: u32) -> Result<TableRow> {
+        let table = self
+            .get_table(table_id)?
+            .ok_or_else(|| CatalogError::NotFound {
+                object: format!("table {table_id}"),
+            })?;
+        if table.state != TableState::Active {
+            return Err(CatalogError::InvalidInput {
+                detail: format!("table {table_id} is being dropped"),
+            });
+        }
+        Ok(table)
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN`: appends a column at the next ordinal (every
+    /// existing ordinal -- and so every primary-key and index definition -- is
+    /// unchanged) and bumps the table's `schema_version`. `backfill_value` is the
+    /// value rows written before this call read as for the new column (its
+    /// literal `DEFAULT`, or `None` for `NULL`). Returns the new ordinal.
+    pub fn add_column(
+        &self,
+        table_id: u32,
+        column: &ColumnDef,
+        backfill_value: Option<Vec<u8>>,
+    ) -> Result<u16> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        validate_name(&column.name, "column")?;
+        let table = self.require_active_table(table_id)?;
+        let columns = self.get_columns(table_id)?;
+        if columns.iter().any(|c| c.name == column.name) {
+            return Err(CatalogError::AlreadyExists {
+                object: format!("column {:?}", column.name),
+            });
+        }
+        if columns.len() >= u16::MAX as usize {
+            return Err(CatalogError::InvalidInput {
+                detail: "too many columns".to_string(),
+            });
+        }
+        let ordinal = columns.len() as u16;
+        let (next_table, table_op) = Self::alter_table_row_op(&table);
+        let row = ColumnRow {
+            table_id,
+            ordinal,
+            name: column.name.clone(),
+            data_type: column.data_type,
+            nullable: column.nullable,
+            default_value: column.default_value.clone(),
+            added_in_schema_version: next_table.schema_version,
+            type_params: column.type_params.clone(),
+            backfill_value,
+        };
+        self.engine.write_batch(&[table_op, Self::column_put_op(&row)])?;
+        Ok(ordinal)
+    }
+
+    fn column_for_alter(&self, table_id: u32, ordinal: u16) -> Result<ColumnRow> {
+        self.get_columns(table_id)?
+            .into_iter()
+            .find(|c| c.ordinal == ordinal)
+            .ok_or_else(|| CatalogError::NotFound {
+                object: format!("column {ordinal} of table {table_id}"),
+            })
+    }
+
+    /// `ALTER TABLE ... RENAME COLUMN`: only the name changes. Rows, indexes, the
+    /// primary key and foreign keys all refer to a column by ordinal, so no stored
+    /// byte depends on the name.
+    pub fn rename_column(&self, table_id: u32, ordinal: u16, new_name: &str) -> Result<()> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        validate_name(new_name, "column")?;
+        let table = self.require_active_table(table_id)?;
+        let mut column = self.column_for_alter(table_id, ordinal)?;
+        if self
+            .get_columns(table_id)?
+            .iter()
+            .any(|c| c.name == new_name && c.ordinal != ordinal)
+        {
+            return Err(CatalogError::AlreadyExists {
+                object: format!("column {new_name:?}"),
+            });
+        }
+        if let Some(check) = self
+            .check_constraints()?
+            .iter()
+            .find(|c| c.table_id == table_id && c.column_ordinals.contains(&ordinal))
+        {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "column {:?} is read by CHECK constraint {:?}; drop the constraint, rename the column, and add it again",
+                    column.name, check.name
+                ),
+            });
+        }
+        column.name = new_name.to_string();
+        let (_, table_op) = Self::alter_table_row_op(&table);
+        self.engine.write_batch(&[table_op, Self::column_put_op(&column)])?;
+        Ok(())
+    }
+
+    /// `ALTER COLUMN ... SET DEFAULT <literal>` / `DROP DEFAULT`. Governs only rows
+    /// written afterwards: the value older rows read as is the column's
+    /// `backfill_value`, fixed when the column was added.
+    pub fn set_column_default(
+        &self,
+        table_id: u32,
+        ordinal: u16,
+        default_value: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let table = self.require_active_table(table_id)?;
+        let mut column = self.column_for_alter(table_id, ordinal)?;
+        column.default_value = default_value;
+        let (_, table_op) = Self::alter_table_row_op(&table);
+        self.engine.write_batch(&[table_op, Self::column_put_op(&column)])?;
+        Ok(())
+    }
+
+    /// `ALTER COLUMN ... SET NOT NULL` / `DROP NOT NULL`. The catalog flips the
+    /// flag; for `SET NOT NULL` the caller must already hold the table's epoch
+    /// write-lock and have verified that no row holds `NULL` (`relational::alter`).
+    pub fn set_column_nullable(&self, table_id: u32, ordinal: u16, nullable: bool) -> Result<()> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let table = self.require_active_table(table_id)?;
+        let mut column = self.column_for_alter(table_id, ordinal)?;
+        if nullable && table.pk_ordinals.contains(&ordinal) {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "column {:?} is part of the primary key and cannot be made nullable",
+                    column.name
+                ),
+            });
+        }
+        if !nullable {
+            // A foreign key whose referential action writes NULL needs its column nullable.
+            for fk in self.foreign_keys()?.iter() {
+                if fk.table_id == table_id
+                    && fk.child_ordinals.contains(&ordinal)
+                    && (fk.on_delete == FkAction::SetNull || fk.on_update == FkAction::SetNull)
+                {
+                    return Err(CatalogError::InvalidInput {
+                        detail: format!(
+                            "column {:?} cannot be NOT NULL: foreign key {:?} sets it to NULL",
+                            column.name, fk.name
+                        ),
+                    });
+                }
+            }
+        }
+        column.nullable = nullable;
+        let (_, table_op) = Self::alter_table_row_op(&table);
+        self.engine.write_batch(&[table_op, Self::column_put_op(&column)])?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------
+    // system.foreign_keys (ADR-DDL-FK-01)
+    // -------------------------------------------------------------
+
+    /// Every foreign key in the catalog, from a cache that is rebuilt after any
+    /// change to `system.foreign_keys` (this process is the only writer, so the
+    /// cache cannot go stale behind its back; `fk_generation` guards the one race
+    /// that remains, a load interleaving with an invalidation). Cheap enough to
+    /// call on every commit.
+    pub fn foreign_keys(&self) -> Result<Arc<Vec<ForeignKeyRow>>> {
+        if let Some(cached) = self
+            .fk_cache
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            return Ok(Arc::clone(cached));
+        }
+        let generation = self.fk_generation.load(Ordering::Acquire);
+        let (start, end) = system_table_range(SYSTEM_TABLE_FOREIGN_KEYS);
+        let mut out = Vec::new();
+        for row in self
+            .engine
+            .range_scan(as_bound_ref(&start), as_bound_ref(&end), u64::MAX)
+        {
+            let (key, value) = row?;
+            let fk_id = pk_tail_u32(&key)?;
+            let (_, fields) = decode_row(&value, &FOREIGN_KEYS_SCHEMA)?;
+            out.push(ForeignKeyRow::from_fields(fk_id, fields)?);
+        }
+        let loaded = Arc::new(out);
+        let mut slot = self.fk_cache.write().unwrap_or_else(|p| p.into_inner());
+        if self.fk_generation.load(Ordering::Acquire) == generation {
+            *slot = Some(Arc::clone(&loaded));
+        }
+        Ok(loaded)
+    }
+
+    /// Changes whenever a foreign key is created or dropped. A committing
+    /// transaction compares it before and after taking its table locks, to know
+    /// that the set of keys it validates against is the set in force.
+    pub fn foreign_key_generation(&self) -> u64 {
+        self.fk_generation.load(Ordering::Acquire)
+    }
+
+    fn invalidate_foreign_keys(&self) {
+        self.fk_generation.fetch_add(1, Ordering::AcqRel);
+        *self.fk_cache.write().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    pub fn list_foreign_keys_for_child(&self, table_id: u32) -> Result<Vec<ForeignKeyRow>> {
+        Ok(self
+            .foreign_keys()?
+            .iter()
+            .filter(|fk| fk.table_id == table_id)
+            .cloned()
+            .collect())
+    }
+
+    pub fn list_foreign_keys_for_parent(&self, table_id: u32) -> Result<Vec<ForeignKeyRow>> {
+        Ok(self
+            .foreign_keys()?
+            .iter()
+            .filter(|fk| fk.parent_table_id == table_id)
+            .cloned()
+            .collect())
+    }
+
+    fn fk_shape(&self, table: &TableRow) -> Result<FkShape> {
+        Ok(FkShape {
+            table_id: table.table_id,
+            name: table.name.clone(),
+            pk_ordinals: table.pk_ordinals.clone(),
+            columns: self.get_columns(table.table_id)?,
+            unique_indexes: self
+                .list_indexes(table.table_id)?
+                .into_iter()
+                .filter(|i| i.kind == IndexKind::Unique && i.state == IndexState::Ready)
+                .collect(),
+        })
+    }
+
+    /// Checks everything about a foreign key's *definition* against the catalog
+    /// and returns the `UNIQUE` index its referenced columns resolve to (`None` =
+    /// the primary key): both tables and all columns exist, equal arity and
+    /// identical types, the referenced columns are the primary key or a ready
+    /// `UNIQUE` index, the referential actions are possible for the referencing
+    /// columns, the name is free. It looks at no row --
+    /// `relational::alter::alter_add_foreign_key` validates the existing rows under
+    /// the two tables' locks and then records the key.
+    pub fn check_foreign_key(&self, new: &NewForeignKey) -> Result<Option<u32>> {
+        validate_name(&new.name, "constraint")?;
+        let child = self.require_active_table(new.table_id)?;
+        let parent = self.require_active_table(new.parent_table_id)?;
+        let child_shape = self.fk_shape(&child)?;
+        let parent_shape = if parent.table_id == child.table_id {
+            child_shape.clone()
+        } else {
+            self.fk_shape(&parent)?
+        };
+        let resolved = resolve_foreign_key(
+            &FkDefinition {
+                child_ordinals: &new.child_ordinals,
+                parent_ordinals: &new.parent_ordinals,
+                on_delete: new.on_delete,
+                on_update: new.on_update,
+            },
+            &child_shape,
+            &parent_shape,
+        )?;
+        if self
+            .list_foreign_keys_for_child(child.table_id)?
+            .iter()
+            .any(|f| f.name == new.name)
+            || self
+                .check_constraints()?
+                .iter()
+                .any(|c| c.table_id == child.table_id && c.name == new.name)
+        {
+            return Err(CatalogError::AlreadyExists {
+                object: format!("constraint {:?}", new.name),
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// Records a foreign key (see `check_foreign_key`, which it re-runs under the
+    /// DDL lock). Returns its id.
+    pub fn create_foreign_key(&self, new: &NewForeignKey) -> Result<u32> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let parent_index_id = self.check_foreign_key(new)?;
+        let child = self.require_active_table(new.table_id)?;
+        let (fk_id, counter_op) = self.allocate_id(CounterKind::Constraint)?;
+        let row = ForeignKeyRow {
+            fk_id,
+            table_id: child.table_id,
+            name: new.name.clone(),
+            child_ordinals: new.child_ordinals.clone(),
+            parent_table_id: new.parent_table_id,
+            parent_ordinals: new.parent_ordinals.clone(),
+            parent_index_id,
+            on_delete: new.on_delete,
+            on_update: new.on_update,
+            created_at: now_micros(),
+        };
+        // The child's `schema_version` is bumped with the key: a transaction that
+        // buffered rows for the child before the key existed must not commit them
+        // unchecked (it fails with a conflict instead).
+        let (_, child_op) = Self::alter_table_row_op(&child);
+        let ops = vec![
+            counter_op,
+            child_op,
+            WriteOp::Put {
+                key: catalog_key(SYSTEM_TABLE_FOREIGN_KEYS, &fk_id.to_be_bytes()),
+                value: encode_row(1, &row.to_fields()),
+            },
+        ];
+        self.engine.write_batch(&ops)?;
+        self.invalidate_foreign_keys();
+        Ok(fk_id)
+    }
+
+    /// Drops a foreign key by id. The child table's `schema_version` is bumped so
+    /// an in-flight transaction notices the change.
+    pub fn drop_foreign_key(&self, fk_id: u32) -> Result<()> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let fk = self
+            .foreign_keys()?
+            .iter()
+            .find(|f| f.fk_id == fk_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                object: format!("foreign key {fk_id}"),
+            })?;
+        let mut ops = vec![WriteOp::Delete {
+            key: catalog_key(SYSTEM_TABLE_FOREIGN_KEYS, &fk_id.to_be_bytes()),
+        }];
+        if let Some(child) = self.get_table(fk.table_id)? {
+            ops.push(Self::alter_table_row_op(&child).1);
+        }
+        self.engine.write_batch(&ops)?;
+        self.invalidate_foreign_keys();
+        Ok(())
+    }
+
+    // -------------------------------------------------------------
+    // CHECK constraints (system.constraints, kind Check -- the existing row format)
+    // -------------------------------------------------------------
+
+    /// Every `CHECK` constraint in the catalog, from a cache rebuilt after any change
+    /// (the same arrangement as `foreign_keys`). A write statement asks for the
+    /// constraints of the table it writes on every execution, so this is cheap when
+    /// there are none.
+    pub fn check_constraints(&self) -> Result<Arc<Vec<ConstraintRow>>> {
+        if let Some(cached) = self
+            .check_cache
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            return Ok(Arc::clone(cached));
+        }
+        let generation = self.check_generation.load(Ordering::Acquire);
+        let (start, end) = system_table_range(SYSTEM_TABLE_CONSTRAINTS);
+        let mut out = Vec::new();
+        for row in self
+            .engine
+            .range_scan(as_bound_ref(&start), as_bound_ref(&end), u64::MAX)
+        {
+            let (key, value) = row?;
+            let constraint_id = pk_tail_u32(&key)?;
+            let (_, fields) = decode_row(&value, &CONSTRAINTS_SCHEMA)?;
+            let constraint = ConstraintRow::from_fields(constraint_id, fields)?;
+            if constraint.kind == ConstraintKind::Check {
+                out.push(constraint);
+            }
+        }
+        let loaded = Arc::new(out);
+        let mut slot = self.check_cache.write().unwrap_or_else(|p| p.into_inner());
+        if self.check_generation.load(Ordering::Acquire) == generation {
+            *slot = Some(Arc::clone(&loaded));
+        }
+        Ok(loaded)
+    }
+
+    pub fn check_constraints_for(&self, table_id: u32) -> Result<Vec<ConstraintRow>> {
+        Ok(self
+            .check_constraints()?
+            .iter()
+            .filter(|c| c.table_id == table_id)
+            .cloned()
+            .collect())
+    }
+
+    fn invalidate_checks(&self) {
+        self.check_generation.fetch_add(1, Ordering::AcqRel);
+        *self.check_cache.write().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Records a `CHECK` constraint whose expression the caller has already bound,
+    /// and validated against every existing row, under the table's epoch write-lock
+    /// (`relational::alter`). One batch: the constraint row and the bumped table
+    /// `schema_version`.
+    pub fn create_check_constraint(
+        &self,
+        table_id: u32,
+        name: &str,
+        column_ordinals: &[u16],
+        expression: &str,
+    ) -> Result<u32> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        validate_name(name, "constraint")?;
+        validate_check_expression(expression)?;
+        let table = self.require_active_table(table_id)?;
+        let columns = self.get_columns(table_id)?;
+        if column_ordinals
+            .iter()
+            .any(|&o| !columns.iter().any(|c| c.ordinal == o))
+        {
+            return Err(CatalogError::InvalidInput {
+                detail: "a CHECK constraint names a column that does not exist".to_string(),
+            });
+        }
+        if self
+            .check_constraints()?
+            .iter()
+            .any(|c| c.table_id == table_id && c.name == name)
+            || self
+                .list_foreign_keys_for_child(table_id)?
+                .iter()
+                .any(|f| f.name == name)
+        {
+            return Err(CatalogError::AlreadyExists {
+                object: format!("constraint {name:?}"),
+            });
+        }
+        let (constraint_id, counter_op) = self.allocate_id(CounterKind::Constraint)?;
+        let (next_table, table_op) = Self::alter_table_row_op(&table);
+        let row = ConstraintRow {
+            constraint_id,
+            table_id,
+            name: name.to_string(),
+            kind: ConstraintKind::Check,
+            column_ordinals: column_ordinals.to_vec(),
+            check_expression: Some(expression.to_string()),
+            added_in_schema_version: next_table.schema_version,
+        };
+        self.engine.write_batch(&[
+            counter_op,
+            table_op,
+            WriteOp::Put {
+                key: catalog_key(SYSTEM_TABLE_CONSTRAINTS, &constraint_id.to_be_bytes()),
+                value: encode_row(1, &row.to_fields()),
+            },
+        ])?;
+        self.invalidate_checks();
+        Ok(constraint_id)
+    }
+
+    /// Drops a `CHECK` constraint; the table `schema_version` is bumped so a
+    /// transaction that evaluated it notices.
+    pub fn drop_check_constraint(&self, constraint_id: u32) -> Result<()> {
+        let _guard = self.ddl_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let constraint = self
+            .check_constraints()?
+            .iter()
+            .find(|c| c.constraint_id == constraint_id)
+            .cloned()
+            .ok_or_else(|| CatalogError::NotFound {
+                object: format!("constraint {constraint_id}"),
+            })?;
+        let mut ops = vec![WriteOp::Delete {
+            key: catalog_key(SYSTEM_TABLE_CONSTRAINTS, &constraint_id.to_be_bytes()),
+        }];
+        if let Some(table) = self.get_table(constraint.table_id)? {
+            ops.push(Self::alter_table_row_op(&table).1);
+        }
+        self.engine.write_batch(&ops)?;
+        self.invalidate_checks();
+        Ok(())
+    }
+
+    fn refuse_if_foreign_key_uses_index(&self, index_id: u32) -> Result<()> {
+        if let Some(fk) = self
+            .foreign_keys()?
+            .iter()
+            .find(|fk| fk.parent_index_id == Some(index_id))
+        {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "index {index_id} is the referenced key of foreign key {:?}; drop that constraint first",
+                    fk.name
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------
     // system.grants (D25 — storage only; no authorization checking
     // exists in this increment, per the review directive's own
     // "preserve the boundary, do not prematurely invent a different
@@ -997,6 +1728,171 @@ impl CatalogService {
         }
         Ok(out)
     }
+}
+
+/// Decodes a `system.columns` row by its own envelope version: a version-1 row
+/// (written before `ALTER TABLE`) has `COLUMNS_V1_FIELDS` fields, a later one all
+/// of `COLUMNS_SCHEMA`.
+fn decode_column_row(bytes: &[u8]) -> Result<(u32, Vec<Option<crate::catalog::encoding::CatalogValue>>)> {
+    let version = bytes
+        .get(1..5)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        .ok_or_else(|| CatalogError::InvalidInput {
+            detail: "system.columns row too short for its envelope header".to_string(),
+        })?;
+    let schema = if version >= 2 {
+        &COLUMNS_SCHEMA[..]
+    } else {
+        &COLUMNS_SCHEMA[..COLUMNS_V1_FIELDS]
+    };
+    decode_row(bytes, schema)
+}
+
+/// What a foreign-key definition check needs to know about one table.
+#[derive(Clone)]
+struct FkShape {
+    table_id: u32,
+    name: String,
+    pk_ordinals: Vec<u16>,
+    columns: Vec<ColumnRow>,
+    /// The table's ready `UNIQUE` indexes.
+    unique_indexes: Vec<IndexRow>,
+}
+
+struct FkDefinition<'a> {
+    child_ordinals: &'a [u16],
+    parent_ordinals: &'a [u16],
+    on_delete: FkAction,
+    on_update: FkAction,
+}
+
+/// The rules a foreign-key definition must meet, against the two tables' shapes
+/// (so the same check serves `ALTER TABLE ... ADD FOREIGN KEY`, where both tables
+/// are in the catalog, and `CREATE TABLE`, where the referencing table is not
+/// yet). Returns the `UNIQUE` index the referenced columns resolve to, `None` for
+/// the primary key.
+fn resolve_foreign_key(
+    def: &FkDefinition<'_>,
+    child: &FkShape,
+    parent: &FkShape,
+) -> Result<Option<u32>> {
+    let n = def.child_ordinals.len();
+    if n == 0 || n != def.parent_ordinals.len() {
+        return Err(CatalogError::InvalidInput {
+            detail: "a foreign key needs the same, non-zero number of referencing and referenced columns"
+                .to_string(),
+        });
+    }
+    if n > MAX_COLUMNS_PER_INDEX {
+        return Err(CatalogError::InvalidInput {
+            detail: format!("a foreign key may cover at most {MAX_COLUMNS_PER_INDEX} columns"),
+        });
+    }
+    for (list, what) in [
+        (def.child_ordinals, "referencing"),
+        (def.parent_ordinals, "referenced"),
+    ] {
+        let mut seen = std::collections::HashSet::new();
+        if !list.iter().all(|o| seen.insert(*o)) {
+            return Err(CatalogError::InvalidInput {
+                detail: format!("a {what} column is listed twice"),
+            });
+        }
+    }
+    for (&c, &p) in def.child_ordinals.iter().zip(def.parent_ordinals) {
+        let cc = child
+            .columns
+            .iter()
+            .find(|x| x.ordinal == c)
+            .ok_or_else(|| CatalogError::InvalidInput {
+                detail: format!("referencing column {c} does not exist"),
+            })?;
+        let pc = parent
+            .columns
+            .iter()
+            .find(|x| x.ordinal == p)
+            .ok_or_else(|| CatalogError::InvalidInput {
+                detail: format!("referenced column {p} does not exist"),
+            })?;
+        if cc.data_type != pc.data_type || cc.type_params != pc.type_params {
+            return Err(CatalogError::InvalidInput {
+                detail: format!(
+                    "referencing column {:?} and referenced column {:?} have different types",
+                    cc.name, pc.name
+                ),
+            });
+        }
+    }
+
+    // The referenced columns must be unique: the primary key, or a ready UNIQUE
+    // index, covering exactly the same set of columns.
+    let as_set = |v: &[u16]| v.iter().copied().collect::<std::collections::BTreeSet<u16>>();
+    let wanted = as_set(def.parent_ordinals);
+    let parent_index_id = if as_set(&parent.pk_ordinals) == wanted {
+        None
+    } else {
+        match parent
+            .unique_indexes
+            .iter()
+            .find(|i| as_set(&i.column_ordinals) == wanted)
+        {
+            Some(i) => Some(i.index_id),
+            None => {
+                return Err(CatalogError::InvalidInput {
+                    detail: format!(
+                        "the referenced columns of table {:?} are neither its primary key nor covered by a ready UNIQUE index",
+                        parent.name
+                    ),
+                })
+            }
+        }
+    };
+
+    // A referential action must be possible for the referencing columns.
+    for (action, what) in [(def.on_delete, "ON DELETE"), (def.on_update, "ON UPDATE")] {
+        for &c in def.child_ordinals {
+            let cc = child
+                .columns
+                .iter()
+                .find(|x| x.ordinal == c)
+                .expect("checked above");
+            match action {
+                FkAction::SetNull if !cc.nullable || child.pk_ordinals.contains(&c) => {
+                    return Err(CatalogError::InvalidInput {
+                        detail: format!(
+                            "{what} SET NULL needs column {:?} to be nullable and outside the primary key",
+                            cc.name
+                        ),
+                    })
+                }
+                FkAction::SetDefault if !cc.nullable && cc.default_value.is_none() => {
+                    return Err(CatalogError::InvalidInput {
+                        detail: format!(
+                            "{what} SET DEFAULT needs column {:?} to be nullable or have a DEFAULT",
+                            cc.name
+                        ),
+                    })
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = child.table_id;
+    Ok(parent_index_id)
+}
+
+fn validate_check_expression(expression: &str) -> Result<()> {
+    if expression.trim().is_empty() {
+        return Err(CatalogError::InvalidInput {
+            detail: "CHECK constraint requires a non-empty expression".to_string(),
+        });
+    }
+    if expression.len() > MAX_CHECK_EXPRESSION_BYTES {
+        return Err(CatalogError::InvalidInput {
+            detail: format!("a CHECK expression may be at most {MAX_CHECK_EXPRESSION_BYTES} bytes"),
+        });
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str, kind: &str) -> Result<()> {

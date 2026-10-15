@@ -18,10 +18,13 @@ pub mod service;
 
 pub use error::{CatalogError, Result};
 pub use schema::{
-    ColumnRow, ConstraintKind, ConstraintRow, DatabaseRow, GrantRow, IndexKind, IndexRow,
-    IndexState, ObjectKind, Privilege, SchemaRow, TableRow, TableState,
+    ColumnRow, ConstraintKind, ConstraintRow, DatabaseRow, FkAction, ForeignKeyRow, GrantRow,
+    IndexKind, IndexRow, IndexState, ObjectKind, Privilege, SchemaRow, TableRow, TableState,
 };
-pub use service::{CatalogService, ColumnDef};
+pub use service::{
+    CatalogService, ColumnDef, NewForeignKey, NewTableCheck, NewTableForeignKey,
+    MAX_CHECK_EXPRESSION_BYTES,
+};
 
 #[cfg(test)]
 mod tests;

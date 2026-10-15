@@ -110,6 +110,8 @@ impl ApiError {
             "AUTHORIZATION_ERROR" | "FORBIDDEN" => "This API key's role does not permit the statement. Use a key with the admin role for DDL and writes.",
             "UNAUTHORIZED" => "Check the API key and sign in again.",
             "CONFLICT_ERROR" => "Another transaction changed the same rows first. Roll back and retry the transaction.",
+            "FOREIGN_KEY_VIOLATION" => "Insert the referenced row first, or change or delete the rows that still reference this one (or define the foreign key with ON DELETE / ON UPDATE CASCADE or SET NULL).",
+            "CHECK_VIOLATION" => "Change the values so that every row satisfies the table's CHECK constraint, or drop the constraint (ALTER TABLE ... DROP CONSTRAINT).",
             "RESOURCE_LIMIT" => "Narrow the statement (WHERE, LIMIT) or split it into smaller statements.",
             "TIMEOUT" => "Narrow the query (WHERE, LIMIT) or retry when the server is less busy.",
             "SESSION_NOT_FOUND" => "The transaction session is gone (it ended, expired or belongs to another key). Run BEGIN to start a new one.",
@@ -387,6 +389,23 @@ fn sql_error_parts(e: &SqlError) -> (StatusCode, &'static str, String, Option<St
             StatusCode::CONFLICT,
             "CONFLICT_ERROR",
             "a transaction conflict occurred".to_string(),
+            Some(detail.clone()),
+        ),
+        // The data the statement would leave behind breaks a foreign key. Not a
+        // race to retry blindly (the same statement fails again until the data
+        // changes), so it has its own code; `detail` names the constraint, never a value.
+        SqlError::ForeignKeyViolation { detail } => (
+            StatusCode::CONFLICT,
+            "FOREIGN_KEY_VIOLATION",
+            "the statement would violate a foreign key constraint".to_string(),
+            Some(detail.clone()),
+        ),
+        // A row the statement would write fails a CHECK constraint. Like a foreign-key
+        // violation it is about the data, and names the table and constraint only.
+        SqlError::CheckViolation { detail } => (
+            StatusCode::CONFLICT,
+            "CHECK_VIOLATION",
+            "the statement would violate a check constraint".to_string(),
             Some(detail.clone()),
         ),
     }

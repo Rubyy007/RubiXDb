@@ -238,14 +238,22 @@ impl TableRow {
 // system.columns
 // ---------------------------------------------------------------------
 
-pub const COLUMNS_SCHEMA: [CatalogValueType; 6] = [
+pub const COLUMNS_SCHEMA: [CatalogValueType; 7] = [
     CatalogValueType::Text,
     CatalogValueType::U8,
     CatalogValueType::Bool,
     CatalogValueType::Blob, // default_value; NULL bit means "no default"
     CatalogValueType::U32,
     CatalogValueType::Blob, // type_params (RELATIONAL ADR AMENDMENT 003 RA.4); NULL for every type except DECIMAL/NUMERIC
+    CatalogValueType::Blob, // backfill_value (ADR-DDL-FK-01): what rows written before this column existed read as; NULL = SQL NULL
 ];
+
+/// `system.columns` rows are written with this envelope `schema_version`
+/// (`ADR-DDL-FK-01`): version 1 rows have the first `COLUMNS_V1_FIELDS`
+/// fields, version 2 rows add `backfill_value`. A version-1 row decodes
+/// exactly as it always did (`backfill_value` reads as `None`).
+pub const COLUMN_ROW_VERSION: u32 = 2;
+pub const COLUMNS_V1_FIELDS: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRow {
@@ -266,6 +274,13 @@ pub struct ColumnRow {
     /// parameters. Additive trailing field (D31): appended after every
     /// pre-existing `system.columns` field, never reordering them.
     pub type_params: Option<Vec<u8>>,
+    /// `ADR-DDL-FK-01`: the value a row **written before this column was added**
+    /// (`ALTER TABLE ... ADD COLUMN`) reads as for it -- the literal `DEFAULT` the
+    /// column was added with, or `None` (SQL `NULL`) when it was added without
+    /// one. Fixed at `ADD COLUMN` time and never changed by `SET DEFAULT` /
+    /// `DROP DEFAULT`, which govern only rows written afterwards. Always `None`
+    /// for a column created with its table (no row can predate it).
+    pub backfill_value: Option<Vec<u8>>,
 }
 
 impl ColumnRow {
@@ -277,6 +292,7 @@ impl ColumnRow {
             self.default_value.clone().map(CatalogValue::Blob),
             Some(CatalogValue::U32(self.added_in_schema_version)),
             self.type_params.clone().map(CatalogValue::Blob),
+            self.backfill_value.clone().map(CatalogValue::Blob),
         ]
     }
 
@@ -293,6 +309,12 @@ impl ColumnRow {
         let added_in_schema_version =
             expect_u32(&mut fields, "system.columns.added_in_schema_version")?;
         let type_params = optional_blob(&mut fields)?;
+        // A version-1 row has no seventh field.
+        let backfill_value = if fields.len() == 0 {
+            None
+        } else {
+            optional_blob(&mut fields)?
+        };
         Ok(ColumnRow {
             table_id,
             ordinal,
@@ -302,6 +324,7 @@ impl ColumnRow {
             default_value,
             added_in_schema_version,
             type_params,
+            backfill_value,
         })
     }
 }
@@ -515,6 +538,130 @@ impl ConstraintRow {
 }
 
 // ---------------------------------------------------------------------
+// system.foreign_keys (ADR-DDL-FK-01)
+// ---------------------------------------------------------------------
+
+pub const FOREIGN_KEYS_SCHEMA: [CatalogValueType; 9] = [
+    CatalogValueType::U32,  // table_id (the child)
+    CatalogValueType::Text, // name
+    CatalogValueType::Blob, // child_ordinals
+    CatalogValueType::U32,  // parent_table_id
+    CatalogValueType::Blob, // parent_ordinals
+    CatalogValueType::U32,  // parent_index_id; NULL = the parent's primary key
+    CatalogValueType::U8,   // on_delete
+    CatalogValueType::U8,   // on_update
+    CatalogValueType::I64,  // created_at
+];
+
+/// A referential action (`ON DELETE` / `ON UPDATE`). `NoAction` and `Restrict`
+/// both refuse the change while a referencing row remains; rubiXDb checks
+/// every foreign key immediately, so the two behave identically (see
+/// `ADR-DDL-FK-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    NoAction = 0,
+    Restrict = 1,
+    Cascade = 2,
+    SetNull = 3,
+    SetDefault = 4,
+}
+
+impl FkAction {
+    fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(FkAction::NoAction),
+            1 => Ok(FkAction::Restrict),
+            2 => Ok(FkAction::Cascade),
+            3 => Ok(FkAction::SetNull),
+            4 => Ok(FkAction::SetDefault),
+            other => Err(CatalogError::InvalidInput {
+                detail: format!("unknown FkAction {other}"),
+            }),
+        }
+    }
+
+    /// Does this action refuse the parent change (rather than propagate it)?
+    pub fn is_refusal(self) -> bool {
+        matches!(self, FkAction::NoAction | FkAction::Restrict)
+    }
+}
+
+/// One foreign key: `table_id`'s `child_ordinals` reference `parent_table_id`'s
+/// `parent_ordinals` (pairwise, in order). `parent_index_id` names the `UNIQUE`
+/// index the parent columns resolve to, `None` when they are the primary key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyRow {
+    pub fk_id: u32,
+    pub table_id: u32,
+    pub name: String,
+    pub child_ordinals: Vec<u16>,
+    pub parent_table_id: u32,
+    pub parent_ordinals: Vec<u16>,
+    pub parent_index_id: Option<u32>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+    pub created_at: i64,
+}
+
+impl ForeignKeyRow {
+    pub fn to_fields(&self) -> Vec<Option<CatalogValue>> {
+        vec![
+            Some(CatalogValue::U32(self.table_id)),
+            Some(CatalogValue::Text(self.name.clone())),
+            Some(CatalogValue::Blob(encode_u16_list(&self.child_ordinals))),
+            Some(CatalogValue::U32(self.parent_table_id)),
+            Some(CatalogValue::Blob(encode_u16_list(&self.parent_ordinals))),
+            self.parent_index_id.map(CatalogValue::U32),
+            Some(CatalogValue::U8(self.on_delete as u8)),
+            Some(CatalogValue::U8(self.on_update as u8)),
+            Some(CatalogValue::I64(self.created_at)),
+        ]
+    }
+
+    pub fn from_fields(fk_id: u32, fields: Vec<Option<CatalogValue>>) -> Result<Self> {
+        let mut fields = fields.into_iter();
+        let table_id = expect_u32(&mut fields, "system.foreign_keys.table_id")?;
+        let name = expect_text(&mut fields, "system.foreign_keys.name")?;
+        let child_ordinals = decode_u16_list(&expect_blob(
+            &mut fields,
+            "system.foreign_keys.child_ordinals",
+        )?)?;
+        let parent_table_id = expect_u32(&mut fields, "system.foreign_keys.parent_table_id")?;
+        let parent_ordinals = decode_u16_list(&expect_blob(
+            &mut fields,
+            "system.foreign_keys.parent_ordinals",
+        )?)?;
+        let parent_index_id = match fields.next() {
+            Some(Some(CatalogValue::U32(v))) => Some(v),
+            Some(None) => None,
+            _ => {
+                return Err(CatalogError::InvalidInput {
+                    detail: "expected U32 or NULL for system.foreign_keys.parent_index_id"
+                        .to_string(),
+                })
+            }
+        };
+        let on_delete =
+            FkAction::from_u8(expect_u8(&mut fields, "system.foreign_keys.on_delete")?)?;
+        let on_update =
+            FkAction::from_u8(expect_u8(&mut fields, "system.foreign_keys.on_update")?)?;
+        let created_at = expect_i64(&mut fields, "system.foreign_keys.created_at")?;
+        Ok(ForeignKeyRow {
+            fk_id,
+            table_id,
+            name,
+            child_ordinals,
+            parent_table_id,
+            parent_ordinals,
+            parent_index_id,
+            on_delete,
+            on_update,
+            created_at,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
 // system.grants
 // ---------------------------------------------------------------------
 
@@ -670,6 +817,7 @@ mod tests {
             default_value: Some(vec![0, 0, 0, 0]),
             added_in_schema_version: 1,
             type_params: None,
+            backfill_value: None,
         };
         let encoded = encode_row(1, &with_default.to_fields());
         let (_, fields) = decode_row(&encoded, &COLUMNS_SCHEMA).unwrap();
@@ -701,6 +849,7 @@ mod tests {
             default_value: None,
             added_in_schema_version: 1,
             type_params: Some(vec![10, 2]), // DECIMAL(10, 2)
+            backfill_value: None,
         };
         let encoded = encode_row(1, &decimal_column.to_fields());
         let (_, fields) = decode_row(&encoded, &COLUMNS_SCHEMA).unwrap();
@@ -789,6 +938,66 @@ mod tests {
         let encoded = encode_row(1, &pk.to_fields());
         let (_, fields) = decode_row(&encoded, &CONSTRAINTS_SCHEMA).unwrap();
         assert_eq!(ConstraintRow::from_fields(1, fields).unwrap(), pk);
+    }
+
+    #[test]
+    fn foreign_key_row_round_trips_with_and_without_a_parent_index() {
+        let row = ForeignKeyRow {
+            fk_id: 7,
+            table_id: 3,
+            name: "orders_customer_fk".to_string(),
+            child_ordinals: vec![1, 2],
+            parent_table_id: 4,
+            parent_ordinals: vec![0, 1],
+            parent_index_id: None,
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::SetNull,
+            created_at: 1000,
+        };
+        let encoded = encode_row(1, &row.to_fields());
+        let (_, fields) = decode_row(&encoded, &FOREIGN_KEYS_SCHEMA).unwrap();
+        assert_eq!(ForeignKeyRow::from_fields(7, fields).unwrap(), row);
+
+        let with_index = ForeignKeyRow {
+            parent_index_id: Some(11),
+            on_delete: FkAction::Restrict,
+            on_update: FkAction::SetDefault,
+            ..row
+        };
+        let encoded = encode_row(1, &with_index.to_fields());
+        let (_, fields) = decode_row(&encoded, &FOREIGN_KEYS_SCHEMA).unwrap();
+        assert_eq!(ForeignKeyRow::from_fields(7, fields).unwrap(), with_index);
+    }
+
+    /// `ADR-DDL-FK-01`: a version-1 `system.columns` row (six fields, as every
+    /// column row written before `ALTER TABLE` existed is) still decodes, with no
+    /// backfill value; a version-2 row round-trips its backfill value.
+    #[test]
+    fn column_row_version_one_decodes_and_version_two_round_trips_backfill() {
+        let v2 = ColumnRow {
+            table_id: 3,
+            ordinal: 4,
+            name: "added".to_string(),
+            data_type: 2,
+            nullable: true,
+            default_value: Some(vec![1, 2, 3]),
+            added_in_schema_version: 2,
+            type_params: None,
+            backfill_value: Some(vec![9, 9]),
+        };
+        let encoded = encode_row(COLUMN_ROW_VERSION, &v2.to_fields());
+        let (_, fields) = decode_row(&encoded, &COLUMNS_SCHEMA).unwrap();
+        assert_eq!(ColumnRow::from_fields(3, 4, fields).unwrap(), v2);
+
+        // A version-1 row, byte for byte as the previous catalog wrote it.
+        let v1_fields = v2.to_fields()[..COLUMNS_V1_FIELDS].to_vec();
+        let encoded_v1 = encode_row(1, &v1_fields);
+        let (version, fields) =
+            decode_row(&encoded_v1, &COLUMNS_SCHEMA[..COLUMNS_V1_FIELDS]).unwrap();
+        assert_eq!(version, 1);
+        let row = ColumnRow::from_fields(3, 4, fields).unwrap();
+        assert_eq!(row.backfill_value, None);
+        assert_eq!(row.default_value, v2.default_value);
     }
 
     #[test]

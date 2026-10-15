@@ -168,6 +168,7 @@ pub fn convert_statement(stmt: &sp::Statement, limits: &SqlLimits) -> Result<Sta
                 other => Err(unsupported(format!("DROP {other:?}"))),
             }
         }
+        sp::Statement::AlterTable(at) => Ok(Statement::AlterTable(convert_alter_table(at, limits)?)),
         sp::Statement::Explain {
             statement,
             analyze,
@@ -1934,11 +1935,19 @@ fn convert_create_table(ct: &sp::CreateTable, limits: &SqlLimits) -> Result<Crea
             ),
         });
     }
-    let columns = ct
-        .columns
-        .iter()
-        .map(|c| convert_column_def(c, limits))
-        .collect::<Result<Vec<_>>>()?;
+    let mut columns = Vec::with_capacity(ct.columns.len());
+    let mut foreign_keys: Vec<ForeignKeyDef> = Vec::new();
+    let mut checks: Vec<CheckDef> = Vec::new();
+    for c in &ct.columns {
+        let (column, extras) = convert_column_def_with_fk(c, limits)?;
+        // An inline `REFERENCES` is a one-column foreign key on that column.
+        if let Some(mut fk) = extras.foreign_key {
+            fk.columns = vec![column.name.clone()];
+            foreign_keys.push(fk);
+        }
+        checks.extend(extras.checks);
+        columns.push(column);
+    }
 
     let mut table_primary_key: Option<Vec<Ident>> = None;
     for constraint in &ct.constraints {
@@ -1954,11 +1963,11 @@ fn convert_create_table(ct: &sp::CreateTable, limits: &SqlLimits) -> Result<Crea
                     "table-level UNIQUE constraint (create the table, then CREATE UNIQUE INDEX)",
                 ))
             }
-            sp::TableConstraint::ForeignKey(_) => {
-                return Err(unsupported("FOREIGN KEY constraints"))
+            sp::TableConstraint::ForeignKey(fk) => {
+                foreign_keys.push(convert_foreign_key(fk, limits)?);
             }
-            sp::TableConstraint::Check(_) => {
-                return Err(unsupported("table-level CHECK constraints"))
+            sp::TableConstraint::Check(check) => {
+                checks.push(convert_check(check, limits)?);
             }
             other => return Err(unsupported(format!("table constraint kind: {other:?}"))),
         }
@@ -1969,6 +1978,217 @@ fn convert_create_table(ct: &sp::CreateTable, limits: &SqlLimits) -> Result<Crea
         if_not_exists: ct.if_not_exists,
         columns,
         table_primary_key,
+        foreign_keys,
+        checks,
+    })
+}
+
+/// `CHECK (expr)`. `NOT ENFORCED` is refused: every constraint here is enforced.
+fn convert_check(check: &sp::CheckConstraint, limits: &SqlLimits) -> Result<CheckDef> {
+    if check.enforced == Some(false) {
+        return Err(unsupported("CHECK ... NOT ENFORCED (every constraint is enforced)"));
+    }
+    if check.no_inherit {
+        return Err(unsupported("CHECK ... NO INHERIT"));
+    }
+    let dg = DepthGuard { limits };
+    Ok(CheckDef {
+        name: check.name.as_ref().map(|n| convert_ident(n, limits)).transpose()?,
+        expr: convert_expr(&check.expr, &dg, 1)?,
+        text: check.expr.to_string(),
+    })
+}
+
+/// What a column definition declares beyond the column itself.
+#[derive(Default)]
+struct ColumnExtras {
+    foreign_key: Option<ForeignKeyDef>,
+    checks: Vec<CheckDef>,
+}
+
+fn convert_referential_action(a: &sp::ReferentialAction) -> ReferentialAction {
+    match a {
+        sp::ReferentialAction::Restrict => ReferentialAction::Restrict,
+        sp::ReferentialAction::Cascade => ReferentialAction::Cascade,
+        sp::ReferentialAction::SetNull => ReferentialAction::SetNull,
+        sp::ReferentialAction::NoAction => ReferentialAction::NoAction,
+        sp::ReferentialAction::SetDefault => ReferentialAction::SetDefault,
+    }
+}
+
+/// `FOREIGN KEY (...) REFERENCES t [(...)] [ON DELETE a] [ON UPDATE a]` (and the
+/// inline `REFERENCES` form, whose `columns` the caller fills in). `MATCH FULL` /
+/// `MATCH PARTIAL` and `DEFERRABLE` are refused: rubiXDb implements `MATCH SIMPLE`
+/// with immediate enforcement.
+fn convert_foreign_key(fk: &sp::ForeignKeyConstraint, limits: &SqlLimits) -> Result<ForeignKeyDef> {
+    if let Some(kind) = &fk.match_kind {
+        if !matches!(kind, sp::ConstraintReferenceMatchKind::Simple) {
+            return Err(unsupported(
+                "foreign key MATCH FULL / MATCH PARTIAL (only the default MATCH SIMPLE exists)",
+            ));
+        }
+    }
+    if fk.characteristics.is_some() {
+        return Err(unsupported(
+            "DEFERRABLE / INITIALLY DEFERRED foreign keys (enforcement is always immediate)",
+        ));
+    }
+    let name = fk.name.as_ref().map(|n| convert_ident(n, limits)).transpose()?;
+    Ok(ForeignKeyDef {
+        name,
+        columns: fk
+            .columns
+            .iter()
+            .map(|c| convert_ident(c, limits))
+            .collect::<Result<_>>()?,
+        foreign_table: convert_object_name(&fk.foreign_table, limits)?,
+        referred_columns: fk
+            .referred_columns
+            .iter()
+            .map(|c| convert_ident(c, limits))
+            .collect::<Result<_>>()?,
+        on_delete: fk.on_delete.as_ref().map(convert_referential_action),
+        on_update: fk.on_update.as_ref().map(convert_referential_action),
+    })
+}
+
+// ---------------------------------------------------------------------
+// ALTER TABLE
+// ---------------------------------------------------------------------
+
+/// One-operation `ALTER TABLE`. The forms rubiXDb cannot do safely are refused here
+/// with the reason, so the statement never reaches the binder:
+///
+/// * `DROP COLUMN` -- BLOCKED: a column's identity is its position, which the
+///   primary key, every index, every foreign key and every stored row use
+///   (`docs/adr/ADR-DDL-FK-01.md`);
+/// * `ALTER COLUMN ... TYPE` -- NOT IMPLEMENTED (needs a bounded rewrite);
+/// * `ADD/DROP PRIMARY KEY`, `ADD CHECK`, `RENAME TO`, `NOT VALID` -- NOT IMPLEMENTED.
+fn convert_alter_table(at: &sp::AlterTable, limits: &SqlLimits) -> Result<AlterTable> {
+    if at.only || at.location.is_some() || at.on_cluster.is_some() || at.table_type.is_some() {
+        return Err(unsupported(
+            "ALTER TABLE with ONLY / LOCATION / ON CLUSTER / a table type",
+        ));
+    }
+    let [op] = at.operations.as_slice() else {
+        return Err(unsupported(
+            "ALTER TABLE with more than one operation (each change is applied atomically on its own; send one statement per change)",
+        ));
+    };
+    let operation = match op {
+        sp::AlterTableOperation::AddColumn {
+            column_def,
+            if_not_exists,
+            column_position,
+            ..
+        } => {
+            if column_position.is_some() {
+                return Err(unsupported("ADD COLUMN ... FIRST / AFTER (columns are always appended)"));
+            }
+            let (column, inline_fk) = convert_column_def_with_fk(column_def, limits)?;
+            if column.primary_key {
+                return Err(unsupported(
+                    "ADD COLUMN ... PRIMARY KEY (a table has one primary key, fixed at CREATE TABLE)",
+                ));
+            }
+            if inline_fk.foreign_key.is_some() {
+                return Err(unsupported(
+                    "ADD COLUMN ... REFERENCES (add the column, then ALTER TABLE ... ADD FOREIGN KEY)",
+                ));
+            }
+            if !inline_fk.checks.is_empty() {
+                return Err(unsupported(
+                    "ADD COLUMN ... CHECK (add the column, then ALTER TABLE ... ADD CONSTRAINT CHECK)",
+                ));
+            }
+            AlterOperation::AddColumn {
+                column,
+                if_not_exists: *if_not_exists,
+            }
+        }
+        sp::AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => AlterOperation::RenameColumn {
+            from: convert_ident(old_column_name, limits)?,
+            to: convert_ident(new_column_name, limits)?,
+        },
+        sp::AlterTableOperation::AlterColumn { column_name, op } => {
+            let column = convert_ident(column_name, limits)?;
+            match op {
+                sp::AlterColumnOperation::SetNotNull => AlterOperation::SetNotNull { column },
+                sp::AlterColumnOperation::DropNotNull => AlterOperation::DropNotNull { column },
+                sp::AlterColumnOperation::SetDefault { value } => {
+                    let dg = DepthGuard { limits };
+                    AlterOperation::SetDefault {
+                        column,
+                        value: convert_expr(value, &dg, 1)?,
+                    }
+                }
+                sp::AlterColumnOperation::DropDefault => AlterOperation::DropDefault { column },
+                sp::AlterColumnOperation::SetDataType { .. } => {
+                    return Err(unsupported(
+                        "ALTER COLUMN ... TYPE (NOT IMPLEMENTED: a type change needs a bounded rewrite of every stored row)",
+                    ))
+                }
+                _ => return Err(unsupported("this ALTER COLUMN operation")),
+            }
+        }
+        sp::AlterTableOperation::AddConstraint {
+            constraint,
+            not_valid,
+        } => {
+            if *not_valid {
+                return Err(unsupported(
+                    "ADD CONSTRAINT ... NOT VALID (a constraint is always validated against the existing rows)",
+                ));
+            }
+            match constraint {
+                sp::TableConstraint::ForeignKey(fk) => {
+                    AlterOperation::AddForeignKey(convert_foreign_key(fk, limits)?)
+                }
+                sp::TableConstraint::Unique(u) => AlterOperation::AddUnique {
+                    name: u.name.as_ref().map(|n| convert_ident(n, limits)).transpose()?,
+                    columns: index_columns_to_idents(&u.columns, limits)?,
+                },
+                sp::TableConstraint::PrimaryKey(_) => {
+                    return Err(unsupported(
+                        "ADD PRIMARY KEY (a table's primary key is fixed at CREATE TABLE)",
+                    ))
+                }
+                sp::TableConstraint::Check(check) => {
+                    AlterOperation::AddCheck(convert_check(check, limits)?)
+                }
+                _ => return Err(unsupported("this table constraint kind")),
+            }
+        }
+        sp::AlterTableOperation::DropConstraint {
+            if_exists,
+            name,
+            drop_behavior,
+        } => {
+            if matches!(drop_behavior, Some(sp::DropBehavior::Cascade)) {
+                return Err(unsupported("DROP CONSTRAINT ... CASCADE"));
+            }
+            AlterOperation::DropConstraint {
+                name: convert_ident(name, limits)?,
+                if_exists: *if_exists,
+            }
+        }
+        sp::AlterTableOperation::DropColumn { .. } => {
+            return Err(unsupported(
+                "DROP COLUMN (BLOCKED: a column is identified by its position, which the primary key, indexes, foreign keys and stored rows all use; see docs/adr/ADR-DDL-FK-01.md)",
+            ))
+        }
+        sp::AlterTableOperation::RenameTable { .. } => {
+            return Err(unsupported("ALTER TABLE ... RENAME TO (NOT IMPLEMENTED)"))
+        }
+        _ => return Err(unsupported("this ALTER TABLE operation")),
+    };
+    Ok(AlterTable {
+        name: convert_object_name(&at.name, limits)?,
+        if_exists: at.if_exists,
+        operation,
     })
 }
 
@@ -1988,13 +2208,33 @@ fn index_columns_to_idents(cols: &[sp::IndexColumn], limits: &SqlLimits) -> Resu
         .collect()
 }
 
-fn convert_column_def(c: &sp::ColumnDef, limits: &SqlLimits) -> Result<ColumnDef> {
+/// A column definition, plus -- when it carries an inline `REFERENCES` -- the
+/// foreign key it declares (its `columns` left empty for the caller to fill).
+fn convert_column_def_with_fk(
+    c: &sp::ColumnDef,
+    limits: &SqlLimits,
+) -> Result<(ColumnDef, ColumnExtras)> {
     let data_type = convert_data_type(&c.data_type)?;
     let mut nullable = true;
     let mut default = None;
     let mut primary_key = false;
+    let mut extras = ColumnExtras::default();
     for opt in &c.options {
         match &opt.option {
+            sp::ColumnOption::ForeignKey(fk) => {
+                let mut def = convert_foreign_key(fk, limits)?;
+                if def.name.is_none() {
+                    def.name = opt.name.as_ref().map(|n| convert_ident(n, limits)).transpose()?;
+                }
+                extras.foreign_key = Some(def);
+            }
+            sp::ColumnOption::Check(check) => {
+                let mut def = convert_check(check, limits)?;
+                if def.name.is_none() {
+                    def.name = opt.name.as_ref().map(|n| convert_ident(n, limits)).transpose()?;
+                }
+                extras.checks.push(def);
+            }
             sp::ColumnOption::Null => {}
             sp::ColumnOption::NotNull => nullable = false,
             sp::ColumnOption::Default(e) => {
@@ -2013,13 +2253,16 @@ fn convert_column_def(c: &sp::ColumnDef, limits: &SqlLimits) -> Result<ColumnDef
             other => return Err(unsupported(format!("column option kind: {other:?}"))),
         }
     }
-    Ok(ColumnDef {
-        name: convert_ident(&c.name, limits)?,
-        data_type,
-        nullable,
-        default,
-        primary_key,
-    })
+    Ok((
+        ColumnDef {
+            name: convert_ident(&c.name, limits)?,
+            data_type,
+            nullable,
+            default,
+            primary_key,
+        },
+        extras,
+    ))
 }
 
 fn convert_data_type(dt: &sp::DataType) -> Result<SqlDataType> {

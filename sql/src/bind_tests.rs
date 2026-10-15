@@ -348,11 +348,19 @@ fn update_binds_assignment_ordinals_and_where() {
     f.cleanup();
 }
 
+/// Superseded by SQL Phase 2b+3 (`docs/adr/ADR-DDL-FK-01.md`, matrix row G-8): this
+/// test used to pin the refusal of `UPDATE` on a primary-key column (D6, "use DELETE +
+/// INSERT"). `ON UPDATE CASCADE` cannot exist without it, so the statement now binds;
+/// the behaviour is covered end to end by `phase2b3_tests::primary_key_update`.
+/// `INSERT ... ON CONFLICT DO UPDATE` still refuses to assign a key column.
 #[test]
-fn update_of_primary_key_column_is_rejected() {
+fn update_of_primary_key_column_now_binds() {
     let f = Fixture::new("update_pk");
-    let err = bind(&f, "UPDATE t SET id = 2 WHERE id = 1").unwrap_err();
-    assert!(matches!(err, SqlError::Unsupported { .. }));
+    let BoundStatement::Update(u) = bind(&f, "UPDATE t SET id = 2 WHERE id = 1").unwrap() else {
+        panic!()
+    };
+    assert_eq!(u.assignments.len(), 1);
+    assert_eq!(u.assignments[0].ordinal, 0); // id
     f.cleanup();
 }
 

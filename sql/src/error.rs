@@ -117,6 +117,13 @@ pub enum SqlError {
     /// index with that name). The caller's own mistake, so it maps to a client error -- never the generic
     /// catalog failure it used to be folded into. `detail` is the catalog's own safe text (`schema "x"`).
     AlreadyExists { detail: String },
+    /// A write would leave a foreign key without its referenced row, or remove a row
+    /// that is still referenced (`ADR-DDL-FK-01`). The caller's data, not a fault;
+    /// `detail` names the constraint and tables, never a row value.
+    ForeignKeyViolation { detail: String },
+    /// A row a statement would write violates a `CHECK` constraint
+    /// (`ADR-DDL-FK-01`). `detail` names the table and the constraint, never a value.
+    CheckViolation { detail: String },
 }
 
 impl fmt::Display for SqlError {
@@ -148,6 +155,10 @@ impl fmt::Display for SqlError {
             SqlError::DeadlineExceeded => write!(f, "execution deadline exceeded"),
             SqlError::Conflict { detail } => write!(f, "transaction conflict: {detail}"),
             SqlError::AlreadyExists { detail } => write!(f, "already exists: {detail}"),
+            SqlError::ForeignKeyViolation { detail } => {
+                write!(f, "foreign key violation: {detail}")
+            }
+            SqlError::CheckViolation { detail } => write!(f, "check violation: {detail}"),
         }
     }
 }
@@ -180,6 +191,7 @@ impl From<rubixdb::relational::RelationalError> for SqlError {
         match e {
             RE::ResourceLimit { detail } => SqlError::ResourceLimit { detail },
             RE::Conflict { detail } => SqlError::Conflict { detail },
+            RE::ForeignKeyViolation { detail } => SqlError::ForeignKeyViolation { detail },
             RE::InvalidInput { detail } => SqlError::ExecutionParameter { detail },
             // e.g. `CREATE INDEX` on a name already taken: classified exactly like a direct catalog error.
             RE::Catalog(ce) => SqlError::from(ce),
@@ -187,6 +199,27 @@ impl From<rubixdb::relational::RelationalError> for SqlError {
                 SqlError::Storage(e.to_string())
             }
         }
+    }
+}
+
+/// A catalog refusal of a DDL definition (a type mismatch between the two sides of
+/// a foreign key, dropping a table another table references, ...) is the
+/// statement's own fault, a 400-class error -- not the 500-class "catalog error" an
+/// inconsistency would be.
+pub fn ddl_catalog_error(e: rubixdb::catalog::CatalogError) -> SqlError {
+    match e {
+        rubixdb::catalog::CatalogError::InvalidInput { detail } => {
+            SqlError::ExecutionParameter { detail }
+        }
+        other => other.into(),
+    }
+}
+
+/// `ddl_catalog_error` for the relational layer's DDL operations.
+pub fn ddl_relational_error(e: rubixdb::relational::RelationalError) -> SqlError {
+    match e {
+        rubixdb::relational::RelationalError::Catalog(ce) => ddl_catalog_error(ce),
+        other => other.into(),
     }
 }
 
